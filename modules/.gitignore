@@ -1,0 +1,73 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+
+# VS Code
+.vscode/
+
+# JetBrains IDEs
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Audio files (optional)
+recordings/
+audio/
+*.wav
+*.mp3
+
+# Python build files
+build/
+dist/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# SQLite databases
+*.sqlite3
+*.db
+
+# Model/cache folders
+models/
+cache/
+
+# Ollama / AI generated temp files
+*.gguf
+*.bin
+
+# PyInstaller
+*.spec
+
+# System files
+.desktop
+
+# Secrets
+config/secrets.json
+credentials.json
