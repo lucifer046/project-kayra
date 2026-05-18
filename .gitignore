@@ -58,6 +58,7 @@ htmlcov/
 models/*
 !models/
 !models/voices.bin
+!models/kokoro.onnx
 cache/
 
 # Ollama / AI generated temp files
