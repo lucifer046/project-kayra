@@ -2,3 +2,7 @@ selenium
 mtranslate
 python-dotenv
 rich
+kokoro-onnx 
+sounddevice 
+numpy 
+soundfile

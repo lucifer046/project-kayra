@@ -55,22 +55,25 @@ htmlcov/
 *.db
 
 # Model/cache folders
-models/
+models/*
+!models/
+!models/voices.bin
 cache/
 
 # Ollama / AI generated temp files
 *.gguf
 *.bin
+!models/voices.bin
 
 # PyInstaller
 *.spec
 
 # System files
-.desktop
+*.desktop
 
 # Secrets
 config/secrets.json
 credentials.json
 
 # Project specific transient status files
-Data/Files/*.data
+data/Files/*.data
