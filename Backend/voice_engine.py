@@ -182,7 +182,7 @@ class OnlineSpeechEngine:
         print("[OnlineSpeechEngine] Headless Chrome session ready.")
 
         # Path for status communication with GUI
-        self.temp_dir_path = os.path.join(os.getcwd(), "Frontend", "Files")
+        self.temp_dir_path = os.path.join(os.getcwd(), "Data", "Files")
         os.makedirs(self.temp_dir_path, exist_ok=True)
 
         # Start background continuous recording immediately
