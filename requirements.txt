@@ -9,3 +9,4 @@ soundfile==0.13.1
 openai==2.37.0
 cohere==6.1.0
 requests==2.34.2
+onnxruntime>=1.19.0

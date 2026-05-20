@@ -77,5 +77,8 @@ cache/
 config/secrets.json
 credentials.json
 
-# Project specific transient status files
-data/Files/*.data
+# Project specific files
+data/*.json
+data/Files/*.data
+data/Files/*.json
+

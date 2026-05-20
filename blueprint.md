@@ -20,9 +20,11 @@ project-optimus/
 └── modules/              # Core Intelligence Systems
     ├── __init__.py       # Package definition and namespace exports
     ├── utils.py          # Cyberpunk terminal UI, pathing, and logging
+    ├── chatbot.py        # Conversational memory engine & persistent context layers
     ├── llm_engine.py     # Centralized LLM Engine (DMM & Chat Streaming)
     ├── speech_to_text.py # Continuous Web Speech API via headless Chrome
     └── text_to_speech.py # Offline Kokoro-ONNX Real-Time Audio Streaming
+
 ```
 
 ## Core Modules Logic & Functions
@@ -90,6 +92,14 @@ project-optimus/
   * `is_online()`: Checks model reachability and network connection to determine execution mode.
   * `classify_intent(query)`: The Decision Making Model (DMM). Analyzes raw input via `cohere` or local APIs to categorize intent (e.g., realtime, deep research, general).
   * `generate_chat_stream(messages)`: Generates continuous conversational AI replies and streams them token-by-token. 
+
+### `modules/chatbot.py`
+**Purpose:** Orchestrates conversational state persistence and memory context tables. Manages both volatile short-term session RAM sliding windows and persistent long-term storage contexts.
+* `AnswerModifier(Answer)`: Formats assistant response text to maximize density.
+* `load_memory()`: Loads history files, providing automated fallback/index recovery in case of system interrupt.
+* `save_memory(memory_list)`: Executes atomic transactional disk writes to avoid concurrency collisions.
+* `Chatbot(query)`: Runs sliding memory window alignment logic, interfaces with the central LLM engine streaming channel, indexes queries, and triggers automated storage registers.
+
 
 ### `modules/speech_to_text.py`
 **Purpose:** A flawless background STT engine. Unlike normal Python scripts that lock up the mic, this spins up an invisible headless Chrome browser utilizing the native Web Speech API. 

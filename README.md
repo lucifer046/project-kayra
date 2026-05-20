@@ -24,6 +24,7 @@ Optimus-DA is a high-performance, intelligent desktop assistant framework. It fe
 project-optimus/
 ├── modules/
 │   ├── __init__.py           # Package exports & legacy backwards-compatibility mappings
+│   ├── chatbot.py            # Conversational memory engine & persistent context layers
 │   ├── llm_engine.py         # Decision Making Model & Chat Stream manager
 │   ├── text_to_speech.py     # Local offline Kokoro TTS Engine wrapper
 │   ├── speech_to_text.py     # Browser-based Continuous STT engine
@@ -92,3 +93,40 @@ Launches an interactive console utility that lets you type any sentence and hear
 ```bash
 python tests/test_voice.py
 ```
+
+---
+
+## Conversational Memory & Storage Architecture
+
+The assistant implements a hybrid dual-tier memory system designed for maximum conversation speed, contextual relevance, and durable persistence.
+
+### 1. The Dual-Tier Memory System
+
+* **Short-Term Session Memory (Volatile)**: 
+  * Maintained in-memory inside a volatile RAM list (`session_memory`).
+  * Stores all dialogues during the current running session.
+  * Bounded to a **sliding window of the last 6 messages** (3 conversational exchanges). This bounds context token usage to ensure high execution speeds and prevent model context window overflow.
+  
+* **Long-Term Context Memory (Persistent)**:
+  * Restored from a local database file (`data/conversation.json`) at startup.
+  * Injected directly at the top of the LLM context pool on every request, creating a persistent personality baseline and history.
+  * Handled dynamically to survive sudden terminal halt events.
+
+### 2. When & How Data is Stored
+
+The assistant is engineered to avoid cluttering long-term memory with small talk. Instead, it selectively commits items to long-term storage based on user directives:
+
+* **Trigger Commands**:
+  The system automatically monitors user prompts for explicit memory-save trigger words:
+  `"store this"`, `"remember this"`, `"save this"`, `"memorize this"`, `"note this"`
+  
+* **Storage Execution**:
+  When a trigger word is matched, the active user query and the corresponding response are appended to the permanent memory list and committed directly to disk.
+
+### 3. Fail-safe Atomic File Writing
+
+To protect your conversational history from sudden system terminations, the persistence layer utilizes an atomic file transaction scheme:
+1. Writes the fresh JSON context payload to a secondary backup location: `data/conversation_backup.json`.
+2. Replaces the primary `data/conversation.json` database via an atomic system-level copying transaction (`shutil.copy`).
+3. If the primary file ever gets corrupted or experiences half-write failures during unexpected shutdowns, the startup recovery pipeline automatically detects the error and restores the database using the secondary backup copy.
+

@@ -1,3 +1,15 @@
+# ===========================================================================================================
+#                                 llm_engine.py (Centralized LLM Engine & Intent Classifier)
+# ===========================================================================================================
+# This module implements the central orchestrator and fallback intelligence system.
+#
+# Core Frameworks & Architectures:
+# 1. Decision-Making Model (DMM): Classifies raw user inputs into structured system-level execution arrays.
+# 2. Local-Cloud Switcher Matrix: Automatically routes queries to cloud engines (Gemini/Cohere) or offline
+#    local endpoints (Ollama/LM Studio) based on host availability and environment configurations.
+# 3. Stream-Based Generation: Leverages token generators to stream dialogue responses with zero lag.
+# ===========================================================================================================
+
 import os
 import time
 import requests
@@ -92,6 +104,28 @@ class CentralizedLLMEngine:
                 {"role": "User", "message": "chat with me."},
                 {"role": "Chatbot", "message": "general chat with me."}
             ]
+
+    def get_identity_prompt(self):
+        """
+        Compiles the system persona instructions for the assistant based on env configuration.
+        """
+        name = self.env_vars.get("ASSISTANT_NAME", "KYRA").strip()
+        gender = self.env_vars.get("ASSISTANT_GENDER", "Female").strip()
+        lang = self.env_vars.get("LANGUAGE", "English").strip()
+        username = self.env_vars.get("USERNAME", "User").strip()
+        
+        prompt = (
+            f"Hello, I am {username}. You are a highly accurate, advanced, and premium AI chatbot named {name}. "
+            f"Your gender profile is {gender}. You must always respond and converse fluently in {lang}. "
+            f"You have access to real-time, up-to-date information from the internet.\n\n"
+            f"CRITICAL BEHAVIORAL DIRECTIVES:\n"
+            f"1. Be extremely concise.\n"
+            f"2. Maintain a respectful, professional, and polite tone at all times.\n"
+            f"3. Do not tell the time unless explicitly requested.\n"
+            f"4. Never provide conversational 'notes' or disclaimers in the output. Simply deliver the precise answer.\n"
+            f"5. Under no circumstances should you ever mention your training data, AI architecture, or model limitations."
+        )
+        return prompt
 
     def _check_local_server(self):
             """Pings the local model endpoint. Returns True if alive."""
