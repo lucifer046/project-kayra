@@ -4,13 +4,24 @@ Kayra-DA is a high-performance, intelligent desktop assistant framework. It feat
 
 ---
 
-## Key Features
+### Key Features
 
 ### Centralized LLM Engine (`modules/llm_engine.py`)
 * **Hybrid Connectivity Matrix:** Automatically switches between offline local models (such as LM Studio or Ollama) and powerful Cloud APIs (Gemini 2.5 & Cohere Command).
 * **Intent-Driven Decision Making Model (DMM):** Uses high-speed classification to parse user inputs into structured system commands (e.g., deep research, application control, search queries, reminders) or general conversational responses.
 * **Stream-Based Chunk Generation:** Provides real-time token streaming for low-latency assistant responses.
 * **Robust Fallback Engine:** Features multi-level catch-and-retry patterns to handle network disruptions or local server authentication adjustments seamlessly.
+
+### Real-Time Search & RAG Engine (`modules/real_time_search.py`)
+* **Zero-Cost Web Scraper:** Scrapes DuckDuckGo without API keys, featuring automatic switching between text and scraper-based HTML backends.
+* **Retrieval-Augmented Generation (RAG):** Grounded LLM responses that merge real-time search context, volatile sliding short-term memory, and persistent long-term database storage.
+* **Dual-Tier Memory Integration:** Integrates search queries and RAG context with persistent memory storage automatically when triggers are detected.
+
+### Autonomous Deep Research Engine (`modules/deep_research.py`)
+* **Multi-Step Query Decomposition:** Automatically breaks down a complex central research topic into highly targeted sub-queries.
+* **Scrape-Based Context Compiler:** Crawls and compiles comprehensive context pools for all queries in parallel.
+* **Technical Synthesis Loop:** Uses the Centralized LLM Engine to synthesize context pools into exhaustive Markdown whitepapers.
+* **Durable Export Pipeline:** Saves generated reports to a dedicated local workspace under the `Reports/` directory.
 
 ### Offline Speech Matrix (`modules/speech_to_text.py` & `modules/text_to_speech.py`)
 * **Continuous Speech-to-Text (STT):** Continuous, asynchronous browser-based STT transcription tailored to your preferred language matrix.
@@ -25,15 +36,18 @@ project-kayra/
 ├── modules/
 │   ├── __init__.py           # Package exports & legacy backwards-compatibility mappings
 │   ├── chatbot.py            # Conversational memory engine & persistent context layers
+│   ├── deep_research.py      # Autonomous query decomposition & technical whitepaper writer
 │   ├── llm_engine.py         # Decision Making Model & Chat Stream manager
+│   ├── real_time_search.py   # RAG-grounded search engine with auto-switching DuckDuckGo backends
 │   ├── text_to_speech.py     # Local offline Kokoro TTS Engine wrapper
 │   ├── speech_to_text.py     # Browser-based Continuous STT engine
 │   └── utils.py              # Shared helpers, logs, and path resolution
+├── Reports/                  # Output directory for autonomous research whitepapers
 ├── tests/
 │   ├── test_engine.py        # LLM Engine integration and fallback tests
 │   └── test_voice.py         # Interactive TTS voice playground
 ├── .env.example              # Central environment configuration template
-└── requirements.txt          # Python dependency declarations
+├── requirements.txt          # Python dependency declarations
 ```
 
 ---
@@ -92,6 +106,18 @@ python tests/test_engine.py
 Launches an interactive console utility that lets you type any sentence and hear it synthesized locally using the premium Kokoro TTS voice engine.
 ```bash
 python tests/test_voice.py
+```
+
+### Real-Time Search Sandbox
+Launches an interactive RAG console allowing you to query the live internet via DuckDuckGo. The assistant grounds its streaming replies using retrieved online resources.
+```bash
+python modules/real_time_search.py
+```
+
+### Deep Research Sandbox
+Launches the autonomous research loop. Enter any complex topic, and watch the model decompose it, retrieve data points, and synthesize a comprehensive technical whitepaper under the `Reports/` directory.
+```bash
+python modules/deep_research.py
 ```
 
 ---

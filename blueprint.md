@@ -10,6 +10,7 @@ project-kayra/
 ├── requirements.txt      # Python dependencies
 ├── data/                 # Dynamic data generation and caching directory
 │   └── Files/            # Sub-directory for temp STT/TTS status tracking
+├── Reports/              # Generated markdown whitepapers
 ├── logs/                 # Standardized system activity logs
 ├── models/               # Offline models directory
 │   ├── kokoro.onnx       # Kokoro TTS ONNX Model (82M)
@@ -22,6 +23,8 @@ project-kayra/
     ├── utils.py          # Cyberpunk terminal UI, pathing, and logging
     ├── chatbot.py        # Conversational memory engine & persistent context layers
     ├── llm_engine.py     # Centralized LLM Engine (DMM & Chat Streaming)
+    ├── real_time_search.py # DuckDuckGo unauthenticated search engine & RAG
+    ├── deep_research.py  # Autonomous multi-step topic decomposition and whitepaper writer
     ├── speech_to_text.py # Continuous Web Speech API via headless Chrome
     └── text_to_speech.py # Offline Kokoro-ONNX Real-Time Audio Streaming
 
@@ -100,6 +103,18 @@ project-kayra/
 * `save_memory(memory_list)`: Executes atomic transactional disk writes to avoid concurrency collisions.
 * `Chatbot(query)`: Runs sliding memory window alignment logic, interfaces with the central LLM engine streaming channel, indexes queries, and triggers automated storage registers.
 
+### `modules/real_time_search.py`
+**Purpose:** Web Search and Retrieval-Augmented Generation (RAG) module. Scrapes live information from DuckDuckGo without any API key or authentication and integrates the structured results as direct system context to generate grounded LLM responses.
+* `WebSearch(query)`: Leverages the `DDGS` unauthenticated text backend (with automated fallback to HTML scraper mode) to retrieve the top 5 web results, compiling titles, snippets, and URLs.
+* `AnswerModifier(Answer)`: Formats assistant response text to maximize density.
+* `load_memory()` and `save_memory(memory_list)`: Atomic transactional database methods handling corruption-resistant memory tracking.
+* `RealTimeSearchEngine(query)`: The central orchestrator for the RAG search pipeline. Scrapes the web, builds an augmented user prompt structure, handles sliding short-term and persistent memory contexts, streams answers live to terminal, and persists triggered memory frames.
+
+### `modules/deep_research.py`
+**Purpose:** Autonomous multi-phase technical research agent. Decomposes broad central themes into focused research vectors, crawls search indexes to collect broad pools of contextual data, and synthesizes exhaustive, professional Markdown reports.
+* `generate_sub_queries(topic)`: Decomposes a broad central theme into a structured list of distinct, specific search queries using the LLM.
+* `bulk_scrape(query)`: Scrapes up to 5 comprehensive text snippets per search query to build a rich raw context repository.
+* `DeepResearchEngine(topic)`: The master orchestration workflow. Generates query sub-vectors, pulls bulk scraper context, prompts the LLM to write a comprehensive, highly-structured technical report (Executive Summary, Deep Dive categories, Conclusion), streams the document live to terminal, and writes the final markdown file with a clean timestamp to the `Reports/` folder.
 
 ### `modules/speech_to_text.py`
 **Purpose:** A flawless background STT engine. Unlike normal Python scripts that lock up the mic, this spins up an invisible headless Chrome browser utilizing the native Web Speech API. 
