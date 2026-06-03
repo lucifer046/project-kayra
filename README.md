@@ -3,6 +3,7 @@
 Kayra is a high-performance, intelligent desktop assistant designed to provide a robust, hands-free hardware and operating system control experience. Equipped with a hybrid **Centralized LLM Engine** and a continuous **Offline Speech Matrix** (Speech-to-Text & Kokoro TTS), Kayra translates your natural language spoken or typed queries into instant hardware actions, real-time web searches, or publication-grade deep research reports.
 
 ### ✨ New Features
+- **Beast Gesture Engine (Spatial Vision Core)**: High-performance hand-gesture mouse and task control system utilizing MediaPipe and pure Win32 kernel input injection. Tuned with a 1-Euro adaptive tracking filter, scale/rotation-invariant anatomical finger classifications, and multi-frame pinch hysteresis to guarantee zero phantom clicks or cursor wobble.
 - **Curated Orchestrator & Strict DMM Routing**: The Decision Making Model (DMM) has been mathematically mapped to 100% of the system's hardware automation functions, entirely eliminating LLM hallucinations or improper action execution.
 - **Synchronized TTS Boot Sequence**: Kayra now features a highly advanced, line-by-line cinematic system boot sequence. Hardware interfaces and API states are analyzed and spoken aloud in real-time.
 - **100% Offline Capability**: Automatically falls back to a locally hosted LLM Server if no internet connection or cloud API keys are detected, allowing complete offline hardware automation and chatting.
@@ -181,6 +182,20 @@ Invokes advanced data collection and technical research whitepaper synthesis.
 - **How to say it:**
   - `"search on google: [topic]"` / `"search on youtube: [video]"` -> Standard web query targets.
   - `"run deep research on [topic]"` / `"do deep research on [topic]"` -> Triggers Kayra's **advanced 6-stage autonomous research pipeline**. The model builds a research plan (10 queries), scrapes index pools, deep-extracts full page contents (stripping boilerplate via BeautifulSoup), performs gap analysis, completes follow-up scrapes, and compiles a comprehensive, publication-grade markdown technical whitepaper saved in the `Reports/` directory.
+
+### 13. Spatial Gesture Control (Beast Gesture Engine)
+
+Kayra features a high-performance, real-time webcam spatial gesture tracking system. Spin up the engine to seamlessly control your desktop, browse, or double click using your hands.
+
+- **Gestures vocabulary:**
+  - Index finger extended -> MOVE cursor smoothly (wobble-free 1-Euro tracking filter).
+  - Thumb + Index pinch -> Left Click / Hold (3-frame hysteresis confirmation debounce + 450ms spam cooldown).
+  - Thumb + Middle pinch -> Right Click (450ms spam cooldown).
+  - Thumb + Index + Middle pinch -> Double Click (3-finger bird beak pinch, programmatically sent instantly).
+  - Index + Middle extended -> Continuous Joystick Scroll (Hold hand above or below active anchor to scroll up or down).
+
+- **How to launch it:**
+  - Run `python modules/air_cursor_engine.py` from your terminal to boot the engine independently.
 
 ---
 

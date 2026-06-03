@@ -27,6 +27,7 @@ project-kayra/
     ├── deep_research.py  # Autonomous multi-step topic decomposition and whitepaper writer
     ├── speech_to_text.py # Continuous Web Speech API via headless Chrome
     ├── text_to_speech.py # Offline Kokoro-ONNX Real-Time Audio Streaming
+    ├── air_cursor_engine.py # Spatial hand tracking and hardware click injection
     └── automation_windows.py # High-utility hardware input injection & OS/browser automation
 ```
 
@@ -138,6 +139,19 @@ project-kayra/
 * **Class `DynamicVoiceEngine`**:
   * `__init__()`: Autodetects `ASSISTANT_GENDER` from `.env` to map to premium voices (`am_adam` or `af_bella`). Performs highly robust fallback path resolutions to locate `kokoro.onnx` and `voices.bin`.
   * `speak(text)`: Consumes the `stream()` audio arrays chunk by chunk, feeding them instantly to `sounddevice` for zero-latency speaker playback.
+
+### `modules/air_cursor_engine.py`
+**Purpose:** Real-time spatial hand gesture recognition and pure C-level user32 input injection. Eliminates pyautogui dependency and leverages advanced computer vision to implement seamless cursor navigation, clicking, double clicking, and natural scrolling using webcams.
+* **1-Euro Filter Class (`OneEuroFilter`)**:
+  * An adaptive, low-pass filter configured with `min_cutoff=2.0` and `beta=0.05`. Aggressively smooths slow movements to eliminate micro-hand wobble and jitter while dynamically widening the cutoff during fast actions to ensure zero-lag tracking.
+* **Gesture Recognition Engine (`GestureStateMachine`)**:
+  * `classify(landmarks, cam_w, cam_h, now)`: Computes spatial anatomical properties. Classifies extended/curled states using a scale/rotation-invariant relative joint distance algorithm (`dist(wrist, tip) > dist(wrist, pip) * 1.05`).
+  * **Hysteresis Click Debouncer**: Confirms left/right pinch gestures over a 3-frame buffer to prevent sensor noise from triggering phantom clicks. Integrates a strict `CLICK_COOLDOWN = 0.45s` to guarantee clean inputs.
+  * **3-Finger Programmatic Double Click**: Classifies a simultaneous pinch of Thumb + Index + Middle (Bird Beak pinch) and fires a clean programmatic double click event instantly.
+  * **Absolute Gesture Isolation**: Automatically disables click/pinch tracking whenever the scroll navigation pose is active, preventing false triggers during workspace navigation.
+  * **Continuous Joystick Scroll**: Anchors a virtual Y-position when the scrolling pose starts, producing continuous upward or downward scroll inputs proportional to how far you hold your hand from the baseline anchor.
+* **Webcam Engine (`GestureMouseEngine`)**:
+  * `start_capture_loop()`: Spins up OpenCV video stream at 30 FPS. Draws interactive zones utilizing asymmetric anatomical comfort bounds (`MARGIN_X = 100`, `MARGIN_TOP = 100`, `MARGIN_BOTTOM = 185`) to easily reach the bottom edges of standard monitors without cutting off the wrist and forearm at the webcam border.
 
 ### `modules/automation_windows.py`
 **Purpose:** High-utility hardware input injection, system telemetry aggregator, and OS/browser orchestration module. Simulates hardware keyboard presses, adjusts monitor panels, interacts with active window contexts, and acts as the physical "hands" of the assistant.
