@@ -76,6 +76,14 @@ except ImportError:
     except ImportError:
         async def Automation(cmds): print_error("Automation Engine is offline.")
 
+try:
+    from modules.emotion_engine import EmotionEngine
+    emotion_engine = EmotionEngine()
+    EMOTION_ENABLED = True
+except ImportError:
+    emotion_engine = None
+    EMOTION_ENABLED = False
+
 # 4. Ears (Speech-to-Text integration)
 try:
     from modules.speech_to_text import SpeechToTextEngine
@@ -296,6 +304,9 @@ async def Main_Loop():
                 
             if AUDIO_ENABLED:
                 print_info(f"Transcribed Input: '{user_input}'")
+
+            if EMOTION_ENABLED:
+                detected_mood = emotion_engine.analyze_text(user_input)
 
             # 2. Feed text into the Decision Making Model (DMM)
             try:

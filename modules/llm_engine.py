@@ -94,7 +94,7 @@ class CentralizedLLMEngine:
                 if self._gemini_key else None
             )
             
-            self.dmm_status = f"DMM initialised with Cohere ({self.cohere_model})" if self.cohere_client else "DMM initialised with None (Offline)"
+            self.dmm_status = f"Decision making initialised with Cohere ({self.cohere_model})" if self.cohere_client else "Decision making initialised with None (Offline)"
             
             chat_models = []
             if self.groq_client: chat_models.append("Groq")
@@ -108,7 +108,7 @@ class CentralizedLLMEngine:
             self.groq_client   = None
             self.gemini_client = None
             
-            self.dmm_status = f"DMM initialised with Local LLM ({self.local_decision_model})"
+            self.dmm_status = f"Decision making initialised with Local LLM ({self.local_decision_model})"
             self.chat_status = f"Chat model initialised with Local LLM ({self.local_chat_model})"
 
         # Secure the boot-lock so prints never repeat on subsequent instantiations
@@ -375,9 +375,12 @@ class CentralizedLLMEngine:
             gender = self.env_vars.get("ASSISTANT_GENDER", "Female").strip()
         lang = self.env_vars.get("LANGUAGE", "English").strip()
         username = self.env_vars.get("USERNAME", "User").strip()
+        user_gender = self.env_vars.get("USER_GENDER", "Male").strip()
+        
+        user_title = "Ma'am" if user_gender.lower() == "female" else "Sir"
         
         prompt = (
-            f"Hello, I am {username}. You are a highly intelligent, empathetic, and witty AI companion named {name}. "
+            f"Hello, my username is {username}. You are a highly intelligent, empathetic, and witty AI companion named {name}. "
             f"Your gender profile is {gender}. You must always respond and converse fluently in {lang}. "
             f"You have access to real-time, up-to-date information from the internet.\n\n"
             f"CRITICAL BEHAVIORAL DIRECTIVES:\n"
@@ -386,7 +389,8 @@ class CentralizedLLMEngine:
             f"3. Keep your answers reasonably concise but do not sacrifice conversational flow.\n"
             f"4. Do not tell the time unless explicitly requested.\n"
             f"5. Never provide conversational 'notes' or disclaimers in the output. Just talk naturally.\n"
-            f"6. Under no circumstances should you ever mention your training data, AI architecture, or model limitations."
+            f"6. Under no circumstances should you ever mention your training data, AI architecture, or model limitations.\n"
+            f"7. Always address me as '{user_title}' instead of my username during the conversation."
         )
         return prompt
 

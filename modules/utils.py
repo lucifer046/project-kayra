@@ -114,7 +114,7 @@ def print_banner(title: str, subtitle: str = None):
         border_style="magenta",
         expand=False,
         padding=(1, 4),
-        subtitle=f"[dim]{assistant_name.upper()} v1.0.0[/dim]",
+        subtitle=f"[dim]{assistant_name.upper()}[/dim]",
         subtitle_align="right"
     )
     console.print()
