@@ -13,8 +13,10 @@ DMM: Cohere Command-R (cloud) or local model (offline)
 
 import os
 import time
+import socket
 import requests
 import cohere
+from urllib.parse import urlparse
 from openai import OpenAI
 from dotenv import dotenv_values
 
@@ -33,10 +35,27 @@ class CentralizedLLMEngine:
     Centralized intelligence routing matrix.
     Checks host environments to dynamically swap between offline local endpoints (Ollama/LM Studio)
     and online cloud endpoints (Gemini/Cohere). Houses the Decision-Making Model (DMM) for intent parsing.
+
+    Singleton: every module in the project does `engine = CentralizedLLMEngine()` at import
+    time (main.py, chatbot.py, real_time_search.py, automation_windows.py, deep_research.py).
+    Without a singleton, that meant up to 5 fully independent instances at every boot — each
+    re-probing the local LLM server, re-reading .env, and re-constructing its own Cohere/Groq/
+    Gemini API clients. `__new__` here ensures they all share ONE instance/one set of clients.
     """
+    _instance = None
     _has_booted = False
 
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
+        if self._initialized:
+            return  # Shared singleton already fully constructed — nothing to redo.
+        self._initialized = True
+
         # Resolve absolute pathways to locate .env profile parameters dynamically
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.env_vars = dotenv_values(os.path.join(project_root, ".env")) or {}
@@ -114,157 +133,168 @@ class CentralizedLLMEngine:
         # Secure the boot-lock so prints never repeat on subsequent instantiations
         CentralizedLLMEngine._has_booted = True
 
-    def run_boot_sequence(self, tts_engine=None):
-        """Prints and speaks the boot sequence line by line."""
-        import time
-        from modules.utils import print_system
-
-        # 1. Announce DMM
-        print_system(self.dmm_status)
-        if tts_engine:
-            tts_engine.speak(self.dmm_status)
-        time.sleep(0.1)
-
-        # 2. Announce Chat Model
-        print_system(self.chat_status)
-        if tts_engine:
-            tts_engine.speak(self.chat_status)
-        time.sleep(0.1)
-
-        # Valid intents/commands acceptable by the system parser
+        # Valid intents/commands acceptable by the system parser, and the DMM's few-shot
+        # training prompt. Set here (not in run_boot_sequence) so classify_intent() works
+        # immediately on any freshly constructed instance, regardless of whether the caller
+        # ever invokes run_boot_sequence() — a standalone diagnostic script that only needs
+        # classify_intent() shouldn't have to know that unrelated method exists.
+        # The accepted-token vocabulary, grouped by the category it belongs to. This list is
+        # the gate: `classify_intent` discards anything the model emits that does not start
+        # with one of these, so a token here that no executor handles is worse than useless —
+        # it passes the filter and is then silently dropped by the automation router.
+        # Every token below is dispatched by modules/automation_windows.py or by main.py.
         self.funcs = [
-            "exit", "general", "realtime", "open", "close", "play",
-            "generate image", "system", "content", "google search", 
-            "youtube search", "reminder", "deep research",
-            "screenshot", "take screenshot", "copy", "paste", "copy text",
-            "snap left", "snap right", "minimize all", "show desktop",
-            "switch window", "alt tab", "task view", "maximize", "minimize",
-            "close window", "action center", "notification", "emoji",
-            "pause", "resume", "next track", "previous track", "stop media",
+            # conversation / retrieval / research
+            "general", "realtime", "deep research", "exit",
+            # applications, windows, tabs
+            "open", "close", "close window", "close tab", "new tab",
+            "minimize", "minimize all", "maximize", "show desktop",
+            "snap left", "snap right", "switch window", "alt tab", "task view",
+            "action center", "notification", "emoji",
+            # media
+            "play", "pause", "resume", "next track", "previous track", "stop media",
+            # system control & information
+            "system", "wifi",
             "battery", "cpu", "ram", "disk", "uptime", "ip address",
-            "timer", "set timer",
-            "undo", "redo", "select all", "save file", "save", "find", "search",
-            "new tab", "close tab", "refresh", "reload", "fullscreen", "print",
+            # authoring, input, clipboard
+            "content", "write", "type", "copy", "paste", "copy text",
+            # browser/editor hotkeys
+            "undo", "redo", "select all", "save", "save file", "find", "search",
+            "refresh", "reload", "fullscreen", "print",
             "zoom in", "zoom out", "reset zoom", "task manager", "run dialog",
-            "wifi", "write", "type"
+            # search pages & utilities
+            "google search", "youtube search",
+            "screenshot", "take screenshot", "timer", "set timer", "reminder",
         ]
         
-        # Preamble instructions to restrict DMM responses to structured task labels
+        # Preamble instructions to restrict DMM responses to structured task labels.
+        #
+        # Organised by intent CATEGORY (conversation / retrieval / app / window / tab / media /
+        # system / info / input / utility). The category names are for the classifier's
+        # reasoning only — they are never emitted; the parser expects the literal tokens.
+        #
+        # Kept deliberately tight: this preamble plus `dmm_chat_history` is re-sent on every
+        # single classification, so redundant prose is paid for on every user turn.
         self.dmm_preamble = """
-            You are a very accurate Decision-Making Model, which decides what kind of a query is given to you.
-            You will decide whether a query is a 'general' query, a 'realtime' query, or is asking to perform any task or automation like 'open facebook, instagram', 'can you write a application and open it in notepad'.
-            
-            *** DO NOT ANSWER THE QUERY DIRECTLY. JUST DECIDE WHAT KIND OF QUERY IT IS AND FORMAT IT EXACTLY AS INSTRUCTED BELOW. ***
-            
-            =========================================
-            INTENT CLASSIFICATION & FORMATTING RULES
-            =========================================
-            
-            [1. KNOWLEDGE & CONVERSATION]
-            -> Respond with 'deep research (topic)' if the query explicitly requests to deeply analyze, research, do a deep dive, or write an exhaustive technical report on a specific topic. Example: if the query is 'do deep research on carbon batteries' respond with 'deep research carbon batteries'.
-            
-            -> Respond with 'general (query)' if a query can be answered by an LLM model (conversational AI chatbot) and doesn't require any up-to-date information like if the query is 'who was akbar?' respond with 'general who was akbar?'.
-               - Also use 'general (query)' if the query lacks a proper noun or is incomplete/ambiguous (e.g., uses pronouns like he, she, it, him, her). Examples: 'who is he?', "what's his networth?", 'tell me more about him.'.
-               - Also use 'general (query)' if the query is asking about time, day, date, month, year, etc.
-               
-            -> Respond with 'realtime (query)' if a query cannot be answered by an LLM model (because they don't have realtime data) and requires up-to-date information like if the query is 'who is indian prime minister' respond with 'realtime who is indian prime minister', if the query is 'what is today's news?' respond with 'realtime what is today's news?'.
-               - Also use 'realtime (query)' if it asks about any specific individual or thing using proper nouns. Examples: 'who is akshay kumar', "tell me about facebook's recent update.", 'tell me news about coronavirus.', "what is today's headline?".
+            You are a Decision-Making Model. You classify the user's request into system task tokens.
 
-            [2. SYSTEM & MEDIA AUTOMATION]
-            -> Respond with 'open (application name or website name)' if a query is asking to open any application like 'open facebook'. If asking to open multiple, respond with 'open 1st application name, open 2nd application name' and so on.
-            
-            -> Respond with 'close (application name)' if a query is asking to close any application like 'close notepad'. If asking to close multiple, respond with 'close 1st application name, close 2nd application name' and so on.
-            
-            -> Respond with 'play (song or genre)' if a query is asking to play any song or listen to music, like 'play afsanay by ys' or 'i want to listen to rock music'. If asking to play multiple songs, respond with 'play 1st song name, play 2nd song name' and so on. If the user just says 'play music', respond with 'play music'.
-            
-            -> Respond with 'generate image (image prompt)' if a query is requesting to generate an image with a given prompt like 'generate image of a lion'. If asking to generate multiple images, respond with 'generate image 1st image prompt, generate image 2nd image prompt' and so on.
-            
-            -> Respond with 'reminder (datetime with message)' if a query is requesting to set a reminder like 'set a reminder at 9:00pm on 25th june for my business meeting.' respond with 'reminder 9:00pm 25th june business meeting'.
-            
-            -> Respond with 'system (task name)' if a query is asking to mute, unmute, volume up, volume down, increase/decrease brightness, lock the system, shutdown, restart, or sleep. Use the exact user phrasing for the task. Examples:
-               - 'mute the sound' -> 'system mute'
-               - 'increase volume by 20%' -> 'system increase volume by 20%'
-               - 'set brightness to 50%' -> 'system brightness 50%'
-               - 'lock my pc' -> 'system lock'
-               - 'shutdown the computer' -> 'system shutdown'
-            
-            [3. CONTENT GENERATION & SEARCH]
-            -> Respond with 'content (topic)' if a query is asking to write any type of content like application, codes, emails or anything else. If asking to write multiple types of content, respond with 'content 1st topic, content 2nd topic' and so on.
-            
-            -> Respond with 'google search (topic)' if a query is asking to search a specific topic on Google. If asking to search multiple topics, respond with 'google search 1st topic, google search 2nd topic' and so on.
-            
-            -> Respond with 'youtube search (topic)' if a query is asking to search a specific topic on YouTube. If asking to search multiple topics, respond with 'youtube search 1st topic, youtube search 2nd topic' and so on.
-            
-            [4. DESKTOP CONTROLS & UTILITIES]
-            -> Respond with 'take screenshot' if the user asks to capture the screen, take a screenshot, or snap the screen.
-            
-            -> Respond with 'copy' if the user asks to copy something. Respond with 'paste' if the user asks to paste. Respond with 'copy text (message)' if the user wants to copy specific text to clipboard.
-            
-            -> Respond with 'write (text)' or 'type (text)' if the user asks to type or write text at the current cursor position. Example: 'type hello world' -> 'write hello world'.
-            
-            -> For window management, respond EXACTLY with the matching command:
-               - 'minimize all windows' or 'show desktop' -> 'minimize all'
-               - 'snap this to the left' -> 'snap left'
-               - 'snap to right' -> 'snap right'
-               - 'switch window' or 'alt tab' -> 'switch window'
-               - 'maximize this window' -> 'maximize'
-               - 'minimize this window' -> 'minimize'
-               - 'close this window' -> 'close window'
-               - 'open task view' -> 'task view'
-               - 'open action center' or 'open notifications' -> 'notification'
-               - 'open emoji picker' -> 'emoji'
-            
-            -> For media playback, respond EXACTLY with:
-               - 'pause the music' or 'play music' -> 'pause'
-               - 'resume the music' -> 'resume'
-               - 'next song' or 'skip track' -> 'next track'
-               - 'previous song' or 'go back' -> 'previous track'
-               - 'stop the music' -> 'stop media'
-            
-            -> For system info queries, respond EXACTLY with:
-               - 'check battery' or 'battery status' -> 'battery'
-               - 'how much ram' or 'memory usage' -> 'ram'
-               - 'cpu info' or 'processor info' -> 'cpu'
-               - 'disk space' or 'storage info' -> 'disk'
-               - 'system uptime' -> 'uptime'
-               - 'what is my ip' or 'network info' -> 'ip address'
-            
-            -> Respond with 'set timer (duration)' if the user asks to set a timer or countdown. Example: 'set a timer for 5 minutes' -> 'set timer 5 minutes'.
-            
-            -> For keyboard shortcuts, respond EXACTLY with:
-               - 'undo that' -> 'undo'
-               - 'redo that' -> 'redo'
-               - 'select all' -> 'select all'
-               - 'save the file' -> 'save file'
-               - 'find something' -> 'find'
-               - 'search the page' -> 'search'
-               - 'open a new tab' -> 'new tab'
-               - 'close this tab' -> 'close tab'
-               - 'refresh the page' -> 'refresh'
-               - 'reload the page' -> 'reload'
-               - 'print this' -> 'print'
-               - 'go fullscreen' -> 'fullscreen'
-               - 'zoom in' -> 'zoom in'
-               - 'zoom out' -> 'zoom out'
-               - 'reset zoom' -> 'reset zoom'
-               - 'open task manager' -> 'task manager'
-               - 'open run dialog' -> 'run dialog'
-            
-            -> For wifi control, respond with:
-               - 'turn off wifi' or 'disable wifi' -> 'wifi off'
-               - 'turn on wifi' or 'enable wifi' -> 'wifi on'
-            
-            =========================================
-            MULTI-TASKING & FALLBACK PROTOCOLS
-            =========================================
-            *** MULTI-TASKING: If the query is asking to perform multiple tasks like 'open facebook and close whatsapp' respond with 'open facebook, close whatsapp'
-            *** CONVERSATION END: If the user is saying goodbye or wants to end the conversation like 'bye jarvis.' respond with 'exit'.
-            *** FALLBACK: Respond with 'general (query)' if you can't decide the kind of query or if a query is asking to perform a task which is not mentioned above.
+            *** DO NOT ANSWER THE QUERY. OUTPUT ONLY TOKENS. ***
+
+            OUTPUT CONTRACT (violating this breaks the system):
+            - Output a comma-separated list of task tokens and NOTHING else.
+            - No prose, no greeting, no explanation, no markdown, no quotes, no emojis.
+            - Only use the token names defined below. Never invent a token.
+            - Where a token carries text ('general', 'realtime', 'deep research', 'open',
+              'close', 'play', 'content', 'write', 'system', ...), that text is THE USER'S
+              OWN WORDS. Copy them. Never write the literal words 'query', 'topic', 'text'
+              or '...' as the payload — those are placeholders in these instructions, not
+              output. 'what is the capital of japan' -> 'general what is the capital of
+              japan', NOT 'general query'.
+            - Never emit the same token twice for one request.
+            - Emit ONE token per distinct action the user actually asked for. Do not invent
+              extra actions, and do not merge two genuinely different actions into one.
+
+            =========================================================
+            A. DECIDING BETWEEN CONVERSATION, RETRIEVAL AND RESEARCH
+            =========================================================
+            Judge the SENTENCE AS A WHOLE. Never pick an automation token just because an
+            automation keyword ("open", "close", "play", "find", "screenshot", "minimize")
+            happens to appear inside a sentence that is really a question or a discussion.
+
+            -> 'general ...' — answerable from an LLM's own knowledge, or conversational,
+               or about the current time/date, or too vague/pronoun-bound to resolve
+               ('who is he?', 'tell me more about him.').
+            -> 'realtime ...' — needs current information the model cannot know: news,
+               prices, weather, live status, "who is the current ...", anything about a
+               named person/company/product where freshness matters. Also use this when the
+               user asks to look something up or search the web for an ANSWER.
+            -> 'deep research ...' — only when the user explicitly asks for deep research,
+               a deep dive, an exhaustive report, or a thorough investigation of a topic.
+
+            Boundary rules:
+            - "search the web for X" / "look up X" / "google what X is" -> 'realtime X'
+              (the user wants the ANSWER).
+            - 'google search (topic)' / 'youtube search (topic)' ONLY when the user wants the
+              SEARCH RESULTS PAGE opened in a browser, e.g. "search youtube for lofi mixes".
+            - A how-to question is conversation, not an instruction to perform the action.
+
+            =========================================================
+            B. APPLICATIONS, WINDOWS AND TABS  (do not confuse these)
+            =========================================================
+            -> 'open (app or website)'  — launch an application or site: "open chrome",
+               "open github.com". Multiple: 'open chrome, open telegram'.
+            -> 'close (app name)'       — close a NAMED application: "close spotify".
+            -> 'close window'           — close the CURRENT/THIS window (no app named).
+            -> 'close tab'              — close the CURRENT/THIS browser tab.
+            -> 'new tab'                — open a new browser tab (NOT 'open').
+            The distinction is what the user named: an application -> 'close (app)';
+            "this window" -> 'close window'; "this tab" -> 'close tab'.
+
+            Window tokens (emit exactly): 'minimize' (this window), 'minimize all' (every
+            window / show the desktop), 'maximize', 'snap left', 'snap right',
+            'switch window' (also for alt tab), 'task view', 'notification' (action centre
+            / notifications), 'emoji'.
+
+            =========================================================
+            C. MEDIA
+            =========================================================
+            -> 'play (song, artist or genre)' — start specific music: "play let her go",
+               "i want to listen to rock music" -> 'play rock music'.
+            -> 'pause'       — pause whatever is playing (also a bare "play/pause" toggle).
+            -> 'resume'      — resume paused playback.
+            -> 'next track'  / 'previous track' — skip forward/back.
+            -> 'stop media'  — stop playback entirely ("stop the music").
+            "Play" only means media when the user is asking for audio; "tell me about the
+            play Hamlet" is conversation.
+
+            =========================================================
+            D. SYSTEM, INFORMATION, INPUT AND UTILITIES
+            =========================================================
+            -> 'system (task)' — volume, brightness, mute/unmute, lock, shutdown, restart,
+               sleep. Keep the user's wording: 'mute the sound' -> 'system mute';
+               'increase volume by 20%' -> 'system increase volume by 20%';
+               'set brightness to 50' -> 'system brightness 50%'; 'lock my pc' -> 'system lock'.
+            -> 'wifi on' / 'wifi off' — enable/disable Wi-Fi.
+            -> System information about THIS machine (emit exactly): 'battery', 'ram', 'cpu',
+               'disk', 'uptime', 'ip address'. These are about the user's own computer — a
+               general question about what RAM is remains 'general'.
+            -> Clipboard: 'copy', 'paste', 'copy text (message)' for copying specific text.
+            -> 'write (text)' — type text at the cursor: "type hello world" -> 'write hello world'.
+            -> 'content (topic)' — compose something written: an email, an essay, code, a
+               document. "write me an email to my boss" -> 'content email to my boss'.
+               'content' is for AUTHORING; 'write' is for KEYSTROKES.
+            -> 'take screenshot' — capture the screen.
+            -> 'set timer (duration)' — "set a timer for 5 minutes" -> 'set timer 5 minutes'.
+            -> 'reminder (datetime message)' — "remind me at 9pm on 25 june about the meeting"
+               -> 'reminder 9:00pm 25 june meeting'.
+            -> Editing/browser hotkeys (emit exactly): 'undo', 'redo', 'select all', 'save',
+               'save file', 'find', 'search', 'print', 'refresh', 'reload', 'fullscreen',
+               'zoom in', 'zoom out', 'reset zoom', 'task manager', 'run dialog'.
+
+            =========================================================
+            E. MULTI-INTENT, EXIT AND FALLBACK
+            =========================================================
+            *** MULTI-TASKING: one token per requested action, in the order requested.
+                'open facebook and close whatsapp' -> 'open facebook, close whatsapp'
+                'who is akshay kumar and what is his net worth' -> 'realtime who is akshay kumar and what is his net worth'
+                Only split when the actions are genuinely different; a single question about
+                one subject stays a single token.
+            *** EXIT: goodbye / "that's all" / "exit" -> 'exit'
+            *** FALLBACK: if you cannot confidently place the request, or it asks for
+                something not listed above, emit 'general ' followed by their words. Never guess an
+                automation token.
             """
         
-        # Few-shot conversational history to teach DMM target output alignment
-        # IMPORTANT ORDER: Most recent examples (bottom of list) have HIGHEST weight in Cohere.
-        # Exit/bye examples are intentionally placed early so open/close examples dominate recency.
+        # Few-shot conversational history to teach DMM target output alignment.
+        #
+        # IMPORTANT ORDER: Most recent examples (bottom of list) have HIGHEST weight in Cohere,
+        # so the list ends with the CONTRASTIVE pairs — each correct classification sitting
+        # next to the near-miss it is most often confused with (close app / close window /
+        # close tab, minimize / minimize all, look-up vs open-results-page, authoring vs
+        # keystrokes, and automation keywords appearing inside ordinary questions).
+        # Exit/bye examples are intentionally placed early so they never dominate recency.
+        # NEVER slice or truncate this list: a `[:40]` slice once silently dropped exactly
+        # these disambiguating examples in local-model mode.
         self.dmm_chat_history = [
             # -- Conversation & Knowledge --
             {"role": "User", "message": "how are you?"},
@@ -350,19 +380,73 @@ class CentralizedLLMEngine:
             {"role": "Chatbot", "message": "close notepad, close spotify"},
             {"role": "User", "message": "Close youtube."},
             {"role": "Chatbot", "message": "close youtube"},
-            {"role": "User", "message": "close youtube"},
-            {"role": "Chatbot", "message": "close youtube"},
             {"role": "User", "message": "Open youtube."},
             {"role": "Chatbot", "message": "open youtube"},
-            {"role": "User", "message": "open youtube"},
-            {"role": "Chatbot", "message": "open youtube"},
+            # -- CONTRASTIVE BOUNDARIES (LAST = highest recency weight in Cohere) --
+            # Each pair puts a correct classification next to the near-miss it is most often
+            # confused with, which is what the model actually needs to separate them. These
+            # sit at the end deliberately; see the ordering note above.
+            # close: named app vs this window vs this tab
+            {"role": "User", "message": "close spotify"},
+            {"role": "Chatbot", "message": "close spotify"},
+            {"role": "User", "message": "close this window"},
+            {"role": "Chatbot", "message": "close window"},
+            {"role": "User", "message": "close this tab"},
+            {"role": "Chatbot", "message": "close tab"},
+            # minimize one vs all
+            {"role": "User", "message": "minimize this window"},
+            {"role": "Chatbot", "message": "minimize"},
+            {"role": "User", "message": "minimize everything"},
+            {"role": "Chatbot", "message": "minimize all"},
+            # look-up-the-answer vs open-the-results-page
+            {"role": "User", "message": "search the web for the latest iphone price"},
+            {"role": "Chatbot", "message": "realtime latest iphone price"},
+            {"role": "User", "message": "search youtube for lofi mixes"},
+            {"role": "Chatbot", "message": "youtube search lofi mixes"},
+            # authoring vs keystrokes
+            {"role": "User", "message": "write me an email to my boss about the delay"},
+            {"role": "Chatbot", "message": "content email to my boss about the delay"},
+            {"role": "User", "message": "type hello world"},
+            {"role": "Chatbot", "message": "write hello world"},
+            # automation keyword inside a conversational sentence -> conversation
+            {"role": "User", "message": "how do i take a screenshot on a mac?"},
+            {"role": "Chatbot", "message": "general how do i take a screenshot on a mac?"},
+            {"role": "User", "message": "what's the best way to close a business deal?"},
+            {"role": "Chatbot", "message": "general what's the best way to close a business deal?"},
+            {"role": "User", "message": "tell me about the play hamlet"},
+            {"role": "Chatbot", "message": "general tell me about the play hamlet"},
+            {"role": "User", "message": "explain how to minimize latency in a web app"},
+            {"role": "Chatbot", "message": "general explain how to minimize latency in a web app"},
         ]
 
-    def get_identity_prompt(self):
+    def run_boot_sequence(self, tts_engine=None):
+        """
+        Prints and speaks the model-routing status lines. Purely cosmetic narration —
+        `self.funcs`/`self.dmm_preamble`/`self.dmm_chat_history` are already set in __init__,
+        so classify_intent()/generate_chat_stream() work correctly whether or not this is ever
+        called (callers that don't care about the boot narration, e.g. test scripts, can skip it).
+        """
+        print_system(self.dmm_status)
+        print_system(self.chat_status)
+
+        # Narration is opt-in. main.py calls this WITHOUT a TTS engine and speaks one short
+        # consolidated line instead: reading both status strings aloud cost ~7s of speech
+        # before the assistant was usable, and made a fast boot sound like a slow one.
+        if tts_engine:
+            tts_engine.speak(self.dmm_status)
+            time.sleep(0.1)
+            tts_engine.speak(self.chat_status)
+            time.sleep(0.1)
+
+    def get_identity_prompt(self, mood: str = None):
         """
         Compiles the system persona instructions for the assistant based on env configuration.
         Constructs the identity prompt dynamically based on the configured name, gender,
         target language, and username.
+
+        Parameters:
+            mood (str): Optional detected user mood (e.g. "Angry", "Happy", "Sad") from the
+                        SemanticEmotionEngine, used to steer tone/empathy for this turn.
 
         Returns:
             str: Compiled system alignment payload instruction block.
@@ -376,22 +460,47 @@ class CentralizedLLMEngine:
         lang = self.env_vars.get("LANGUAGE", "English").strip()
         username = self.env_vars.get("USERNAME", "User").strip()
         user_gender = self.env_vars.get("USER_GENDER", "Male").strip()
-        
+
         user_title = "Ma'am" if user_gender.lower() == "female" else "Sir"
-        
+
+        # NOTE ON THE FORMATTING RULES BELOW: this response is spoken by the TTS engine, so
+        # markdown and symbols are not neutral decoration — they are either pronounced as
+        # literal noise or removed by `speech_safe_text()`, which changes what the user hears.
+        # Asking the model not to emit them is better than cleaning up afterwards; both
+        # layers exist and are deliberately consistent with each other.
         prompt = (
             f"Hello, my username is {username}. You are a highly intelligent, empathetic, and witty AI companion named {name}. "
-            f"Your gender profile is {gender}. You must always respond and converse fluently in {lang}. "
-            f"You have access to real-time, up-to-date information from the internet.\n\n"
-            f"CRITICAL BEHAVIORAL DIRECTIVES:\n"
-            f"1. Be highly conversational, relatable, and human-like. Speak to me like a close, trusted friend.\n"
-            f"2. Show personality! Feel free to be witty, charming, and expressive instead of robotic and formal.\n"
-            f"3. Keep your answers reasonably concise but do not sacrifice conversational flow.\n"
-            f"4. Do not tell the time unless explicitly requested.\n"
-            f"5. Never provide conversational 'notes' or disclaimers in the output. Just talk naturally.\n"
-            f"6. Under no circumstances should you ever mention your training data, AI architecture, or model limitations.\n"
-            f"7. Always address me as '{user_title}' instead of my username during the conversation."
+            f"Your gender profile is {gender}. You must always respond and converse fluently in {lang}.\n\n"
+            f"YOU ARE BEING SPOKEN ALOUD. Your reply is converted to speech and heard, not read.\n\n"
+            f"HOW TO TALK:\n"
+            f"1. Talk like a close, trusted friend — warm, natural and direct. Show personality: be witty and "
+            f"expressive rather than formal and robotic.\n"
+            f"2. Open with the answer, not with filler. Never begin with 'Certainly!', 'Of course!', "
+            f"'I would be happy to assist you with that' or any similar throat-clearing. "
+            f"'Sure, I can help with that' is how a person actually says it.\n"
+            f"3. Match the length to what was asked. A quick question gets a sentence or two; a request for an "
+            f"explanation, comparison or walkthrough gets the detail it genuinely needs. Do not pad a short "
+            f"answer to sound thorough, and do not compress a real explanation into one line.\n"
+            f"4. Use plain spoken sentences. No markdown, no asterisks, no bullet points, no numbered lists, no "
+            f"headers, no tables, no emojis, no code fences — none of that survives being spoken aloud. When you "
+            f"need to list things, say them: 'there are three: X, Y and Z'.\n"
+            f"5. If I explicitly ask for code or exact notation, give it plainly and keep the explanation around "
+            f"it conversational.\n"
+            f"6. Never add conversational 'notes', disclaimers, or a summary of what you just said.\n"
+            f"7. Do not tell the time unless explicitly requested.\n"
+            f"8. Under no circumstances should you ever mention your training data, AI architecture, or model limitations.\n"
+            f"9. Address me as '{user_title}' — naturally, the way a person would, not in every sentence.\n"
+            f"10. Only rely on up-to-date web information when it is explicitly provided to you in this context. "
+            f"Otherwise, answer from your own trained knowledge and say so plainly if you are unsure about anything recent — never invent facts or pretend to have browsed the web."
         )
+
+        if mood and mood.strip().lower() not in ("", "neutral"):
+            prompt += (
+                f"\n\nEMOTIONAL CONTEXT: {username} currently sounds {mood} based on their phrasing. "
+                f"Adjust your tone with genuine empathy to match — reassure if they seem upset or anxious, "
+                f"match their energy if they seem happy or excited — without explicitly announcing that you detected their mood."
+            )
+
         return prompt
 
     def _check_local_server(self):
@@ -399,13 +508,57 @@ class CentralizedLLMEngine:
         Pings the local model endpoint using a lightweight GET request.
         
         Verification Strategy:
-            Issues a quick ping to f"{local_base_url}/models" with a tight timeout of 1.5 seconds.
-            If the response status code is 200 (Success) or 401 (Unauthorized but alive),
-            we confidently conclude the local offline server (LM Studio/Ollama) is responsive.
+            1. A raw TCP connect to the endpoint's host:port. A closed local port refuses
+               the connection in about a millisecond, so the overwhelmingly common
+               "no local server running" case costs essentially nothing.
+            2. Only if the port is open, the HTTP ping to /models confirms it is really an
+               OpenAI-compatible server. Both 200 (Success) and 401 (Unauthorized but
+               alive) count as responsive.
+
+        Why the TCP pre-check exists: this used to be a bare `requests.get(..., timeout=1.5)`,
+        which measured at ~3.0s on a host with no local server — "localhost" resolves to both
+        ::1 and 127.0.0.1, and the full timeout was paid once per address family. That single
+        call was the largest contributor to cold-start latency in cloud mode.
 
         Returns:
             bool: True if the local endpoint is alive and responsive, False otherwise.
         """
+        parsed = urlparse(self.local_base_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        # Per-address budget. Windows Firewall silently DROPS connections to a closed
+        # loopback port instead of refusing them, so a failed attempt always costs the full
+        # timeout — and "localhost" resolves to two families, so the cost is paid twice.
+        # A local server that is actually listening accepts a loopback TCP connection in
+        # well under a millisecond, so this can be very tight without false negatives.
+        probe_timeout = float(self.env_vars.get("LOCAL_PROBE_TIMEOUT_SECONDS", "0.15"))
+
+        try:
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError:
+            return False
+
+        # IPv4 first: local model servers bind 127.0.0.1 far more often than ::1.
+        addresses.sort(key=lambda a: 0 if a[0] == socket.AF_INET else 1)
+
+        port_open = False
+        for family, socktype, proto, _canon, sockaddr in addresses:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(probe_timeout)
+            try:
+                sock.connect(sockaddr)
+                port_open = True
+            except OSError:
+                continue
+            finally:
+                sock.close()
+            if port_open:
+                break
+
+        if not port_open:
+            return False
+
         try:
             response = requests.get(f"{self.local_base_url}/models", timeout=1.5)
             # Both 200 (Success) and 401 (Unauthorized/Auth required) show the server is alive
@@ -464,7 +617,10 @@ class CentralizedLLMEngine:
                     + self.dmm_preamble.strip()
                 )
                 local_messages = [{"role": "system", "content": strict_system}]
-                for msg in self.dmm_chat_history[:40]:
+                # NOTE: Deliberately NOT sliced. The few-shot examples above are ordered so the
+                # highest-value disambiguating pairs (open/close, window management) sit LAST for
+                # maximum recency weight — truncating this list would silently drop exactly those.
+                for msg in self.dmm_chat_history:
                     role = "user" if msg["role"] == "User" else "assistant"
                     local_messages.append({"role": role, "content": msg['message']})
                 local_messages.append({
@@ -482,14 +638,47 @@ class CentralizedLLMEngine:
 
             # Clean and split response text into discrete tasks
             response_text = response_text.replace("\n", "")
-            raw_tasks = [i.strip() for i in response_text.split(",")]
+            raw_tasks = [i.strip() for i in response_text.split(",") if i.strip()]
 
-            # Filter generated task strings, keeping only those that match known intent headers
+            # Filter generated task strings, keeping only those that match a known intent header.
+            # IMPORTANT: match each task against the header set ONCE (not once per matching prefix) —
+            # several headers are prefixes of one another (e.g. "close" / "close window" / "close tab",
+            # "save" / "save file", "minimize" / "minimize all"), so a naive per-func append duplicates
+            # the task once per overlapping header and double-executes it downstream (e.g. "minimize all"
+            # would fire Win+D twice, re-opening every window it just minimized).
+            # Tokens whose payload is free text taken from the user. If the model echoes the
+            # placeholder from the preamble instead ("general query"), the payload is
+            # meaningless — main.py hands `original_query` to the chatbot so conversation
+            # still works by luck, but `deep research` slices the payload out of the token
+            # and would research the word "topic". Repair it rather than executing it.
+            TEXT_CARRYING = ("general", "realtime", "deep research")
+            PLACEHOLDERS = ("query", "topic", "the query", "the topic", "text", "...",
+                            "user query", "your query")
+
             parsed_task = []
+            seen_tasks = set()
             for task in raw_tasks:
-                for func in self.funcs:
-                    if task.lower().startswith(func):
-                        parsed_task.append(task)
+                task_lower = task.lower()
+                if not any(task_lower.startswith(func) for func in self.funcs):
+                    continue
+
+                for header in TEXT_CARRYING:
+                    if task_lower.startswith(header + " "):
+                        payload = task[len(header):].strip().strip("()'\"")
+                        if payload.lower().rstrip(".?!") in PLACEHOLDERS:
+                            print_warning(
+                                f"DMM emitted a placeholder payload ('{task}'). "
+                                "Substituting the user's actual words."
+                            )
+                            task = f"{header} {prompt}"
+                            task_lower = task.lower()
+                        break
+                # Guard against the DMM itself emitting the exact same token twice
+                dedup_key = task_lower
+                if dedup_key in seen_tasks:
+                    continue
+                seen_tasks.add(dedup_key)
+                parsed_task.append(task)
 
             # Intercept empty or failed token responses to attempt recursive retries
             if len(parsed_task) == 0:
@@ -501,9 +690,18 @@ class CentralizedLLMEngine:
             return parsed_task
 
         except cohere.TooManyRequestsError:
-            print_error("Cohere Rate Limit Reached. Cooling down for 10 seconds...")
-            time.sleep(10)
-            return self.classify_intent(prompt=prompt, retries=retries)
+            # Bounded backoff. This used to recurse with the SAME `retries` value, so a
+            # sustained rate limit (a trial key under load does this readily) meant unbounded
+            # recursion: the assistant would sit in a 10-second-per-frame loop until the
+            # stack blew, with no way out and no message to the user.
+            if retries >= 3:
+                print_error("Cohere rate limit persisted. Routing this query to conversation.")
+                return ["general " + prompt]
+            cooldown = 5 * (retries + 1)
+            print_warning(f"Cohere rate limit reached. Cooling down {cooldown}s "
+                          f"[attempt {retries + 1}/3]...")
+            time.sleep(cooldown)
+            return self.classify_intent(prompt=prompt, retries=retries + 1)
 
         except Exception as e:
             print_error(f"DMM exception: {e}")

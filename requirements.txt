@@ -1,30 +1,45 @@
+# ==============================================================================
+#                        KAYRA ENGINE PYTHON DEPENDENCIES
+# ==============================================================================
+# Version floors are pinned where a breaking major-version change is known to
+# exist upstream. Everything else is left open to track security/bug fixes.
+# ==============================================================================
+
 # Core Engine Dependencies
-selenium
-mtranslate
-python-dotenv
-rich
-requests
+selenium>=4.20
+mtranslate>=1.8
+python-dotenv>=1.0
+rich>=13.7
+requests>=2.31
+psutil>=5.9          # Process cleanup on shutdown (main.py, tests/test_DMM.py)
+schedule>=1.2        # Periodic task scheduling (modules/proactive_agent.py)
+pygetwindow>=0.0.9   # Active-window tracking (modules/proactive_agent.py)
 
 # LLM & AI Clients
-openai
-cohere
+openai>=1.30         # Also used as the OpenAI-compatible client for Groq/Gemini/local endpoints
+cohere>=6.0,<8        # chat_stream(message=, preamble=, chat_history=) verified compatible through 7.1.1
 
 # Audio & Voice (Kokoro TTS)
-kokoro-onnx
-sounddevice
-numpy
-soundfile
-onnxruntime
+kokoro-onnx>=0.4
+sounddevice>=0.4
+numpy>=1.26
+soundfile>=0.12
+onnxruntime>=1.17
 
 # Search & RAG
-duckduckgo-search
+ddgs>=9.0                  # Current package name for the DuckDuckGo search client
+duckduckgo-search>=6.0     # Legacy name kept as an import fallback (see real_time_search.py / deep_research.py)
 
 # Web Scraping
-beautifulsoup4
+beautifulsoup4>=4.12
 
 # Windows System Control & Keystroke Automation
-AppOpener
-pyautogui
-pynput
-pywhatkit
-keyboard
+AppOpener>=1.7
+pyautogui>=0.9
+pynput>=1.7
+pywhatkit>=5.4
+keyboard>=0.13
+
+# Air Cursor Engine (optional hand-gesture mouse control, modules/air_cursor_engine.py)
+opencv-python>=4.9
+mediapipe>=0.10

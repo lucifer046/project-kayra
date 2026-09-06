@@ -9,10 +9,7 @@ It features a dual-tier memory system comprising:
 - A persistent long-term memory database backed by transactional, corruption-resistant storage.
 """
 
-import os 
-import datetime
-import json
-import shutil 
+import os
 from dotenv import dotenv_values
 
 # Robust imports supporting relative paths across all execution contexts
@@ -26,12 +23,24 @@ except ImportError:
         from llm_engine import CentralizedLLMEngine
 
 try:
-    from .utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
+    from .utils import (
+        print_banner, print_info, print_success, print_warning, print_error, print_system, console,
+        load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
+        SentenceStreamer,
+    )
 except ImportError:
     try:
-        from modules.utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
+        from modules.utils import (
+            print_banner, print_info, print_success, print_warning, print_error, print_system, console,
+            load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
+            SentenceStreamer,
+        )
     except ImportError:
-        from utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
+        from utils import (
+            print_banner, print_info, print_success, print_warning, print_error, print_system, console,
+            load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
+            SentenceStreamer,
+        )
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -48,107 +57,30 @@ if not assistant_name:
 # Access the centralized mode-switching infrastructure broker (offline Kokoro / online cloud endpoints)
 engine = CentralizedLLMEngine()
 
-# Secure Long-term data persistence pathways
-# Database holds permanent long-term memory registers across application runs.
-DB_FILE = r"data\conversation.json"
-BACKUP_FILE = r"data\conversation_backup.json"
-
-# ┌────────────────────────────────────────────────────────────────────────┐
-# │                       MEMORY MANAGEMENT LAYER                          │
-# └────────────────────────────────────────────────────────────────────────┘
-def AnswerModifier(Answer):
-    """
-    Cleans structural whitespace anomalies out of the response string.
-    Removes empty vertical spaces and breaks to maximize text density on the terminal layout.
-    """
-    lines = Answer.split("\n")
-    non_empty_lines = [line for line in lines if line.strip()]
-    return '\n'.join(non_empty_lines)
-
-def load_memory():
-    """
-    Loads historical message layers from local persistent storage.
-    
-    Data Recovery Safeguard:
-        Uses a transactional schema. If the primary index is missing or corrupted
-        due to sudden system halts, it intercepts the FileNotFoundError/JSONDecodeError
-        and attempts to restore data state using the rolling secondary backup copy.
-
-    Returns:
-        list: A list of dictionaries representing the long-term conversational history.
-              Returns an empty list if no valid database or backup exists.
-    """
-    # Enforce database folder structure presence
-    if not os.path.exists("data"):
-        os.makedirs("data", exist_ok=True)
-    try:
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        try:
-            with open(BACKUP_FILE, "r") as f:
-                data = json.load(f)
-            print_warning("Primary index compromised. Restored data from rolling backup.")
-            return data
-        except:
-            # Fallback to an empty schema if both primary and backups are unreadable
-            return []
-    
-def save_memory(memory_list):
-    """
-    Persists data context tables to disk using an atomic transaction technique.
-    
-    Pipeline Isolation Strategy:
-        1. Writes the fresh context list to the 'BACKUP_FILE' path first.
-        2. Performs a transactional copy (via shutil.copy) from backup to the main 'DB_FILE'.
-        This prevents file corruption: if the system terminates midway during step 1, 
-        the original primary DB file remains uncorrupted.
-
-    Args:
-        memory_list (list): The updated long-term memory context array to be written to disk.
-
-    Returns:
-        bool: True if the atomic write and copy succeeded, False otherwise.
-    """
-    try:
-        with open(BACKUP_FILE, "w") as f:
-            json.dump(memory_list, f, indent=4)
-        shutil.copy(BACKUP_FILE, DB_FILE)
-        return True
-    except Exception as e:
-        print_error(f"Persistent storage transaction failed: {e}")
-        return False
-
+# Memory persistence, response cleanup, and temporal-context helpers now live in modules/utils.py
+# (previously duplicated near-verbatim across chatbot.py / real_time_search.py).
+AnswerModifier = answer_modifier
+RealTimeInformation = real_time_info
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                     MEMORY SPACE INITIALIZATION                        │
 # └────────────────────────────────────────────────────────────────────────┘
 
 # Long-term data tables pulled from disk. Contains selectively saved/remembered dialogue frames.
-permanent_memory = load_memory()  
+permanent_memory = load_conversation_memory()
 
 # Volatile processing RAM buffer. Acts as a short-term sliding context window for the current session.
-session_memory = []              
-
-def RealTimeInformation():
-    """
-    Compiles live host processing time parameters to inject into the neural system message.
-    This dynamically updates the model's temporal awareness on every message transaction.
-    """
-    current_date_time = datetime.datetime.now()
-    data = f"Current Time: {current_date_time.strftime('%I:%M %p')}\n"
-    data += f"Day: {current_date_time.strftime('%A')}, Date: {current_date_time.strftime('%d %B %Y')}"
-    return data
+session_memory = []
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                       MAIN INTERACTION PIPELINE                        │
 # └────────────────────────────────────────────────────────────────────────┘
 
-def Chatbot(query, tts_engine=None):
+def Chatbot(query, tts_engine=None, mood=None):
     """
     Orchestrates the conversational memory tree window, structures payload contexts,
     and returns token response generation patterns natively via the central engine pipeline.
-    
+
     Memory Context Hierarchy Injection Sequence:
         1. Renders the dynamic System Identity Prompt + Temporal Environment metrics.
         2. Appends historical Long-Term context frames (loaded dynamically from disk).
@@ -158,6 +90,8 @@ def Chatbot(query, tts_engine=None):
     Args:
         query (str): The raw text input spoken or typed by the user.
         tts_engine: Optional TTS engine instance to enable live audio streaming.
+        mood (str): Optional detected user mood (from SemanticEmotionEngine) used to steer
+                    the assistant's tone for this turn.
 
     Returns:
         str: The full, normalized text response generated by the LLM pipeline.
@@ -165,18 +99,28 @@ def Chatbot(query, tts_engine=None):
     global permanent_memory, session_memory
 
     try:
-        # Setup real-time audio streaming queue and worker
+        # Real-time speech streaming.
+        #
+        # There is deliberately NO private queue/worker thread here any more. The TTS
+        # engine owns a single cancellable pipeline (text queue -> synthesis -> playback),
+        # so `tts_engine.speak()` returns immediately and a barge-in drops pending
+        # sentences, in-flight synthesis and buffered audio in one atomic step. The old
+        # local worker kept its own backlog that survived `tts.stop()`, which is why an
+        # interrupted answer used to carry on talking sentence after sentence.
+        streamer = None
         if tts_engine:
-            import queue, threading
-            speech_queue = queue.Queue()
-            def speech_worker():
-                while True:
-                    text = speech_queue.get()
-                    if text is None: break
-                    tts_engine.speak(text)
-            threading.Thread(target=speech_worker, daemon=True).start()
+            # Capture this turn's token once. Checking the token (rather than the global
+            # `interrupted` flag) means nothing else clearing that flag — a proactive
+            # suggestion calling begin_turn(), say — can resurrect a response the user
+            # already interrupted.
+            turn_token = tts_engine.turn_token()
+            streamer = SentenceStreamer(
+                tts_engine.speak,
+                stop_check=lambda: tts_engine.is_cancelled(turn_token),
+            )
+
         # 1. Fetch current identity alignment conditions (forces strict behavior directives)
-        identity_prompt = engine.get_identity_prompt()
+        identity_prompt = engine.get_identity_prompt(mood=mood)
 
         # Compile base system payload context
         api_messages = [
@@ -197,31 +141,25 @@ def Chatbot(query, tts_engine=None):
         api_messages.append({"role": "user", "content": query})
 
         response_text = ""
-        sentence_buffer = ""
         console.print("\n[bold white]Streaming Response Live:[/bold white] ", end="")
 
         # 5. Interface with the auto-switching engine streaming chunk generator channels
         for chunk in engine.generate_chat_stream(api_messages):
             console.print(chunk, end="", style="italic green")
             response_text += chunk
-            sentence_buffer += chunk
-            
-            # Stream completed sentences to the TTS queue dynamically
-            if tts_engine and any(char in sentence_buffer for char in [". ", "? ", "! ", "\n"]):
-                for char in [". ", "? ", "! ", "\n"]:
-                    if char in sentence_buffer:
-                        parts = sentence_buffer.split(char, 1)
-                        sentence = parts[0] + char
-                        if sentence.strip():
-                            speech_queue.put(sentence)
-                        sentence_buffer = parts[1]
-                        break
 
-        # Flush any remaining text in the buffer to the TTS queue
-        if tts_engine:
-            if sentence_buffer.strip():
-                speech_queue.put(sentence_buffer)
-            speech_queue.put(None)  # Signal worker thread to terminate
+            if streamer:
+                streamer.feed(chunk)
+                if tts_engine.is_cancelled(turn_token):
+                    # The user barged in. Stop pulling tokens: continuing would burn quota
+                    # on an answer nobody is listening to, and every sentence produced from
+                    # here on could only ever arrive after the interruption.
+                    print_system("Response cancelled by user interruption.")
+                    break
+
+        # Flush the trailing partial sentence
+        if streamer:
+            streamer.flush()
 
         console.print("\n")
 
@@ -241,7 +179,7 @@ def Chatbot(query, tts_engine=None):
             permanent_memory.append({"role": "assistant", "content": response_text})
 
             # Execute transactional commit to disk
-            if save_memory(permanent_memory):
+            if save_conversation_memory(permanent_memory):
                 print_success(f"Secure context verified. Stored in {assistant_name} structural database.")
         
         return response_text

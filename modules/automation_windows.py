@@ -13,12 +13,14 @@ Core Frameworks & Architectures:
 """
 
 import os
+import re
 import sys
 import time
 import ctypes
 import platform
 import tempfile
 import asyncio
+import threading
 import subprocess
 import requests
 import webbrowser
@@ -166,7 +168,6 @@ def OpenApp(app):
     print_info(f"Targeting system execution paths for: '{app_target}'")
 
     # Detect if the input is a URL or domain name (e.g. github.com, https://example.org, claude.ai)
-    import re
     domain_extensions = r'\.(com|org|net|in|io|ai|co|dev|me|xyz|gov|edu|info|app|tech|site|online|live|pro|cc|tv|gg|us|uk|eu)(/|$|\s)'
     is_url = app_target.startswith("http://") or app_target.startswith("https://")
     is_domain = bool(re.search(domain_extensions, app_target))
@@ -202,8 +203,7 @@ def OpenApp(app):
         return True
     except:
         print_warning(f"Local app shortcut not resolved. Running fast web scraping link extraction...")
-        import re
-        
+
         # Parse targets by commas or 'and'. If none, split by space to support multi-site space-separated lists
         if "," in app_target or " and " in app_target:
             targets = [t.strip() for t in re.split(r',|\band\b', app_target) if t.strip()]
@@ -290,7 +290,6 @@ def CloseApp(app):
     # 2. Try AppOpener to close known local apps cleanly if no active windows matched
     from AppOpener import close as appclose
     try:
-        import sys, os
         _old_stdout = sys.stdout
         sys.stdout = open(os.devnull, 'w')
         try:
@@ -358,8 +357,6 @@ def _set_volume(target):
 def ExecuteCommand(command):
     """Hardware command registry processing matrix."""
     cmd = command.lower().strip()
-    import re
-    
     if "mute" in cmd:
         keyboard.press_and_release("volume mute")
     elif "volume" in cmd:
@@ -658,7 +655,6 @@ def SystemInfo(query):
 
 def SetTimer(command):
     """Sets a countdown timer that triggers a Windows notification toast when complete."""
-    import re
     cmd = command.lower().strip()
 
     # Parse duration from natural language (e.g. "5 minutes", "30 seconds", "1 hour")
@@ -688,7 +684,6 @@ def SetTimer(command):
         subprocess.Popen(toast_cmd, shell=True)
         print_success(f"Timer complete: {label}")
 
-    import threading
     label = f"{value} {unit}(s)"
     timer_thread = threading.Thread(target=_timer_worker, args=(total_seconds, label), daemon=True)
     timer_thread.start()
@@ -780,6 +775,16 @@ async def translate_and_execute(commands: list[str]):
                 tasks.append(asyncio.to_thread(OpenApp, cmd_str.removeprefix("open ").strip()))
         elif cmd_lower.startswith("general "):
             pass # Skip general command flag
+
+        # NOTE: These two exact-match literal tokens MUST be checked BEFORE the generic
+        # "close " prefix branch below — otherwise "close window"/"close tab" (which both
+        # start with "close ") get shadowed and routed to CloseApp("window")/CloseApp("tab"),
+        # which tries to close an app literally named "window"/"tab" instead of sending the
+        # intended Alt+F4 / Ctrl+W hotkey.
+        elif cmd_lower == "close window":
+            tasks.append(asyncio.to_thread(WindowManage, cmd_str))
+        elif cmd_lower == "close tab":
+            tasks.append(asyncio.to_thread(HotkeyShortcut, cmd_str))
         elif cmd_lower.startswith("close "):
             tasks.append(asyncio.to_thread(CloseApp, cmd_str.removeprefix("close ").strip()))
         elif cmd_lower.startswith("play "):
@@ -806,10 +811,10 @@ async def translate_and_execute(commands: list[str]):
         elif cmd_lower.startswith("copy text "):
             tasks.append(asyncio.to_thread(ClipboardCopyText, cmd_str.removeprefix("copy text ").strip()))
 
-        # 5. Window management
+        # 5. Window management ("close window" is handled by the exact-match branch above)
         elif any(k in cmd_lower for k in ["minimize all", "show desktop", "snap left", "snap right",
                 "switch window", "alt tab", "task view", "maximize", "minimize",
-                "close window", "action center", "notification", "emoji"]):
+                "action center", "notification", "emoji"]):
             tasks.append(asyncio.to_thread(WindowManage, cmd_str))
 
         # 6. Media playback controls
@@ -826,9 +831,17 @@ async def translate_and_execute(commands: list[str]):
         elif cmd_lower.startswith("timer ") or cmd_lower.startswith("set timer ") or cmd_lower.startswith("remind"):
             tasks.append(asyncio.to_thread(SetTimer, cmd_str))
 
-        # 9. Hotkey shortcut injection
-        elif any(k in cmd_lower for k in ["undo", "redo", "select all", "save file",
-                "find", "new tab", "close tab", "refresh", "reload", "fullscreen",
+        # 9. Hotkey shortcut injection ("close tab" is handled by the exact-match branch above)
+        #
+        # The exact-match tuple carries the tokens HotkeyShortcut's map supports but the
+        # keyword test below cannot safely look for as substrings: "save" is a substring of
+        # nothing useful but "search" appears inside "google search ..." and "print" inside
+        # ordinary prose. Matching them only as whole commands dispatches them (they used to
+        # fall through to the unmapped-token warning and silently do nothing) without
+        # shadowing the google/youtube search branches above.
+        elif cmd_lower in ("save", "search", "print") or any(k in cmd_lower for k in [
+                "undo", "redo", "select all", "save file",
+                "find", "new tab", "refresh", "reload", "fullscreen",
                 "zoom in", "zoom out", "reset zoom", "task manager", "run dialog"]):
             tasks.append(asyncio.to_thread(HotkeyShortcut, cmd_str))
 

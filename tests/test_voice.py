@@ -40,7 +40,9 @@ def main():
             if not user_text:
                 continue
             if user_text.lower() in ["exit", "quit"]:
-                tts.speak("Deactivating speech systems. Goodbye.")
+                # blocking=True: speak() queues asynchronously now, and the process
+                # exits on the next line — without this the farewell is cut off.
+                tts.speak("Deactivating speech systems. Goodbye.", blocking=True)
                 break
             
             tts.speak(user_text)

@@ -76,8 +76,7 @@ engine = CentralizedLLMEngine()
 
 # Ensure dedicated Reports output directory exists
 REPORTS_DIR = os.path.join(root, "Reports")
-if not os.path.exists(REPORTS_DIR):
-    os.mkdir(REPORTS_DIR)
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                    STAGE 1: RESEARCH PLAN GENERATION                    │

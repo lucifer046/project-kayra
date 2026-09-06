@@ -46,10 +46,12 @@ def get_hybrid_input(stt_engine):
         # 2. Check for Voice Input (only if user hasn't started manually typing)
         if not is_typing and stt_engine and stt_engine.driver:
             try:
-                # Pop from Chrome's speech queue non-blockingly
-                text = stt_engine.driver.execute_script("return window.speechQueue.shift();")
-                if text:
-                    translated = translate_query(text)
+                # Pop from Chrome's speech queue non-blockingly. Entries are
+                # {text, start, end} objects — the capture timestamps are what the main
+                # loop uses for echo rejection; this diagnostic only needs the text.
+                item = stt_engine._script("return window.speechQueue.shift() || null;")
+                if item and item.get("text"):
+                    translated = translate_query(item["text"])
                     formatted = format_query(translated)
                     return formatted
             except Exception:
