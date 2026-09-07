@@ -34,14 +34,9 @@ import numpy as np
 import sounddevice as sd
 from collections import deque
 from kokoro_onnx import Kokoro
-from dotenv import dotenv_values
-try:
-    from .utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
-except ImportError:
-    try:
-        from modules.utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
-    except ImportError:
-        from utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
+from kayra.core.config import env_values
+from kayra.core.paths import model_path as model_file
+from kayra.utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
 
 
 # Sample rate the Kokoro v1.0 checkpoints synthesize at.
@@ -119,11 +114,9 @@ class DynamicVoiceEngine:
     )
 
     def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin", warm_up=True):
-        # Robust path resolution
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-        # Load environment specifications
-        env_vars = dotenv_values(os.path.join(project_root, ".env")) or {}
+        # Paths and configuration both come from the core, never from a local guess at
+        # where the project root is relative to this file.
+        env_vars = env_values()
 
         # Dynamic name and fallback gender mapping
         self.assistant_name = env_vars.get("ASSISTANT_NAME", "").strip()
@@ -133,13 +126,13 @@ class DynamicVoiceEngine:
         else:
             gender = env_vars.get("ASSISTANT_GENDER", "Female").strip().lower()
 
-        model_path = os.path.join(project_root, "models", model_filename)
-        voices_path = os.path.join(project_root, "models", voices_filename)
+        model_path = model_file(model_filename)
+        voices_path = model_file(voices_filename)
 
         # Automatic fallback to standard filenames if default filenames are not present
         if not os.path.exists(model_path) or not os.path.exists(voices_path):
-            alt_model_path = os.path.join(project_root, "models", "kokoro.onnx")
-            alt_voices_path = os.path.join(project_root, "models", "voices.bin")
+            alt_model_path = model_file("kokoro.onnx")
+            alt_voices_path = model_file("voices.bin")
             if os.path.exists(alt_model_path) and os.path.exists(alt_voices_path):
                 model_path = alt_model_path
                 voices_path = alt_voices_path

@@ -11,9 +11,14 @@ mtranslate>=1.8
 python-dotenv>=1.0
 rich>=13.7
 requests>=2.31
-psutil>=5.9          # Process cleanup on shutdown (main.py, tests/test_DMM.py)
-schedule>=1.2        # Periodic task scheduling (modules/proactive_agent.py)
-pygetwindow>=0.0.9   # Active-window tracking (modules/proactive_agent.py)
+psutil>=5.9          # Process cleanup on shutdown (shutdown in src/kayra/app.py, tests/test_DMM.py)
+pygetwindow>=0.0.9   # Active-window context signal (src/kayra/services/proactive_agent.py)
+pywin32>=306         # Win32 window enumeration / focus / WM_CLOSE (src/kayra/automation/targets.py).
+                     # Required for target resolution; without it the resolver reports
+                     # UNAVAILABLE rather than guessing, and window control is disabled.
+pyperclip>=1.8       # In-process clipboard read/write (replaces a shell 'clip' spawn per call)
+send2trash>=1.8      # OPTIONAL. When present, file deletion goes to the Recycle Bin instead of
+                     # being permanent. Absent, DeletePath still works and deletes outright.
 
 # LLM & AI Clients
 openai>=1.30         # Also used as the OpenAI-compatible client for Groq/Gemini/local endpoints
@@ -28,7 +33,7 @@ onnxruntime>=1.17
 
 # Search & RAG
 ddgs>=9.0                  # Current package name for the DuckDuckGo search client
-duckduckgo-search>=6.0     # Legacy name kept as an import fallback (see real_time_search.py / deep_research.py)
+duckduckgo-search>=6.0     # Legacy name kept as an import fallback (see src/kayra/services/real_time_search.py / deep_research.py)
 
 # Web Scraping
 beautifulsoup4>=4.12
@@ -40,6 +45,6 @@ pynput>=1.7
 pywhatkit>=5.4
 keyboard>=0.13
 
-# Air Cursor Engine (optional hand-gesture mouse control, modules/air_cursor_engine.py)
+# Air Cursor Engine (optional hand-gesture mouse control, src/kayra/input/gesture.py)
 opencv-python>=4.9
 mediapipe>=0.10

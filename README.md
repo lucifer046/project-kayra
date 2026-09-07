@@ -24,18 +24,16 @@ Create a isolated environment and install the required modules:
 # Clone or navigate to your project directory
 cd project-kayra
 
-# Initialize the virtual environment
-python -m venv .venv
-
-# Activate the virtual environment
-# On Windows (PowerShell):
-.venv\Scripts\Activate.ps1
-# On Linux/macOS:
-source .venv/bin/activate
-
-# Install dependencies (automatically retrieves latest stable versions)
-pip install -r requirements.txt
+# One command prepares everything: checks your Python version, creates .venv,
+# installs dependencies, creates .env, and reports what is missing.
+python setup.py
 ```
+
+`setup.py` runs on your system Python and does not need the virtual environment to
+exist yet. It never overwrites an existing `.env` and never deletes an existing
+`.venv` without asking.
+
+You do **not** need to activate the virtual environment yourself — `run.py` finds it.
 
 ### 3. Environment Configuration
 
@@ -195,7 +193,7 @@ Kayra features a high-performance, real-time webcam spatial gesture tracking sys
   - Index + Middle extended -> Continuous Joystick Scroll (Hold hand above or below active anchor to scroll up or down).
 
 - **How to launch it:**
-  - Run `python modules/air_cursor_engine.py` from your terminal to boot the engine independently.
+  - Run `python -m kayra.input.gesture` from the virtual environment to boot the engine independently.
 
 ---
 
@@ -204,15 +202,22 @@ Kayra features a high-performance, real-time webcam spatial gesture tracking sys
 You can launch and test individual subsystems inside the sandbox or run the unified main controller:
 
 ```bash
-# Run the Main Desktop Assistant Controller (STT + TTS + Automation Loop)
-python main.py
+# Start Kayra (this is the normal way — no venv activation needed)
+python run.py
 
-# Test Windows Automation Subsystem directly (CLI prompt simulator)
-python modules/automation_windows.py
+# Equivalent entry points, all landing in the same place
+python main.py            # backward-compatibility shim
+python -m kayra           # from inside the virtual environment
+```
 
-# Test Advanced 6-stage Deep Research Engine
-python modules/deep_research.py
+Individual subsystems, run from the virtual environment:
 
-# Test TTS Audio Synthesizer Sandbox
-python tests/test_voice.py
+```bash
+# Hardware-free test suites (fast; no audio, browser or network)
+.venv\Scripts\python.exe tests/test_automation.py
+.venv\Scripts\python.exe tests/test_emotion_engine.py
+.venv\Scripts\python.exe tests/test_proactive_agent.py
+
+# TTS Audio Synthesizer Sandbox
+.venv\Scripts\python.exe tests/test_voice.py
 ```

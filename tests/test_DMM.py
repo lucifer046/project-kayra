@@ -4,12 +4,13 @@ import time
 import msvcrt
 
 # Ensure project root is in path for absolute importing across directories
+# The package lives under src/; put it on the path so the suite runs without installing.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from modules.llm_engine import CentralizedLLMEngine
-from modules.speech_to_text import SpeechToTextEngine, format_query, translate_query
-from modules.utils import print_system, print_info, print_success, print_error, console
+from kayra.intelligence.llm_engine import CentralizedLLMEngine
+from kayra.input.speech_to_text import SpeechToTextEngine, format_query, translate_query
+from kayra.utils import print_system, print_info, print_success, print_error, console
 
 def get_hybrid_input(stt_engine):
     """

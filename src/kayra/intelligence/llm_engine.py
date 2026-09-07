@@ -18,16 +18,10 @@ import requests
 import cohere
 from urllib.parse import urlparse
 from openai import OpenAI
-from dotenv import dotenv_values
 
 # Robust relative path imports across standalone and package execution
-try:
-    from .utils import print_info, print_warning, print_error, print_system, print_success
-except ImportError:
-    try:
-        from modules.utils import print_info, print_warning, print_error, print_system, print_success
-    except ImportError:
-        from utils import print_info, print_warning, print_error, print_system, print_success
+from kayra.core.config import env_values
+from kayra.utils import print_info, print_warning, print_error, print_system, print_success
 
 
 class CentralizedLLMEngine:
@@ -56,9 +50,8 @@ class CentralizedLLMEngine:
             return  # Shared singleton already fully constructed — nothing to redo.
         self._initialized = True
 
-        # Resolve absolute pathways to locate .env profile parameters dynamically
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.env_vars = dotenv_values(os.path.join(project_root, ".env")) or {}
+        # One cached parse of .env for the whole process — see kayra/core/config.py.
+        self.env_vars = env_values()
         
         # Load model identifier strings configured in profile
         self.cohere_model        = self.env_vars.get("COHERE_DECISION_MODEL", "command-r-plus-08-2024")
@@ -146,6 +139,8 @@ class CentralizedLLMEngine:
         self.funcs = [
             # conversation / retrieval / research
             "general", "realtime", "deep research", "exit",
+            # assistant self-control (handled in main.py, not by the automation router)
+            "proactive on", "proactive off",
             # applications, windows, tabs
             "open", "close", "close window", "close tab", "new tab",
             "minimize", "minimize all", "maximize", "show desktop",
@@ -165,6 +160,18 @@ class CentralizedLLMEngine:
             # search pages & utilities
             "google search", "youtube search",
             "screenshot", "take screenshot", "timer", "set timer", "reminder",
+            # ── added with the automation upgrade (2026-09-07) ──
+            # Every one of these is dispatched by automation_windows.normalize_command; the
+            # acceptance gate must never contain a token no executor handles.
+            "focus", "switch to", "restart app", "restore",
+            "next tab", "previous tab", "reopen tab", "duplicate tab",
+            "go back", "go forward",
+            "open folder", "open file", "create folder", "create file",
+            "delete file", "delete folder", "rename", "find file", "search files",
+            "cut", "clear clipboard", "read clipboard",
+            "cancel timer", "list timers",
+            "click", "double click", "right click", "scroll up", "scroll down",
+            "terminal", "run command",
         ]
         
         # Preamble instructions to restrict DMM responses to structured task labels.
@@ -272,6 +279,30 @@ class CentralizedLLMEngine:
                'zoom in', 'zoom out', 'reset zoom', 'task manager', 'run dialog'.
 
             =========================================================
+            D2. FOCUS, TABS, FILES, MOUSE AND TERMINAL
+            =========================================================
+            -> 'focus (app)' — bring an app to the front: "switch to vs code", "go to chrome",
+               "bring the terminal up" -> 'focus vs code' / 'focus chrome' / 'focus terminal'.
+               This is NOT 'switch window' — that one is a blind alt-tab, used only when the
+               user names no target ("switch windows", "alt tab").
+            -> 'restart app (name)' — close and reopen an application.
+            -> Browser tabs (emit exactly): 'new tab', 'close tab', 'next tab',
+               'previous tab', 'reopen tab', 'duplicate tab', 'go back', 'go forward',
+               'refresh'.
+            -> Files and folders: 'open folder (name)' ("open my downloads folder"),
+               'open file (name)', 'create folder (name)', 'create file (name)',
+               'rename (old) to (new)', 'find file (name)', 'delete file (name)'.
+               A path or folder is NOT an app: "open my downloads folder" is
+               'open folder downloads', never 'open downloads'.
+            -> Clipboard extras: 'cut', 'read clipboard', 'clear clipboard'.
+            -> Mouse (emit exactly): 'click', 'double click', 'right click', 'scroll up',
+               'scroll down'.
+            -> Timers: 'cancel timer', 'list timers'.
+            -> 'terminal (command)' — ONLY when the user explicitly asks to run a shell or
+               terminal command: "run git status in the terminal" -> 'terminal git status'.
+               A question about a command is conversation, not execution.
+
+            =========================================================
             E. MULTI-INTENT, EXIT AND FALLBACK
             =========================================================
             *** MULTI-TASKING: one token per requested action, in the order requested.
@@ -279,6 +310,13 @@ class CentralizedLLMEngine:
                 'who is akshay kumar and what is his net worth' -> 'realtime who is akshay kumar and what is his net worth'
                 Only split when the actions are genuinely different; a single question about
                 one subject stays a single token.
+            *** ASSISTANT SELF-CONTROL: the user is talking about Kayra's own unprompted
+                suggestions, NOT about audio playback.
+                "stop proactive suggestions" / "don't interrupt me" / "disable proactive mode"
+                / "stop giving me suggestions" -> 'proactive off'
+                "enable proactive mode" / "you can suggest things again" -> 'proactive on'
+                A bare "stop" is NOT this token — it is handled by the audio layer and never
+                reaches you. "stop the music" is 'stop media'.
             *** EXIT: goodbye / "that's all" / "exit" -> 'exit'
             *** FALLBACK: if you cannot confidently place the request, or it asks for
                 something not listed above, emit 'general ' followed by their words. Never guess an
@@ -319,8 +357,6 @@ class CentralizedLLMEngine:
             {"role": "Chatbot", "message": "play afsanay by ys, play let her go"},
             {"role": "User", "message": "i want to listen to some rock music"},
             {"role": "Chatbot", "message": "play rock music"},
-            {"role": "User", "message": "generate image of a lion and generate image of a cat"},
-            {"role": "Chatbot", "message": "generate image of a lion, generate image of a cat"},
             {"role": "User", "message": "search weather on google and search java on google"},
             {"role": "Chatbot", "message": "google search weather, google search java"},
             {"role": "User", "message": "search tutorial on youtube and search cooking on youtube"},
@@ -417,6 +453,42 @@ class CentralizedLLMEngine:
             {"role": "Chatbot", "message": "general tell me about the play hamlet"},
             {"role": "User", "message": "explain how to minimize latency in a web app"},
             {"role": "Chatbot", "message": "general explain how to minimize latency in a web app"},
+            # proactive self-control vs stopping playback vs a real "stop" command
+            {"role": "User", "message": "stop the music"},
+            {"role": "Chatbot", "message": "stop media"},
+            {"role": "User", "message": "stop giving me proactive suggestions"},
+            {"role": "Chatbot", "message": "proactive off"},
+            {"role": "User", "message": "don't interrupt me"},
+            {"role": "Chatbot", "message": "proactive off"},
+            {"role": "User", "message": "enable proactive mode again"},
+            {"role": "Chatbot", "message": "proactive on"},
+            # Editing keystrokes are not media controls. This pair sits at the very END on
+            # purpose: with a media token in the last position, "undo that" was being pulled
+            # to 'resume' by sheer recency weight (measured, 52/53 -> 53/53).
+            {"role": "User", "message": "undo that"},
+            {"role": "Chatbot", "message": "undo"},
+            {"role": "User", "message": "redo that"},
+            {"role": "Chatbot", "message": "redo"},
+            # named-target focus vs blind alt-tab
+            {"role": "User", "message": "switch to vs code"},
+            {"role": "Chatbot", "message": "focus vs code"},
+            {"role": "User", "message": "switch windows"},
+            {"role": "Chatbot", "message": "switch window"},
+            # a folder is not an application
+            {"role": "User", "message": "open my downloads folder"},
+            {"role": "Chatbot", "message": "open folder downloads"},
+            {"role": "User", "message": "open spotify"},
+            {"role": "Chatbot", "message": "open spotify"},
+            # tab navigation vs track navigation
+            {"role": "User", "message": "go to the next tab"},
+            {"role": "Chatbot", "message": "next tab"},
+            {"role": "User", "message": "play the next song"},
+            {"role": "Chatbot", "message": "next track"},
+            # running a command vs talking about one
+            {"role": "User", "message": "run git status in the terminal"},
+            {"role": "Chatbot", "message": "terminal git status"},
+            {"role": "User", "message": "what does git status do?"},
+            {"role": "Chatbot", "message": "general what does git status do?"},
         ]
 
     def run_boot_sequence(self, tts_engine=None):
@@ -445,8 +517,9 @@ class CentralizedLLMEngine:
         target language, and username.
 
         Parameters:
-            mood (str): Optional detected user mood (e.g. "Angry", "Happy", "Sad") from the
-                        SemanticEmotionEngine, used to steer tone/empathy for this turn.
+            mood: Optional detected user mood for this turn. Either a plain string or an
+                  `emotion_engine.EmotionReading` (which is a str subclass carrying
+                  `.confidence` and `.tone`). Steers TONE only — never intent.
 
         Returns:
             str: Compiled system alignment payload instruction block.
@@ -494,12 +567,29 @@ class CentralizedLLMEngine:
             f"Otherwise, answer from your own trained knowledge and say so plainly if you are unsure about anything recent — never invent facts or pretend to have browsed the web."
         )
 
-        if mood and mood.strip().lower() not in ("", "neutral"):
-            prompt += (
-                f"\n\nEMOTIONAL CONTEXT: {username} currently sounds {mood} based on their phrasing. "
-                f"Adjust your tone with genuine empathy to match — reassure if they seem upset or anxious, "
-                f"match their energy if they seem happy or excited — without explicitly announcing that you detected their mood."
-            )
+        # EMOTION INFLUENCES TONE, NEVER INTENT.
+        #
+        # This is the ONLY place a detected mood reaches the model, and all it can do is add a
+        # delivery instruction. It cannot change what the user asked for: intent classification
+        # happens in the DMM, which never sees the mood at all.
+        #
+        # `mood` may be a plain string (the historical contract) or an `EmotionReading`, which
+        # subclasses str and additionally carries `.confidence` and `.tone`. Both work here.
+        if mood and str(mood).strip().lower() not in ("", "neutral"):
+            confidence = getattr(mood, "confidence", None)
+            tone = getattr(mood, "tone", "")
+
+            # A low-confidence guess about someone's emotional state is worse than no guess:
+            # it steers the whole reply on weak evidence. The engine already returns neutral
+            # below its own threshold; this is the second gate for callers passing raw strings.
+            if confidence is None or confidence >= 0.45:
+                guidance = (f" Specifically: {tone}." if tone else "")
+                prompt += (
+                    f"\n\nEMOTIONAL CONTEXT: {username} currently sounds {mood} based on how "
+                    f"they phrased this.{guidance} Adjust only your TONE and length to suit — "
+                    f"never change what they actually asked for, and never announce that you "
+                    f"detected their mood."
+                )
 
         return prompt
 

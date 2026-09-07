@@ -10,37 +10,17 @@ It features a dual-tier memory system comprising:
 """
 
 import os
-from dotenv import dotenv_values
 
 # Robust imports supporting relative paths across all execution contexts
 # Fallbacks are configured to handle standalone execution vs imported module contexts cleanly.
-try:
-    from .llm_engine import CentralizedLLMEngine
-except ImportError:
-    try:
-        from modules.llm_engine import CentralizedLLMEngine
-    except ImportError:
-        from llm_engine import CentralizedLLMEngine
+from kayra.core.config import assistant_name as get_assistant_name
+from kayra.intelligence.llm_engine import CentralizedLLMEngine
 
-try:
-    from .utils import (
-        print_banner, print_info, print_success, print_warning, print_error, print_system, console,
-        load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
-        SentenceStreamer,
-    )
-except ImportError:
-    try:
-        from modules.utils import (
-            print_banner, print_info, print_success, print_warning, print_error, print_system, console,
-            load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
-            SentenceStreamer,
-        )
-    except ImportError:
-        from utils import (
-            print_banner, print_info, print_success, print_warning, print_error, print_system, console,
-            load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
-            SentenceStreamer,
-        )
+from kayra.utils import (
+    print_banner, print_info, print_success, print_warning, print_error, print_system,
+    console, answer_modifier, real_time_info, SentenceStreamer
+)
+from kayra.memory.conversation import load_conversation_memory, save_conversation_memory
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -48,11 +28,7 @@ except ImportError:
 # └────────────────────────────────────────────────────────────────────────┘
 
 # Load environment configuration parameters from active profile
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-env_vars = dotenv_values(os.path.join(root, ".env")) or {}
-assistant_name = env_vars.get("ASSISTANT_NAME", "").strip()
-if not assistant_name:
-    assistant_name = "Kayra"
+assistant_name = get_assistant_name()
 
 # Access the centralized mode-switching infrastructure broker (offline Kokoro / online cloud endpoints)
 engine = CentralizedLLMEngine()

@@ -25,10 +25,11 @@ import os
 import sys
 import time
 
+# The package lives under src/; put it on the path so the suite runs without installing.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from modules.utils import print_banner, print_info, print_success, print_error, print_system, console
+from kayra.utils import print_banner, print_info, print_success, print_error, print_system, console
 
 RESULTS = []
 

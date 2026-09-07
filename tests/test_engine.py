@@ -17,11 +17,12 @@ if sys.platform.startswith("win"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 # Append the project root folder to the Python path to allow importing the modules package
+# The package lives under src/; put it on the path so the suite runs without installing.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from modules.llm_engine import CentralizedLLMEngine
-from modules.utils import (
+from kayra.intelligence.llm_engine import CentralizedLLMEngine
+from kayra.utils import (
     print_info,
     print_warning,
     print_error,

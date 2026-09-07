@@ -27,11 +27,12 @@ import os
 import sys
 import time
 
+# The package lives under src/; put it on the path so the suite runs without installing.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from modules.llm_engine import CentralizedLLMEngine
-from modules.utils import print_banner, print_info, print_success, print_error, print_system, console
+from kayra.intelligence.llm_engine import CentralizedLLMEngine
+from kayra.utils import print_banner, print_info, print_success, print_error, print_system, console
 
 VERBOSE = "--verbose" in sys.argv
 
@@ -132,7 +133,7 @@ CASES = [
     ("exit",        "Goodbye Kayra.",                                ["exit"],        ["general "]),
 ]
 
-# Tokens the automation router in modules/automation_windows.py can actually execute.
+# Tokens the automation router in src/kayra/automation/windows.py can actually execute.
 # A token outside this set is either a conversational route or would be silently dropped.
 ROUTABLE_PREFIXES = (
     "general ", "realtime ", "deep research ", "exit",

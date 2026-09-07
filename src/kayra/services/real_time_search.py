@@ -10,7 +10,6 @@ orchestrates conversational streaming with support for dual-tier memory manageme
 """
 
 import os
-from dotenv import dotenv_values
 
 # Fallback block to safely import DDGS from ddgs or duckduckgo_search packages
 try:
@@ -19,41 +18,21 @@ except ImportError:
     from duckduckgo_search import DDGS
 
 # Robust relative path imports supporting standalone and package-level execution
-try:
-    from .llm_engine import CentralizedLLMEngine
-except ImportError:
-    try:
-        from modules.llm_engine import CentralizedLLMEngine
-    except ImportError:
-        from llm_engine import CentralizedLLMEngine
+from kayra.core.config import env_values
+from kayra.intelligence.llm_engine import CentralizedLLMEngine
 
-try:
-    from .utils import (
-        print_banner, print_info, print_success, print_warning, print_error, print_system, console,
-        load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
-        SentenceStreamer,
-    )
-except ImportError:
-    try:
-        from modules.utils import (
-            print_banner, print_info, print_success, print_warning, print_error, print_system, console,
-            load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
-            SentenceStreamer,
-        )
-    except ImportError:
-        from utils import (
-            print_banner, print_info, print_success, print_warning, print_error, print_system, console,
-            load_conversation_memory, save_conversation_memory, answer_modifier, real_time_info,
-            SentenceStreamer,
-        )
+from kayra.utils import (
+    print_banner, print_info, print_success, print_warning, print_error, print_system,
+    console, answer_modifier, real_time_info, SentenceStreamer
+)
+from kayra.memory.conversation import load_conversation_memory, save_conversation_memory
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                            CONFIGURATION                               │
 # └────────────────────────────────────────────────────────────────────────┘
 
 # Dynamically calculate project root directory to ensure .env is discovered reliably
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if __file__ else "."
-env_vars = dotenv_values(os.path.join(root, ".env")) or {}
+env_vars = env_values()
 
 assistant_name = env_vars.get("ASSISTANT_NAME", "").strip()
 if not assistant_name:

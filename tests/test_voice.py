@@ -10,12 +10,12 @@ Enables real-time command-line voice synthesis testing.
 import os
 import sys
 
-# Append the project root folder to the Python path to allow importing the modules package
+# The package lives under src/; put it on the path so the suite runs without installing.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from modules import TextToSpeechEngine
-from modules.utils import print_banner, print_info, print_error, print_system, print_success, console
+from kayra.output.text_to_speech import TextToSpeechEngine
+from kayra.utils import print_banner, print_info, print_error, print_system, print_success, console
 
 def main():
     print_banner("KAYRA TTS PLAYGROUND", "Interactive Offline Voice Synthesis Sandbox")

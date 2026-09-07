@@ -26,10 +26,11 @@ import os
 import sys
 import time
 
+# The package lives under src/; put it on the path so the suite runs without installing.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, os.path.join(project_root, "src"))
 
-from modules.utils import print_banner, print_info, print_success, print_error, print_system
+from kayra.utils import print_banner, print_info, print_success, print_error, print_system
 
 try:
     import psutil
@@ -37,7 +38,7 @@ except ImportError:
     print_error("psutil is required for this diagnostic (pip install psutil).")
     sys.exit(1)
 
-from modules.speech_to_text import SpeechToTextEngine, SttState, get_shared_engine
+from kayra.input.speech_to_text import SpeechToTextEngine, SttState, get_shared_engine
 
 CYCLES = int(sys.argv[1]) if len(sys.argv) > 1 else 15
 FAILURES = []

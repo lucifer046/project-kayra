@@ -26,7 +26,6 @@ import time
 import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
-from dotenv import dotenv_values
 
 # Fallback import handles modern ddgs vs legacy duckduckgo_search libraries
 try:
@@ -35,29 +34,18 @@ except ImportError:
     from duckduckgo_search import DDGS
 
 # Robust relative path imports across standalone and package execution
-try:
-    from .llm_engine import CentralizedLLMEngine
-except ImportError:
-    try:
-        from modules.llm_engine import CentralizedLLMEngine
-    except ImportError:
-        from llm_engine import CentralizedLLMEngine
+from kayra.core.config import env_values
+from kayra.core.paths import reports_dir
+from kayra.intelligence.llm_engine import CentralizedLLMEngine
 
-try:
-    from .utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
-except ImportError:
-    try:
-        from modules.utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
-    except ImportError:
-        from utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
+from kayra.utils import print_banner, print_info, print_success, print_warning, print_error, print_system, console
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                            CONFIGURATION                               │
 # └────────────────────────────────────────────────────────────────────────┘
 
 # Resolve absolute pathways to dynamically locate .env from any execution directory
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if __file__ else "."
-env_vars = dotenv_values(os.path.join(root, ".env")) or {}
+env_vars = env_values()
 
 # Research depth parameters (configurable via .env)
 MAX_SUB_QUESTIONS = int(env_vars.get("MAX_SUB_QUESTIONS", "5"))
@@ -75,7 +63,9 @@ SESSION.headers.update({
 engine = CentralizedLLMEngine()
 
 # Ensure dedicated Reports output directory exists
-REPORTS_DIR = os.path.join(root, "Reports")
+# Resolved from the project root, never the working directory: a report written to a
+# relative "Reports" folder lands wherever the user happened to launch Kayra from.
+REPORTS_DIR = reports_dir()
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 # ┌────────────────────────────────────────────────────────────────────────┐

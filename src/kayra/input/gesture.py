@@ -31,13 +31,7 @@ import collections
 import cv2
 import mediapipe as mp
 
-try:
-    from .utils import print_info, print_warning, print_error, print_success, print_banner
-except ImportError:
-    try:
-        from modules.utils import print_info, print_warning, print_error, print_success, print_banner
-    except ImportError:
-        from utils import print_info, print_warning, print_error, print_success, print_banner
+from kayra.utils import print_info, print_warning, print_error, print_success, print_banner
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
