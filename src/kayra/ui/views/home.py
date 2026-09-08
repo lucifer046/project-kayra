@@ -112,8 +112,27 @@ class HomeView(View):
         self._timer.setInterval(Motion.metrics_interval * 2)
         self._timer.timeout.connect(self._refresh_panels)
 
-        bridge.stateChanged.connect(self._on_state)
+        # THE VOICE CAPTION HAS ONE SOURCE. This screen used to compose it from a cached
+        # `_state` and a cached `_listening`, which is how a user talking to an open
+        # microphone could be told "Listening paused": neither cached value was wrong, and
+        # together they did not describe the situation. `voiceStateChanged` carries the
+        # resolved answer and its revision; nothing here re-derives it.
+        self._voice_revision = -1
+        # Latched by `_request_shutdown`. Once teardown has begun the controls stay disabled,
+        # so a late boot/voice re-sync cannot hand the user a button that re-enters a shutdown
+        # already in progress — the same reason the shutdown button disables itself.
+        self._shutting_down = False
+        bridge.voiceStateChanged.connect(self._on_voice_state)
+        # Still needed, and still separate facts: the button label is about what the user can
+        # DO, and the orb's colour follows the assistant's work as well as the microphone.
         bridge.listeningChanged.connect(self._on_listening)
+        # A SCREEN BUILT BEFORE THE BACKEND IS READY MUST RE-READ WHEN IT BECOMES READY.
+        # Home is constructed and shown by `KayraWindow.__init__`, several seconds before the
+        # session finishes booting, and `listening_changed` never fires for a value that
+        # never changes — so without this the control keeps whatever it was painted with
+        # during the boot window. That is the whole defect: the button said "Start listening"
+        # beside an orb that was listening, and only two real toggles fixed it.
+        bridge.bootFinished.connect(lambda ok, detail: self._sync_voice())
         bridge.userMessage.connect(self._on_user_message)
         bridge.assistantMessage.connect(self._on_assistant_message)
 
@@ -211,12 +230,14 @@ class HomeView(View):
         if box.exec() != QMessageBox.Yes:
             return
 
+        self._shutting_down = True
         self.shutdown_button.setEnabled(False)
         self.shutdown_button.setText("Shutting down\u2026")
         self.talk_button.setEnabled(False)
         self.listen_button.setEnabled(False)
-        self.prompt.setText(PROMPTS["SHUTTING_DOWN"])
-        self.state_caption.setText("Stopping services and closing the browser session.")
+        # The caption is not written here. `request_shutdown` moves the voice state to
+        # STOPPING, which is an ABSORBING state, so the machine paints it and nothing —
+        # including a late VAD sample from the control watcher — can put it back.
         self.bridge.shutdown(hard=True)
 
     def _toggle_listening(self):
@@ -297,67 +318,113 @@ class HomeView(View):
         self.gpu_card.body.addWidget(self._gpu_empty)
         self._gpu_empty.setVisible(False)
 
+        # ── Proactive presence ──
+        # The one screen where a subsystem that is meant to stay quiet can be seen working.
+        # It carries three facts and no telemetry for decoration: whether it is on, what it
+        # last observed, and when it could next speak. Everything here is already computed —
+        # `presence_status()` is a dict read off the running service, with no I/O behind it.
+        self.presence_card = Card("Presence")
+        self.presence_pill = StatusPill("—", "neutral")
+        self.presence_card.add_header_widget(self.presence_pill)
+        self.presence_last = Caption("—")
+        self.presence_next = Caption("—")
+        self.presence_budget = Caption("—")
+        for caption in (self.presence_last, self.presence_next, self.presence_budget):
+            # Elided, never wrapped, and never allowed to set the card's width — the same
+            # rule the System card's footprint line had to learn. A non-wrapping QLabel
+            # reports its full text width as its minimum, which is what clipped the last
+            # card off the right edge of this strip once already.
+            caption.setWordWrap(False)
+            caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.presence_card.body.addWidget(caption)
+        self._presence_empty = EmptyState("Presence is off",
+                                          "Kayra will only speak when you ask.")
+        self.presence_card.body.addWidget(self._presence_empty)
+        self._presence_empty.setVisible(False)
+
         # A fixed height keeps the bottom strip from resizing every time a line of activity
         # arrives — an anchor that jumps whenever content changes is not an anchor.
-        for card in (self.activity_card, self.system_card, self.gpu_card):
+        for card in (self.activity_card, self.system_card, self.gpu_card, self.presence_card):
             card.setFixedHeight(206)
 
         self.system_card.body.addStretch(1)
         self.gpu_card.body.addStretch(1)
+        self.presence_card.body.addStretch(1)
 
         row.addWidget(self.activity_card, 3)
         row.addWidget(self.system_card, 2)
         row.addWidget(self.gpu_card, 2)
+        row.addWidget(self.presence_card, 2)
         self.content.addLayout(row)
 
     # ──────────────────────────────────────────────────────────────────
     #                             UPDATES
     # ──────────────────────────────────────────────────────────────────
 
-    def _on_state(self, state, previous):
-        self.orb.set_state(state)
-        self._state = state
-        self._refresh_caption()
-
-    def _on_listening(self, listening):
+    def _on_voice_state(self, state, text, detail, revision):
         """
-        Reflects the microphone state.
+        Renders the ONE resolved voice state. Infers nothing.
 
-        LISTENING and PAUSED are shown as different WORDS, not just a different button label,
-        because "is it hearing me?" is the question this screen has to answer before any other
-        and a user should never have to infer it from the state of a control.
+        STALE CALLBACKS ARE DROPPED. Qt delivers queued signals in order, but this slot is
+        also reached from `on_show()` — a synchronous read taken when the screen becomes
+        visible — and that read can be overtaken by a transition already in the event queue.
+        Comparing revisions makes "the newest state wins" true regardless of arrival order,
+        rather than "whichever call happened last wins", which is the ordering assumption
+        that produced a stale caption in the first place.
         """
+        if revision <= self._voice_revision:
+            return
+        self._voice_revision = revision
+        self._voice_state = state
+
+        from kayra.core.voice_state import ORB_STATE, ORB_AMPLITUDE
+        self.orb.set_state(ORB_STATE.get(state, "IDLE"), ORB_AMPLITUDE.get(state))
+        self.prompt.setText(text)
+        self.state_caption.setText(detail)
+
+    def _on_listening(self, listening, known=True):
+        """
+        Updates the CONTROL, not the caption.
+
+        The caption is the voice state machine's to write. This is only about what the button
+        offers to do next — a separate fact, and the reason `listeningChanged` is still
+        connected: the machine resolves what is happening, and the button says what the user
+        can change about it.
+
+        `known=False` means the backend has not booted, so there is no answer yet. The button
+        is disabled rather than guessed at, which is also the truth about what it can DO:
+        `set_listening` returns False before the session exists, so an enabled button there
+        would be a control that silently does nothing.
+        """
+        listening = bool(listening)
         self.listen_button.set_label("Pause listening" if listening else "Start listening")
         self.listen_button.set_icon("pause" if listening else "mic")
         self.listen_button.setToolTip(
-            "Close the microphone. Kayra keeps running." if listening
+            "Kayra is still starting." if not known
+            else "Close the microphone. Kayra keeps running." if listening
             else "Open the microphone again.")
-        self._listening = bool(listening)
-        self._refresh_caption()
+        if not self._shutting_down:
+            self.listen_button.setEnabled(bool(known))
+        self._listening = listening
 
-    def _refresh_caption(self):
-        state = getattr(self, "_state", "IDLE")
-        if state == "SHUTTING_DOWN":
-            # Wins over everything, including the paused-microphone line below: once teardown
-            # has started, no other caption on this screen is still true.
-            self.prompt.setText(PROMPTS["SHUTTING_DOWN"])
-            self.state_caption.setText("Stopping services and closing the browser session.")
+    def _sync_voice(self):
+        """
+        Paints from the current voice state, for a screen that has just become visible.
+
+        A screen showing up mid-session has missed every transition so far, so it takes one
+        synchronous read — and routes it through `_on_voice_state`, so the revision guard
+        applies to it exactly as it does to a signal.
+        """
+        snapshot = self.bridge.voice_runtime_state() or {}
+        if not snapshot:
             return
-        if not getattr(self, "_listening", True):
-            # This wins over every idle-ish caption: a paused microphone is the most important
-            # thing on the screen, because everything else on it implies Kayra can hear you.
-            self.prompt.setText("Listening paused")
-            self.state_caption.setText(
-                "Kayra is still running. Start listening to talk again.")
-            return
-        self.prompt.setText(PROMPTS.get(state, STATE_LABELS.get(state, state.title())))
-        self.state_caption.setText({
-            "IDLE": "Say \"Kayra\" or type below",
-            "LISTENING": "Microphone open",
-            "PROCESSING": "Working out what you meant",
-            "SPEAKING": "Say \"stop\" to interrupt",
-            "AUTOMATING": "Controlling applications on your machine",
-        }.get(state, ""))
+        # ONE read for the whole voice picture, control included. Reading the caption from
+        # the snapshot and the button from a separate `listening_enabled()` call is how the
+        # two came to disagree in the first place.
+        self._on_listening(snapshot.get("listening", True),
+                           known=bool(snapshot.get("listening_known", True)))
+        self._on_voice_state(snapshot.get("state", "OFFLINE"), snapshot.get("text", ""),
+                             snapshot.get("detail", ""), int(snapshot.get("revision", 0)))
 
     def _on_user_message(self, text, source):
         self._push_activity("You", text, voice=(source == "voice"))
@@ -423,6 +490,49 @@ class HomeView(View):
             f"{count} action{'s' if count != 1 else ''}", "neutral")
 
         self._refresh_gpu()
+        self._refresh_presence()
+
+    def _refresh_presence(self):
+        """
+        Three facts about a subsystem whose whole job is to stay quiet.
+
+        The card hides itself when the layer is not running, rather than showing a plausible
+        empty state for a service that does not exist — the same rule the Graphics card
+        follows on a machine with no GPU.
+        """
+        status = self.bridge.presence_status()
+        if not status:
+            self.presence_card.setVisible(False)
+            return
+        self.presence_card.setVisible(True)
+
+        enabled = bool(status.get("enabled"))
+        for caption in (self.presence_last, self.presence_next, self.presence_budget):
+            caption.setVisible(enabled)
+        self._presence_empty.setVisible(not enabled)
+        if not enabled:
+            self.presence_pill.set_status("Off", "neutral")
+            return
+        self.presence_pill.set_status("Active", "success")
+
+        last = status.get("last_kind")
+        self._elide(self.presence_last,
+                    f"Last observation: {str(last).replace('_', ' ')}" if last
+                    else "Last observation: none yet")
+
+        seconds = int(status.get("next_eligible_seconds") or 0)
+        if seconds <= 0:
+            next_text = "Next eligible: now, if there is a reason"
+        elif seconds < 90:
+            next_text = f"Next eligible: in {seconds} seconds"
+        else:
+            next_text = f"Next eligible: in {seconds // 60} minutes"
+        self._elide(self.presence_next, next_text)
+
+        budget = int(status.get("daily_budget") or 0)
+        spoken = int(status.get("spoken_today") or 0)
+        self._elide(self.presence_budget,
+                    f"Spoken today: {spoken}" + (f" of {budget}" if budget else ""))
 
     @staticmethod
     def _elide(label, text):
@@ -521,7 +631,11 @@ class HomeView(View):
     def on_show(self):
         self._refresh_panels()
         # Read the live state on entry: it may have changed while this screen was hidden.
-        self._on_listening(self.bridge.listening_enabled())
+        # `_sync_voice` is the ONE read — it paints the caption, the orb and the control from
+        # a single snapshot, and it routes both through the same slots the signals use, so the
+        # revision guard applies to a synchronous paint exactly as it does to an asynchronous
+        # one.
+        self._sync_voice()
         self._timer.start()
 
     def on_hide(self):

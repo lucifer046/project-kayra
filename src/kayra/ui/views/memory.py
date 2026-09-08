@@ -46,6 +46,11 @@ class MemoryView(View):
     title = "Memory"
     subtitle = "What Kayra has kept, and how to remove it."
 
+    # How many memories are built as widgets. The count in the header is the TRUE total; this
+    # bounds only what is rendered, so a store grown over months cannot turn one navigation
+    # into thousands of widget constructions.
+    MAX_ROWS = 50
+
     def __init__(self, bridge, parent=None):
         super().__init__(bridge, parent)
 
@@ -81,7 +86,52 @@ class MemoryView(View):
         self.saved_body = QVBoxLayout()
         self.saved_body.setSpacing(Space.xs)
         self.saved_card.body.addLayout(self.saved_body)
+
+        # The empty state is a PERMANENT child, shown and hidden — never created and
+        # destroyed. `QLayout.takeAt` removes an item from the layout without hiding or
+        # deleting the widget, and `deleteLater` only runs when control returns to the event
+        # loop, so an empty state "removed" on one render pass is still a visible child at its
+        # stale geometry with the new rows laid out on top of it.
+        self.saved_empty = EmptyState(
+            "Nothing saved yet",
+            "Say \"remember this\" during a conversation and it will be kept here.")
+        self.saved_card.body.addWidget(self.saved_empty)
+
         self.content.addWidget(self.saved_card)
+        self._build_location()
+
+    def _build_location(self):
+        """
+        Where memory actually lives, and a way to get there.
+
+        The path is READ FROM THE BACKEND, never composed here — `core.paths` is the single
+        source of truth for every filesystem location in Kayra, and a settings screen that
+        hardcoded `data\\conversation.json` would be exactly the bare relative path that once
+        fragmented the assistant's memory across several files.
+        """
+        card = Card("Memory storage", flat=True)
+
+        self.location_label = Secondary("—")
+        self.location_label.setWordWrap(True)
+        card.body.addWidget(self.location_label)
+
+        self.location_detail = Caption("")
+        self.location_detail.setWordWrap(True)
+        card.body.addWidget(self.location_detail)
+
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, Space.sm, 0, 0)
+        layout.setSpacing(Space.sm)
+        layout.addStretch(1)
+
+        open_button = GhostButton("Open file location")
+        open_button.setToolTip("Show the memory file in File Explorer")
+        open_button.clicked.connect(self._open_location)
+        layout.addWidget(open_button)
+
+        card.body.addWidget(row)
+        self.content.addWidget(card)
 
     def _build_habits(self):
         self.habits_card = Card("Learned routines")
@@ -108,23 +158,48 @@ class MemoryView(View):
 
     def _refresh(self):
         self._refresh_saved()
+        self._refresh_location()
         self._refresh_habits()
 
     def _refresh_saved(self):
+        """
+        Rebuilds the list from `list_memories()`, which carries a stable id per record.
+
+        BOUNDED ON PURPOSE. Only the most recent `MAX_ROWS` are built as widgets; the pill
+        reports the true total. A store grown over months would otherwise create thousands of
+        widgets on every navigation to this screen, which is the cost this screen is least
+        able to afford — it is a privacy surface people open and close, not one they live in.
+        """
         self._clear_layout(self.saved_body)
-        entries = self.bridge.conversation_memory()
+        entries = self.bridge.list_memories()
 
         if not entries:
             self.saved_pill.set_status("Nothing saved", "neutral")
-            self.saved_body.addWidget(EmptyState(
+            self.saved_empty.set_message(
                 "Nothing saved yet",
-                "Say \"remember this\" during a conversation and it will be kept here."))
+                "Say \"remember this\" during a conversation and it will be kept here.")
+            self.saved_empty.setVisible(True)
             return
 
+        self.saved_empty.setVisible(False)
         count = len(entries)
         self.saved_pill.set_status(f"{count} item{'s' if count != 1 else ''}", "neutral")
-        for index, entry in enumerate(entries[-30:]):
-            self.saved_body.addWidget(_MemoryRow(entry, index, self._delete_saved))
+        for entry in entries[:self.MAX_ROWS]:
+            self.saved_body.addWidget(_MemoryRow(entry, self._delete_saved))
+
+    def _refresh_location(self):
+        described = self.bridge.memory_store() or {}
+        path = described.get("path") or "unknown"
+        self.location_label.setText(path)
+        self.location_label.setToolTip(path)          # the full path, however long
+        if described.get("exists"):
+            size = described.get("size_bytes", 0)
+            self.location_detail.setText(
+                f"{described.get('count', 0)} entries · "
+                f"{size / 1024:.1f} KB · a rolling backup is kept beside it")
+        else:
+            self.location_detail.setText(
+                "The file is created the first time you ask Kayra to remember something.")
 
     def _refresh_habits(self):
         self._clear_layout(self.habits_body)
@@ -146,33 +221,83 @@ class MemoryView(View):
 
     # ──────────────────────────────────────────────────────────────────
 
-    def _delete_saved(self, index):
-        from kayra.memory.conversation import load_conversation_memory, save_conversation_memory
-        entries = load_conversation_memory() or []
-        recent = entries[-30:]
-        if 0 <= index < len(recent):
-            target = recent[index]
-            try:
-                entries.remove(target)
-            except ValueError:
-                return
-            save_conversation_memory(entries)
-            self._refresh_saved()
+    def _delete_saved(self, memory_id):
+        """
+        Deletes ONE memory, by id, after confirming — and only redraws once it is really gone.
 
-    def _clear_saved(self):
+        BY ID, NEVER BY POSITION. The store is appended to by the running assistant, so the
+        entry at row 4 when this screen rendered is not necessarily the entry at row 4 when
+        the button is clicked. Deleting the wrong memory has no undo, which is why identity
+        had to become a property of the record rather than of the list.
+
+        THE ROW STAYS UNTIL PERSISTENCE SUCCEEDS. `delete_memory` returns False when the write
+        failed; the screen then says so and leaves the row where it is. A UI that removes a
+        row on click and finds it back after a restart is worse than one that admits the
+        failure.
+        """
         from PySide6.QtWidgets import QMessageBox
-        from kayra.memory.conversation import save_conversation_memory
 
         box = QMessageBox(self)
-        box.setWindowTitle("Clear saved memory")
-        box.setText("Delete everything Kayra has saved?")
-        box.setInformativeText("This removes the long-term conversation memory permanently. "
-                               "Learned routines are not affected.")
+        box.setWindowTitle("Delete memory")
+        box.setText("Delete this memory?")
+        box.setInformativeText("It is removed from Kayra's long-term memory permanently.")
         box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
         box.setDefaultButton(QMessageBox.Cancel)
-        if box.exec() == QMessageBox.Yes:
-            save_conversation_memory([])
-            self._refresh_saved()
+        if box.exec() != QMessageBox.Yes:
+            return
+
+        deleted, detail = self.bridge.delete_memory(memory_id)
+        if not deleted:
+            self.saved_pill.set_status("Delete failed", "warning")
+            self.saved_empty.set_message("Could not delete that memory",
+                                         detail or "The memory store could not be written.")
+            self.saved_empty.setVisible(True)
+            return
+        self._refresh()
+
+    def _clear_saved(self):
+        """
+        Empties the store, behind a deliberately blunt confirmation.
+
+        The wording states the consequence rather than the action, and the default button is
+        Cancel: this is the one control on the screen that can destroy months of the user's
+        data in a click, and it should read like it.
+        """
+        from PySide6.QtWidgets import QMessageBox
+
+        total = (self.bridge.memory_store() or {}).get("count", 0)
+        if not total:
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear all memories")
+        box.setText("Delete all stored memories? This cannot be undone.")
+        box.setInformativeText(
+            f"All {total} saved entries are removed from Kayra's long-term memory "
+            f"permanently. Learned routines are not affected.")
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
+        box.setDefaultButton(QMessageBox.Cancel)
+        if box.exec() != QMessageBox.Yes:
+            return
+
+        cleared, ok = self.bridge.clear_memories()
+        if not ok:
+            self.saved_pill.set_status("Clear failed", "warning")
+            return
+        self.saved_pill.set_status(f"Cleared {cleared}", "neutral")
+        self._refresh()
+
+    def _open_location(self):
+        """
+        Reveals the memory file in File Explorer.
+
+        On failure the exact path is put on screen, because "could not open Explorer" without
+        the path leaves the user unable to do the thing they were trying to do; with it, they
+        can navigate there by hand.
+        """
+        ok, detail = self.bridge.open_memory_location()
+        if not ok:
+            self.location_detail.setText(f"Could not open File Explorer. The file is at:\n{detail}")
 
     def on_show(self):
         self._refresh()
@@ -209,15 +334,16 @@ class _MemoryRow(ListRow):
 
     SPEAKER = {"user": "You", "assistant": "Kayra", "system": "Kayra"}
 
-    def __init__(self, entry, index, on_delete, parent=None):
+    def __init__(self, entry, on_delete, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(38)
 
-        if isinstance(entry, dict):
-            role = str(entry.get("role", "")).strip().lower()
-            text = str(entry.get("content", "") or "")
-        else:
-            role, text = "", str(entry)
+        # `entry` comes from `memory.store.list_memories`, so it always carries an id. The row
+        # holds that id and nothing positional: the delete button knows WHICH memory it
+        # removes, not merely which row it sits in.
+        self._memory_id = str(entry.get("id", ""))
+        role = str(entry.get("role", "")).strip().lower()
+        text = str(entry.get("content", "") or "")
 
         speaker = self.SPEAKER.get(role, "")
         self._text = " ".join(text.split())
@@ -236,7 +362,7 @@ class _MemoryRow(ListRow):
         remove = GhostButton("Remove")
         remove.setFixedWidth(78)
         remove.setToolTip("Delete this memory permanently")
-        remove.clicked.connect(lambda: on_delete(index))
+        remove.clicked.connect(lambda: on_delete(self._memory_id))
         self.row.addWidget(remove)
 
     def resizeEvent(self, event):

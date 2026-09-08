@@ -2414,6 +2414,7 @@ async def translate_and_execute(commands):
 
     _set_runtime(AssistantState.AUTOMATING if AssistantState else None)
     spoken = []
+    outcomes = {"ok": 0, "failed": 0, "tokens": []}
     try:
         for group in plan_actions(actions):
             if len(group) == 1:
@@ -2426,14 +2427,42 @@ async def translate_and_execute(commands):
             for result in results:
                 if result.message:
                     spoken.append(result.message)
+                # Tallied for the runtime event below. The proactive presence layer uses
+                # repeated failures of the SAME action as its evidence for offering another
+                # approach, and a guess about what failed would be worse than no offer.
+                if result.status == Status.OK:
+                    outcomes["ok"] += 1
+                elif result.status == Status.FAILED:
+                    outcomes["failed"] += 1
+                    outcomes["tokens"].append(f"{result.action.domain}.{result.action.action}"
+                                              if getattr(result, "action", None) else "")
                 # A question stops the batch. Continuing past "which tab did you mean?" would
                 # execute the rest of a plan whose earlier step never happened.
                 if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):
                     return " ".join(spoken)
     finally:
         _set_runtime(AssistantState.PROCESSING if AssistantState else None)
+        _emit_outcome(outcomes)
 
     return " ".join(spoken)
+
+
+def _emit_outcome(outcomes):
+    """
+    Publishes the batch's outcome on the runtime bus.
+
+    Optional in exactly the same way `_set_runtime` is: this module runs standalone from its
+    own diagnostic block, where there is no runtime to talk to. It carries counts and action
+    identities only — never the user's words.
+    """
+    if get_runtime_state is None or not (outcomes["ok"] or outcomes["failed"]):
+        return
+    try:
+        get_runtime_state().emit("automation_result", ok=outcomes["ok"],
+                                 failed=outcomes["failed"],
+                                 tokens=[t for t in outcomes["tokens"] if t])
+    except Exception:
+        pass
 
 
 def _set_runtime(state):

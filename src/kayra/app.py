@@ -68,7 +68,11 @@ if sys.platform.startswith("win"):
 from kayra.core.config import (load_environment, env_values,
                                assistant_name as configured_assistant_name)
 from kayra.core.runtime_state import AssistantState, get_runtime_state
+from kayra.core.conversation_context import get_conversation_context
 from kayra.core.voice_control import ControlKind, classify_control
+from kayra.core.voice_state import get_voice_state
+from kayra.core import logbus
+from kayra.core.logbus import Subsystem
 from kayra.utils import (
     print_banner, print_system, print_info, print_error, print_success, print_warning,
     console, StageTimer, now_ms,
@@ -97,6 +101,14 @@ EMOTION_ENABLED = False
 
 proactive_agent = None
 PROACTIVE_AVAILABLE = False
+
+# The transcript repair stage, built on first use. `False` means "tried and unavailable",
+# which is distinct from `None` ("not built yet") so a failure is not retried per utterance.
+_REPAIR_STAGE = None
+
+# How long the audio-pipeline report waits for the microphone to be granted before saying it
+# was not. Generous, because it runs on its own thread and delays nothing.
+AUDIO_REPORT_TIMEOUT_S = 8.0
 
 Chatbot = None
 RealTimeSearchEngine = None
@@ -144,11 +156,145 @@ STATE_SPEAKING = AssistantState.SPEAKING
 STATE_INTERRUPTING = AssistantState.INTERRUPTING
 STATE_AUTOMATING = AssistantState.AUTOMATING
 
+# What the conversation is currently ABOUT, as opposed to what the assistant is DOING.
+# A separate object from RUNTIME for the same reason listening is a separate axis from state:
+# they answer different questions, and one of them is read on the recognition path by a stage
+# that must never import the intelligence layer to get an answer.
+CONTEXT = get_conversation_context()
+
 set_state = RUNTIME.set_state
+
+# The authoritative voice state. `RUNTIME` says what the assistant is DOING; this says what
+# the user should be told about the microphone, resolved from every relevant fact at once.
+VOICE = get_voice_state()
 
 
 def get_state():
     return RUNTIME.state
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                       VOICE STATE PUBLICATION                          │
+# └────────────────────────────────────────────────────────────────────────┘
+# THIS ORCHESTRATOR IS THE ONLY THING THAT FEEDS THE VOICE STATE MACHINE. Four producers each
+# know one fact and none knows them all — the runtime bus knows the turn, the backend manager
+# knows the session, the control watcher knows what the VAD hears, and `set_listening` /
+# `set_sleeping` know what the user asked for. They report facts HERE; the machine resolves
+# them; everything downstream renders the answer.
+#
+# It lives in `app.py` rather than in `core` because it is wiring: `core.voice_state` is a leaf
+# that imports only the stdlib, and it must stay one so a UI can import it without dragging in
+# the STT engine.
+
+def _voice_facts(**facts):
+    """
+    Hands facts to the voice state machine and logs any transition it commits.
+
+    THE TRANSITION LOG LIVES HERE AND NOWHERE ELSE. One line per committed change, at INFO —
+    not per animation frame, not per VAD sample, and not again in the UI. `update()` returns
+    None when nothing changed, which is what keeps a 5Hz VAD poll from producing 5 lines a
+    second.
+    """
+    try:
+        transition = VOICE.update(**facts)
+    except Exception:
+        return None
+    if transition is not None:
+        logbus.info(Subsystem.VOICE,
+                    f"State: {transition.previous} -> {transition.state}",
+                    correlate=False)
+    return transition
+
+
+def _refresh_voice_state(**extra):
+    """Re-resolves the voice state from everything currently observable."""
+    backend_status = "OFF"
+    try:
+        from kayra.input.stt_backend import get_stt_backend_manager
+        backend_status = get_stt_backend_manager().snapshot().status
+    except Exception:
+        pass
+    facts = {
+        "assistant_state": RUNTIME.state,
+        "listening": RUNTIME.listening,
+        "sleeping": RUNTIME.sleeping,
+        "shutting_down": RUNTIME.shutdown_event.is_set(),
+        "voice_available": bool(AUDIO_ENABLED and stt_engine is not None),
+        "backend_status": backend_status,
+    }
+    facts.update(extra)
+    return _voice_facts(**facts)
+
+
+def _on_runtime_voice_event(event, payload):
+    """
+    Runtime-bus subscriber that keeps the voice state in step with the turn machine.
+
+    Deliberately narrow: it reads the payload it was given and re-resolves. It must return
+    fast and must never raise — `emit()` fans out synchronously from the main loop and from
+    the control watcher, and a slow subscriber would stall both.
+    """
+    try:
+        if event == "state_changed":
+            _refresh_voice_state(assistant_state=payload.get("state", "IDLE"))
+        elif event == "listening_changed":
+            _refresh_voice_state(listening=bool(payload.get("listening", True)),
+                                 voice_active=False)
+        elif event == "sleeping_changed":
+            _refresh_voice_state(sleeping=bool(payload.get("sleeping", False)))
+        elif event == "barge_in":
+            # RE-RESOLVE, but do NOT assert that a voice is present.
+            #
+            # `barge_in` is emitted by every path that silences speech, including ones with no
+            # user in them at all: entering standby and starting a shutdown both cancel
+            # playback and both emit it. Setting `voice_active=True` here latched that fact
+            # with nothing to clear it, and the assistant visual then read "Listening…" — the
+            # user is speaking — for the rest of the session with the room silent. Caught in
+            # the live boot test.
+            #
+            # A REAL spoken barge-in is already covered twice over without this: the control
+            # watcher publishes the VAD sample that produced it, and the turn machine's
+            # INTERRUPTING state resolves to USER_SPEAKING on its own.
+            _refresh_voice_state()
+    except Exception:
+        pass
+
+
+def _on_backend_changed(_state):
+    """Backend manager subscriber: a session transition is a voice-state fact like any other."""
+    try:
+        _refresh_voice_state()
+    except Exception:
+        pass
+
+
+def voice_runtime_state():
+    """
+    Everything a presentation layer needs to render the assistant's voice presence, in one
+    read: the state, its revision, the facts behind it and the live backend.
+
+    THE UI CONSUMES THIS AND INFERS NOTHING. It is deliberately a single call rather than a
+    set of getters, because the bug this replaced was four surfaces each reading a different
+    subset and disagreeing about the rest.
+    """
+    snapshot = VOICE.snapshot()
+    try:
+        from kayra.input.stt_backend import get_stt_backend_manager
+        backend = get_stt_backend_manager().snapshot().to_dict()
+    except Exception:
+        backend = {}
+    snapshot["stt_backend"] = backend.get("active_backend")
+    snapshot["stt_backend_label"] = backend.get("active_label", "None")
+    snapshot["stt_requested"] = backend.get("requested_backend")
+    snapshot["stt_status"] = backend.get("status", snapshot.get("stt_status"))
+    snapshot["last_error"] = backend.get("last_error", "")
+    snapshot["last_transition"] = snapshot.get("seconds_in_state")
+    # The microphone fact travels with the rest of the voice picture, and is accompanied by
+    # whether it is KNOWN. A presentation layer that reads them separately can be handed
+    # "not listening" when the honest answer is "not booted yet" — see `listening_known`.
+    snapshot["listening"] = bool(snapshot.get("facts", {}).get("listening", True))
+    snapshot["listening_known"] = True
+    return snapshot
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -179,8 +325,84 @@ def _boot_stt():
         # picks whichever installed browser can genuinely transcribe.
         browser = getattr(getattr(stt_engine, "browser", None), "label", None) or "browser"
         BOOT.mark(f"STT ready (headless {browser} Web Speech + VAD)")
+        # Hand the live session to the backend manager, which from here on is the ONE place
+        # that answers "which backend was requested, which is active, and how did that
+        # happen?". Adoption seeds `requested` from configuration so the very first snapshot
+        # is truthful rather than reporting `auto` while `.env` says `chrome`.
+        try:
+            from kayra.input.stt_backend import get_stt_backend_manager
+            manager = get_stt_backend_manager()
+            manager.subscribe(_on_backend_changed)
+            manager.adopt(requested=env_values().get("STT_BROWSER", "auto"), source="env")
+        except Exception as exc:
+            print_warning(f"Speech backend state unavailable: {exc}")
+        # Reported from a short-lived daemon thread rather than inline. `getUserMedia` is
+        # ASYNCHRONOUS: the session is up before the device is granted, so reporting here
+        # printed "microphone settings unavailable" on every single boot — a false alarm
+        # about the one subsystem whose warnings need to be trustworthy. Waiting inline
+        # instead would put the delay straight into cold start, which is the other thing
+        # this boot path is not allowed to do.
+        threading.Thread(target=_report_audio_pipeline, daemon=True,
+                         name="kayra-audio-report").start()
     except Exception as e:
         _boot_errors.append(("Speech-to-Text", e))
+
+
+def _report_audio_pipeline():
+    """
+    Prints what the capture pipeline ACTUALLY got, read back from the live microphone track.
+
+    Constraints are a request, not a promise. Echo cancellation, noise suppression and gain
+    control are asked for; whether the browser and the device grant them depends on the driver
+    and the device, and an assistant that assumes it got them will misdescribe the one thing
+    that explains its mistakes. This is the same rule the speech-device card follows for the
+    ONNX provider: report the session that exists, never the one that was requested.
+
+    Diagnostics only — nothing here is load-bearing, and a failure to read it is not an error.
+    """
+    # The device is granted asynchronously, so poll briefly rather than reading once. A
+    # refusal is reported the moment it is known; a grant usually lands well inside a second.
+    report, settings = {}, {}
+    deadline = time.time() + AUDIO_REPORT_TIMEOUT_S
+    while time.time() < deadline:
+        try:
+            report = stt_engine.audio_pipeline_report()
+        except Exception:
+            return
+        settings = report.get("settings") or {}
+        if settings or report.get("error"):
+            break
+        time.sleep(0.25)
+
+    if not settings:
+        detail = report.get("error") or "microphone settings unavailable"
+        logbus.warning(Subsystem.STT,
+                       f"Capture: {detail}. Echo rejection falls back to the capture "
+                       f"timestamp gate alone.")
+        return
+
+    granted = [name for name, key in (("echo cancellation", "echoCancellation"),
+                                      ("noise suppression", "noiseSuppression"),
+                                      ("gain control", "autoGainControl"))
+               if settings.get(key)]
+    missing = [name for name, key in (("echo cancellation", "echoCancellation"),
+                                      ("noise suppression", "noiseSuppression"),
+                                      ("gain control", "autoGainControl"))
+               if not settings.get(key)]
+    rate = settings.get("sampleRate")
+    channels = settings.get("channelCount")
+    # WHAT WAS GRANTED is stated once, by the startup report, which reads the same values
+    # from the same place. This thread only owns what was REFUSED — the part the startup
+    # report cannot know it should mention, and the part that actually changes what the user
+    # should expect from the assistant.
+    logbus.debug(Subsystem.STT,
+                 "capture: " + (", ".join(granted) or "no processing") +
+                 (f" @ {rate} Hz" if rate else "") +
+                 (f", {channels}ch" if channels else ""))
+    if missing:
+        logbus.warning(Subsystem.STT,
+                       "Capture did NOT get: " + ", ".join(missing) +
+                       ". Recognition accuracy while Kayra is speaking will be lower.")
 
 
 def _report_boot_errors():
@@ -217,6 +439,15 @@ def bootstrap():
     load_environment()
     env_vars = env_values()
     assistant_name = configured_assistant_name()
+
+    # Third-party loggers down to WARNING before anything can start chattering. Never
+    # disabled and never raised past WARNING — a real Selenium or SDK failure still reaches
+    # the terminal; what is suppressed is urllib3 announcing every WebDriver connection at
+    # 17Hz while the control watcher polls.
+    logbus.quiet_third_party()
+
+    # Subscribed BEFORE the engines come up, so no transition is missed while they boot.
+    RUNTIME.subscribe(_on_runtime_voice_event)
 
     # ── STAGE 1 — launch the slow engines in parallel ──
     tts_thread = threading.Thread(target=_boot_tts, daemon=True, name="kayra-boot-tts")
@@ -315,7 +546,10 @@ def bootstrap():
 
     # Model-routing diagnostics: printed, not spoken. Narrating them cost several seconds of
     # blocking speech synthesis before the assistant was usable.
-    engine.run_boot_sequence()
+    # NOT `engine.run_boot_sequence()`. That prints the same provider block the startup
+    # report prints at the end of `bootstrap`, and two copies of one fact is the duplication
+    # section 13.21 exists to remove. The method is kept for standalone diagnostics that boot
+    # the engine alone and want the routing narrated.
     BOOT.mark("Assistant ready")
 
     # ── STAGE 4 — background services ──
@@ -334,7 +568,106 @@ def bootstrap():
             print_warning(f"Proactive agent failed to start (non-fatal): {e}")
             proactive_agent = None
 
+    _report_startup()
     _install_signal_handlers()
+
+
+def _report_startup():
+    """
+    The startup summary: one short block per subsystem, in a fixed order.
+
+    WHY A REPORT RATHER THAN THE LINES EACH SUBSYSTEM ALREADY PRINTS. Boot is where the
+    terminal is least readable, because half a dozen subsystems come up on overlapping threads
+    and interleave their output. This runs AFTER all of them, on one thread, and states the
+    facts a person actually needs: which speech backend, which speech device, which model
+    routing, how much memory, and whether presence is on. It answers "what is Kayra running
+    with?" without requiring anyone to reconstruct it from the order things happened to print.
+
+    Every value is READ FROM THE LIVE SUBSYSTEM, never from configuration. That is the same
+    rule the speech-device card follows and it is the whole point: a boot report that recites
+    `.env` back would say "GPU" on a machine where synthesis is running on the processor.
+    """
+    from kayra.core.logbus import field
+    from kayra.intelligence.provider_router import ROUTE_CHAT, ROUTE_DECISION
+
+    logbus.section(Subsystem.BOOT, "Kayra is ready")
+
+    # ── Models ──
+    try:
+        logbus.info(Subsystem.LLM, "Providers", correlate=False)
+        if getattr(engine, "is_online", False):
+            field(Subsystem.LLM, "DMM", engine.router.describe(ROUTE_DECISION))
+            field(Subsystem.LLM, "Chat", engine.router.describe(ROUTE_CHAT))
+        else:
+            field(Subsystem.LLM, "DMM", f"Local ({engine.local_decision_model})")
+            field(Subsystem.LLM, "Chat", f"Local ({engine.local_chat_model})")
+    except Exception:
+        logbus.warning(Subsystem.LLM, "Model routing unavailable")
+
+    # ── Speech output ──
+    if TTS_ENABLED and tts_engine is not None:
+        try:
+            report = tts_engine.device_status.to_dict()
+            field(Subsystem.TTS, "Provider", report.get("provider", "unknown"))
+            field(Subsystem.TTS, "Device", report.get("device", "unknown"))
+            if report.get("fallback"):
+                # "Asked for a GPU and got the CPU" is the one thing about this subsystem a
+                # user must not have to discover later.
+                logbus.warning(Subsystem.TTS,
+                               f"Fell back to {report.get('device')}: {report.get('reason', '')}")
+        except Exception:
+            field(Subsystem.TTS, "Provider", "unknown")
+    else:
+        logbus.warning(Subsystem.TTS, "Speech output unavailable — Kayra will run muted")
+
+    # ── Speech input ──
+    if AUDIO_ENABLED and stt_engine is not None:
+        try:
+            backend = stt_backend_state()
+            field(Subsystem.STT, "Backend", backend.get("active_label", "unknown"))
+            if not backend.get("matches"):
+                logbus.warning(Subsystem.STT,
+                               f"Requested {backend.get('requested_label')} but "
+                               f"{backend.get('active_label')} is active")
+        except Exception:
+            pass
+        try:
+            pipeline = stt_engine.audio_pipeline_report() or {}
+            settings = pipeline.get("settings") or {}
+            if settings.get("label"):
+                field(Subsystem.STT, "Microphone", settings["label"])
+            # Constraints are a REQUEST, not a promise. Reporting what the browser actually
+            # granted is the same rule the speech-device card follows for the ONNX provider:
+            # an assistant that claims echo cancellation it never got is misdescribing the one
+            # thing that explains its mistakes.
+            for label, key in (("AEC", "echoCancellation"),
+                               ("Noise supp.", "noiseSuppression")):
+                if key in settings:
+                    field(Subsystem.STT, label, "ON" if settings[key] else "OFF")
+            vad = pipeline.get("vad") or {}
+            field(Subsystem.STT, "VAD", "READY" if vad.get("ready") else "unavailable")
+        except Exception:
+            pass
+    else:
+        logbus.warning(Subsystem.STT, "Speech input unavailable — keyboard input only")
+
+    # ── Memory ──
+    try:
+        from kayra.memory.store import report_loaded
+        report_loaded()
+    except Exception:
+        pass
+
+    # ── Presence ──
+    try:
+        presence = presence_engine()
+        if presence is not None:
+            field(Subsystem.PRESENCE, "Contextual",
+                  "enabled" if getattr(presence, "enabled", False) else "disabled")
+    except Exception:
+        pass
+
+    logbus.section_end()
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -507,7 +840,14 @@ def _local_control_watcher():
             # the next response starts. The utterance still reaches the normal queue, where
             # Listen() decides what to do with it.
 
-            time.sleep(0.06 if speaking else 0.2)
+            # VOICE ACTIVITY, FROM THE POLL THAT ALREADY HAPPENED. `poll_controls` reads
+            # `window.kayraVad.voice` in the same round-trip it uses for the interrupt flags,
+            # so this costs nothing beyond a dict read — and it is what lets the assistant
+            # visual show "I am hearing you right now" without a second observation, a second
+            # thread or a second Selenium command over the driver lock.
+            _refresh_voice_state(voice_active=bool(getattr(stt_engine, "voice_active", False)))
+
+            time.sleep(0.06 if speaking else 0.15)
         except Exception:
             # A watcher crash must never take the assistant down or wedge playback.
             time.sleep(0.5)
@@ -581,6 +921,60 @@ def set_listening(enabled, announce=True):
     return reply if announce else ""
 
 
+def set_stt_backend(backend, source="settings"):
+    """
+    Changes which browser runs speech recognition, on the LIVE session. Returns (ok, detail).
+
+    THE ONE ENTRY POINT, for the same reason `set_listening` is: the Settings dropdown, a
+    future spoken command and any test all have to produce identical state, and two
+    implementations of a browser swap would mean two answers to "which backend is active".
+
+    It is a THIN pass-through on purpose. The backend manager owns the transaction (request,
+    stop, start, verify, publish) and the STT engine owns the safety of the swap (teardown
+    before rebuild, PID-scoped reaping, restore-on-failure). Sequencing any of that here would
+    be a second implementation of the one operation that must not have two — exactly the rule
+    already applied to `set_tts_device`.
+
+    THE CURRENT STATE IS PRESERVED ACROSS THE SWITCH. A backend change is not a pause, not a
+    barge-in, not a wake and not a shutdown: if listening was paused it stays paused, if Kayra
+    was asleep it stays asleep. What it does interrupt is playback, and only when it must —
+    the browser session being torn down is the one holding the microphone that barge-in
+    depends on, so a half-swapped session must not be left able to hear "stop".
+    """
+    from kayra.core.settings_log import get_settings_recorder
+    from kayra.input.stt_backend import get_stt_backend_manager, normalize, label_for
+
+    manager = get_stt_backend_manager()
+    target = normalize(backend)
+    before = manager.snapshot()
+
+    # RECOVERING while the swap runs, never PAUSED. A backend switch is a session transition,
+    # and showing "Listening paused" during one would be the same false pause an STT recovery
+    # used to produce.
+    _refresh_voice_state(backend_status="STARTING", voice_active=False)
+
+    recorder = get_settings_recorder()
+    committed, detail = recorder.apply(
+        "STT_BROWSER", target,
+        runtime=lambda: manager.request(target, source=source),
+        old_value=before.requested_backend,
+        subsystem=Subsystem.SETTINGS,
+        # So the line reads `Automatic -> Google Chrome` rather than `auto -> chrome`. The
+        # names live in `stt_backend`; the recorder is a leaf in `core` and must not import
+        # them, so the caller — which already has them — hands the resolver over.
+        label_value=label_for,
+    )
+
+    _refresh_voice_state()
+    return committed, (detail or label_for(target))
+
+
+def stt_backend_state():
+    """The requested/active speech backend, as a plain dict. Never boots an engine."""
+    from kayra.input.stt_backend import get_stt_backend_manager
+    return get_stt_backend_manager().snapshot().to_dict()
+
+
 def listening_enabled():
     """Whether the microphone is currently open. One source of truth, read by every surface."""
     try:
@@ -623,12 +1017,21 @@ def set_sleeping(enabled, announce=True):
     enabled = bool(enabled)
     runtime = get_runtime_state()
 
+    changed = runtime.set_sleeping(enabled)
+
     if enabled:
-        # Silence first. Falling asleep mid-sentence and continuing to talk is the one
-        # behaviour that would make this feature feel broken.
+        # Silence, AFTER the standby flag is set rather than before it.
+        #
+        # The order matters only to the assistant visual, and only for a few microseconds —
+        # but that is the flicker requirement 29 forbids. `_interrupt_speech` moves the turn
+        # machine to INTERRUPTING, which the voice state machine resolves to USER_SPEAKING
+        # ("the user has the floor"). Silencing first therefore rendered a phantom
+        # LISTENING -> USER_SPEAKING -> STANDBY on the way into standby, with nobody talking.
+        # With the flag already set, standby outranks the turn machine and the visual goes
+        # straight to STANDBY. Nothing about the SILENCING changes: it still happens before
+        # this function returns, so Kayra cannot fall asleep mid-sentence and keep talking.
         _interrupt_speech("sleep", announce=False)
 
-    changed = runtime.set_sleeping(enabled)
     if not changed:
         return ""
 
@@ -663,6 +1066,63 @@ def sleeping():
         return False
 
 
+def _repair_stage():
+    """
+    The process's transcript repair stage, built lazily with this installation's vocabulary.
+
+    The classifier's task headers are INJECTED rather than imported by the input layer: that
+    keeps `kayra.input` from reaching into `kayra.intelligence` on the recognition path, and
+    it means the words the repair stage considers plausible are exactly the words this
+    assistant can actually act on.
+    """
+    global _REPAIR_STAGE
+    if _REPAIR_STAGE is None:
+        try:
+            from kayra.input.transcript_repair import get_transcript_repair
+            vocabulary = []
+            try:
+                vocabulary = list(getattr(engine, "funcs", ()) or ())
+            except Exception:
+                vocabulary = []
+            _REPAIR_STAGE = get_transcript_repair(vocabulary=vocabulary)
+        except Exception as exc:
+            print_warning(f"Transcript repair unavailable (non-fatal): {exc}")
+            _REPAIR_STAGE = False          # False, not None: do not retry every utterance
+    return _REPAIR_STAGE or None
+
+
+def _repair_transcript(result):
+    """
+    Runs the LAST stage of the capture pipeline and returns the text to act on.
+
+    Everything before this — the microphone constraints, echo cancellation, the voice-activity
+    endpointer, the recognizer itself — has already happened inside the browser. This stage
+    only chooses between readings the recognizer offered, using what the conversation is
+    currently about. It changes nothing for the overwhelming majority of utterances, and when
+    it does change something it says so on the console, because an invisible correction layer
+    is worse than none.
+    """
+    text = (result.get("text") or "").strip()
+    stage = _repair_stage()
+    if stage is None or not text:
+        return text
+    try:
+        alternatives = result.get("alternatives") or []
+        confidence = None
+        if alternatives:
+            confidence = alternatives[0].get("confidence")
+        outcome = stage.repair(text, alternatives=alternatives, confidence=confidence,
+                               uncommitted=bool(result.get("uncommitted")))
+    except Exception as exc:
+        # A repair failure must never cost the user their command.
+        print_warning(f"Transcript repair failed (non-fatal): {exc}")
+        return text
+    if outcome.changed:
+        print_info(f"[TRANSCRIPT] '{outcome.original}' -> '{outcome.text}' "
+                   f"({outcome.reason})")
+    return outcome.text
+
+
 def Listen():
     """
     Captures one usable user utterance.
@@ -684,7 +1144,12 @@ def Listen():
             if result is None:
                 return ""
 
-            user_input = (result.get("text") or "").strip()
+            # ── STAGE 5: conservative, context-aware repair ──
+            # Ordered here deliberately: after the recognizer, before anything acts on the
+            # words. The four stages before it (capture, echo cancellation, voice-activity
+            # endpointing, recognition) all live in the browser page; this one lives here
+            # because it is the only one that needs to know what the conversation is about.
+            user_input = _repair_transcript(result)
             if not user_input:
                 return ""
 
@@ -808,6 +1273,11 @@ def request_shutdown(reason="", farewell=False, exit_code=0):
     # 1-2. Announce, and stop accepting work.
     RUNTIME.shutdown_event.set()
     RUNTIME.set_state(AssistantState.SHUTTING_DOWN)
+    # STOPPING is an ABSORBING state in the voice machine: once it is entered, no fact — not a
+    # late VAD sample from a watcher thread that has not noticed yet, not a backend
+    # notification from a session being reaped — can put the assistant visual back to
+    # LISTENING. That is the guarantee, and this is where it starts.
+    _refresh_voice_state(shutting_down=True, voice_active=False)
 
     # A farewell is spoken BEFORE anything is disposed, and blocking, because the audio device
     # is torn down four steps below. It is skipped for a signal-driven shutdown: someone
@@ -895,7 +1365,11 @@ def request_shutdown(reason="", farewell=False, exit_code=0):
         threading.Thread(target=run, daemon=True, name="kayra-exit-hook").start()
         done.wait(timeout=HOOK_TIMEOUT)
 
-    print_system("System shutdown complete.")
+    # The last thing said about the microphone. OFFLINE is the only transition the machine
+    # permits out of STOPPING, so this is the terminal state by construction rather than by
+    # being the last line that happens to run.
+    _voice_facts(voice_available=False, backend_status="OFF", shutting_down=False)
+    logbus.success(Subsystem.SHUTDOWN, "Kayra has stopped.", correlate=False)
     os._exit(exit_code)
 
 
@@ -936,6 +1410,29 @@ def _install_signal_handlers():
 # │                             TASK ROUTER                                │
 # └────────────────────────────────────────────────────────────────────────┘
 
+def presence_engine():
+    """The running contextual presence layer, or None. One accessor, no second copy."""
+    agent = proactive_agent
+    return getattr(agent, "presence", None) if agent is not None else None
+
+
+def _presence_greeting(text):
+    """
+    The contextual reply to a bare greeting, or None when this is not one.
+
+    Returns None for every failure mode — presence absent, greetings switched off, the
+    utterance not actually a greeting — and the caller then routes to the chatbot exactly as
+    it always has. A greeting must never be able to cost the user their answer.
+    """
+    presence = presence_engine()
+    if presence is None:
+        return None
+    try:
+        return presence.greeting(text)
+    except Exception:
+        return None
+
+
 async def Execute_Task(intent_array, original_query, mood=None):
     """
     Takes the parsed intent array from the DMM and routes it to the correct modules, then
@@ -945,6 +1442,13 @@ async def Execute_Task(intent_array, original_query, mood=None):
 
     for task in intent_array:
         task_lower = task.strip().lower()
+
+        # Resolved ONCE per task. Calling the greeting builder inside the `elif` condition
+        # and again in its body would render two different wordings and record both as
+        # "recently said", which is precisely the repetition the presence ledger exists to
+        # prevent. It is None for anything that is not a bare greeting.
+        greeting_reply = (_presence_greeting(original_query)
+                          if task_lower.startswith("general ") else None)
 
         # A barge-in mid-response cancels the rest of the turn: the user has moved on.
         if TTS_ENABLED and tts_engine is not None and tts_engine.interrupted:
@@ -989,6 +1493,25 @@ async def Execute_Task(intent_array, original_query, mood=None):
         elif task_lower.startswith("stop listening"):
             await asyncio.to_thread(_dispatch_control, ControlKind.PAUSE_LISTENING,
                                     original_query, "dmm")
+
+        # 2c. A bare greeting.
+        #
+        #     Answered from local context — the clock, how long the user has actually been
+        #     away, and whether this is the first exchange of the session — instead of being
+        #     sent to the chatbot for the same "Hello! How can I help you today?" every time.
+        #
+        #     It is deliberately narrow. `is_greeting` matches the WHOLE utterance once the
+        #     assistant's name and filler are stripped, so "hello" is a greeting and "hello,
+        #     open Chrome" is an instruction; anything that is not purely a greeting falls
+        #     through to the branch below exactly as before. No model is called on this path,
+        #     which is the point: a greeting that costs a cloud round-trip arrives after the
+        #     moment for it has passed.
+        elif greeting_reply is not None:
+            reply = greeting_reply
+            CONTEXT.note_assistant_turn(reply)
+            print_system(reply)
+            if TTS_ENABLED:
+                tts_engine.speak(reply)
 
         # 3. General conversation (knowledge, math, logic)
         elif task_lower.startswith("general "):
@@ -1038,6 +1561,18 @@ async def Execute_Task(intent_array, original_query, mood=None):
         # ever said, so a failed or ambiguous action was indistinguishable from a successful
         # one. The layer now returns the sentence to say — including the question when it needs
         # to disambiguate or confirm.
+        # The targets automation just acted on are the things most likely to be referred
+        # to again in the next utterance, which is legitimate evidence for the repair stage.
+        for command in automation_commands:
+            parts = command.split()
+            CONTEXT.note_automation(action=parts[0] if parts else "",
+                                    target=" ".join(parts[1:])[:60])
+        if spoken and isinstance(spoken, str):
+            CONTEXT.note_assistant_turn(spoken)
+            # A question from automation ("Which browser did you mean?") makes the answer
+            # vocabulary plausible on the very next utterance.
+            CONTEXT.set_pending_confirmation(
+                (pending_confirmation() or "") if pending_confirmation else "")
         if spoken and isinstance(spoken, str) and TTS_ENABLED and not tts_engine.interrupted:
             tts_engine.speak(spoken)
 
@@ -1064,7 +1599,17 @@ async def Main_Loop():
     # belong; narrating them cost several seconds of speech before the first user turn.
     if TTS_ENABLED:
         tts_engine.begin_turn()
-        tts_engine.speak(f"{assistant_name} online.")
+        # Same one-sentence budget as before, now aware of the hour. A contextual opening
+        # line costs nothing at boot — it is a dictionary lookup and a `random.choice` — and
+        # it is the first thing that makes the assistant feel present rather than started.
+        opening = None
+        presence = presence_engine()
+        if presence is not None:
+            try:
+                opening = presence.boot_line()
+            except Exception:
+                opening = None
+        tts_engine.speak(opening or f"{assistant_name} online.")
 
     while True:
         try:
@@ -1102,6 +1647,11 @@ async def Main_Loop():
                     if TTS_ENABLED:
                         tts_engine.speak(reply)
                     RUNTIME.note_user_utterance()
+                    CONTEXT.note_user_turn(user_input)
+                    CONTEXT.note_assistant_turn(reply)
+                    # Answered: the question is no longer outstanding, so the answer
+                    # vocabulary stops being the plausible one on the next utterance.
+                    CONTEXT.set_pending_confirmation("")
                     set_state(STATE_LISTENING)
                     continue
 
@@ -1112,6 +1662,11 @@ async def Main_Loop():
             RUNTIME.note_user_utterance()
             RUNTIME.begin_turn()
             RUNTIME.emit("user_utterance", text=user_input)
+            # The conversation context is updated on the SAME path as the runtime state, so
+            # the repair stage reading it on the next utterance can never be a turn behind.
+            CONTEXT.note_user_turn(user_input)
+            CONTEXT.set_pending_confirmation(
+                (pending_confirmation() or "") if pending_confirmation else "")
 
             set_state(STATE_PROCESSING)
 
@@ -1147,6 +1702,7 @@ async def Main_Loop():
                 os._exit(1)
 
             RUNTIME.emit("intent_classified", text=user_input, tokens=list(dmm_commands))
+            CONTEXT.note_intent(list(dmm_commands))
 
             # 3. Dispatch to the execution router
             try:

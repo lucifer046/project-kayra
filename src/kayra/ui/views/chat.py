@@ -373,6 +373,11 @@ class ChatView(View):
             self.voice_note.setText("Voice input is unavailable — typing still works normally.")
             self.voice_note.setVisible(True)
         self.mic_button.set_enabled_look(self.bridge.voice_available())
+        # The composer's microphone has the same boot-ordering problem Home's control had:
+        # this view is constructed before the session boots, `listening_changed` never fires
+        # for a value that never changes, and the button would keep whatever it was painted
+        # with during the boot window. Re-read the moment there is something to read.
+        self._on_listening(self.bridge.listening_enabled())
 
     # ──────────────────────────────────────────────────────────────────
     #                        THINKING INDICATOR

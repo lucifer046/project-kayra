@@ -69,6 +69,46 @@ Measured on a real `python run.py`: window painted immediately; backend `Assista
 **5.70s** (against 4.36s for the console front end — Qt startup competes for CPU during boot,
 which is a real cost, paid where the user cannot see it).
 
+### The obligation this creates: the boot window
+
+Painting first has a consequence, and it produced a real bug before it was written down.
+
+**Every view is constructed and shown before the backend exists.** `KayraWindow.__init__`
+builds all seven screens and navigates to Home, and only then does `bridge.start()` run. For
+the next several seconds any screen that asks the bridge a question is asking something with no
+backend behind it — and **an answer given then is not a measurement**.
+
+That is survivable for a value the backend will later CHANGE, because the change emits an event
+and the screen repaints. It is NOT survivable for a value that is already at its final setting:
+`RuntimeState._listening` starts `True` and `set_listening` correctly does not emit for a value
+that did not change, so a control painted during the boot window is latched forever.
+
+Which is exactly what happened. `KayraSession.listening_enabled()` answered `False` before boot
+(because `self._runtime is None`), Home painted its microphone button from it, no event ever
+followed, and the button read **"Start listening" beside an orb that was listening** — until
+the user toggled listening off and on, producing two genuine events that repaired it.
+
+**The rule:**
+
+> A view constructed before the backend is ready must connect `bootFinished` and RE-READ.
+> And the bridge must never report "not booted yet" as a negative fact.
+
+Both halves are needed. Re-reading a value that is still a lie fixes nothing, and an honest
+value nobody re-reads is never seen.
+
+| | |
+|---|---|
+| honesty at the source | `listening_enabled()` returns the runtime's own starting value instead of claiming the microphone is closed; `listening_known()` reports whether it is a measurement |
+| one read | `voice_runtime_state()` carries `listening` and `listening_known` alongside the state, so the caption, the orb and the control come from ONE snapshot — reading the caption from the snapshot and the button from a separate call is how the two came to disagree |
+| re-read | Home and Chat connect `bootFinished`; while the answer is unknown the control is **disabled** rather than guessed at, which is also the truth about what it can do (`set_listening` returns False with no session) |
+| no regressions | `_shutting_down` latches, so a late re-sync cannot re-enable controls during a teardown already in progress |
+
+Verified against the real backend, sampling once a second across a 9-second boot with no toggle
+ever performed: `Pause listening` throughout, disabled until the session existed, enabled and
+correct afterwards, agreeing with the microphone — and **0** `listeningChanged` events fired.
+`tests/test_ui.py::section_boot_ordering` pins it, including the event count; reintroducing the
+old behaviour makes 5 of its checks fail.
+
 ---
 
 ## 3. The UI ↔ backend boundary
@@ -446,8 +486,12 @@ smallest interface that could express it:
 | `core/runtime_state.py` | `listening` property, `set_listening()`, a `listening_changed` event, and `listening` in `snapshot()` |
 | `app.py` | `set_listening(enabled)`, `listening_enabled()`, a `stop listening` branch in `Execute_Task`, and a `Listen()` that returns promptly while paused |
 | `intelligence/llm_engine.py` | the `stop listening` token plus one preamble paragraph |
-| `ui/session.py` | `set_listening` / `listening_enabled`, a `listening_changed` callback, and a listener thread that parks on an Event |
-| `ui/bridge.py` | `listeningChanged` signal, `set_listening`, `listening_enabled` |
+| `ui/session.py` | `set_listening` / `listening_enabled` / `listening_known`, a `listening_changed` callback, and a listener thread that parks on an Event |
+| `ui/bridge.py` | `listeningChanged` signal, `set_listening`, `listening_enabled`, `listening_known` |
+
+`listening_known()` was added later, with the boot-window fix above: it is what lets a view
+tell "the microphone is closed" apart from "nobody has asked the backend yet". The two are
+different claims and only one of them was ever true during startup.
 
 Nothing was rewritten. STT, TTS, the DMM, the LLM router, automation, the proactive agent, the
 emotion engine, memory and the shutdown path are untouched.
@@ -465,6 +509,11 @@ is a manual action: the button, Ctrl+M, or the tray.
 pause closes the microphone, shutdown ends the process. Ctrl+. is barge-in; Ctrl+M is the
 microphone. Live-verified that interrupting does not change the listening state and that
 pausing calls neither interrupt nor shutdown.
+
+**What the user is TOLD about the microphone is a fourth thing, and it is resolved elsewhere.**
+`core/voice_state.py` owns the caption, the orb state and the orb amplitude; this axis owns
+only what the CONTROL offers to do next. They are painted from one snapshot so they cannot
+disagree — see the boot-window section, and section 5.
 
 ### Chat auto-scroll
 
@@ -634,9 +683,22 @@ refusing to start over a presentation dependency.
 
 ## 12. Testing
 
-`tests/test_ui.py` — **131 checks**, hardware-free, on Qt's `offscreen` platform. No display, no
+`tests/test_ui.py` — **416 checks**, hardware-free, on Qt's `offscreen` platform. No display, no
 microphone, no browser, no LLM, no network. The backend is replaced by `StubBridge`, which
-mirrors the real signal signatures exactly.
+mirrors the real signal signatures exactly — including `voiceStateChanged` and
+`sttBackendChanged`, so a view connecting to something the stub lacks fails loudly rather than
+rendering dead.
+
+**The suite has no side effects, and that had to be enforced rather than assumed.** The
+speech-backend checks drive the real `SettingsView._on_backend`, which — correctly, by design —
+persists the setting once a switch is committed. With a stubbed bridge reporting success, that
+call reached the real `core.config.write_env_values` and rewrote the DEVELOPER'S OWN `.env`,
+silently changing which browser Kayra starts with. `NoEnvWrites` now blocks and RECORDS those
+writes, which also makes them assertable: a committed switch must persist, and a failed one
+must not. `section_no_side_effects` then compares the WHOLE `.env` before and after the run, so
+any future writer — a control that persists on change, a screen that saves on close — is named
+by the suite instead of being discovered days later as a mysteriously changed setting. Verified
+by injecting a write: the check fails.
 
 Covered: stylesheet generation; palette direction (the accent's hue is asserted to be amber, not
 blue); WCAG contrast ratios; no hardcoded colours outside the theme; every component painting in
@@ -647,8 +709,24 @@ minimum window size; the ambient assistant; shutdown delegation; and the boundar
 assertions that no view touches the runtime bus or an engine, and that `session.py` contains no
 Qt).
 
+Added with the routing / backend / memory / voice-state round:
+
+* **Voice presence** — the orb and captions follow the resolved state; a stale revision cannot
+  overwrite a newer one; silence never renders as paused; an STT recovery reads as reconnecting.
+* **Speech input card** — requested and active rendered as separate lines, `Not applied` when
+  they disagree, `Active: None` when nothing is running, and `.env` written only on success.
+* **Memory** — rows carry stable ids and delete by id, both confirmations, a failed delete
+  leaving the row in place, the store location, and `Open file location` reaching the backend.
+* **The boot window** — a screen built before the backend must not paint a guessed microphone
+  state, must disable a control it cannot use, and must re-read at `bootFinished` **with zero
+  `listeningChanged` events**. Reintroducing the old behaviour makes 5 of these fail.
+
 What it cannot cover is how the interface *looks*; visual design is not assertable and is not
 claimed to be tested.
 
-**Full suite: 752 checks passing** (automation 263, proactive 140, emotion 119, browser 64, UI
-131, audio 35), plus the DMM matrix at 53/53.
+**Full tier-1 suite: 2578 checks, 2574 passing** (automation 263, proactive agent 140, emotion
+119, browser selection 63, voice control 186, target resolution 108, capture pipeline 132,
+proactive presence 213, TTS device 141, environment 63, UI 416, provider router 124, STT
+backend 127, memory store 138, voice state 196, logging 149). The four failures are
+pre-existing on `HEAD` and depend on this machine's `.env` rather than on the code — see
+section 35 of the system architecture.

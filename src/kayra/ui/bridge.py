@@ -49,6 +49,20 @@ class KayraBridge(QObject):
     sleepingChanged = Signal(bool)          # standby entered or left
     moodDetected = Signal(str, float)       # emotion label, confidence
 
+    # ── Voice presence ──
+    # THE signal every surface that renders the microphone listens to. `revision` is not
+    # decoration: Qt delivers queued signals in order but a widget can also be repainted from
+    # a timer, a `showEvent` or a synchronous read, and any of those can land after a newer
+    # transition. A consumer keeps the last revision it rendered and drops anything not newer.
+    #
+    # `listeningChanged` and `stateChanged` are KEPT, unchanged, because they are separate
+    # facts that other parts of the UI legitimately need (a button label, a window icon).
+    # What no longer happens is a screen deriving the voice CAPTION from them.
+    voiceStateChanged = Signal(str, str, str, int)   # state, text, detail, revision
+
+    # ── Speech backend ──
+    sttBackendChanged = Signal(dict)        # the full requested/active snapshot
+
     # ── Conversation ──
     userMessage = Signal(str, str)          # text, source ("text" | "voice")
     assistantMessage = Signal(str)          # one spoken sentence, as it is produced
@@ -72,6 +86,9 @@ class KayraBridge(QObject):
         events.busy_changed = lambda busy: self.busyChanged.emit(bool(busy))
         events.listening_changed = lambda listening: self.listeningChanged.emit(bool(listening))
         events.sleeping_changed = lambda sleeping: self.sleepingChanged.emit(bool(sleeping))
+        events.voice_state_changed = lambda state, text, detail, revision: (
+            self.voiceStateChanged.emit(str(state), str(text), str(detail), int(revision)))
+        events.stt_backend_changed = lambda state: self.sttBackendChanged.emit(dict(state or {}))
         events.mood_detected = lambda emotion, confidence: self.moodDetected.emit(str(emotion),
                                                                                   float(confidence))
         events.user_message = lambda text, source: self.userMessage.emit(str(text), str(source))
@@ -120,6 +137,20 @@ class KayraBridge(QObject):
         """Standby. A third thing again: not a barge-in, not a pause, not a shutdown."""
         return self._session.set_sleeping(enabled)
 
+    def set_presence(self, enabled):
+        """
+        The contextual presence layer, on or off, for this session.
+
+        Distinct from `set_proactive`, which is the master switch for the whole subsystem:
+        turning presence off leaves the habit-based suggestions running, turning the
+        subsystem off silences both. The master switch stays authoritative.
+        """
+        return self._session.set_presence(enabled)
+
+    def set_presence_category(self, name, enabled):
+        """One presence category (greetings, context, late_night, work_session, system, humor)."""
+        return self._session.set_presence_category(name, enabled)
+
     def set_tts_device(self, mode):
         """AUTO / GPU / CPU, applied to the running Kokoro session."""
         return self._session.set_tts_device(mode)
@@ -163,6 +194,24 @@ class KayraBridge(QObject):
     def listening_enabled(self):
         return self._session.listening_enabled()
 
+    def presence_available(self):
+        return self._session.presence_available()
+
+    def presence_enabled(self):
+        return self._session.presence_enabled()
+
+    def presence_categories(self):
+        return self._session.presence_categories()
+
+    def presence_status(self):
+        """
+        What the presence layer is doing right now — read live, never cached here.
+
+        Returns `{}` when the layer is not running, which is what lets the Home card say so
+        rather than showing a plausible-looking empty state for a service that is off.
+        """
+        return self._session.presence_status()
+
     def sleeping(self):
         return self._session.sleeping()
 
@@ -193,6 +242,68 @@ class KayraBridge(QObject):
         """True while GPU telemetry is still being fetched, as opposed to genuinely absent."""
         return self._session.gpu_telemetry_pending()
 
+    # ──────────────────────────────────────────────────────────────────
+    #                     VOICE PRESENCE AND BACKEND
+    # ──────────────────────────────────────────────────────────────────
+
+    def voice_runtime_state(self):
+        """
+        The whole voice picture in one synchronous read: state, revision, the facts behind it,
+        and the live speech backend.
+
+        Used for the INITIAL paint and for a screen becoming visible again. Everything after
+        that arrives on `voiceStateChanged` — this is not something to poll, and the absence
+        of a timer anywhere near it is deliberate.
+        """
+        return self._session.voice_runtime_state()
+
+    def listening_known(self):
+        """
+        Whether `listening_enabled()` is a measurement rather than the pre-boot default.
+
+        A view built before the session boots must not paint a microphone control as though
+        it had asked — see `KayraSession.listening_enabled`.
+        """
+        return self._session.listening_known()
+
+    def stt_backend_state(self):
+        """Requested vs active speech backend. The two are separate fields and stay separate."""
+        return self._session.stt_backend_state()
+
+    def set_stt_backend(self, backend):
+        """
+        Switches the live speech backend. Returns (committed, detail).
+
+        A pass-through, for the same reason `set_tts_device` is one: the backend manager owns
+        the transaction and the engine owns the swap. A UI that sequenced it would be a second
+        implementation of the one operation that must not have two.
+        """
+        return self._session.set_stt_backend(backend)
+
+    # ──────────────────────────────────────────────────────────────────
+    #                             MEMORY
+    # ──────────────────────────────────────────────────────────────────
+
+    def list_memories(self, limit=None):
+        """Saved memories, newest first, each with a stable id. Deletion is BY that id."""
+        return self._session.list_memories(limit=limit)
+
+    def delete_memory(self, memory_id):
+        """Removes one memory by id. Returns (deleted, detail) — False means it is still there."""
+        return self._session.delete_memory(memory_id)
+
+    def clear_memories(self):
+        """Empties the store. Returns (count_cleared, ok)."""
+        return self._session.clear_memories()
+
+    def memory_store(self):
+        """Where memory lives, how big it is and how many entries it holds."""
+        return self._session.memory_store()
+
+    def open_memory_location(self):
+        """Reveals the memory file in File Explorer. Returns (ok, path_or_error)."""
+        return self._session.open_memory_location()
+
     def recent_automation(self, limit=20):
         """
         The automation audit ring, newest last.
@@ -208,6 +319,14 @@ class KayraBridge(QObject):
             return []
 
     def conversation_memory(self):
+        """
+        The raw saved exchanges.
+
+        Kept for compatibility with anything reading the plain list, but the Memory screen
+        uses `list_memories()` instead: this shape has no stable identity, and deleting from
+        it meant deleting by position — which is wrong the moment a chat turn appends to the
+        store between the render and the click.
+        """
         try:
             from kayra.memory.conversation import load_conversation_memory
             return list(load_conversation_memory() or [])

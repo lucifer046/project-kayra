@@ -130,9 +130,17 @@ def print_section(title: str):
     console.print(Rule(f"[bold white]{title.upper()}[/bold white]", style="dim magenta", align="left"))
 
 
-def safe_print(msg_format: str):
+def safe_print(msg_format: str, **kwargs):
+    """
+    The one write to the console.
+
+    `**kwargs` is forwarded to `Console.print`. The structured logger in `core/logbus.py`
+    passes `soft_wrap=True`: a log line word-wrapped at the terminal width breaks the column
+    alignment that makes the output scannable in the first place, and a truncated-looking
+    second line reads as a different message.
+    """
     try:
-        console.print(msg_format)
+        console.print(msg_format, **kwargs)
     except ValueError as e:
         if "closed file" in str(e):
             # Terminal was abruptly closed (e.g., via Ctrl+W shortcut hitting the terminal)

@@ -50,7 +50,8 @@ except ImportError:
 from kayra.core.config import env
 from kayra.core.paths import data_path
 from kayra.input import browsers
-from kayra.utils import print_info, print_warning, print_error, print_system, print_success, print_banner, console, now_ms
+from kayra.core.logbus import Subsystem, info, warning, error
+from kayra.utils import print_warning, print_error, print_success, print_banner, console, now_ms
 
 
 # The control vocabulary lives in `core.voice_control` — one table, shared by the STT page
@@ -149,6 +150,65 @@ html_code = """<!DOCTYPE html>
         const MAX_NETWORK_ERRORS = 3;
         let currentText = "";
 
+        // ── THE CAPTURE PIPELINE, IN ORDER ────────────────────────────────
+        // audio capture -> AEC / noise suppression -> VAD / endpointing -> STT -> (Python)
+        //                                                                          conservative,
+        //                                                                          context-aware
+        //                                                                          repair
+        //
+        // Everything below implements the first three stages. The fourth is the browser's own
+        // recognizer, and the fifth deliberately lives in Python where the conversation
+        // context is — a correction stage with no evidence about what is plausible is a
+        // spelling corrector, and a spelling corrector will eventually turn a legitimate word
+        // into the wrong command.
+
+        // What the microphone track ACTUALLY granted, read back from the live track rather
+        // than assumed from what was requested. Constraints are a request, not a promise, and
+        // an assistant that reports echo cancellation it did not get is lying about the one
+        // thing that explains its mistakes.
+        window.kayraAudioSettings = null;
+        window.kayraAudioError = "";
+
+        // Live voice-activity state, published for diagnostics. `voice` is the only field the
+        // endpointer reads; the rest exist so a bad room can be diagnosed rather than guessed
+        // at.
+        window.kayraVad = { ready: false, rms: 0, floor: 0, voice: false, threshold: 0 };
+
+        // The finalized segments of the utterance being assembled, each with the recognizer's
+        // OWN alternatives. This is what makes context-aware repair safe: Python re-ranks
+        // among readings the recognizer actually offered instead of inventing one.
+        let segments = [];
+        let interimText = "";
+        let lastVoiceMs = 0;
+        let noiseFloor = 0.006;
+        let audioCtx = null, analyser = null, vadFrame = null, vadTimer = null;
+
+        // Endpointing tuning. Overridable from Python so there is one source of truth, with
+        // these as the defaults every value was measured against.
+        let tuning = {
+            // A short, already-finalized command does not need the full silence window; the
+            // recognizer has committed and waiting longer only makes the assistant feel slow.
+            fastEndpointMs: 420,
+            // Words the recognizer has not committed yet are worth waiting for. Cutting the
+            // utterance here is how a spoken word becomes no word at all.
+            interimGraceMs: 1400,
+            // Nothing waits forever: if results keep arriving but the endpoint never settles,
+            // flush anyway rather than accumulating a paragraph.
+            maxWaitMs: 6000,
+            // How long the room must be quiet, in ENERGY terms, on top of the recognizer
+            // going quiet. This is what stops a mid-sentence pause ending the utterance.
+            vadHangoverMs: 500,
+            // Voice is RMS above this multiple of the learned noise floor.
+            vadMargin: 3.2,
+            // ...and above this much higher multiple while Kayra is audible, so residual echo
+            // of her own voice cannot hold the endpoint open or open a new utterance.
+            vadEchoMargin: 7.0,
+            vadFloorMin: 0.004,
+            vadIntervalMs: 50,
+            maxAlternatives: 5
+        };
+        const MAX_SEGMENTS = 8;
+
         const statusEl = document.getElementById('status');
 
         // Cap on pending utterances. The queue only drains when the main loop is back in
@@ -169,16 +229,100 @@ html_code = """<!DOCTYPE html>
         // the guarantee — but this removes much of the echo at the source.
         function primeProcessedMicrophone() {
             try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    window.kayraAudioError = "mediaDevices unavailable (insecure context?)";
+                    return;
+                }
                 navigator.mediaDevices.getUserMedia({
                     audio: {
                         echoCancellation: true,
                         noiseSuppression: true,
-                        autoGainControl: true
+                        autoGainControl: true,
+                        // One channel at a speech rate. A stereo 48k capture gives the
+                        // recognizer nothing extra and gives the processing module more to do.
+                        channelCount: 1,
+                        sampleRate: 16000
                     }
                 }).then(function (stream) {
                     window.kayraMicStream = stream;
-                }).catch(function () { /* non-fatal */ });
-            } catch (e) { /* non-fatal */ }
+                    try {
+                        const track = stream.getAudioTracks()[0];
+                        const settings = track ? track.getSettings() : null;
+                        window.kayraAudioSettings = settings ? {
+                            echoCancellation: settings.echoCancellation,
+                            noiseSuppression: settings.noiseSuppression,
+                            autoGainControl: settings.autoGainControl,
+                            channelCount: settings.channelCount,
+                            sampleRate: settings.sampleRate,
+                            deviceId: settings.deviceId ? "present" : "",
+                            label: track ? String(track.label || "").slice(0, 80) : ""
+                        } : null;
+                    } catch (e) { /* settings are diagnostics, never load-bearing */ }
+                    startVoiceActivityDetection(stream);
+                }).catch(function (err) {
+                    window.kayraAudioError = String((err && err.name) || err || "denied");
+                });
+            } catch (e) {
+                window.kayraAudioError = String(e);
+            }
+        }
+
+        // ── VAD: energy-based voice activity on the processed stream ──────
+        // The recognizer's own timing is not an endpointer. It reports when it produced a
+        // RESULT, which lags the sound by a variable amount, so a fixed "no results for
+        // 800ms" window ends the utterance while the user is still talking whenever the
+        // backend is slow — and a clipped word is not a misheard word, it is a missing one.
+        //
+        // The stream is NEVER connected to the destination: playing the microphone back
+        // through the speakers would create exactly the feedback loop this pipeline exists to
+        // suppress.
+        function startVoiceActivityDetection(stream) {
+            try {
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                if (!Ctx) { return; }
+                if (audioCtx) { try { audioCtx.close(); } catch (e) {} }
+                audioCtx = new Ctx();
+                const source = audioCtx.createMediaStreamSource(stream);
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 1024;
+                analyser.smoothingTimeConstant = 0.2;
+                source.connect(analyser);
+                vadFrame = new Float32Array(analyser.fftSize);
+                lastVoiceMs = Date.now();
+                window.kayraVad.ready = true;
+                if (vadTimer) { clearInterval(vadTimer); }
+                vadTimer = setInterval(sampleVoiceActivity, tuning.vadIntervalMs);
+            } catch (e) {
+                window.kayraVad.ready = false;
+            }
+        }
+
+        function sampleVoiceActivity() {
+            if (!analyser || !vadFrame) { return; }
+            try {
+                analyser.getFloatTimeDomainData(vadFrame);
+            } catch (e) { return; }
+            let sum = 0;
+            for (let i = 0; i < vadFrame.length; i++) { sum += vadFrame[i] * vadFrame[i]; }
+            const rms = Math.sqrt(sum / vadFrame.length);
+
+            // The threshold is a multiple of the LEARNED floor, not a constant: a quiet room
+            // and a noisy one need different numbers, and a fixed threshold is wrong in both.
+            const margin = window.kayraSpeaking ? tuning.vadEchoMargin : tuning.vadMargin;
+            const threshold = Math.max(tuning.vadFloorMin, noiseFloor * margin);
+            const voice = rms > threshold;
+
+            if (voice) {
+                lastVoiceMs = Date.now();
+            } else if (!window.kayraSpeaking) {
+                // Adapt only on quiet frames, and NEVER while Kayra is audible. Learning the
+                // floor from her own voice would raise it until the detector went deaf.
+                noiseFloor = (noiseFloor * 0.95) + (rms * 0.05);
+            }
+            window.kayraVad.rms = rms;
+            window.kayraVad.floor = noiseFloor;
+            window.kayraVad.voice = voice;
+            window.kayraVad.threshold = threshold;
         }
 
         // Shared normalization. Mirrors `voice_control.normalize_utterance` on the Python
@@ -251,8 +395,19 @@ html_code = """<!DOCTYPE html>
         }
 
         function startContinuousRecognition(lang, silenceMs, interruptWords, fillers,
-                                            controlPhrases, assistantName) {
+                                            controlPhrases, assistantName, tuningOverride) {
             silenceLimit = silenceMs || 800;
+            if (tuningOverride) {
+                for (const key in tuningOverride) {
+                    if (Object.prototype.hasOwnProperty.call(tuning, key) &&
+                        typeof tuningOverride[key] === "number") {
+                        tuning[key] = tuningOverride[key];
+                    }
+                }
+            }
+            segments = [];
+            interimText = "";
+            lastVoiceMs = Date.now();
             window.speechQueue = [];
             window.kayraInterrupt = null;
             window.kayraControl = null;
@@ -272,12 +427,24 @@ html_code = """<!DOCTYPE html>
             utteranceStart = Date.now();
             statusEl.textContent = "listening";
 
-            primeProcessedMicrophone();
+            // Re-arm the VAD sampler if the stream is already open (a resume after a pause),
+            // otherwise acquire the device and start it.
+            if (window.kayraMicStream && analyser) {
+                if (vadTimer) { clearInterval(vadTimer); }
+                lastVoiceMs = Date.now();
+                vadTimer = setInterval(sampleVoiceActivity, tuning.vadIntervalMs);
+            } else {
+                primeProcessedMicrophone();
+            }
 
             recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
             recognition.lang = lang || 'en-US';
             recognition.continuous = true;
             recognition.interimResults = true;
+            // N-best. This is the single most important line for accuracy: it is what lets
+            // the repair stage in Python prefer a reading the recognizer ITSELF considered,
+            // rather than rewriting a word into something nobody heard.
+            try { recognition.maxAlternatives = tuning.maxAlternatives; } catch (e) {}
 
             recognition.onstart = () => {
                 statusEl.textContent = "listening";
@@ -303,15 +470,37 @@ html_code = """<!DOCTYPE html>
                 let finalTranscript = "";
                 let interimTranscript = "";
                 for (let i = event.resultIndex; i < event.results.length; ++i) {
-                    if (event.results[i].isFinal) {
-                        finalTranscript += event.results[i][0].transcript + " ";
+                    const result = event.results[i];
+                    if (result.isFinal) {
+                        finalTranscript += result[0].transcript + " ";
+                        // Keep every reading the recognizer offered for this segment, with
+                        // its confidence. Bounded on both axes so a long dictation cannot
+                        // grow the renderer's memory.
+                        if (segments.length < MAX_SEGMENTS) {
+                            const alternatives = [];
+                            const count = Math.min(result.length, tuning.maxAlternatives);
+                            for (let a = 0; a < count; a++) {
+                                alternatives.push({
+                                    text: String(result[a].transcript || "").trim(),
+                                    confidence: (typeof result[a].confidence === "number")
+                                        ? result[a].confidence : null
+                                });
+                            }
+                            segments.push({ text: String(result[0].transcript || "").trim(),
+                                            alternatives: alternatives });
+                        }
                     } else {
-                        interimTranscript += event.results[i][0].transcript + " ";
+                        interimTranscript += result[0].transcript + " ";
                     }
                 }
                 if (finalTranscript) {
                     currentText += finalTranscript;
                 }
+                // Held so the endpointer can tell "the user stopped" from "the recognizer has
+                // not committed yet", and so an interim that never finalizes is delivered
+                // instead of silently discarded. Dropping it was a real cause of a spoken
+                // word producing nothing at all.
+                interimText = interimTranscript;
 
                 // Fast path: publish an interruption the moment we see one, without
                 // waiting for the silence timer or for the sentence to be finalized.
@@ -373,29 +562,76 @@ html_code = """<!DOCTYPE html>
 
             recognition.start();
 
-            // Check for silence gap every 100ms
+            // ── ENDPOINTING ──────────────────────────────────────────
+            // TWO conditions, not one. The recognizer must have gone quiet AND the room must
+            // have gone quiet. Either alone is wrong in a way that costs words: results lag
+            // the sound, so recognizer-silence alone ends the utterance while the user is
+            // still speaking; and energy alone would wait out every background noise.
             if (checkInterval) clearInterval(checkInterval);
             checkInterval = setInterval(() => {
-                if (isSpeaking && (Date.now() - lastResultTime > silenceLimit)) {
-                    let completedSentence = currentText.trim();
-                    if (completedSentence) {
-                        window.speechQueue.push({
-                            text: completedSentence,
-                            start: utteranceStart,
-                            // The utterance physically ended when results stopped arriving,
-                            // i.e. `silenceLimit` ms ago — not now.
-                            end: lastResultTime
-                        });
-                        // Drop the oldest if the consumer has fallen far behind.
-                        while (window.speechQueue.length > MAX_QUEUE) {
-                            window.speechQueue.shift();
-                        }
-                        currentText = ""; // Clear buffer for next sentence
-                    }
-                    isSpeaking = false;
-                    statusEl.textContent = "listening";
+                if (!isSpeaking) { return; }
+                const now = Date.now();
+                const sinceResult = now - lastResultTime;
+                // With no VAD (no WebAudio, or permission refused) this degrades exactly to
+                // the old recognizer-only behaviour rather than failing.
+                const sinceVoice = window.kayraVad.ready ? (now - lastVoiceMs) : sinceResult;
+
+                const pendingInterim = interimText.trim().length > 0;
+                const settled = currentText.trim();
+                const shortCommand = settled && settled.split(/\\s+/).length <= 3;
+
+                let quietNeeded = silenceLimit;
+                if (pendingInterim) {
+                    // Uncommitted words: wait for them. This is the whole reason short
+                    // commands used to vanish.
+                    quietNeeded = Math.max(silenceLimit, tuning.interimGraceMs);
+                } else if (shortCommand) {
+                    // Committed and short: answer promptly. "stop" should not cost 800ms.
+                    quietNeeded = Math.min(silenceLimit, tuning.fastEndpointMs);
                 }
-            }, 100);
+
+                const recognizerQuiet = sinceResult > quietNeeded;
+                const roomQuiet = sinceVoice > tuning.vadHangoverMs;
+                const hardTimeout = sinceResult > tuning.maxWaitMs;
+
+                if (!((recognizerQuiet && roomQuiet) || hardTimeout)) { return; }
+                flushUtterance(hardTimeout ? "timeout" : "endpoint");
+            }, 60);
+        }
+
+        // Publishes the assembled utterance. Everything the repair stage needs to be
+        // conservative travels WITH it — the alternatives, the confidence, whether any of it
+        // was still uncommitted, and whether Kayra was audible while it was captured.
+        function flushUtterance(reason) {
+            const uncommitted = interimText.trim();
+            let text = currentText.trim();
+            if (!text && uncommitted) {
+                // The recognizer never committed these words. Delivering them flagged is
+                // strictly better than delivering nothing: the repair stage knows not to
+                // trust them, and the user's word is at least heard.
+                text = uncommitted;
+            }
+            if (text) {
+                window.speechQueue.push({
+                    text: text,
+                    start: utteranceStart,
+                    // The utterance physically ended when results stopped arriving, not now.
+                    end: lastResultTime,
+                    segments: segments.slice(0, MAX_SEGMENTS),
+                    uncommitted: (!currentText.trim() && uncommitted) ? uncommitted : "",
+                    duringSpeech: !!window.kayraSpeaking,
+                    reason: reason || "endpoint",
+                    vadReady: !!window.kayraVad.ready
+                });
+                while (window.speechQueue.length > MAX_QUEUE) {
+                    window.speechQueue.shift();
+                }
+            }
+            currentText = "";
+            interimText = "";
+            segments = [];
+            isSpeaking = false;
+            statusEl.textContent = "listening";
         }
 
         // Discards the partially-accumulated utterance without touching the session. Python
@@ -404,8 +640,11 @@ html_code = """<!DOCTYPE html>
         // delivered that string as the user's next command one VAD window later.
         function resetUtteranceBuffer() {
             currentText = "";
+            interimText = "";
+            segments = [];
             isSpeaking = false;
             lastResultTime = Date.now();
+            lastVoiceMs = Date.now();
             utteranceStart = Date.now();
         }
 
@@ -421,6 +660,10 @@ html_code = """<!DOCTYPE html>
         function stopContinuousRecognition() {
             statusEl.textContent = "stopped";
             clearInterval(checkInterval);
+            // The VAD timer stops with recognition; the STREAM and the AudioContext are kept,
+            // because pausing must not tear down the capture path — reacquiring the device is
+            // the expensive part, and `pause_listening` exists precisely to avoid it.
+            if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
             if (recognition) {
                 recognition.onend = null;
                 recognition.stop();
@@ -441,6 +684,31 @@ html_code = """<!DOCTYPE html>
 # They are deliberately not expressed as lifecycle states: a paused engine is still READY or
 # LISTENING, still owns its browser, and still recovers from a crash. Pausing is a property of
 # the microphone, not a stage in the session's life.
+
+
+def _capture_tuning():
+    """
+    Endpointing and VAD tuning, resolved once from the environment.
+
+    These are the numbers the capture pipeline is shaped by, and they are configurable for the
+    same reason the automation bounds are: a quiet office and a noisy room genuinely need
+    different hangovers, and the alternative to a setting is a user with no way to fix a
+    recognizer that keeps cutting them off. Every value is range-clamped, so a malformed
+    `.env` degrades to the measured defaults instead of producing an endpointer that never
+    fires.
+    """
+    from kayra.core.config import env_float, env_int
+    return {
+        "fastEndpointMs": env_int("STT_FAST_ENDPOINT_MS", 420, 150, 2000),
+        "interimGraceMs": env_int("STT_INTERIM_GRACE_MS", 1400, 300, 5000),
+        "maxWaitMs": env_int("STT_MAX_UTTERANCE_WAIT_MS", 6000, 1500, 30000),
+        "vadHangoverMs": env_int("STT_VAD_HANGOVER_MS", 500, 100, 3000),
+        "vadMargin": env_float("STT_VAD_MARGIN", 3.2, 1.2, 20.0),
+        "vadEchoMargin": env_float("STT_VAD_ECHO_MARGIN", 7.0, 1.5, 40.0),
+        "vadFloorMin": env_float("STT_VAD_FLOOR_MIN", 0.004, 0.0001, 0.2),
+        "vadIntervalMs": env_int("STT_VAD_INTERVAL_MS", 50, 10, 250),
+        "maxAlternatives": env_int("STT_MAX_ALTERNATIVES", 5, 1, 10),
+    }
 
 
 class SttState:
@@ -536,6 +804,21 @@ class _PageServer:
         self._thread = None
 
 
+def _notify_backend_recovery(phase, reason=""):
+    """
+    Tells the backend manager that a session recovery started or finished.
+
+    Guarded and lazy on purpose. This sits on the recovery path, which is the least
+    appropriate place in the system for an import error or a listener bug to matter: a
+    reporting concern must never be able to stop a dead speech session from being rebuilt.
+    """
+    try:
+        from kayra.input.stt_backend import get_stt_backend_manager
+        get_stt_backend_manager().note_recovery(phase, reason)
+    except Exception:
+        pass
+
+
 class SpeechToTextEngine:
     """
     Continuous Asynchronous Speech-to-Text Engine.
@@ -597,6 +880,15 @@ class SpeechToTextEngine:
 
         self.language = language
         self.silence_limit_ms = int(silence_limit * 1000)
+        # Endpointing and VAD tuning, handed to the page at `startContinuousRecognition` so
+        # there is ONE source of truth for these numbers rather than a set in Python and a
+        # second set baked into the JavaScript.
+        self.tuning = _capture_tuning()
+        # Diagnostics for the capture pipeline. `last_capture` describes the most recent
+        # utterance; the warning latch keeps a degraded pipeline to one line per session
+        # instead of one per utterance.
+        self.last_capture = {}
+        self._warned_no_vad = False
         # The name the user addresses the assistant by. The page needs it because "turn off
         # Vega" has to reach the shutdown table with the same meaning "turn off Kayra" does,
         # and the lifecycle phrases are stored in their canonical "kayra" form.
@@ -622,6 +914,10 @@ class SpeechToTextEngine:
         # now", and only the first is permanent. Nothing is written to disk from here.
         self._rejected_browsers = set()
         self.state = SttState.NOT_STARTED
+        # Sampled by `poll_controls`; read by the voice state machine for the assistant
+        # visual. Initialised here so a read before the first poll is False, not an error.
+        self._voice_active = False
+        self._page_status = ""
         self.owned_pids = set()
         self._service_pid = None
         self._recovery_count = 0
@@ -836,13 +1132,14 @@ class SpeechToTextEngine:
         """(Re)starts continuous recognition on the page with this engine's configuration."""
         self.driver.execute_script(
             "startContinuousRecognition(arguments[0], arguments[1], arguments[2], arguments[3],"
-            " arguments[4], arguments[5]);",
+            " arguments[4], arguments[5], arguments[6]);",
             self.language,
             self.silence_limit_ms,
             INTERRUPT_PHRASES,
             sorted(INTERRUPT_FILLERS),
             _CONTROL_PHRASE_TABLE,
             self.assistant_alias,
+            self.tuning,
         )
 
     @property
@@ -909,8 +1206,8 @@ class SpeechToTextEngine:
         if failed is not None:
             self._rejected_browsers.add(failed.key)
 
-        print_warning(f"{label} stopped being able to transcribe ({reason}). "
-                      f"Switching speech input to another browser.")
+        warning(Subsystem.STT, f"{label} stopped being able to transcribe ({reason}). "
+                               f"Switching to another browser.")
 
         with self._lifecycle_lock:
             self._teardown_session(quiet=True)
@@ -921,13 +1218,111 @@ class SpeechToTextEngine:
                 self._start_session()
             except Exception as e:
                 self.state = SttState.FAILED
-                print_error(f"No usable browser for speech input: {e}")
+                error(Subsystem.STT, f"No usable browser for speech input: {e}")
                 return False
 
         self.state = SttState.LISTENING
         return True
 
-    def _start_session(self):
+    # ──────────────────────────────────────────────────────────────────────
+    #                    EXPLICIT BACKEND SELECTION (live)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def backend_key(self):
+        """The key of the browser ACTUALLY running recognition, or None."""
+        return self.browser.key if self.browser is not None else None
+
+    def backend_label(self):
+        """The label of the browser ACTUALLY running recognition, or None."""
+        return self.browser.label if self.browser is not None else None
+
+    def switch_backend(self, preference):
+        """
+        Changes which browser runs recognition, on a LIVE engine. Returns (ok, detail).
+
+        `preference` is a browser key ("chrome", "edge", …) or "auto"/None for the existing
+        capability-driven selection.
+
+        WHY THE OLD SESSION IS TORN DOWN FIRST, AND FULLY
+        -------------------------------------------------
+        Two live sessions would mean two browsers holding the microphone. `_teardown_session`
+        followed by `_await_owned_termination` is the same order `recover()` uses, for the same
+        reason, and it is what keeps the "no duplicate STT session, no leaked browser process"
+        guarantee true across a switch. Only PIDs this engine recorded are reaped — the user's
+        own Chrome windows are never in `owned_pids`, so a switch cannot touch them.
+
+        WHY A FAILED SWITCH RESTORES THE PREVIOUS BACKEND
+        -------------------------------------------------
+        Leaving Kayra deaf because a browser the user named could not start would turn a wrong
+        setting into a broken assistant. The previous backend is brought back and the failure
+        is reported, so the requested and active values genuinely differ and the UI can say so.
+        Returning True here on a failed start would be the exact lie this whole path exists to
+        prevent.
+        """
+        requested = (str(preference).strip().lower() if preference else "auto")
+        if requested in ("", "auto", "default"):
+            requested = "auto"
+        target = None if requested == "auto" else requested
+
+        previous_pref = self.preferred_browser
+        previous_rejects = set(self._rejected_browsers)
+        was_paused = self.listening_paused
+
+        if self.state in (SttState.STOPPING, SttState.STOPPED, SttState.FAILED) \
+                and self.driver is None and self.state != SttState.FAILED:
+            return False, "the speech session is shutting down"
+
+        with self._lifecycle_lock:
+            self.preferred_browser = target
+            # A browser rejected earlier in this session may be exactly the one the user is
+            # now naming — a machine that was offline when Kayra started is the ordinary
+            # case. An explicit request clears that session-scoped verdict and re-probes.
+            if target:
+                self._rejected_browsers.discard(target)
+
+            self._teardown_session(quiet=True)
+            self._await_owned_termination(timeout=6.0)
+            self.driver = None
+            self.browser = None
+            self.state = SttState.NOT_STARTED
+
+            try:
+                self._start_session(strict=bool(target))
+            except Exception as exc:
+                detail = str(exc).splitlines()[0][:160]
+                # Put the previous backend back rather than leaving the assistant deaf.
+                self.preferred_browser = previous_pref
+                self._rejected_browsers = previous_rejects
+                self._teardown_session(quiet=True)
+                self.driver = None
+                self.browser = None
+                self.state = SttState.NOT_STARTED
+                try:
+                    self._start_session()
+                    self.state = SttState.LISTENING if not was_paused else SttState.READY
+                    restored = self.backend_label() or "none"
+                except Exception:
+                    self.state = SttState.FAILED
+                    return False, f"{detail}; and the previous backend could not be restored"
+                return False, f"{detail}; still on {restored}"
+
+            self.state = SttState.READY
+
+        # The recognition loop only runs when the microphone is meant to be open. A switch
+        # performed while listening was paused must NOT quietly reopen it — pause is a
+        # separate axis and this operation has no business changing it.
+        if was_paused:
+            self._listening_paused = True
+            try:
+                self._raw_script("stopContinuousRecognition();")
+            except Exception:
+                pass
+        else:
+            self.state = SttState.LISTENING
+        self.clear_queue()
+        return True, self.backend_label() or ""
+
+    def _start_session(self, strict=False):
         """
         Brings up the single owned browser session. Raises on failure after marking FAILED,
         so a caller cannot mistake a dead subsystem for a working one.
@@ -937,6 +1332,18 @@ class SpeechToTextEngine:
         Edge ships on every Windows 11 machine and has its own backend - but it does require a
         browser that can genuinely transcribe, and that cannot be determined from the browser's
         name or from the presence of `webkitSpeechRecognition`.
+
+        STRICT MODE, AND WHY IT HAD TO EXIST
+        ------------------------------------
+        `strict=True` restricts the attempt to `self.preferred_browser` and nothing else. It is
+        used when the USER has named a backend from Settings, and it is the difference between
+        a setting and a suggestion: with the ordinary (non-strict) list, choosing "Google
+        Chrome" on a machine where Chrome cannot reach a backend would quietly bring up Edge
+        and report success, so the screen would read "Chrome" while Edge held the microphone.
+        A named backend that cannot start is an honest, visible failure.
+
+        `auto` never uses strict mode: the whole meaning of `auto` is "pick one that works",
+        and the capability logic in `kayra.input.browsers` stays exactly as it was.
         """
         with self._lifecycle_lock:
             if self.driver is not None:
@@ -945,7 +1352,16 @@ class SpeechToTextEngine:
             self.state = SttState.STARTING
             page_url = self._page_server.start()
 
-            options = browsers.candidates(self.preferred_browser)
+            if strict and self.preferred_browser:
+                options = tuple(spec for spec in browsers.discover_browsers()
+                                if spec.key == self.preferred_browser)
+                if not options:
+                    self.state = SttState.FAILED
+                    raise RuntimeError(
+                        f"STT session failed to start: {self.preferred_browser} is not "
+                        f"installed on this machine.")
+            else:
+                options = browsers.candidates(self.preferred_browser)
             if not options:
                 self.state = SttState.FAILED
                 raise RuntimeError(
@@ -969,12 +1385,13 @@ class SpeechToTextEngine:
                     self.browser = spec
                     browsers.remember_working(spec.key)
                     browsers.warn_about_default(spec)
-                    print_info(f"Speech input using {spec.label} ({reason}).")
+                    info(Subsystem.STT, f"Backend: {spec.label} ({reason})")
                     self.state = SttState.READY
                     return self.driver
 
                 failures.append(f"{spec.label}: {reason}")
-                print_warning(f"{spec.label} cannot transcribe ({reason}); trying another browser.")
+                warning(Subsystem.STT,
+                        f"{spec.label} cannot transcribe ({reason}); trying another browser.")
                 self._rejected_browsers.add(spec.key)
                 self._teardown_session(quiet=True)
 
@@ -1091,10 +1508,13 @@ class SpeechToTextEngine:
 
             self._recovery_count += 1
             self.state = SttState.RECOVERING
-            print_warning(
-                f"STT session lost ({reason}). Recovering "
-                f"[attempt {self._recovery_count}/{self.MAX_RECOVERY_ATTEMPTS}]..."
-            )
+            # The BACKEND MANAGER announces the recovery, not this method. One owner per
+            # event: the manager also publishes the transition that drives the assistant
+            # visual's RECOVERING state, so a lost session shows as "Reconnecting" rather
+            # than as a false "Listening paused" — and it cannot be announced twice.
+            _notify_backend_recovery(
+                "started",
+                f"{reason} [attempt {self._recovery_count}/{self.MAX_RECOVERY_ATTEMPTS}]")
 
             # 1. Old session down first — never run two.
             #    session_dead=True: we are here precisely because it stopped responding, so
@@ -1104,16 +1524,19 @@ class SpeechToTextEngine:
             #    these are orphans of a dead driver, not a cooperative shutdown.
             survivors = self._await_owned_termination(timeout=1.0)
             if survivors:
-                print_warning(f"Old STT processes would not die: {sorted(survivors)}")
+                warning(Subsystem.STT,
+                        f"Old speech processes would not die: {sorted(survivors)}")
 
             # 3. Only now build the replacement.
             try:
                 self._start_session()
-                print_success("STT session restored.")
+                self.state = SttState.LISTENING if not self.listening_paused else SttState.READY
+                _notify_backend_recovery("finished")
                 return self.driver
             except Exception as e:
                 self.state = SttState.FAILED
-                print_error(f"STT recovery failed: {e}")
+                _notify_backend_recovery("finished")
+                error(Subsystem.STT, f"Recovery failed: {e}")
                 return None
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1232,15 +1655,43 @@ class SpeechToTextEngine:
             "if (arguments[0] !== null) { window.kayraSpeaking = arguments[0]; }"
             " var i = window.kayraInterrupt, c = window.kayraControl;"
             " window.kayraInterrupt = null; window.kayraControl = null;"
-            " return {interrupt: i || null, control: c || null};",
+            " var v = window.kayraVad || {};"
+            " return {interrupt: i || null, control: c || null,"
+            "         voice: !!v.voice, vadReady: !!v.ready,"
+            "         status: (document.getElementById('status') || {}).textContent || ''};",
             None if speaking is None else bool(speaking),
         )
         if not isinstance(payload, dict):
+            self._voice_active = False
             return None, None
+        # Voice-activity and page status ride along in the SAME round-trip, so the orb learns
+        # that the user is speaking at no extra cost. A separate poll for this would be a
+        # second Selenium command per tick over the same driver lock the capture loop needs —
+        # exactly the contention `poll_controls` was created to remove.
+        self._voice_active = bool(payload.get("voice")) and bool(payload.get("vadReady"))
+        self._page_status = str(payload.get("status") or "")
         interrupt = payload.get("interrupt")
         control = payload.get("control")
         return (interrupt if isinstance(interrupt, dict) and interrupt.get("text") else None,
                 control if isinstance(control, dict) and control.get("kind") else None)
+
+    @property
+    def voice_active(self):
+        """
+        True when the page's VAD last reported the user's voice above the noise floor.
+
+        Sampled by `poll_controls`, which the local control watcher already runs — this is a
+        READ of a value the system was collecting anyway, not a new observation. It is
+        deliberately a best-effort indicator for the assistant visual and nothing else: no
+        decision in Kayra is made from it, so a stale sample costs a frame of animation and
+        never a wrong action.
+        """
+        return bool(getattr(self, "_voice_active", False))
+
+    @property
+    def page_status(self):
+        """The recognition page's own status string ("listening", "stopped", …), or ""."""
+        return str(getattr(self, "_page_status", ""))
 
     # ──────────────────────────────────────────────────────────────────────
     #                             CAPTURE
@@ -1291,12 +1742,26 @@ class SpeechToTextEngine:
                     raw_text = item["text"]
                     self.set_assistant_status("Translating...")
                     translated_text = translate_query(raw_text, needs_translation=self._needs_translation)
-                    return {
+                    result = {
                         "text": format_query(translated_text),
                         "raw": raw_text,
                         "start_ms": float(item.get("start") or now_ms()),
                         "end_ms": float(item.get("end") or now_ms()),
+                        # Everything the repair stage needs to be conservative, carried WITH
+                        # the utterance rather than re-derived from it afterwards.
+                        "segments": item.get("segments") or [],
+                        "uncommitted": item.get("uncommitted") or "",
+                        "during_speech": bool(item.get("duringSpeech")),
+                        "endpoint_reason": item.get("reason") or "",
+                        "vad": bool(item.get("vadReady")),
+                        # Only meaningful when the recognizer produced a single committed
+                        # segment: alternatives for a two-segment utterance would have to be
+                        # a cross product, which is neither what the recognizer meant nor
+                        # something a conservative stage should invent.
+                        "alternatives": self._alternatives(item),
                     }
+                    self._note_capture(result)
+                    return result
 
                 # Check for critical runtime errors reported inside the browser engine
                 status = payload.get("status") or ""
@@ -1313,7 +1778,7 @@ class SpeechToTextEngine:
                             continue
                         return None
 
-                    print_error(f"STT Internal Error: {error_msg}")
+                    error(Subsystem.STT, f"Recognition page reported: {error_msg}")
                     return {"text": "", "raw": "", "start_ms": now_ms(), "end_ms": now_ms()}
 
                 # Super-low CPU polling sleep interval (50ms) to ensure minimal host thread impact
@@ -1321,6 +1786,71 @@ class SpeechToTextEngine:
 
         except KeyboardInterrupt:
             return None
+
+    @staticmethod
+    def _alternatives(item):
+        """
+        The recognizer's own N-best readings for the utterance, best first.
+
+        Returned ONLY for a single committed segment. For a multi-segment utterance the
+        honest answer is "no alternatives for the whole thing" — combining per-segment lists
+        would manufacture readings the recognizer never proposed, which is the exact failure
+        mode the repair stage exists to avoid.
+        """
+        segments = item.get("segments") or []
+        if len(segments) != 1:
+            return []
+        out = []
+        for alternative in (segments[0].get("alternatives") or [])[:10]:
+            text = str(alternative.get("text") or "").strip()
+            if not text:
+                continue
+            out.append({"text": text, "confidence": alternative.get("confidence")})
+        return out
+
+    def _note_capture(self, result):
+        """
+        Records the last capture for diagnostics, and warns ONCE about a degraded pipeline.
+
+        A degraded capture path — no echo cancellation, or no VAD — is the single most useful
+        thing to know when transcripts start coming back wrong, and it is invisible without
+        this: the assistant keeps working, just less accurately.
+        """
+        self.last_capture = {
+            "endpoint_reason": result.get("endpoint_reason"),
+            "vad": result.get("vad"),
+            "during_speech": result.get("during_speech"),
+            "uncommitted": bool(result.get("uncommitted")),
+            "alternatives": len(result.get("alternatives") or []),
+        }
+        if not result.get("vad") and not self._warned_no_vad:
+            self._warned_no_vad = True
+            print_warning("Speech endpointing is running without voice-activity detection "
+                          "(WebAudio unavailable or the microphone was refused). Utterances "
+                          "will be ended by recognizer silence alone.")
+
+    def audio_pipeline_report(self):
+        """
+        What the capture pipeline is ACTUALLY doing, read from the live page.
+
+        Reported rather than assumed, for the same reason the speech-device card reports the
+        provider the ONNX session really got: constraints are a request, and an assistant
+        that claims echo cancellation it was never granted is misdescribing the one thing
+        that explains its mistakes.
+        """
+        report = {"settings": None, "error": "", "vad": None, "tuning": dict(self.tuning)}
+        try:
+            payload = self._script(
+                "return {settings: window.kayraAudioSettings || null,"
+                " error: window.kayraAudioError || '',"
+                " vad: window.kayraVad || null};", recover=False)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            report.update(settings=payload.get("settings"),
+                          error=payload.get("error") or "",
+                          vad=payload.get("vad"))
+        return report
 
     def listen_and_transcribe(self):
         """
@@ -1355,7 +1885,8 @@ class SpeechToTextEngine:
 
             if not quiet:
                 label = self.browser.label if getattr(self, "browser", None) else "browser"
-                print_system(f"Shutting down headless {label} background session...")
+                info(Subsystem.SHUTDOWN, f"Closing the headless {label} session",
+                     correlate=False)
 
             if not session_dead:
                 # 1. Stop Web Speech recognition inside the page.
@@ -1455,7 +1986,8 @@ class SpeechToTextEngine:
         self._teardown_session()
         survivors = self._await_owned_termination()
         if survivors:
-            print_warning(f"STT processes still alive after shutdown: {sorted(survivors)}")
+            warning(Subsystem.SHUTDOWN,
+                    f"Speech processes still alive after shutdown: {sorted(survivors)}")
 
         self._page_server.stop()
 
@@ -1554,7 +2086,7 @@ def translate_query(query, needs_translation=True):
         try:
             english_query = mt.translate(corrected_query, "en", "auto")
         except Exception as e:
-            print_warning(f"Translation unavailable, using raw transcript: {e}")
+            warning(Subsystem.STT, f"Translation unavailable, using raw transcript: {e}")
             english_query = corrected_query
 
     # Post-translation robustness:

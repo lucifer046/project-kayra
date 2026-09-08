@@ -77,6 +77,12 @@ class SessionEvents:
         self.busy_changed = lambda busy: None
         self.listening_changed = lambda listening: None
         self.sleeping_changed = lambda sleeping: None
+        # The AUTHORITATIVE voice presence, carrying its revision so a late Qt callback can be
+        # identified and dropped. Everything about the microphone that a screen renders comes
+        # through here — no view resolves "am I listening or paused?" for itself any more.
+        self.voice_state_changed = lambda state, text, detail, revision: None
+        # The speech backend: requested, active, and how that came to be.
+        self.stt_backend_changed = lambda state: None
 
 
 class KayraSession:
@@ -100,6 +106,11 @@ class KayraSession:
 
         self._app = None            # the kayra.app module, imported during boot
         self._runtime = None
+        # What the conversation is currently about. Resolved at boot alongside the runtime
+        # state, from the same process-wide accessor `app` uses — a second context here would
+        # be a second answer to "what is plausible right now", and the repair stage would be
+        # reading the one nobody writes.
+        self._context = None
         self._ready = threading.Event()
         self._boot_error = None
         self._loop = None           # asyncio loop owned by the runner thread
@@ -151,13 +162,34 @@ class KayraSession:
             return False
 
     def listening_enabled(self):
-        """Whether the microphone is open. Read from the runtime, never cached here."""
+        """
+        Whether the microphone is open. Read from the runtime, never cached here.
+
+        BEFORE THE BACKEND HAS BOOTED THIS IS A GUESS, and callers must use
+        `listening_known()` to find out. It returns the runtime's own default rather than
+        False, because False is a POSITIVE CLAIM that the microphone is closed and that claim
+        was wrong: `KayraWindow` builds and shows Home before the session boots, Home painted
+        its control from this value, and `RuntimeState._listening` then never changed — so
+        `listening_changed` never fired and the button read "Start listening" beside an orb
+        that was listening, until the user toggled it twice.
+        """
         if self._runtime is None:
-            return False
+            return True                 # the runtime's own starting value; see the docstring
         try:
             return bool(self._runtime.listening)
         except Exception:
-            return False
+            return True
+
+    def listening_known(self):
+        """
+        Whether `listening_enabled()` is a MEASUREMENT rather than a default.
+
+        The same distinction the speech-device card and the speech-backend card both make:
+        "this is what is running" and "this is what would run" are different claims, and a
+        control painted from the second while presented as the first is the lie this whole
+        milestone is about.
+        """
+        return self._runtime is not None
 
     # ──────────────────────────────────────────────────────────────────
     #                             LIFECYCLE
@@ -376,6 +408,58 @@ class KayraSession:
         except Exception:
             return False
 
+    # ── Contextual presence ───────────────────────────────────────────
+    # Read and written through the RUNNING service, never through a copy held here. A second
+    # record of "are contextual remarks on" in the UI would be a second source of truth that
+    # could disagree with the one the agent actually consults.
+
+    def _presence(self):
+        agent = getattr(self._app, "proactive_agent", None) if self._app else None
+        return getattr(agent, "presence", None) if agent is not None else None
+
+    def presence_available(self):
+        return self._presence() is not None
+
+    def presence_enabled(self):
+        presence = self._presence()
+        return bool(presence.enabled) if presence is not None else False
+
+    def presence_categories(self):
+        presence = self._presence()
+        try:
+            return dict(presence.categories()) if presence is not None else {}
+        except Exception:
+            return {}
+
+    def set_presence(self, enabled):
+        presence = self._presence()
+        if presence is None:
+            return False
+        try:
+            presence.set_enabled(bool(enabled))
+            return True
+        except Exception:
+            return False
+
+    def set_presence_category(self, name, enabled):
+        presence = self._presence()
+        if presence is None:
+            return False
+        try:
+            return bool(presence.set_category(str(name), bool(enabled)))
+        except Exception:
+            return False
+
+    def presence_status(self):
+        """Cheap status for the Home card: no I/O, no model, no process scan."""
+        presence = self._presence()
+        if presence is None:
+            return {}
+        try:
+            return dict(presence.describe())
+        except Exception:
+            return {}
+
     # ──────────────────────────────────────────────────────────────────
     #                          RUNNER THREAD
     # ──────────────────────────────────────────────────────────────────
@@ -417,12 +501,22 @@ class KayraSession:
             self.events.boot_stage("Loading Kayra", 0.0)
             from kayra import app as kayra_app
             from kayra.core.runtime_state import get_runtime_state
+            from kayra.core.conversation_context import get_conversation_context
 
             self._app = kayra_app
             self._runtime = get_runtime_state()
+            self._context = get_conversation_context()
 
             # Subscribed BEFORE bootstrap so no transition is missed while the engines come up.
             self._runtime.subscribe(self._on_runtime_event)
+
+            # The voice state machine is subscribed to directly rather than being recomputed
+            # here. `app` FEEDS it (it is the only thing that sees every fact) and this layer
+            # only forwards what it commits — a UI that re-derived the state from the same
+            # events would be the fifth writer to the caption this whole change removes.
+            from kayra.core.voice_state import get_voice_state
+            self._voice = get_voice_state()
+            self._voice.subscribe(self._on_voice_transition)
 
             self.events.boot_stage("Starting speech, voice and models", 0.0)
             kayra_app.bootstrap()
@@ -436,6 +530,15 @@ class KayraSession:
                                  name="kayra-barge-in", daemon=True).start()
 
             self._install_output_tap()
+
+            # The backend manager is subscribed AFTER bootstrap: `_boot_stt` creates it and
+            # adopts the live session, and subscribing before that would deliver a snapshot
+            # describing an engine that does not exist yet.
+            try:
+                from kayra.input.stt_backend import get_stt_backend_manager
+                get_stt_backend_manager().subscribe(self._on_backend_changed)
+            except Exception:
+                pass
 
             self._ready.set()
             detail = self._boot_summary()
@@ -557,12 +660,19 @@ class KayraSession:
                 if app.TTS_ENABLED and app.tts_engine is not None:
                     app.tts_engine.speak(reply)
                 self._runtime.note_user_utterance()
+                self._context.note_user_turn(text)
+                self._context.note_assistant_turn(reply)
+                self._context.set_pending_confirmation("")
                 self._set_state("IDLE")
                 return
 
         self._runtime.note_user_utterance()
         self._runtime.begin_turn()
         self._runtime.emit("user_utterance", text=text)
+        # The same conversation-context bookkeeping `app.Main_Loop` does, in the same order.
+        # The UI does not reimplement a turn, and that includes the state a turn maintains.
+        self._context.note_user_turn(text)
+        self._context.set_pending_confirmation((pending() or "") if pending else "")
 
         if app.TTS_ENABLED and app.tts_engine is not None:
             app.tts_engine.begin_turn()
@@ -592,6 +702,7 @@ class KayraSession:
         tokens = list(tokens or [])
         self.events.intent_classified(text, tokens)
         self._runtime.emit("intent_classified", text=text, tokens=tokens)
+        self._context.note_intent(tokens)
 
         automation = [t for t in tokens
                       if not t.strip().lower().startswith(
@@ -647,6 +758,126 @@ class KayraSession:
                 self.events.system_message("Interrupted.", "warning")
         except Exception:
             pass
+
+    def _on_voice_transition(self, transition):
+        """
+        Forwards a committed voice transition, with its revision, to the presentation layer.
+
+        Runs on whichever thread committed it — the turn runner, the control watcher, the
+        backend manager — which is exactly why it does nothing but hand the values on. The
+        Qt adapter above is the marshalling point; this must not touch a widget and must not
+        raise.
+        """
+        try:
+            self.events.voice_state_changed(transition.state, transition.text,
+                                            transition.detail, transition.revision)
+        except Exception:
+            pass
+
+    def _on_backend_changed(self, state):
+        try:
+            self.events.stt_backend_changed(state.to_dict())
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────
+    #                      VOICE PRESENCE AND BACKEND
+    # ──────────────────────────────────────────────────────────────────
+
+    def voice_runtime_state(self):
+        """
+        Everything needed to render the assistant's voice presence, in one read.
+
+        A pass-through to `app.voice_runtime_state`, deliberately: the console front end and
+        the UI must describe the microphone identically, and two implementations of "what is
+        the voice doing" is the defect this milestone exists to remove.
+        """
+        if self._app is None:
+            from kayra.core.voice_state import VoiceState, STATE_TEXT, STATE_DETAIL
+            return {"state": VoiceState.STARTING, "revision": 0,
+                    "text": STATE_TEXT[VoiceState.STARTING],
+                    "detail": STATE_DETAIL[VoiceState.STARTING],
+                    "orb_state": "STARTING", "orb_amplitude": 0.45,
+                    "capture_active": False, "vad_active": False,
+                    # NOT KNOWN, and said so. A screen painted before boot must be able to
+                    # tell the difference between "the microphone is closed" and "nobody has
+                    # asked the backend yet".
+                    "listening": True, "listening_known": False}
+        try:
+            snapshot = self._app.voice_runtime_state()
+        except Exception:
+            return {}
+        snapshot["listening_known"] = self.listening_known()
+        return snapshot
+
+    def stt_backend_state(self):
+        """The requested/active speech backend. Never boots an engine to answer."""
+        try:
+            from kayra.input.stt_backend import get_stt_backend_manager
+            return get_stt_backend_manager().snapshot().to_dict()
+        except Exception:
+            return {}
+
+    def set_stt_backend(self, backend):
+        """
+        Switches the LIVE speech backend. Returns (committed, detail).
+
+        Delegates to `app.set_stt_backend`, which is the one entry point — the settings
+        recorder announces the change, the backend manager runs the transaction and the STT
+        engine performs the swap. Nothing is sequenced here.
+        """
+        if self._app is None:
+            return False, "Kayra is still starting"
+        control = getattr(self._app, "set_stt_backend", None)
+        if control is None:
+            return False, "this build cannot switch the speech backend live"
+        try:
+            return control(backend, source="settings")
+        except Exception as exc:
+            self.events.error(f"Could not switch the speech backend: {exc}")
+            return False, str(exc)
+
+    # ──────────────────────────────────────────────────────────────────
+    #                             MEMORY
+    # ──────────────────────────────────────────────────────────────────
+    # Straight through to `memory.store`, which owns identity, deletion and the atomic write.
+    # A copy of any of that here would be a second source of truth for the only durable
+    # conversational state in the system.
+
+    def list_memories(self, limit=None):
+        try:
+            from kayra.memory.store import list_memories
+            return list_memories(limit=limit)
+        except Exception:
+            return []
+
+    def delete_memory(self, memory_id):
+        try:
+            from kayra.memory.store import delete_memory
+            return delete_memory(memory_id)
+        except Exception as exc:
+            return False, str(exc)
+
+    def clear_memories(self):
+        try:
+            from kayra.memory.store import clear_all_memories
+            return clear_all_memories()
+        except Exception:
+            return 0, False
+
+    def memory_store(self):
+        try:
+            from kayra.memory.store import describe_store
+            return describe_store()
+        except Exception:
+            return {}
+
+    def open_memory_location(self):
+        try:
+            from kayra.memory.store import open_memory_location
+            return open_memory_location()
+        except Exception as exc:
+            return False, str(exc)
 
     def _set_state(self, state):
         if self._runtime is not None:

@@ -11,7 +11,6 @@ Cloud Chat Priority: Groq (primary) -> Gemini (fallback on quota/rate-limit)
 DMM: Cohere Command-R (cloud) or local model (offline)
 """
 
-import os
 import time
 import socket
 import requests
@@ -21,7 +20,12 @@ from openai import OpenAI
 
 # Robust relative path imports across standalone and package execution
 from kayra.core.config import env_values
-from kayra.utils import print_info, print_warning, print_error, print_system, print_success
+from kayra.core.logbus import Subsystem, info, warning, error, debug, field
+from kayra.intelligence.provider_router import (
+    ROUTE_CHAT, ROUTE_DECISION, COHERE, GROQ, GEMINI, LOCAL,
+    AllProvidersFailed, FailureKind, get_provider_router,
+)
+from kayra.utils import print_system
 
 
 class CentralizedLLMEngine:
@@ -91,37 +95,83 @@ class CentralizedLLMEngine:
         local_key = self.env_vars.get("LOCAL_API_KEY", "lm-studio")
         if not self.is_online:
             self.local_base_url = self.env_vars.get("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
-        self.local_client = OpenAI(base_url=self.local_base_url if hasattr(self, "local_base_url") else "http://127.0.0.1:1234/v1", api_key=local_key)
+        self.local_client = OpenAI(
+            base_url=self.local_base_url if hasattr(self, "local_base_url")
+            else "http://127.0.0.1:1234/v1",
+            api_key=local_key,
+            # Same rule as the cloud clients: one attempt, bounded. A local server that has
+            # hung should hand the turn back rather than be retried behind the caller's back.
+            max_retries=0,
+            timeout=self._provider_timeout(),
+        )
 
         # ── Cloud clients (only activated when local server is NOT running) ──
+        #
+        # `max_retries=0` IS LOAD-BEARING, AND IT WAS MEASURED, NOT ASSUMED.
+        #
+        # The OpenAI SDK retries transport failures twice by default, with its own backoff.
+        # That is a SECOND retry authority underneath the router, and it produces exactly the
+        # failure mode the router exists to prevent: one user request becomes three provider
+        # calls, the fallback the router would have made instantly is delayed by the SDK's
+        # backoff, and a rate-limited key gets hit two more times on the way. Measured live on
+        # this machine before the change: a single Groq DMM call took 9.9s and then 24.0s,
+        # while the router's own fallback for the same class of failure takes ~700ms.
+        #
+        # The router is the one authority. A provider call fails once, is classified once, and
+        # the next provider gets its turn — see `ProviderRouter.run`.
+        #
+        # The timeout is the OTHER half of the same rule (1.3: "TIMEOUT: fallback after a
+        # bounded timeout"). Without it a hung provider blocks the user indefinitely while two
+        # perfectly good fallbacks sit idle.
+        timeout = self._provider_timeout()
         if self.is_online:
-            self.cohere_client = cohere.Client(api_key=self._cohere_key) if self._cohere_key else None
+            self.cohere_client = (
+                cohere.Client(api_key=self._cohere_key, timeout=timeout)
+                if self._cohere_key else None
+            )
             self.groq_client = (
-                OpenAI(api_key=self._groq_key, base_url="https://api.groq.com/openai/v1")
+                OpenAI(api_key=self._groq_key, base_url="https://api.groq.com/openai/v1",
+                       max_retries=0, timeout=timeout)
                 if self._groq_key else None
             )
             self.gemini_client = (
                 OpenAI(api_key=self._gemini_key,
-                       base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+                       base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                       max_retries=0, timeout=timeout)
                 if self._gemini_key else None
             )
-            
-            self.dmm_status = f"Decision making initialised with Cohere ({self.cohere_model})" if self.cohere_client else "Decision making initialised with None (Offline)"
-            
-            chat_models = []
-            if self.groq_client: chat_models.append("Groq")
-            if self.gemini_client: chat_models.append("Gemini")
-            
-            self.chat_status = f"Chat model initialised with {' & '.join(chat_models)}" if chat_models else "Chat model initialised with None (Offline)"
             
         else:
             # Local mode — cloud clients set to None so no accidental cloud calls occur
             self.cohere_client = None
             self.groq_client   = None
             self.gemini_client = None
-            
-            self.dmm_status = f"Decision making initialised with Local LLM ({self.local_decision_model})"
-            self.chat_status = f"Chat model initialised with Local LLM ({self.local_chat_model})"
+
+        # ┌────────────────────────────────────────────────────────┐
+        # │              THE PROVIDER ROUTING AUTHORITY            │
+        # └────────────────────────────────────────────────────────┘
+        # ONE router for the process, holding ONE set of cooldowns. Every provider decision
+        # this engine makes goes through it, and neither `classify_intent` nor
+        # `generate_chat_stream` contains fallback logic of its own any more — two
+        # independent notions of "is this a rate limit?" is exactly how one user request
+        # became four provider calls against an already-limited key.
+        #
+        # Availability is registered as a CALLABLE rather than a bool: the cloud clients
+        # exist only in online mode, and a router holding a stale True would route into a
+        # `None`. Local is registered too, so the same object can describe the offline
+        # routing in the boot report.
+        self.router = get_provider_router()
+        self.router.register(COHERE, lambda: self.cohere_client is not None)
+        self.router.register(GROQ, lambda: self.groq_client is not None)
+        self.router.register(GEMINI, lambda: self.gemini_client is not None)
+        self.router.register(LOCAL, lambda: not self.is_online)
+
+        if self.is_online:
+            self.dmm_status = f"Decision routing: {self.router.describe(ROUTE_DECISION)}"
+            self.chat_status = f"Chat routing: {self.router.describe(ROUTE_CHAT)}"
+        else:
+            self.dmm_status = f"Decision routing: Local ({self.local_decision_model})"
+            self.chat_status = f"Chat routing: Local ({self.local_chat_model})"
 
         # Secure the boot-lock so prints never repeat on subsequent instantiations
         CentralizedLLMEngine._has_booted = True
@@ -509,8 +559,18 @@ class CentralizedLLMEngine:
         so classify_intent()/generate_chat_stream() work correctly whether or not this is ever
         called (callers that don't care about the boot narration, e.g. test scripts, can skip it).
         """
-        print_system(self.dmm_status)
-        print_system(self.chat_status)
+        # The hierarchy, stated as a hierarchy. `Cohere > Groq > Gemini` on one line and
+        # `Groq > Gemini` on the next is the whole routing policy, visible at a glance at every
+        # boot — which is what makes a later `[DMM] Fallback: Groq` legible instead of
+        # surprising. Both lines come from the ONE router, so the boot report and the live
+        # routing cannot drift into two accounts of the same configuration.
+        info(Subsystem.LLM, "Providers")
+        if self.is_online:
+            field(Subsystem.LLM, "DMM", self.router.describe(ROUTE_DECISION))
+            field(Subsystem.LLM, "Chat", self.router.describe(ROUTE_CHAT))
+        else:
+            field(Subsystem.LLM, "DMM", f"Local ({self.local_decision_model})")
+            field(Subsystem.LLM, "Chat", f"Local ({self.local_chat_model})")
 
         # Narration is opt-in. main.py calls this WITHOUT a TTS engine and speaks one short
         # consolidated line instead: reading both status strings aloud cost ~7s of speech
@@ -604,6 +664,21 @@ class CentralizedLLMEngine:
 
         return prompt
 
+    def _provider_timeout(self):
+        """
+        The per-request budget handed to every model client, in seconds.
+
+        A BOUND, not a behaviour switch — like every automation knob in this codebase. It is
+        clamped rather than trusted: a malformed `.env` must not be able to set an infinite
+        timeout, which would reintroduce the hang the bound exists to prevent, nor a
+        sub-second one, which would make every provider look broken.
+        """
+        try:
+            value = float(str(self.env_vars.get("PROVIDER_TIMEOUT_SECONDS", "30")).strip())
+        except (TypeError, ValueError):
+            value = 30.0
+        return min(300.0, max(5.0, value))
+
     def _check_local_server(self):
         """
         Pings the local model endpoint using a lightweight GET request.
@@ -682,60 +757,24 @@ class CentralizedLLMEngine:
         Returns:
             list: List of parsed task labels matching standard intents.
         """
-        response_text = ""
         try:
             if self.is_online:
-                if self.cohere_client:
-                    # ── Primary: Cohere Command-R streaming DMM ──
-                    strict_system = (
-                        "SYSTEM RULE: You are an intent classification engine. "
-                        "Your ONLY job is to output a comma-separated list of intent tokens. "
-                        "DO NOT answer the user's question. DO NOT explain. DO NOT add any prose. "
-                        "ONLY output tokens like: 'general query', 'realtime query', 'play song', 'open app', 'exit', etc.\n\n"
-                        + self.dmm_preamble.strip()
+                try:
+                    response_text = self.router.run(
+                        ROUTE_DECISION,
+                        lambda provider: self._dmm_call(provider, prompt),
+                        describe=self._provider_label,
                     )
-                    stream = self.cohere_client.chat_stream(
-                        model=self.cohere_model,
-                        preamble=strict_system,
-                        message=prompt,
-                        chat_history=self.dmm_chat_history,
-                        prompt_truncation='OFF',
-                        temperature=0.1
-                    )
-                    for event in stream:
-                        if event.event_type == "text-generation":
-                            response_text += event.text
-                else:
-                    print_warning("Cohere API key missing. DMM requires Cohere for online intent routing.")
+                except AllProvidersFailed:
+                    # Every decision provider is unconfigured or standing down. Degrading to
+                    # conversation is the honest answer: the assistant can still talk, it
+                    # simply cannot classify. The router has already said which provider
+                    # failed and why, so this line adds the CONSEQUENCE and nothing else.
+                    warning(Subsystem.DMM,
+                            "No decision provider answered. Treating this as conversation.")
                     return ["general " + prompt]
             else:
-                # ── Offline Mode ──
-                strict_system = (
-                    "SYSTEM RULE: You are an intent classification engine. "
-                    "Your ONLY job is to output a comma-separated list of intent tokens. "
-                    "DO NOT answer the user's question. DO NOT explain. DO NOT add any prose. "
-                    "ONLY output tokens like: 'general query', 'realtime query', 'play song', 'open app', 'exit', etc.\n\n"
-                    + self.dmm_preamble.strip()
-                )
-                local_messages = [{"role": "system", "content": strict_system}]
-                # NOTE: Deliberately NOT sliced. The few-shot examples above are ordered so the
-                # highest-value disambiguating pairs (open/close, window management) sit LAST for
-                # maximum recency weight — truncating this list would silently drop exactly those.
-                for msg in self.dmm_chat_history:
-                    role = "user" if msg["role"] == "User" else "assistant"
-                    local_messages.append({"role": role, "content": msg['message']})
-                local_messages.append({
-                    "role": "user",
-                    "content": prompt
-                })
-
-                local_response = self.local_client.chat.completions.create(
-                    model=self.local_decision_model,
-                    messages=local_messages,
-                    temperature=0.1,
-                    max_tokens=128,
-                )
-                response_text = local_response.choices[0].message.content
+                response_text = self._dmm_local(prompt)
 
             # Clean and split response text into discrete tasks
             response_text = response_text.replace("\n", "")
@@ -767,10 +806,9 @@ class CentralizedLLMEngine:
                     if task_lower.startswith(header + " "):
                         payload = task[len(header):].strip().strip("()'\"")
                         if payload.lower().rstrip(".?!") in PLACEHOLDERS:
-                            print_warning(
-                                f"DMM emitted a placeholder payload ('{task}'). "
-                                "Substituting the user's actual words."
-                            )
+                            warning(Subsystem.DMM,
+                                    f"Placeholder payload emitted ({task!r}). "
+                                    "Substituting the words the user actually said.")
                             task = f"{header} {prompt}"
                             task_lower = task.lower()
                         break
@@ -784,51 +822,145 @@ class CentralizedLLMEngine:
             # Intercept empty or failed token responses to attempt recursive retries
             if len(parsed_task) == 0:
                 if retries < 3:
-                    print_warning(f"Empty token response. Retrying DMM step #{retries + 1}...")
+                    # A retry over the model's OUTPUT, not over a transport failure — the
+                    # router owns the latter and this must never become a second retry
+                    # authority for it. Bounded at 3, and it re-enters the router, so a
+                    # provider that has meanwhile been stood down is skipped rather than
+                    # hammered.
+                    warning(Subsystem.DMM,
+                            f"Empty token response. Retrying ({retries + 1}/3).")
                     return self.classify_intent(prompt=prompt, retries=retries + 1)
                 else:
                     return ["general " + prompt]
             return parsed_task
 
-        except cohere.TooManyRequestsError:
-            # Bounded backoff. This used to recurse with the SAME `retries` value, so a
-            # sustained rate limit (a trial key under load does this readily) meant unbounded
-            # recursion: the assistant would sit in a 10-second-per-frame loop until the
-            # stack blew, with no way out and no message to the user.
-            if retries >= 3:
-                print_error("Cohere rate limit persisted. Routing this query to conversation.")
-                return ["general " + prompt]
-            cooldown = 5 * (retries + 1)
-            print_warning(f"Cohere rate limit reached. Cooling down {cooldown}s "
-                          f"[attempt {retries + 1}/3]...")
-            time.sleep(cooldown)
-            return self.classify_intent(prompt=prompt, retries=retries + 1)
-
         except Exception as e:
-            print_error(f"DMM exception: {e}")
+            # Transport failures never reach here any more — the router classifies them,
+            # stands the provider down and moves to the next one. What is left is a genuine
+            # defect in the parsing below, so it keeps its traceback, at DEBUG.
+            from kayra.core.logbus import exception as log_exception
+            log_exception(Subsystem.DMM, "Intent parsing failed", e)
             return ["general " + prompt]
+
+    # ── Per-provider DMM calls ────────────────────────────────────────────
+    # THE PROMPT CONTRACT IS IDENTICAL ON ALL THREE. The same strict system rule, the same
+    # `dmm_preamble` and the same `dmm_chat_history` in the same order reach every provider —
+    # only the transport differs (Cohere's native preamble/chat_history parameters versus the
+    # OpenAI-compatible message list Groq and Gemini speak). A fallback that changed the
+    # prompt would be classifying a different question, and the token contract the whole
+    # automation layer depends on would silently vary with whichever provider answered.
+
+    _DMM_SYSTEM_RULE = (
+        "SYSTEM RULE: You are an intent classification engine. "
+        "Your ONLY job is to output a comma-separated list of intent tokens. "
+        "DO NOT answer the user's question. DO NOT explain. DO NOT add any prose. "
+        "ONLY output tokens like: 'general query', 'realtime query', 'play song', "
+        "'open app', 'exit', etc.\n\n"
+    )
+
+    def _dmm_system(self):
+        return self._DMM_SYSTEM_RULE + self.dmm_preamble.strip()
+
+    def _dmm_messages(self, prompt):
+        """
+        The DMM few-shot exchange as an OpenAI-compatible message list.
+
+        NOTE: deliberately NOT sliced. The examples are ordered so the highest-value
+        disambiguating pairs (open/close, window management, undo/redo) sit LAST for maximum
+        recency weight — truncating this list has silently dropped exactly those before.
+        """
+        messages = [{"role": "system", "content": self._dmm_system()}]
+        for msg in self.dmm_chat_history:
+            role = "user" if msg["role"] == "User" else "assistant"
+            messages.append({"role": role, "content": msg["message"]})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _provider_label(self, provider):
+        """`Cohere (command-r-plus-08-2024)` — the name plus the model actually configured."""
+        return f"{provider} ({self._model_for(provider)})"
+
+    def _model_for(self, provider):
+        return {
+            COHERE: self.cohere_model,
+            GROQ: self.groq_model,
+            GEMINI: self.gemini_model,
+            LOCAL: self.local_chat_model,
+        }.get(provider, "unknown")
+
+    def _dmm_call(self, provider, prompt):
+        """
+        One DMM attempt against one provider. Raises on failure — the ROUTER decides what
+        that means and whether anybody else gets a turn. Nothing here retries, catches a
+        transport error or sleeps; a second retry authority inside a provider call is how one
+        user request turns into four calls against an already rate-limited key.
+        """
+        if provider == COHERE:
+            response_text = ""
+            stream = self.cohere_client.chat_stream(
+                model=self.cohere_model,
+                preamble=self._dmm_system(),
+                message=prompt,
+                chat_history=self.dmm_chat_history,
+                prompt_truncation="OFF",
+                temperature=0.1,
+            )
+            for event in stream:
+                if event.event_type == "text-generation":
+                    response_text += event.text
+            return response_text
+
+        client = self.groq_client if provider == GROQ else self.gemini_client
+        if client is None:
+            raise RuntimeError(f"{provider} is not configured")
+        completion = client.chat.completions.create(
+            model=self._model_for(provider),
+            messages=self._dmm_messages(prompt),
+            temperature=0.1,
+            max_tokens=128,
+        )
+        return completion.choices[0].message.content or ""
+
+    def _dmm_local(self, prompt):
+        """
+        The offline DMM. Not routed: local-first is absolute, so when a local server is up
+        there is exactly one provider, and a chain of one is a chain with no decisions in it.
+        """
+        response = self.local_client.chat.completions.create(
+            model=self.local_decision_model,
+            messages=self._dmm_messages(prompt),
+            temperature=0.1,
+            max_tokens=128,
+        )
+        return response.choices[0].message.content
 
     # ┌────────────────────────────────────────────────────────────────────────┐
     # │              2. CHAT & SEARCH STREAMING CHUNKS GENERATOR               │
     # └────────────────────────────────────────────────────────────────────────┘
     def generate_chat_stream(self, api_messages):
         """
-        Token-by-token generation channel powering direct low-latency feedback logs on CLI.
+        Token-by-token generation channel for every conversational surface.
 
-        Execution Priority:
-            1. Local LLM (LM Studio / Ollama) — HIGHEST PRIORITY. If running, all generation
-               routes here exclusively. Zero cloud calls are made.
-            2. Groq — Primary cloud provider when no local server is detected.
-            3. Gemini — Auto-fallback if Groq quota/rate-limit is exceeded.
+        ROUTING
+            1. Local LLM (LM Studio / Ollama) — HIGHEST PRIORITY. When one is running, all
+               generation goes there exclusively and zero cloud calls are made.
+            2. Otherwise the CHAT route, which is Groq -> Gemini, in that order and no other.
+               Cohere is NOT a chat provider: it leads the DECISION route and appears nowhere
+               here. The two hierarchies are separate on purpose and the router holds both.
+
+        Fallback is the router's, not this function's. What used to live here — a private
+        string-matching notion of "quota error", a hand-rolled Groq-then-Gemini sequence, and
+        no memory of the failure from one request to the next — is exactly the duplication
+        that made a rate-limited key get hit again on every following turn.
 
         Parameters:
-            api_messages (list): Full system prompt, context layers, and history blocks in OpenAI format.
+            api_messages (list): Full system prompt, context layers and history, OpenAI format.
 
         Yields:
-            str: Next text token string chunk generated by the active model engine.
+            str: The next text chunk from whichever provider answered.
         """
         if not self.is_online:
-            # ── Offline Mode: Local model only ──
+            # ── Offline: local model only. Not routed; see `_dmm_local`. ──
             try:
                 stream = self.local_client.chat.completions.create(
                     model=self.local_chat_model,
@@ -836,62 +968,57 @@ class CentralizedLLMEngine:
                     temperature=0.7,
                     stream=True,
                 )
-                print_info(f"Generating via Local Model: {self.local_chat_model}")
+                info(Subsystem.CHAT, f"Provider: Local ({self.local_chat_model})")
                 for chunk in stream:
                     if chunk.choices[0].delta.content:
                         yield chunk.choices[0].delta.content
             except Exception as e:
+                error(Subsystem.CHAT, f"Local engine failure: {type(e).__name__}")
+                debug(Subsystem.CHAT, str(e))
                 yield f"\n[Local Engine Failure: {e}]"
             return
 
-        # ── Online Mode: Try Groq first, fall back to Gemini ──
-        QUOTA_SIGNALS = (
-            "rate_limit", "quota", "429", "resource_exhausted",
-            "too many requests", "ratelimitexceeded"
+        try:
+            for chunk in self.router.run_stream(
+                ROUTE_CHAT,
+                lambda provider: self._chat_call(provider, api_messages),
+                describe=self._provider_label,
+            ):
+                yield chunk
+        except AllProvidersFailed as failure:
+            # Every chat provider is unconfigured or standing down. One clear sentence, in the
+            # stream, because that is the only channel the user is actually watching — and no
+            # further recursion: an exhausted chain does not become answerable by asking again.
+            if FailureKind.RATE_LIMITED in failure.kinds:
+                yield ("\n[Every conversational model is rate-limited right now. "
+                       "Please try again shortly.]")
+            else:
+                yield "\n[No conversational model is available right now.]"
+        except Exception as e:
+            # A mid-stream failure, after tokens have already reached the user. The router
+            # re-raises rather than splicing a second provider's answer into a half-spoken
+            # sentence, and it has already stood the provider down so the NEXT turn routes
+            # elsewhere. All that is left is to end this one honestly.
+            debug(Subsystem.CHAT, f"Stream ended early: {type(e).__name__}: {e}")
+            yield "\n[The response was cut short. Please ask again.]"
+
+    def _chat_call(self, provider, api_messages):
+        """
+        One chat attempt against one provider, as an iterator of text chunks.
+
+        Returns a GENERATOR, so no network work begins until the router pulls the first
+        chunk — which is what makes the router's "fallback only before the first token" rule
+        meaningful rather than theoretical.
+        """
+        client = self.groq_client if provider == GROQ else self.gemini_client
+        if client is None:
+            raise RuntimeError(f"{provider} is not configured")
+        stream = client.chat.completions.create(
+            model=self._model_for(provider),
+            messages=api_messages,
+            temperature=0.7,
+            stream=True,
         )
-
-        def _is_quota_error(exc: Exception) -> bool:
-            return any(s in str(exc).lower() for s in QUOTA_SIGNALS)
-
-        # --- Attempt 1: Groq ---
-        if self.groq_client:
-            try:
-                stream = self.groq_client.chat.completions.create(
-                    model=self.groq_model,
-                    messages=api_messages,
-                    temperature=0.7,
-                    stream=True,
-                )
-                print_info(f"Generating via Groq: {self.groq_model}")
-                for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-                return  # Groq succeeded, done
-            except Exception as e:
-                if _is_quota_error(e):
-                    print_warning(f"Groq quota reached. Switching to Gemini fallback...")
-                else:
-                    print_error(f"Groq stream error: {e}. Trying Gemini fallback...")
-
-        # --- Attempt 2: Gemini fallback ---
-        if self.gemini_client:
-            try:
-                stream = self.gemini_client.chat.completions.create(
-                    model=self.gemini_model,
-                    messages=api_messages,
-                    temperature=0.7,
-                    stream=True,
-                )
-                print_info(f"Generating via Gemini: {self.gemini_model}")
-                for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-                return  # Gemini succeeded, done
-            except Exception as e:
-                if _is_quota_error(e):
-                    yield "\n[All cloud quotas exhausted. Please wait a moment before trying again.]"
-                else:
-                    yield f"\n[Gemini Engine Failure: {e}]"
-                return
-
-        yield "\n[No available cloud chat provider. Check your API keys in .env]"
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content

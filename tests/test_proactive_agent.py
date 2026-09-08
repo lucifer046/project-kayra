@@ -34,6 +34,40 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 
 from kayra.utils import print_banner, print_info, print_success, print_error, print_system
 from kayra.core.runtime_state import RuntimeState, AssistantState
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                    HOST ISOLATION — read this first                    │
+# └────────────────────────────────────────────────────────────────────────┘
+# THIS SUITE IS TIER 1: hardware-free, and its results must not depend on the machine it runs
+# on. `system_profile.pressure_sample()` reads the REAL battery, CPU and memory, and the
+# presence layer turns a low battery into a CRITICAL candidate — which by design outranks
+# every candidate the tests below are trying to exercise.
+#
+# That is the presence layer working correctly and the SUITE being wrong. Caught the honest
+# way: the run was green all afternoon and then failed 9 checks, on unchanged code, because
+# the laptop had dropped to 12% and unplugged. A suite whose verdict depends on the charge
+# level is not a suite anybody can trust.
+#
+# Pinned to a healthy, plugged-in machine under no load. The battery, CPU and memory
+# THRESHOLDS are still exercised — the tests that care drive `pressure_sample` directly with
+# the values they need — but nothing is decided by the host's own state.
+def _pin_host_environment():
+    from kayra.core import system_profile
+
+    def stable_sample(max_age=20.0):
+        return {"cpu_percent": 8.0, "ram_percent": 42.0,
+                "battery_percent": 88.0, "battery_plugged": True}
+
+    system_profile.pressure_sample = stable_sample
+    try:
+        import kayra.intelligence.proactive_presence as presence
+        presence.pressure_sample = stable_sample
+    except Exception:
+        pass                    # the presence layer is optional; the agent runs without it
+
+
+_pin_host_environment()
 import kayra.services.proactive_agent as pa
 from kayra.services.proactive_agent import (ProactiveAgent, ProactiveConfig, ProactiveState,
                                      HabitStore, Candidate, normalize_app_name,

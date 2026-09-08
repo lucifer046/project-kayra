@@ -103,19 +103,36 @@ class AssistantOrb(QWidget):
     def state(self):
         return self._state
 
-    def set_state(self, state):
+    DEFAULT_LEVELS = {
+        "IDLE": 0.26, "OFFLINE": 0.08, "STARTING": 0.45,
+        "LISTENING": 0.85, "PROCESSING": 0.60, "SPEAKING": 0.95,
+        "AUTOMATING": 0.70, "INTERRUPTING": 0.50, "PROACTIVE": 0.55,
+        "ERROR": 0.35, "SHUTTING_DOWN": 0.08,
+    }
+
+    def set_state(self, state, amplitude=None):
+        """
+        Sets the visual state, and optionally its activity amplitude.
+
+        THE ORB RENDERS; IT DOES NOT DECIDE. It has no timer that reasons about state, no
+        inference from silence, and no opinion about whether the microphone is open — it is
+        handed a state and an amplitude by `kayra.core.voice_state` through the bridge, and
+        draws them. That is what makes it impossible for this component to be the thing that
+        disagrees with the caption beside it.
+
+        `amplitude` exists so LISTENING and USER_SPEAKING can be the SAME animation at
+        different energies. The travelling wave is already the "I am hearing you" element; a
+        second visual for the same fact would be one more thing that can fall out of step.
+        """
         state = (state or "IDLE").upper()
-        if state == self._state:
+        level = self.DEFAULT_LEVELS.get(state, 0.2) if amplitude is None \
+            else max(0.0, min(1.0, float(amplitude)))
+        if state == self._state and abs(level - self._target_level) < 0.01:
             return
         self._state = state
         # The activity envelope is a target rather than a jump, so a state change eases in over
         # a few frames instead of snapping — the difference between "alive" and "flickering".
-        self._target_level = {
-            "IDLE": 0.26, "OFFLINE": 0.08, "STARTING": 0.45,
-            "LISTENING": 0.85, "PROCESSING": 0.60, "SPEAKING": 0.95,
-            "AUTOMATING": 0.70, "INTERRUPTING": 0.50, "PROACTIVE": 0.55,
-            "ERROR": 0.35, "SHUTTING_DOWN": 0.08,
-        }.get(state, 0.2)
+        self._target_level = level
         self._sync_timer()
         self.update()
 

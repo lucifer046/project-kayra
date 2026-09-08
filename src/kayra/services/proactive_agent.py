@@ -63,6 +63,17 @@ from kayra.utils import (print_info, print_warning, print_system, print_success,
 from kayra.core.paths import data_path
 from kayra.core.runtime_state import AssistantState, get_runtime_state
 
+# The contextual presence layer. It EXTENDS this agent rather than replacing it: it supplies
+# extra reasons to speak, extra suppression rules and the wording, while the thread, the
+# habit model, the safety gate and the single route to the TTS pipeline all stay here.
+# Optional by construction — a failed import costs the presence candidates and nothing else.
+try:
+    from kayra.intelligence.proactive_presence import ProactivePresence
+    PRESENCE_AVAILABLE = True
+except Exception:                                        # pragma: no cover - defensive
+    ProactivePresence = None
+    PRESENCE_AVAILABLE = False
+
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                            CONFIGURATION                               │
@@ -453,10 +464,13 @@ class ProactiveAgent:
             approved candidate. Any failure falls back to the template.
         config: optional `ProactiveConfig` (mostly for tests).
         clock: optional `callable() -> float` epoch seconds, for deterministic tests.
+        presence: optional `ProactivePresence` to use instead of the default one, or
+            `False` to run without the contextual layer entirely (the pre-presence
+            behaviour, which the test suite exercises to prove nothing regressed).
     """
 
     def __init__(self, runtime=None, speak_fn=None, is_speaking_fn=None,
-                 phrase_fn=None, config=None, clock=None):
+                 phrase_fn=None, config=None, clock=None, presence=None):
         self.config = config or ProactiveConfig()
         self.runtime = runtime if runtime is not None else get_runtime_state()
         self.speak_fn = speak_fn
@@ -493,11 +507,41 @@ class ProactiveAgent:
 
         self._last_save = self._clock()
         self._stop_event = threading.Event()
+        # Woken by a meaningful state change (a failed automation, the user coming back) so
+        # an event-driven reason to speak is evaluated at once instead of at the next tick.
+        # It is still the SAME single thread and the same evaluation — the event only decides
+        # WHEN the existing tick runs, never whether the assistant speaks.
+        self._wake_event = threading.Event()
         self._thread = None
 
         # Diagnostics — cheap counters, read by tests and by the shutdown report.
         self.stats = {"ticks": 0, "candidates": 0, "spoken": 0,
                       "deferred": 0, "dropped": 0, "llm_calls": 0}
+
+        # The signal snapshot the most recent presence evaluation reasoned about. Kept only
+        # so an approved candidate's LLM prompt can quote the same numbers the decision used.
+        self._last_presence_signals = None
+
+        # ── The contextual presence layer ──────────────────────────────────
+        # Constructed here so it shares this agent's clock (deferral ages and cooldowns are
+        # compared against one time source — mixing two made every candidate look stale) and
+        # this agent's habit-derived annoyance signal, rather than owning a second feedback
+        # store of its own.
+        self.presence = None
+        if PRESENCE_AVAILABLE and presence is not False:
+            try:
+                # `annoyance_fn` is a lambda, not a bound method, ON PURPOSE. Binding
+                # `self.habits.annoyance` here captures the habit store that exists at
+                # construction, and anything that later REPLACES `self.habits` — a reload, or
+                # a test redirecting persistence away from the real data directory — would
+                # leave presence quietly consulting the old one. That is not a hypothetical:
+                # it made presence read the developer's real habits.json in a suite that had
+                # carefully isolated everything else.
+                self.presence = presence if presence else ProactivePresence(
+                    clock=self._clock, annoyance_fn=lambda kind: self.habits.annoyance(kind))
+            except Exception as exc:                     # pragma: no cover - defensive
+                print_warning(f"Proactive presence unavailable (non-fatal): {exc}")
+                self.presence = None
 
         self.context_available = gw is not None
         if not self.context_available:
@@ -545,6 +589,7 @@ class ProactiveAgent:
         """
         self._set_state(ProactiveState.STOPPING)
         self._stop_event.set()
+        self._wake_event.set()
         try:
             self.runtime.unsubscribe(self.on_event)
         except Exception:
@@ -566,6 +611,11 @@ class ProactiveAgent:
         subsystem off and leaves playback alone.
         """
         self.config.enabled = bool(enabled)
+        if self.presence is not None:
+            # The global switch stays authoritative over the presence layer: "stop proactive
+            # suggestions" has always meant ALL of them, and a contextual remark is exactly
+            # what the user is asking not to hear.
+            self.presence.set_enabled(bool(enabled))
         if enabled:
             self._stop_event.clear()
             if self._thread is None or not self._thread.is_alive():
@@ -598,7 +648,11 @@ class ProactiveAgent:
         while True:
             interval = (self.config.defer_poll_seconds if self._pending is not None
                         else self.config.tick_seconds)
-            if self._stop_event.wait(interval):
+            # One Event serves both purposes: `stop()` sets it too, so shutdown still wakes
+            # the thread on its very first line rather than up to a tick later.
+            self._wake_event.wait(interval)
+            self._wake_event.clear()
+            if self._stop_event.is_set():
                 return
             try:
                 self.tick()
@@ -629,17 +683,24 @@ class ProactiveAgent:
             self._maybe_flush(now)
             return
 
-        # 3. Global cooldown: skip candidate generation entirely. Cheapest possible path,
-        #    and it is the one taken for most of the hour after any suggestion.
-        if now - self._last_spoken_any < self.config.global_cooldown_s:
+        # 3. Global cooldown: candidate generation is skipped almost entirely. This is the
+        #    cheapest path and the one taken for most of the hour after any suggestion.
+        #
+        #    The one exception is a CRITICAL presence candidate — a battery about to die or
+        #    memory genuinely exhausted. Staying silent about that for the remainder of an
+        #    hour because a break was suggested at the top of it would be the cooldown
+        #    working correctly and the assistant failing anyway. `critical_only` builds two
+        #    candidates from already-sampled numbers, so the cheap path stays cheap.
+        critical_only = now - self._last_spoken_any < self.config.global_cooldown_s
+        if critical_only and self.presence is None:
             self._set_state(ProactiveState.COOLDOWN)
             self._maybe_flush(now)
             return
 
-        self._set_state(ProactiveState.OBSERVING)
+        self._set_state(ProactiveState.COOLDOWN if critical_only else ProactiveState.OBSERVING)
 
         # 4. Local candidate generation + scoring.
-        best = self.evaluate(now)
+        best = self.evaluate(now, critical_only=critical_only)
         if best is not None:
             self.stats["candidates"] += 1
             best.created_s = now
@@ -687,6 +748,11 @@ class ProactiveAgent:
     def _observe(self, now):
         """Samples the foreground window and maintains the continuous-focus stopwatch."""
         app = self._active_app()
+        # Forwarded unconditionally, INCLUDING the `None` case: a long run of "the foreground
+        # window cannot be read" is a locked or unattended machine, and that is the whole
+        # basis of presence's return detection. One sample, two readers, no extra polling.
+        if self.presence is not None:
+            self.presence.note_focus(app, now)
         if app is None:
             return
         if app != self.current_app:
@@ -704,10 +770,21 @@ class ProactiveAgent:
     #                       CANDIDATE ENGINE + SCORING
     # ──────────────────────────────────────────────────────────────────────
 
-    def evaluate(self, now=None):
+    def evaluate(self, now=None, critical_only=False):
         """
-        Builds candidates from the three signals, scores them locally, and returns the best
-        one that clears both the threshold and its cooldowns — or None.
+        Builds candidates from every signal, scores them locally, and returns the best one
+        that clears the threshold, its cooldowns and the presence gate — or None.
+
+        Two families of candidate meet here and they are scored differently on purpose:
+
+        * the ORIGINAL three (break, late-night, habit routine) are scored by `self.score()`
+          against the weighted four-signal model, unchanged, and gated by `_cooldown_ok`;
+        * PRESENCE candidates arrive pre-scored from their tier's arithmetic and gated by
+          `presence.should_speak()`, which adds the daily budget, the tier and group
+          cooldowns and the repetition check.
+
+        Both then pass through the same global cooldown and the same safety gate, so there
+        is still exactly one place unprompted speech is authorised.
 
         Pure and side-effect free apart from reading the habit store, which is what lets the
         test suite drive it directly with a fake clock.
@@ -715,29 +792,97 @@ class ProactiveAgent:
         now = self._clock() if now is None else now
         stamp = datetime.datetime.fromtimestamp(now)
 
-        candidates = []
-        for builder in (self._candidate_break, self._candidate_late_night,
-                        self._candidate_habit_routine):
-            try:
-                candidate = builder(now, stamp)
-            except Exception:
-                candidate = None
-            if candidate is not None:
-                candidates.append(candidate)
-
         scored = []
-        for candidate in candidates:
-            candidate.score = self.score(candidate)
-            if candidate.score < self.config.score_threshold:
-                continue
-            if not self._cooldown_ok(candidate, now):
-                continue
-            scored.append(candidate)
+
+        if not critical_only:
+            candidates = []
+            for builder in (self._candidate_break, self._candidate_late_night,
+                            self._candidate_habit_routine):
+                try:
+                    candidate = builder(now, stamp)
+                except Exception:
+                    candidate = None
+                if candidate is not None:
+                    candidates.append(candidate)
+
+            for candidate in candidates:
+                candidate.score = self.score(candidate)
+                if candidate.score < self.config.score_threshold:
+                    continue
+                if not self._cooldown_ok(candidate, now):
+                    continue
+                scored.append(candidate)
+
+        scored.extend(self._presence_candidates(now, critical_only))
 
         if not scored:
             return None
-        scored.sort(key=lambda c: c.score, reverse=True)
+        # Priority first, score second: an IMPORTANT observation outranks a higher-scoring
+        # AMBIENT remark, which is what "priority tier" has to mean to be worth having.
+        scored.sort(key=lambda c: (_priority_rank(c), c.score), reverse=True)
         return scored[0]
+
+    def _presence_candidates(self, now, critical_only=False):
+        """
+        Asks the presence layer for reasons to speak and applies both gates.
+
+        The agent's own global cooldown still applies to everything except a CRITICAL
+        candidate — presence can add reasons, but it cannot make the assistant talk more
+        often than the existing spacing allows.
+        """
+        if self.presence is None or not self.presence.enabled:
+            return []
+        try:
+            signals = self.presence.signals(
+                now=now,
+                focus_app=self.current_app,
+                focus_seconds=self.focus_seconds(now),
+                seconds_since_user=self.runtime.seconds_since_user_utterance(),
+                sleeping=bool(getattr(self.runtime, "sleeping", False)))
+            found = self.presence.candidates(signals, critical_only=critical_only)
+        except Exception as exc:                          # pragma: no cover - defensive
+            print_warning(f"Presence evaluation failed (non-fatal): {exc}")
+            return []
+
+        self._last_presence_signals = signals
+        accepted = []
+        for candidate in found:
+            # `PROACTIVE_LATE_NIGHT_ENABLED` is one setting read by both layers, so in
+            # production they always agree. This keeps them agreeing when one is overridden
+            # programmatically — the agent's switch wins, because it is the one the rest of
+            # the system and the test suite treat as authoritative.
+            if candidate.kind == "late_night" and not self.config.late_night_enabled:
+                self._note_suppressed("late night disabled")
+                continue
+            if not getattr(candidate, "bypass_global", False):
+                if now - self._last_spoken_any < self.config.global_cooldown_s:
+                    self._note_suppressed("cooldown")
+                    continue
+                if now - self._last_spoken_text.get(candidate.text, 0.0) < self.config.repeat_cooldown_s:
+                    self._note_suppressed("repeated wording")
+                    continue
+            ok, reason = self.presence.should_speak(candidate, now)
+            if not ok:
+                self._note_suppressed(reason)
+                continue
+            accepted.append(candidate)
+        return accepted
+
+    def _note_suppressed(self, reason):
+        """
+        Records a suppression and logs it at most once a minute per reason.
+
+        A quiet assistant should be explainable — but a line every three seconds while a
+        candidate waits for a safe window would bury the one line that mattered, so the rate
+        limit lives in the presence layer and this only prints what it releases.
+        """
+        if self.presence is None:
+            return
+        try:
+            if self.presence.note_suppressed(reason):
+                print_info(f"[PROACTIVE] suppressed: {reason}")
+        except Exception:
+            pass
 
     def score(self, candidate) -> float:
         """
@@ -795,8 +940,19 @@ class ProactiveAgent:
                          context={"app": self.current_app, "minutes": minutes})
 
     def _candidate_late_night(self, now, stamp):
-        """TIME: the user is still at the machine inside the configured late-night window."""
+        """
+        TIME: the user is still at the machine inside the configured late-night window.
+
+        Skipped entirely when the presence layer owns this kind — presence builds the same
+        situation with the context and the wording, and two candidates for one situation
+        would only compete for the same cooldown key.
+        """
+        # Order matters: the agent's own switch is consulted FIRST, so turning late-night
+        # awareness off here silences both layers rather than handing the kind to presence
+        # and switching off only the builder that was no longer going to run.
         if not self.config.late_night_enabled:
+            return None
+        if self.presence is not None and self.presence.owns_kind("late_night"):
             return None
         start, end = self.config.late_night_start, self.config.late_night_end
         hour = stamp.hour
@@ -899,6 +1055,12 @@ class ProactiveAgent:
         snap = self.runtime.snapshot()
         if snap["shutting_down"]:
             return False, "shutting down"
+        # Standby normally switches this whole service off (app.set_sleeping does exactly
+        # that), so this is belt and braces — but "unprompted speech while the user has asked
+        # for quiet" is bad enough that it is worth being certain about in the one place that
+        # authorises it, rather than trusting every caller to have remembered.
+        if snap.get("sleeping"):
+            return False, "standby"
         if snap["busy"]:
             # PROCESSING / SPEAKING / INTERRUPTING / AUTOMATING — a turn is in flight.
             return False, f"assistant {snap['state'].lower()}"
@@ -968,6 +1130,15 @@ class ProactiveAgent:
             self._prune_text_cooldowns(now)
             self._last_spoken_text[text] = now
             self.habits.record_suggestion(candidate.kind)
+            if self.presence is not None and isinstance(candidate, PresenceCandidateType):
+                # The presence ledgers (daily budget, tier/group spacing, recent wording,
+                # fired work-session milestones) are updated only on a line that ACTUALLY
+                # reached the speaker — a candidate dropped at the safety gate must not
+                # consume a day's budget or retire a milestone that was never mentioned.
+                try:
+                    self.presence.note_spoken(candidate, text, now)
+                except Exception:
+                    pass
             self._awaiting = {"kind": candidate.kind, "at": now,
                               "deadline": now + 300.0}
             print_system(f"[PROACTIVE] {text}")
@@ -993,7 +1164,30 @@ class ProactiveAgent:
         being spoken — the LLM only makes it sound less canned.
         """
         fallback = candidate.text
-        if not (self.config.llm_phrasing and self.phrase_fn):
+        if not self.phrase_fn:
+            return fallback
+
+        # A presence candidate carries its own realization contract, and that contract
+        # returns None for every kind where a model call is not worth the round-trip — a
+        # battery warning does not read better for having been rephrased, and a warning
+        # that depends on a cloud call is a worse warning. Zero LLM calls happen while
+        # DECIDING; this is the only point at which one can happen at all.
+        if self.presence is not None and isinstance(candidate, PresenceCandidateType):
+            prompt = None
+            try:
+                prompt = self.presence.llm_prompt(candidate, self._last_presence_signals)
+            except Exception:
+                prompt = None
+            if not prompt:
+                return fallback
+            try:
+                self.stats["llm_calls"] += 1
+                generated = self.phrase_fn(prompt, fallback)
+            except Exception:
+                return fallback
+            return _validate_phrasing(generated, fallback)
+
+        if not self.config.llm_phrasing:
             return fallback
 
         prompt = (
@@ -1022,13 +1216,32 @@ class ProactiveAgent:
             if event == "intent_classified":
                 self.note_intents(payload.get("tokens") or [])
                 self._react_to_user_text(payload.get("text") or "")
+                if self.presence is not None:
+                    self.presence.note_intents(payload.get("tokens") or [])
             elif event == "user_utterance":
                 self._react_to_user_text(payload.get("text") or "")
+                # ONE call per turn. Both `app.Main_Loop` and `ui.session` emit
+                # `user_utterance` and then `intent_classified` for the same turn, so
+                # counting interactions on the second one too would double every session
+                # length and every interaction count presence reasons about.
+                if self.presence is not None:
+                    self.presence.note_interaction()
+            elif event == "automation_result":
+                # Event-driven, not polled: the automation layer knows the moment an action
+                # failed, and that is the evidence anticipation is built on.
+                if self.presence is not None:
+                    self.presence.note_automation_result(
+                        int(payload.get("ok") or 0), int(payload.get("failed") or 0),
+                        payload.get("tokens") or [])
+                    if payload.get("failed"):
+                        self._wake_event.set()
             elif event == "barge_in":
                 if self._awaiting is not None:
                     self._record_outcome("interrupted")
                 # A candidate waiting to speak has just been overtaken by the user.
                 self._pending = None
+                if self.presence is not None:
+                    self.presence.note_barge_in()
         except Exception:
             pass
 
@@ -1089,12 +1302,33 @@ class ProactiveAgent:
             "pending": self._pending.kind if self._pending else None,
             "awaiting_outcome": self._awaiting["kind"] if self._awaiting else None,
             "stats": dict(self.stats),
+            "presence": self.presence.describe() if self.presence is not None else None,
         }
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                          SMALL PURE HELPERS                            │
 # └────────────────────────────────────────────────────────────────────────┘
+
+# Presence candidates are told apart from the original ones by TYPE, not by a flag on the
+# object: a flag can be forgotten on a new candidate builder, and a missing type cannot.
+# When presence is unavailable the sentinel matches nothing, so every branch guarded by it
+# is simply never taken.
+try:
+    from kayra.intelligence.proactive_presence import PresenceCandidate as PresenceCandidateType
+except Exception:                                        # pragma: no cover - defensive
+    class PresenceCandidateType:                         # noqa: D401 - sentinel
+        """Never instantiated; exists so `isinstance` is always answerable."""
+
+
+# Tier ordering for the merge in `evaluate`. Legacy candidates have no tier and rank with
+# SOCIAL, which is what they have always effectively been.
+_PRIORITY_RANK = {"ambient": 0, "social": 1, "important": 2, "critical": 3}
+
+
+def _priority_rank(candidate):
+    return _PRIORITY_RANK.get(getattr(candidate, "tier", "social"), 1)
+
 
 def _clamp(value, low=0.0, high=1.0):
     try:

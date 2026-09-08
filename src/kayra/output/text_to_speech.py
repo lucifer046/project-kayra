@@ -37,6 +37,7 @@ from kokoro_onnx import Kokoro
 from kayra.output import tts_device
 from kayra.core.config import env_values
 from kayra.core.paths import model_path as model_file
+from kayra.core import logbus
 from kayra.utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
 
 
@@ -188,13 +189,18 @@ class DynamicVoiceEngine:
         self._voices_path = voices_path
         self.onnx = KokoroOnnx(model_path, voices_path, device_mode=self.device_mode)
         self.device_status = self.onnx.device_status
+        # The provider and device are stated ONCE, by the startup report in `app`, which
+        # reads the same `device_status` this line does. The full provider list, the model
+        # and the selection reasoning are genuine diagnostics rather than headline facts, so
+        # they move to DEBUG rather than being printed twice at INFO.
         for line in tts_device.diagnostics(self.device_status):
-            print_info(f"[TTS] {line}")
+            logbus.debug(logbus.Subsystem.TTS, line)
         if self.device_status.fallback:
             # An explicit GPU request that did not happen is stated LOUDLY, once, at boot. A
             # silent downgrade under an explicit request is the one outcome this whole
-            # subsystem exists to make impossible.
-            print_warning(f"[TTS] {self.device_status.reason}")
+            # subsystem exists to make impossible — so this stays at WARNING, where the
+            # startup report also repeats it.
+            logbus.warning(logbus.Subsystem.TTS, self.device_status.reason)
 
         self.sample_rate = SAMPLE_RATE
         self.last_spoken_text = ""

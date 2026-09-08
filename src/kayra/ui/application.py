@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from kayra.ui import theme
-from kayra.ui.theme import Color, Space, Size, Motion, STATE_LABELS
+from kayra.ui.theme import Color, Space, Size, Motion
 from kayra.ui.bridge import KayraBridge
 from kayra.ui.components.navigation import Sidebar
 from kayra.ui.components.orb import AssistantOrb, OrbBadge
@@ -148,8 +148,13 @@ class AmbientAssistant(QWidget):
         self._dragged = False
         self._listening = True
 
-        bridge.stateChanged.connect(self._on_state)
-        bridge.listeningChanged.connect(self._on_listening)
+        # The ambient panel is often the ONLY thing on screen, so it is the surface where a
+        # wrong caption costs the most — and it was the clearest instance of the bug: it wrote
+        # its label from `listeningChanged` and then refused to update it from `stateChanged`
+        # while `_listening` was false, so a single stale boolean could pin "Listening paused"
+        # on screen indefinitely. It now renders the resolved state and holds no flag.
+        self._voice_revision = -1
+        bridge.voiceStateChanged.connect(self._on_voice_state)
         bridge.assistantMessage.connect(self._on_said)
         self.orb.clicked.connect(self.request_open)
 
@@ -175,28 +180,41 @@ class AmbientAssistant(QWidget):
     #                              STATE
     # ──────────────────────────────────────────────────────────────────
 
-    def _on_state(self, state, previous):
-        self.orb.set_state(state)
-        if not self._listening:
-            return                      # the paused label wins; see `_on_listening`
-        self.state_label.setText(STATE_LABELS.get(state, state.title()))
-        if state == "LISTENING":
-            self.detail_label.setText("Listening")
-        elif state == "IDLE":
-            self.detail_label.setText("Say something, or click to open")
+    def _on_voice_state(self, state, text, detail, revision):
+        """Renders the resolved voice state, dropping anything a newer transition has overtaken."""
+        if revision <= self._voice_revision:
+            return
+        self._voice_revision = revision
+        self._voice_state = state
 
-    def _on_listening(self, listening):
-        self._listening = bool(listening)
-        if listening:
-            self._on_state(self.bridge.state(), "")
-        else:
-            # The ambient panel is often the only thing on screen, so it has to carry the one
-            # fact that changes what the user can do: Kayra cannot hear them.
-            self.state_label.setText("Listening paused")
+        from kayra.core.voice_state import ORB_STATE, ORB_AMPLITUDE, VoiceState
+
+        self.orb.set_state(ORB_STATE.get(state, "IDLE"), ORB_AMPLITUDE.get(state))
+        self.state_label.setText(text)
+        if state == VoiceState.PAUSED:
             self.detail_label.setText("Click to open and start listening")
+        else:
+            self.detail_label.setText(detail or "")
+
+    def _sync_voice(self):
+        snapshot = self.bridge.voice_runtime_state() or {}
+        if snapshot:
+            self._on_voice_state(snapshot.get("state", "OFFLINE"), snapshot.get("text", ""),
+                                 snapshot.get("detail", ""), int(snapshot.get("revision", 0)))
 
     def _on_said(self, text):
-        if not self._listening:
+        """
+        Shows the last thing Kayra said, but never over a state that matters more.
+
+        A spoken sentence is the LEAST important thing this panel can show: a paused
+        microphone, a reconnecting session or a shutdown in progress all change what the user
+        can do, and a leftover sentence sitting where that line should be is how the panel
+        came to look correct while being wrong.
+        """
+        from kayra.core.voice_state import VoiceState
+        if getattr(self, "_voice_state", None) in (VoiceState.PAUSED, VoiceState.STANDBY,
+                                                   VoiceState.RECOVERING, VoiceState.STOPPING,
+                                                   VoiceState.ERROR, VoiceState.OFFLINE):
             return
         self.detail_label.setText(text if len(text) < 46 else text[:43].rstrip() + "…")
 
@@ -321,8 +339,9 @@ class KayraWindow(QMainWindow):
         self.navigate_to("home")
         self.sidebar.select("home")
 
+        self._voice_revision = -1
         bridge.stateChanged.connect(self._on_state)
-        bridge.listeningChanged.connect(self.sidebar.set_listening)
+        bridge.voiceStateChanged.connect(self._on_voice_state)
         bridge.bootStage.connect(lambda name: self.sidebar.set_state("STARTING", name))
         bridge.bootFinished.connect(self._on_boot_finished)
 
@@ -375,8 +394,21 @@ class KayraWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────────────
 
     def _on_state(self, state, previous):
-        self.sidebar.set_state(state, self._detail_for(state))
+        """
+        The window ICON follows the assistant's work — a separate fact from the microphone.
+
+        The taskbar icon is about "is Kayra busy", which is exactly what `AssistantState`
+        means, so this stays connected to `stateChanged`. The sidebar's words come from the
+        voice state instead; the two are different questions and used to be answered from one
+        value, which is why the sidebar could say "Idle" beside an orb that was reconnecting.
+        """
         self.setWindowIcon(_app_icon(state))
+
+    def _on_voice_state(self, state, text, detail, revision):
+        if revision <= self._voice_revision:
+            return
+        self._voice_revision = revision
+        self.sidebar.set_voice(state, text, detail)
 
     def _detail_for(self, state):
         if state == "IDLE":
@@ -391,8 +423,13 @@ class KayraWindow(QMainWindow):
 
     def _on_boot_finished(self, ok, detail):
         if ok:
-            self.sidebar.set_state(self.bridge.state(), detail)
-            self.sidebar.set_listening(self.bridge.listening_enabled())
+            snapshot = self.bridge.voice_runtime_state() or {}
+            if snapshot:
+                self._on_voice_state(snapshot.get("state", "OFFLINE"),
+                                     snapshot.get("text", ""), detail or snapshot.get("detail", ""),
+                                     int(snapshot.get("revision", 0)))
+            else:
+                self.sidebar.set_state(self.bridge.state(), detail)
         else:
             self.sidebar.set_state("ERROR", "Startup failed")
 
@@ -543,17 +580,15 @@ def _build_tray(app, window, ambient, bridge):
         lambda reason: window.show_control_centre()
         if reason == QSystemTrayIcon.Trigger else None)
 
-    def _tray_status(state):
-        label = STATE_LABELS.get(state, state)
-        if not bridge.listening_enabled():
-            return f"Kayra — {label} · listening paused"
-        return f"Kayra — {label}"
-
+    # The tooltip is the resolved voice state, verbatim. It used to be composed from the
+    # assistant state plus a `listening_enabled()` read, which is the same two-fact
+    # composition that produced "Idle · listening paused" while an STT session was
+    # reconnecting. The ICON still follows the assistant state, because a taskbar icon is
+    # about whether Kayra is busy — a different question with a different answer.
     bridge.stateChanged.connect(
-        lambda state, previous: (tray.setIcon(_app_icon(state)),
-                                 tray.setToolTip(_tray_status(state))))
-    bridge.listeningChanged.connect(
-        lambda listening: tray.setToolTip(_tray_status(bridge.state())))
+        lambda state, previous: tray.setIcon(_app_icon(state)))
+    bridge.voiceStateChanged.connect(
+        lambda state, text, detail, revision: tray.setToolTip(f"Kayra — {text}"))
     tray.show()
     window.tray = tray
     return tray

@@ -24,6 +24,7 @@
 6. [Input architecture](#6-input-architecture)
 7. [Emotion engine](#7-emotion-engine)
 8. [Decision-Making Model](#8-decision-making-model-dmm)
+8b. [Model provider routing and failover](#8b-model-provider-routing-and-failover)
 9. [Context system](#9-context-system)
 10. [Chatbot](#10-chatbot)
 11. [Real-time search](#11-real-time-search)
@@ -31,13 +32,16 @@
 13. [Automation architecture](#13-automation-architecture)
 14. [Automation safety](#14-automation-safety)
 15. [Browser / STT Chrome lifecycle](#15-browser--stt-chrome-lifecycle)
+15b. [Live speech-backend switching](#15b-live-speech-backend-switching)
 16. [TTS architecture](#16-tts-architecture)
 16b. [TTS device selection (AUTO / GPU / CPU)](#16b-tts-device-selection)
 17. [Barge-in and the local control layer](#17-barge-in-and-the-local-control-layer)
 18. [Self-echo protection](#18-self-echo-protection)
 19. [Proactive agent](#19-proactive-agent)
 20. [Memory](#20-memory)
+20b. [Memory management](#20b-memory-management)
 21. [Runtime state](#21-runtime-state)
+21b. [Voice state and the assistant visual](#21b-voice-state-and-the-assistant-visual)
 22. [Logging](#22-logging)
 23. [Configuration](#23-configuration)
 24. [Startup](#24-startup)
@@ -573,6 +577,94 @@ API clients per boot.
 
 ---
 
+## 8b. Model provider routing and failover
+
+`src/kayra/intelligence/provider_router.py` is the ONE authority for which provider serves a
+request and what happens when it does not.
+
+### Two hierarchies, deliberately different
+
+```
+DECISION (the DMM)   Cohere  ->  Groq  ->  Gemini
+CHAT                 Groq    ->  Gemini
+```
+
+Cohere leads DECISION because the DMM's few-shot token contract was written and measured
+against Command-R. It is not a conversational model for this assistant and appears nowhere in
+the CHAT chain. Groq leads CHAT because it produces the fastest first token here; it is the
+DMM's first FALLBACK rather than its primary because the intent-boundary matrix was tuned
+against Cohere. Both orders live in one constant (`ROUTE_CHAINS`) rather than being implied by
+the ordering of `if` statements in two functions.
+
+Local-first is unchanged and absolute: with an LM Studio / Ollama server up, all traffic goes
+there and the router is not consulted.
+
+### What it replaced, and why it is one module
+
+Fallback used to be invented independently in two places inside `llm_engine.py`:
+
+* `classify_intent` had ONE provider and no fallback at all. A rate limit was answered with
+  `sleep(5)`, `sleep(10)`, `sleep(15)` and then a degrade to conversation — thirty seconds of
+  blocked user, ending in the assistant not doing what was asked, on a machine where two other
+  configured providers sat idle.
+* `generate_chat_stream` had a two-provider chain with its own private string-matching notion
+  of a quota error and no memory: the NEXT request hit the rate-limited provider again, and the
+  one after that, forever.
+
+**When two layers each retry, one user request becomes four provider calls** — which on a
+rate-limited key is precisely the wrong response to a rate limit. That is a correctness
+property, not tidiness, and it is why there is exactly one authority.
+
+### Classification
+
+| Kind | Falls through? | Default cooldown | Why |
+|---|---|---|---|
+| `RATE_LIMITED` | yes | 60s | temporary; the provider is otherwise healthy |
+| `AUTH_FAILURE` | yes | 900s | another key may be fine, but nothing fixes a wrong one soon |
+| `NETWORK_FAILURE` | yes | 30s | transient |
+| `TIMEOUT` | yes | 30s | bounded, then somebody else gets a turn |
+| `SERVER_ERROR` | yes | 60s | their problem, not ours |
+| `MODEL_UNAVAILABLE` | yes | 300s | a decommissioned model id will not come back |
+| `INVALID_REQUEST` | **no** | 0s | the request was wrong, the provider was not |
+| `UNKNOWN` | yes | 20s | short: standing a provider down over a mystery is worse |
+
+A provider-supplied `Retry-After` always wins over the configured default. Verified live: Groq
+returned `Retry-After: 6` under load and was skipped for 6s rather than 60s.
+
+### Execution
+
+Sequential, never concurrent, and **at most one call per provider per request** — the property
+that makes "no duplicate calls" true rather than hoped for. Racing providers would spend three
+quotas to answer one question and would make a rate limit worse.
+
+Streaming may only fall back BEFORE the first chunk. Once a token has reached the user,
+switching providers would splice two answers into one sentence; a mid-stream failure is
+terminal for that request, and the provider is still stood down so the NEXT request routes
+elsewhere.
+
+### `max_retries=0`
+
+The OpenAI SDK retries twice by default with its own backoff — a SECOND retry authority
+underneath the router. Measured live before the change: a single Groq DMM call took **9.9s**
+and then **24.0s**. After setting `max_retries=0` and a bounded `PROVIDER_TIMEOUT_SECONDS`,
+every call in the same test completed in 1.7-2.0s and the full Cohere -> Groq -> Gemini chain
+in 2.03s.
+
+### Measured, live, against the developer's real (rate-limited) Cohere key
+
+```
+[DMM] Provider: Cohere (command-r-plus-08-2024)
+[DMM] Result: RATE_LIMITED from Cohere, cooling down 60s
+[DMM] Fallback: Groq (openai/gpt-oss-120b)
+[DMM] Result: SUCCESS via Groq (openai/gpt-oss-120b)
+   -> ['open youtube']   (708ms)
+```
+
+Twenty consecutive requests against a rate-limited provider produce **one** call to it, not
+twenty. The DMM's cooldown does not affect the CHAT chain, and vice versa.
+
+---
+
 ## 9. Context system
 
 Two distinct things carry context, and they are deliberately separate.
@@ -975,6 +1067,72 @@ Do not reintroduce name matching, and never `taskkill /IM chrome.exe`.
 
 Measured on one host: **10 processes / 541 MB before, 9 / 472 MB after** the Chrome flag work.
 The flags in `_chrome_options` were chosen by measuring each set, not copied from a list.
+
+---
+
+## 15b. Live speech-backend switching
+
+`src/kayra/input/stt_backend.py`.
+
+`STT_BROWSER` was a `.env` value read once, in `SpeechToTextEngine.__init__`. Choosing a
+browser in Settings wrote a string to a file and did nothing else: the live session kept
+running on whatever it started with and the screen showed the new value. **A setting that
+changes only a screen is not a setting.**
+
+### Requested is not active
+
+```
+requested_backend   what the user asked for      "chrome"
+active_backend      what is running right now    "edge", or None
+status              OFF | STARTING | LISTENING | PAUSED | RECOVERING | STOPPING | ERROR
+```
+
+Equal on the happy path, DIFFERENT whenever a switch failed. Settings renders both lines and
+the pill reads `Not applied` rather than `Ready` when they disagree. `auto` matches any active
+backend by definition — automatic means "whichever one works".
+
+### The transaction
+
+```
+record the request -> stop the old session -> start the requested one ->
+verify it can transcribe -> publish -> log -> commit to .env
+```
+
+`.env` is written ONLY on success. An explicit choice uses `_start_session(strict=True)`, which
+restricts the attempt to the named browser — with the ordinary candidate list, choosing Chrome
+on a machine where Chrome cannot reach a backend would quietly bring up Edge and report
+success. `auto` never uses strict mode, so the capability logic in section 15 is unchanged.
+
+A failed switch restores the previous backend (a wrong setting must not leave Kayra deaf) and
+reports the failure. Teardown precedes the rebuild and waits for the owned PIDs to go, the same
+order `recover()` uses — two live sessions would mean two browsers holding the microphone.
+Only PIDs the engine recorded are reaped, so a switch cannot touch the user's browser.
+
+A request arriving mid-switch is REFUSED rather than queued; the user's latest choice is still
+recorded as `requested`.
+
+### The engine lookup must never import the STT module
+
+`_engine()` reads `SpeechToTextEngine._active_instance` out of `sys.modules` by STRING — the
+same technique and reasoning as `automation.targets.kayra_owned_pids`. A settings screen asking
+"which backend is active?" must not boot a headless browser as a side effect. Because the
+lookup is by string, a module rename turns the property off SILENTLY; `ENGINE_MODULES` pins the
+path and the test suite asserts it against the live module.
+
+### Measured, live
+
+| Switch | Result | Time | Leaked | User's browsers |
+|---|---|---|---|---|
+| -> Microsoft Edge | committed | 10.3s (first) | none | 16/16 alive |
+| -> Google Chrome | committed | 3.6s | none | 16/16 alive |
+| -> Microsoft Edge | committed | 3.6s | none | 16/16 alive |
+| -> Automatic | committed (Edge) | 3.6s | none | 16/16 alive |
+| -> Google Chrome | committed | 3.5s | none | 16/16 alive |
+| -> Vivaldi (absent) | **not committed**, still Chrome | 9.7s | none | 16/16 alive |
+| -> Edge, while paused | committed, still paused | 3.6s | none | 16/16 alive |
+
+Shutdown afterwards: 8/8 Kayra-owned processes reaped, 0 survivors, 16/16 of the user's own
+browser processes untouched.
 
 ---
 
@@ -1524,6 +1682,55 @@ deliberately holds no conversational content.
 
 ---
 
+## 20b. Memory management
+
+`src/kayra/memory/store.py` is the management surface over section 20's persistence.
+`memory/conversation.py` stays the only owner of the file and of the atomic write; there is no
+second store.
+
+### Stable identity
+
+The Memory screen previously deleted **by position** — the row's index into the last thirty
+entries. The store is appended to by the running assistant, so the entry at index 4 when the
+screen rendered is not necessarily the entry at index 4 when the button is clicked, and
+deleting the wrong memory has no undo.
+
+Every record now carries an `id`: a short content-derived hash, written INTO the record on
+first sight and persisted with it. Content-derived so a rebuilt store yields the same ids;
+persisted so a later edit cannot orphan one the UI is holding; disambiguated by an occurrence
+ordinal so two identical memories stay two deletable things. The migration is additive — no
+field removed or renamed, `role`/`content` untouched — and a non-dict entry from an older build
+is wrapped rather than dropped.
+
+### The operations
+
+| | |
+|---|---|
+| `list_memories(limit, newest_first)` | migrates ids in, persists once, returns id/role/content/preview |
+| `delete_memory(id)` | re-reads the store, removes that id, verifies the write |
+| `clear_all_memories()` | writes an empty list; returns the count removed |
+| `describe_store()` | path, backup path, existence, size, count |
+| `open_memory_location()` | reveals the file in Explorer |
+| `report_loaded()` | the boot line: path and count |
+
+### The rules
+
+* **Delete re-reads the store**, never trusting what the screen holds.
+* **Persistence is verified before anything is reported as gone.** A failed write returns False
+  and the UI leaves the row where it is.
+* **"Clear all" writes an empty list and never removes a file.** The test suite walks the AST
+  for `remove` / `unlink` / `rmtree` / `rmdir` / `truncate` and asserts none exist.
+* **Explorer is launched with an argument VECTOR and `shell=False`** —
+  `["explorer.exe", "/select,<path>"]`, one argument, as Explorer requires. No `os.system`, no
+  `cmd /c`, no `powershell`, never a concatenated string. A missing file opens the parent
+  folder, because `/select` on a missing path opens Documents. Explorer's exit code is not
+  treated as failure (it routinely returns 1 having worked); a failure to LAUNCH is reported
+  with the exact path so the user can navigate by hand.
+* **Logs carry counts and ids, never content.** This is by construction the most sensitive text
+  in the process.
+
+---
+
 ## 21. Runtime state
 
 `core/runtime_state.py`. The assistant's state machine plus a minimal synchronous event bus, a
@@ -1553,16 +1760,182 @@ client and must never import them — which is what makes it safe for anything t
 
 ---
 
+## 21b. Voice state and the assistant visual
+
+`src/kayra/core/voice_state.py`.
+
+The assistant visual said **"Listening paused" while the user was talking to it.** Not because
+any label was wrong, but because four surfaces each wrote it from a different subset of the
+truth and the screen showed whichever wrote last.
+
+`RuntimeState` (section 21) answers "what is the assistant DOING?". `ConversationContext`
+answers "what is it ABOUT?". This answers "what should the user be told about the microphone
+right now?" — a third question, with a third set of inputs.
+
+### Facts in, one state out
+
+Eleven states: `OFFLINE`, `STARTING`, `LISTENING`, `USER_SPEAKING`, `PROCESSING`,
+`ASSISTANT_SPEAKING`, `PAUSED`, `STANDBY`, `RECOVERING`, `STOPPING`, `ERROR`.
+
+The precedence, and the reason for each step:
+
+1. **Shutdown** — the only irreversible thing here.
+2. **Standby** over the turn machine — a sleeping Kayra may still be draining a sentence.
+3. **The TURN over the SESSION** — if the STT session drops mid-reply, the user is waiting on
+   the reply, not on the microphone.
+4. **A barge-in is `USER_SPEAKING`** — the user needs to know they have the floor.
+5. **Session trouble ABOVE the pause check** — a recovery reads "Reconnecting…", never a pause.
+6. **`PAUSED` requires a deliberately closed microphone.** Nothing else reaches it.
+7. The rest is `LISTENING`, with VAD choosing `LISTENING` or `USER_SPEAKING`.
+
+**Silence is still listening.** There is no `transcript`, `silence` or `timeout` input to the
+machine at all, so it is structurally incapable of turning a late result into a pause.
+
+### Revisions
+
+Every committed transition carries a monotonic revision. A Qt callback arriving late carries a
+revision no greater than the one already rendered and is dropped. Every consuming view keeps
+`_voice_revision` and returns early — this is what makes "the newest state wins" true
+regardless of arrival order.
+
+### Debounce
+
+`USER_SPEAKING` 260ms, `RECOVERING` 400ms, `STARTING` 250ms — enough to absorb one noisy
+sample, never enough to feel sluggish. `IMMEDIATE_STATES` exempts everything the user just did
+and everything the assistant is now doing for them, so only a fall back to a resting state can
+ever be delayed.
+
+### Absorbing shutdown
+
+Once `shutting_down` is observed the machine latches to `STOPPING`/`OFFLINE`. The latch is on
+the OBSERVATION, not the state's identity — `OFFLINE` is also where the machine starts, and
+treating it as absorbing unconditionally makes it unable to boot.
+
+### Where the facts come from
+
+`app.py` is the only feeder, because it is the only thing that sees every fact. VAD costs
+nothing extra: `poll_controls` reads `window.kayraVad.voice` in the same round-trip it already
+uses for the interrupt flags. One transition log, at INFO, in one place.
+
+### The boot window
+
+`KayraWindow.__init__` builds every view and shows Home **before** `KayraSession` boots.
+Anything painted in that window is painted with no backend behind it.
+
+That produced a second, separate reported bug: the microphone button read **"Start listening"
+beside an orb that was listening**, and repaired itself only after the user toggled listening
+off and on. Three things lined up:
+
+1. `KayraSession.listening_enabled()` answered `False` when `self._runtime is None` — an
+   absence of information reported as a negative fact.
+2. Home painted the control from it during the boot window.
+3. `RuntimeState._listening` starts `True` and never changes, so `set_listening` correctly
+   never emits `listening_changed`. **There was no event to correct the label with.**
+
+**The general rule: a screen constructed before the backend is ready must re-read when it
+becomes ready.** `bootFinished` is that signal.
+
+The fix is in three parts, because any one alone leaves the bug reachable:
+
+| | |
+|---|---|
+| honesty at the source | `listening_enabled()` returns the runtime's own starting value rather than claiming the microphone is closed; `listening_known()` says whether it is a measurement |
+| one read | `voice_runtime_state()` carries `listening` and `listening_known`, so the caption, the orb and the control come from a single snapshot |
+| re-read | `bootFinished` re-syncs Home and Chat; while unknown the control is DISABLED rather than guessed at, which is also the truth about what it can do (`set_listening` returns False with no session) |
+
+Verified against the real backend: sampled once a second across a 9-second boot, the button
+read "Pause listening" throughout, agreed with the microphone at the end, and got there with
+**zero** `listeningChanged` events.
+
+### Verified live
+
+```
+LISTENING -> USER_SPEAKING -> LISTENING -> PROCESSING -> ASSISTANT_SPEAKING
+          -> USER_SPEAKING (barge-in) -> PROCESSING -> LISTENING
+LISTENING -> RECOVERING -> LISTENING            (never PAUSED)
+LISTENING -> PAUSED -> LISTENING
+LISTENING -> STANDBY -> LISTENING
+ANY       -> STOPPING -> OFFLINE                (absorbing)
+```
+
+0.6s of silence with the microphone open: **zero transitions**.
+
+Two ordering defects were found by the live boot test rather than by the unit tests, and both
+are documented in `CLAUDE.md`: `barge_in` must not latch "the user is speaking" (standby and
+shutdown emit it too), and `set_sleeping` must silence AFTER setting the standby flag.
+
+---
+
 ## 22. Logging
 
-- Console output goes through the Rich-themed helpers in `utils/console.py`: `print_info`,
-  `print_success`, `print_warning`, `print_error`, `print_system`, `print_banner`,
-  `print_section`, `safe_print`. **Not bare `print()`.**
+### The format
+
+```
+[21:48:03] [INFO   ] [STT] Backend: Google Chrome
+[21:52:14] [INFO   ] [AUTO] Turn #184 · Target: YouTube
+```
+
+A timestamp, a level, a canonical subsystem tag, the message. `core/logbus.py` owns it and
+renders through `utils/console.py`'s `safe_print`, so there is still exactly one Console object
+and one place that copes with a terminal closed underneath the process.
+
+Subsystems: `BOOT`, `STT`, `VOICE`, `DMM`, `LLM`, `CHAT`, `SEARCH`, `RESEARCH`, `AUTO`, `TTS`,
+`PROACTIVE`, `PRESENCE`, `MEMORY`, `SETTINGS`, `UI`, `GPU`, `SYSTEM`, `SHUTDOWN`. **One name per
+subsystem** — `[STT]`, never `[Speech input]` / `[Speech]` / `[Recognizer]` in three places.
+The test suite walks the AST for any literal string passed as a subsystem.
+
+### One owner per event
+
+The layer that PERFORMS an action logs it; the layers above it do not log it again.
+
+| Event | Owner |
+|---|---|
+| provider attempt / fallback / result | `intelligence/provider_router.py` |
+| speech-backend transition, session recovery | `input/stt_backend.py` |
+| setting change (requested / committed / failed) | `core/settings_log.py` |
+| voice state transition | `app.py` |
+| memory delete / clear / load | `memory/store.py` |
+
+No UI module imports the logger at all. Three real duplicates were removed while this was
+built: the provider block printed by both `run_boot_sequence` and the startup report, the
+AEC/microphone line printed by both `_report_audio_pipeline` and the startup report, and the
+TTS provider printed by both `text_to_speech` and the startup report.
+
+### Levels
+
+`DEBUG` / `INFO` / `SUCCESS` / `WARNING` / `ERROR`. `SUCCESS` is its own word but the same
+threshold as `INFO`. The console threshold is `KAYRA_LOG_LEVEL` (default `INFO`), read from the
+process environment first so one run can be made verbose without editing anything.
+
+DEBUG carries interim transcripts, VAD levels, provider exception text, presence scores,
+dropped stale UI revisions and the tracebacks of expected recoverable failures. **Nothing is
+hidden at INFO — it is moved.** A rate limit prints `Result: RATE_LIMITED` and `Fallback: Groq`
+rather than a provider stack trace; the stack trace is still there at DEBUG.
+
+### Secrets
+
+`redact()` runs on every message, including ones logbus did not compose — an SDK error echoing
+the key it was handed is exactly the case a call site would not think to guard. It rewrites
+values whose NAME identifies them as a credential plus a few unmistakable provider key shapes,
+and nothing else: over-redacting makes a real failure undebuggable. Memory content is never
+logged; deletions log an id and clears log a count.
+
+### Third-party output
+
+`quiet_third_party()` raises urllib3, Selenium, httpx, the provider SDKs and friends to
+`WARNING` — never to `ERROR`, never disabled. A real failure in any of them still reaches the
+terminal; what is suppressed is urllib3 announcing every WebDriver connection at 17Hz while the
+control watcher polls. **ONNX Runtime is deliberately untouched**: its provider warnings are the
+evidence for the GPU account section 16b gives.
+
+### Still true
+
 - `setup_logger(name, log_filename)` writes into `logs/`, resolved through `core/paths.py`.
 - `logs/automation.log` holds the automation audit trail; the in-memory ring keeps the last 200
   decisions.
 - `StageTimer` (`utils/timing.py`) records boot stages and prints the breakdown every run.
-- Secrets are never logged. `setup.py` reports keys only as SET / MISSING.
+- `setup.py` reports keys only as SET / MISSING.
+- `KAYRA_LOG_FILE=True` adds a rotating 2 MB × 3 DEBUG file at `logs/kayra-debug.log`.
 
 ---
 
@@ -2000,15 +2373,25 @@ project-kayra/
 │       ├── core/               ← imports nothing from the rest of the package
 │       │   ├── paths.py        ← THE single source of truth for filesystem locations
 │       │   ├── config.py       ← one cached parse of .env
+│       │   ├── logbus.py       ← THE structured log format + redaction (leaf: stdlib+paths)
+│       │   ├── settings_log.py ← THE one place a setting change is announced and committed
 │       │   ├── runtime_state.py← state machine + event bus (singleton)
+│       │   ├── voice_state.py  ← THE authoritative voice presence + revisions (singleton)
+│       │   ├── conversation_context.py
+│       │   ├── system_profile.py
 │       │   └── voice_control.py← the local control vocabulary (pre-DMM, offline)
 │       │
 │       ├── intelligence/
-│       │   ├── llm_engine.py   ← routing, DMM, chat streaming (singleton)
+│       │   ├── llm_engine.py   ← model selection, DMM, chat streaming (singleton)
+│       │   ├── provider_router.py ← THE provider hierarchy, failover and cooldowns
+│       │   ├── proactive_presence.py
 │       │   └── emotion_engine.py
 │       │
 │       ├── input/
 │       │   ├── speech_to_text.py
+│       │   ├── stt_backend.py  ← requested-vs-active backend + the live switch
+│       │   ├── transcript_repair.py
+│       │   ├── browsers.py     ← discovery and capability priors
 │       │   └── gesture.py      ← standalone; not in the main loop
 │       │
 │       ├── output/
@@ -2027,7 +2410,8 @@ project-kayra/
 │       │   └── proactive_agent.py
 │       │
 │       ├── memory/
-│       │   └── conversation.py ← the only durable conversational state
+│       │   ├── conversation.py ← the only durable conversational state, and its only writer
+│       │   └── store.py        ← management: stable ids, delete, clear, locate, reveal
 │       │
 │       └── utils/
 │           ├── __init__.py     ← flat façade re-exporting the three below
@@ -2173,17 +2557,50 @@ Run these first; they need no audio, no browser and no network.
 | Suite | Covers | Result this session |
 |---|---|---|
 | `test_automation.py` | normalizer table, DMM token coverage, DENY/CONFIRM/ALLOW policy, confirmation binding, target resolution and ambiguity, context referents, planner ordering, filesystem, timers, audit log, AST assertions (no `shell=True`, no name-based kill, no LLM on the exec path), performance | **261 passed, 0 failed** |
-| `test_proactive_agent.py` | state model, safety gate, deferral, scoring, cooldowns, habits, reaction learning, LLM-failure fallback, TTS routing, shutdown, barge-in phrase regressions | **140 passed, 0 failed** |
+| `test_proactive_agent.py` | state model, safety gate, deferral, scoring, cooldowns, habits, reaction learning, LLM-failure fallback, TTS routing, shutdown, barge-in phrase regressions. Pins a healthy host — see the host-isolation note below | **140 passed, 0 failed** |
 | `test_emotion_engine.py` | eight states, false positives, third person, negation, ambiguity, malformed input, thread-safety, repeated calls, memory growth, performance, integration contract | **119 passed, 0 failed** |
 | `test_browser_selection.py` | capability priors, candidate ordering, cache asymmetry, page-side dead-backend detection, probe budget, browser-switch path, engine integration | **64 passed, 0 failed** |
 | `test_target_resolution.py` | the website registry, open-target typing, single-target close, strict-vs-loose matching, close/tab semantics, AST proof that no call site fuzzy-matches, STT protection, resolution performance budget | **108 passed, 0 failed** |
-| `test_ui.py` | theme, components, views, state reflection, boundary discipline (AST), refinement regressions, interaction, the shutdown button, the TTS device card, and Home's Graphics card (GPU present / GPU absent / telemetry pending / speech on CPU while a GPU exists / three-card layout fits) | **322 passed, 0 failed** (Qt `offscreen`, backend fully stubbed) |
+| `test_ui.py` | theme, components, views, state reflection, boundary discipline (AST), refinement regressions, interaction, the shutdown button, the TTS device card, Home's Graphics card, the speech-input card's requested-vs-active rendering, memory management by id, the boot-window contract (a screen built before the backend must not paint a guessed microphone state, and must re-read at `bootFinished` with no `listeningChanged` event), and a whole-run proof that the suite did not modify the developer's `.env` | **416 passed, 0 failed** (Qt `offscreen`, backend fully stubbed) |
 | `test_voice_control.py` | interrupt / lifecycle vocabulary, the Kayra-vs-computer shutdown boundary, tail matching, the JS/Python vocabulary agreement, control dispatch, the three runtime axes, shutdown ORDER and idempotency against a stubbed backend with `os._exit` replaced, classification cost | **186 passed, 0 failed** |
 | `test_tts_device.py` | ORT variant sanity and the package-name/import-name distinction, CUDA DLL preparation, the real cached provider probe, mode validation, provider planning with TensorRT excluded, failure modes simulated by substituting the provider list, the structured diagnostic, a real Kokoro session in every mode plus a real runtime switch, telemetry cost | **143 passed, 0 failed** |
-| `test_environment.py` | `run.py` interpreter ownership and the sys.path rule (AST), a real refusal to run on the system interpreter, import origin, the single-ORT-import rule, `setup.py` provisioning / pins / repair, and agreement between setup's CUDA probe and the application's | **56 passed, 0 failed** |
+| `test_environment.py` | `run.py` interpreter ownership and the sys.path rule (AST), a real refusal to run on the system interpreter, import origin, the single-ORT-import rule, `setup.py` provisioning / pins / repair, and agreement between setup's CUDA probe and the application's | 63 checks, **1 pre-existing failure** |
+| `test_capture_pipeline.py` | conversation context and its bounds, the phonetic key and distance, N-best re-ranking, every condition the repair stage refuses on (including an AST proof that no word-replacement table exists and that a shutdown can never be invented), the page's capture/VAD/endpointing contract, turn-loop wiring | **132 passed, 0 failed** |
+| `test_proactive_presence.py` | greeting routing across the clock and across absences, every contextual candidate and its evidence, the suppression matrix, tier arithmetic, tone and phrasebook discipline, the zero-LLM claim asserted over 720 evaluations, integration with the real agent | **213 passed, 0 failed** |
+| `test_provider_router.py` | the two hierarchies and that they stay separate, all eight failure kinds plus `Retry-After`, exact fallback order with at most one call per provider per request, cooldown expiry on an injectable clock, a 20-request storm test proving ONE call to a rate-limited provider rather than twenty, streaming fallback and the no-splice rule, the fallback log lines, integration with the real engine and its unsliced DMM prompt | **124 passed, 0 failed** |
+| `test_stt_backend.py` | requested-vs-active, every transition (Automatic → Edge → Chrome → Edge → Automatic), a named backend that cannot start, switching while listening / paused / recovering, one teardown per switch with teardown BEFORE rebuild, rapid and re-entrant requests, the backend logs, an AST proof that the engine lookup never imports the STT module. `--live` adds real browser discovery | **127 passed, 0 failed** |
+| `test_memory_store.py` | stable content-derived ids and their persistence, listing an empty / missing / corrupted store, delete-by-id including the position bug it replaced, clear-all plus an AST proof that no file-removal call exists, atomicity through the existing helper, the Explorer argument vector, and that no memory content reaches a log. Sandboxed into a temp directory and restored | **138 passed, 0 failed** |
+| `test_voice_state.py` | all 1176 fact combinations resolving to a declared state, silence never becoming PAUSED, barge-in, recovery never becoming a false pause, standby vs pause, absorbing shutdown, revisions and staleness, the dwell table, every named sequence end to end, the orb amplitude contract, the leaf-module rule | **196 passed, 0 failed** |
+| `test_logging.py` | the one format, canonical subsystem names with an AST proof that no call site invents one, level thresholds and DEBUG staying out of INFO, nine shapes of secret redacted plus benign text left intact, one-owner-per-event asserted against every module that could duplicate it, the settings recorder's transactional shape, third-party noise control that disables nothing, cost | **149 passed, 0 failed** |
+
+**Totals this session: 2578 tier-1 checks, 2574 passing.**
 
 `test_automation.py` runs in DRY mode by default and touches nothing on the desktop; pass
 `--live` for the read-only Win32 checks.
+
+### The four failures, and why they are not this work
+
+All four were verified pre-existing by stashing the working tree and re-running against `HEAD`.
+
+| Suite | Check | Cause |
+|---|---|---|
+| `test_browser_selection.py` | `'None' means no explicit preference` | reads `STT_BROWSER` from this machine's `.env`, which is `chrome` — the check depends on the developer's configuration rather than on the code |
+| `test_tts_device.py` ×2 | `with CUDA usable, the default engine runs on CUDA`, `switching replaced the session` | this machine's `.env` sets `TTS_DEVICE_MODE=CPU` |
+| `test_environment.py` | `GPU-capable: no failure reason` | same |
+
+### Host isolation: three defects repaired in the suites themselves
+
+A tier-1 suite is hardware-free by contract, and its verdict must not depend on the machine.
+Three places broke that, and all three were found by a run going red on unchanged code — which
+is the only honest way this class of bug shows up.
+
+| Suite | What it read from the host | Fix |
+|---|---|---|
+| `test_proactive_agent.py` | the REAL battery, via `system_profile.pressure_sample()`. Green all afternoon, then **9 failures** because the laptop hit **12% and unplugged**: the presence layer correctly raised a CRITICAL `battery_low` candidate, which by design outranks every candidate those tests exercise. The layer was right; the suite was wrong | `_pin_host_environment()` pins a healthy, plugged-in, unloaded host. The threshold tests still drive `pressure_sample` directly with their own values |
+| `test_ui.py` | the developer's **`.env`**, and WROTE it. The speech-backend checks drive the real `SettingsView._on_backend`, which persists on a committed switch — so a stubbed bridge reporting success rewrote the real configuration | `NoEnvWrites` blocks and RECORDS the writes, making them assertable (a committed switch must persist, a failed one must not); `section_no_side_effects` compares the whole file before and after the run |
+| `test_ui.py` | the developer's `TTS_DEVICE_MODE`. `setCurrentIndex(2)` is a silent no-op when the dropdown already shows CPU — the signal only fires on a CHANGE, so the check passed or failed by configuration | the index is now chosen RELATIVE to the current one |
+
+`test_proactive_presence.py` already injected its own pressure samples and was unaffected.
 
 ### Tier 2 — needs network or hardware
 
@@ -2211,6 +2628,12 @@ scratchpad rather than `tests/` because they boot and then kill a real assistant
 |---|---|
 | Local control against a real Edge session and real audio | **15/15**. Barge-in `stop` 70 ms, `wait` 41 ms, `hold` 48 ms, echo-polluted tail 72 ms from interim result to silence; nothing resumed afterwards. `stop listening` 187 ms, `start listening` 224 ms, `go to sleep` 74 ms, `wake up` 69 ms. "Open chrome." and "Stop the music." both still reached the DMM path unswallowed |
 | Shutdown, verified from outside the dead process | boot 5.8 s, `request_shutdown` → exit **~3.1 s**; all 8 owned browser PIDs gone, **0 of the user's 23 browser processes touched**, exit code 0 |
+| **Provider routing**, real keys and real models, with a forced Cohere 429 | Cohere `RATE_LIMITED` → Groq `SUCCESS` in **708 ms** (the old path was 5+10+15 s of blocking sleep then a degrade to conversation). Cohere → Groq → Gemini, all three real, in **2.03 s**. 20 requests against a rate-limited provider produced **1** call to it. Groq's own `Retry-After: 6` honoured over the 60 s default. A DMM cooldown left chat unaffected. Chat: Groq → Gemini on a 429, Cohere never involved. Exhausted chain → one clear sentence in **2 ms**, no recursion |
+| **`max_retries=0`**, measured before and after | before: single Groq DMM calls of **9.9 s** and **24.0 s** (the SDK's own retries under the router). After: every call in the same test **1.7–2.0 s** |
+| **Live speech-backend switching**, real headless browsers | 7 switches (Edge ↔ Chrome ↔ Automatic, plus one to an uninstalled browser and one while paused): **3.5–3.6 s** each, exactly one active backend after every one, **0 leaked processes**, **16/16** of the user's own browser processes alive throughout, 8/8 Kayra-owned reaped at shutdown. The uninstalled browser was **not committed**: `requested=Vivaldi`, `active=Google Chrome` |
+| **Voice state**, full stack | boot → turn → barge-in → recovery → pause → standby → shutdown, every transition correct; 0.6 s of silence produced **zero** transitions; shutdown ended `OFFLINE` and a deliberately late VAD sample from another thread could not repaint `LISTENING` |
+| **The boot window**, real backend, no toggle performed | the microphone control sampled once a second across a 9 s boot: `Pause listening` throughout, disabled until the session existed, enabled and correct afterwards, agreeing with the microphone — with **0** `listeningChanged` events fired. Toggling afterwards still worked both ways |
+| **Memory management**, against the real store (backed up and restored byte-for-byte) | ids assigned additively (`['content', 'id', 'role']`), delete-by-id persisted, an unknown id refused without touching the store, clear-all emptied the store while **leaving the file and its backup on disk**, Explorer vector `['explorer.exe', '/select,…\conversation.json']`, logs carried ids and counts only |
 | Shutdown spoken WHILE mid-answer | audible with 2 more chunks queued; `exit` → process gone **8.9 s** (of which ~5 s is speaking the farewell on CPU Kokoro); 8 owned PIDs reaped, 0 of the user's 25 touched. Before the fix that cancels playback first, this took **26.6 s** because the farewell queued behind the rest of the answer |
 | Live JS/Python vocabulary agreement in a real browser | 20 probes; the page and the Python classifier agreed on every one |
 | Real CUDA initialization on the Kokoro graph | `session.get_providers()` → `['CUDAExecutionProvider', 'CPUExecutionProvider']`; session build 1.53 s, 181 MiB VRAM |

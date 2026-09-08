@@ -672,3 +672,67 @@ def human_duration(seconds):
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                     LIGHTWEIGHT PRESSURE SAMPLE                        │
+# └────────────────────────────────────────────────────────────────────────┘
+
+_PRESSURE_CACHE = {"at": 0.0, "value": {}}
+
+
+def pressure_sample(max_age=20.0):
+    """
+    CPU / RAM / battery only, cached. For anything that samples on a slow repeating tick.
+
+    This exists as a SEPARATE entry point from `live_metrics()` for one reason: that function
+    also calls `kayra_footprint()`, which walks Kayra's whole process tree (nine browser
+    processes to stat) for the System screen's footprint line. The proactive presence engine
+    asks about memory pressure once a minute, forever, and paying a process-tree walk each
+    time to answer a question about a percentage is exactly the kind of background cost this
+    codebase does not accept. Same psutil reads, same priming rule, none of the walk.
+    """
+    global _CPU_PRIMED
+    now = time.time()
+    if _PRESSURE_CACHE["value"] and (now - _PRESSURE_CACHE["at"]) < max_age:
+        return dict(_PRESSURE_CACHE["value"])
+
+    sample = {"cpu_percent": None, "ram_percent": None,
+              "battery_percent": None, "battery_plugged": None}
+    if psutil is None:
+        return sample
+
+    primed = _CPU_PRIMED
+    if not primed:
+        # Same first-reading problem `live_metrics` documents: `cpu_percent(interval=None)`
+        # measures since the previous call, and the very first one measures since process
+        # start. Priming discards that reading rather than reporting it as load — but only
+        # the CPU figure is affected, so memory and battery are still read and returned.
+        # Withholding all three would mean a caller sampling once a minute learns nothing
+        # about memory for a full minute after it starts.
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+        _CPU_PRIMED = True
+
+    if primed:
+        try:
+            sample["cpu_percent"] = float(psutil.cpu_percent(interval=None))
+        except Exception:
+            pass
+    try:
+        sample["ram_percent"] = float(psutil.virtual_memory().percent)
+    except Exception:
+        pass
+    try:
+        battery = psutil.sensors_battery()
+        if battery is not None:
+            sample["battery_percent"] = float(battery.percent)
+            sample["battery_plugged"] = bool(battery.power_plugged)
+    except Exception:
+        pass
+
+    _PRESSURE_CACHE["at"] = now
+    _PRESSURE_CACHE["value"] = dict(sample)
+    return sample

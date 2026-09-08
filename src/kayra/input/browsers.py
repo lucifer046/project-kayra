@@ -56,7 +56,7 @@ import json
 import functools
 
 from kayra.core.paths import data_path
-from kayra.utils.console import print_info, print_warning
+from kayra.core.logbus import Subsystem, info, warning
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -330,11 +330,11 @@ def warn_about_default(chosen):
     if default is None or chosen is None or default.key == chosen.key:
         return
     if default.recognition == "none":
-        print_warning(
-            f"{default.label} is your default browser, but it ships without a speech "
-            f"recognition backend (a deliberate privacy choice in that browser), so voice "
-            f"input cannot use it. Using {chosen.label} for speech input instead — your "
-            f"default browser is unchanged and is not launched.")
+        warning(Subsystem.STT,
+                f"{default.label} is your default browser but ships without a speech "
+                f"recognition backend, so voice input cannot use it. Using {chosen.label} "
+                f"instead — your default browser is unchanged and is not launched.")
     else:
-        print_info(f"Speech input is using {chosen.label} rather than your default "
-                   f"({default.label}), which could not start a recognition session.")
+        info(Subsystem.STT,
+             f"Using {chosen.label} rather than your default ({default.label}), which "
+             f"could not start a recognition session.")

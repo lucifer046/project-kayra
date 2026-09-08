@@ -51,6 +51,42 @@ def check(label, condition, detail=""):
 # │                          STUB BACKEND                                  │
 # └────────────────────────────────────────────────────────────────────────┘
 
+class NoEnvWrites:
+    """
+    Blocks `.env` writes for the duration of a block, and records what would have been written.
+
+    THE UI SUITE MUST HAVE NO SIDE EFFECTS. It found this out the hard way: the speech-backend
+    checks drive the real `SettingsView._on_backend`, which — correctly, by design — persists
+    the setting once the switch is committed. With a stubbed bridge reporting success, that
+    call reached the real `core.config.write_env_values` and rewrote the DEVELOPER'S OWN
+    `.env`, silently changing which browser Kayra starts with.
+
+    The view is not wrong; writing on success is the specified behaviour. The test was wrong to
+    let a real write escape a stubbed backend. Blocking it here also makes the write itself
+    assertable, which a side effect never is.
+    """
+
+    def __init__(self):
+        self.writes = []
+        self._saved = None
+
+    def __enter__(self):
+        import kayra.core.config as config_module
+        self._module = config_module
+        self._saved = config_module.write_env_values
+
+        def blocked(updates):
+            self.writes.append(dict(updates))
+            return True
+
+        config_module.write_env_values = blocked
+        return self
+
+    def __exit__(self, *exc):
+        self._module.write_env_values = self._saved
+        return False
+
+
 class StubBridge(QObject):
     """
     A `KayraBridge` with the same signals and methods and no backend behind it.
@@ -74,6 +110,11 @@ class StubBridge(QObject):
     intentClassified = Signal(str, list)
     automationStarted = Signal(list)
     automationFinished = Signal(str)
+    # The authoritative voice presence, and the speech backend. Mirrored here for the same
+    # reason as every other signal: a view connecting to something the stub does not have is
+    # a dead view, and this is where that has to fail loudly.
+    voiceStateChanged = Signal(str, str, str, int)
+    sttBackendChanged = Signal(dict)
 
     def __init__(self, ready=True):
         super().__init__()
@@ -81,6 +122,11 @@ class StubBridge(QObject):
         self.submitted = []
         self.interrupted = 0
         self.proactive = False
+        self.presence = True
+        self.presence_running = True
+        self.presence_cats = {"greetings": True, "context": True, "late_night": True,
+                              "work_session": True, "system": True, "humor": True}
+        self.presence_category_calls = []
         self.listening = True
         self.sleeping = False
         self.shutdown_called = False
@@ -99,6 +145,34 @@ class StubBridge(QObject):
         }
         self.provider = "CUDAExecutionProvider"
         self.telemetry_pending = False
+        # Voice presence, as the real bridge reports it.
+        self.voice = {"state": "LISTENING", "revision": 1, "text": "Listening",
+                      "detail": "Microphone open.", "orb_state": "LISTENING",
+                      "orb_amplitude": 0.72, "capture_active": True, "vad_active": False,
+                      "stt_status": "LISTENING"}
+        # The speech backend. Requested and active are SEPARATE fields here too, so a test can
+        # drive the mismatch the Settings card exists to display.
+        self.backend = {"requested_backend": "auto", "requested_label": "Automatic",
+                        "active_backend": "edge", "active_label": "Microsoft Edge",
+                        "status": "LISTENING", "browser_process_id": 4242,
+                        "session_id": "abc", "last_error": "", "started_at": None,
+                        "settings_source": "env", "revision": 1, "matches": True}
+        self.backend_requests = []
+        self.backend_result = (True, "Google Chrome")
+        # Memory, with stable ids — deletion in this UI is BY id, never by row.
+        self.memories = [
+            {"id": "aaaaaaaaaaaa", "role": "user", "content": "remember my flight is on the 4th",
+             "preview": "remember my flight is on the 4th"},
+            {"id": "bbbbbbbbbbbb", "role": "assistant", "content": "Noted.",
+             "preview": "Noted."},
+        ]
+        self.deleted = []
+        self.cleared = 0
+        self.delete_ok = True
+        self.opened_location = 0
+        # Whether the backend has booted. False reproduces the window in which
+        # `KayraWindow` has built and shown every screen but the session has not started.
+        self.known = True
 
     @property
     def ready(self):
@@ -126,6 +200,38 @@ class StubBridge(QObject):
         self.proactive = bool(enabled)
         return True
 
+    # ── Contextual presence ──
+    # Mirrors the real bridge exactly, including the shapes: `presence_status()` returns {}
+    # when the layer is not running, which is what makes Home hide the card rather than
+    # render an empty state for a service that does not exist.
+
+    def set_presence(self, enabled):
+        self.presence = bool(enabled)
+        return True
+
+    def set_presence_category(self, name, enabled):
+        self.presence_category_calls.append((name, bool(enabled)))
+        self.presence_cats[name] = bool(enabled)
+        return True
+
+    def presence_available(self):
+        return True
+
+    def presence_enabled(self):
+        return self.presence
+
+    def presence_categories(self):
+        return dict(self.presence_cats)
+
+    def presence_status(self):
+        if not self.presence_running:
+            return {}
+        return {"enabled": self.presence, "categories": dict(self.presence_cats),
+                "interactions": 3, "work_minutes": 52, "last_kind": "work_session",
+                "last_text": "You've been at this a while.", "last_suppression": "cooldown",
+                "next_eligible_seconds": 900, "spoken_today": 1, "daily_budget": 8,
+                "stats": {"candidates": 4, "suppressed": 9, "spoken": 1, "llm_calls": 0}}
+
     def set_listening(self, enabled):
         # Mirrors the real bridge: change the state, then announce it. Nothing here touches
         # shutdown or interrupt, which is exactly the property the listening tests assert.
@@ -135,6 +241,15 @@ class StubBridge(QObject):
 
     def listening_enabled(self):
         return self.listening
+
+    def listening_known(self):
+        """
+        Whether `listening_enabled()` is a measurement or the pre-boot default.
+
+        Mirrors the real bridge. A stub that always answered True could never reproduce the
+        boot-window defect this exists to pin.
+        """
+        return self.known
 
     def set_sleeping(self, enabled):
         self.sleeping = bool(enabled)
@@ -166,6 +281,51 @@ class StubBridge(QObject):
 
     def state(self):
         return "IDLE"
+
+    # ── Voice presence and speech backend ──
+
+    def voice_runtime_state(self):
+        snapshot = dict(self.voice)
+        snapshot["listening"] = self.listening
+        snapshot["listening_known"] = self.known
+        return snapshot
+
+    def stt_backend_state(self):
+        return dict(self.backend)
+
+    def set_stt_backend(self, backend):
+        self.backend_requests.append(backend)
+        return self.backend_result
+
+    # ── Memory ──
+
+    def list_memories(self, limit=None):
+        items = list(self.memories)
+        return items[:limit] if limit else items
+
+    def delete_memory(self, memory_id):
+        if not self.delete_ok:
+            return False, "the memory store could not be written"
+        before = len(self.memories)
+        self.memories = [m for m in self.memories if m["id"] != memory_id]
+        if len(self.memories) == before:
+            return False, "no such memory"
+        self.deleted.append(memory_id)
+        return True, ""
+
+    def clear_memories(self):
+        self.cleared = len(self.memories)
+        self.memories = []
+        return self.cleared, True
+
+    def memory_store(self):
+        return {"path": r"D:\Kayra\data\conversation.json",
+                "backup_path": r"D:\Kayra\data\conversation_backup.json",
+                "exists": True, "size_bytes": 4096, "count": len(self.memories)}
+
+    def open_memory_location(self):
+        self.opened_location += 1
+        return True, r"D:\Kayra\data\conversation.json"
 
     def voice_available(self):
         return False
@@ -400,12 +560,32 @@ def section_state(app):
     bridge = StubBridge()
     home = HomeView(bridge)
 
-    bridge.stateChanged.emit("LISTENING", "IDLE")
-    check("the orb follows assistant state", home.orb.state() == "LISTENING")
-    check("the prompt follows assistant state", "Listening" in home.prompt.text())
+    # The voice presence is now ONE resolved state carrying its own revision, not a caption
+    # composed from `stateChanged` plus a cached listening flag. That composition is the
+    # defect these checks exist to prevent coming back.
+    bridge.voiceStateChanged.emit("LISTENING", "Listening", "Microphone open.", 10)
+    check("the orb follows the resolved voice state", home.orb.state() == "LISTENING")
+    check("the prompt follows the resolved voice state", "Listening" in home.prompt.text())
 
-    bridge.stateChanged.emit("AUTOMATING", "LISTENING")
-    check("automating is reflected", home.orb.state() == "AUTOMATING")
+    bridge.voiceStateChanged.emit("PROCESSING", "Thinking", "Working out what you meant.", 11)
+    check("working is reflected", home.orb.state() == "PROCESSING")
+    check("and its caption comes from the state machine, not from the view",
+          home.prompt.text() == "Thinking", home.prompt.text())
+
+    # A stale callback must not repaint an older state. This is the second half of the
+    # original bug: not just the wrong writer, but the right writer arriving out of order.
+    bridge.voiceStateChanged.emit("PAUSED", "Listening paused", "…", 5)
+    check("a stale revision cannot overwrite a newer state",
+          home.prompt.text() == "Thinking", home.prompt.text())
+    check("and the orb is not repainted either", home.orb.state() == "PROCESSING")
+
+    # SILENCE IS STILL LISTENING. The state machine never emits PAUSED for a quiet
+    # microphone, and the view never invents one.
+    bridge.voiceStateChanged.emit("USER_SPEAKING", "Listening…", "Hearing you.", 12)
+    check("user speech shows an active listening state", home.orb.state() == "LISTENING")
+    bridge.voiceStateChanged.emit("LISTENING", "Listening", "Microphone open.", 13)
+    check("falling silent returns to Listening, never to paused",
+          "paused" not in home.prompt.text().lower(), home.prompt.text())
 
     # Home's secondary control is the MICROPHONE, not an interrupt. It used to be a ghost
     # "Stop", which is the same word barge-in uses and one reading away from "quit" — three
@@ -553,8 +733,15 @@ def section_window(app):
 
     ambient = AmbientAssistant(bridge, window)
     check("the ambient assistant constructs", ambient is not None)
-    bridge.stateChanged.emit("SPEAKING", "IDLE")
-    check("the ambient assistant follows state", ambient.orb.state() == "SPEAKING")
+    bridge.voiceStateChanged.emit("ASSISTANT_SPEAKING", "Speaking",
+                                  "Say \"stop\" to interrupt.", 20)
+    check("the ambient assistant follows the resolved voice state",
+          ambient.orb.state() == "SPEAKING")
+    check("and shows its words", ambient.state_label.text() == "Speaking",
+          ambient.state_label.text())
+    bridge.voiceStateChanged.emit("PAUSED", "Listening paused", "…", 3)
+    check("the ambient assistant drops a stale revision",
+          ambient.state_label.text() == "Speaking", ambient.state_label.text())
     check("the ambient assistant paints", paint(ambient, 320, 96))
     check("the ambient assistant is frameless and on top",
           bool(ambient.windowFlags() & Qt.FramelessWindowHint)
@@ -643,7 +830,9 @@ def section_boundary(app):
     # The stub used in these tests must match the real bridge, or the tests prove nothing.
     real = {name for name in dir(bridge_module.KayraBridge) if not name.startswith("_")}
     stub = {name for name in dir(StubBridge) if not name.startswith("_")}
-    missing = {"submit_text", "interrupt", "set_proactive", "recent_automation",
+    missing = {"submit_text", "interrupt", "set_proactive", "set_presence",
+               "set_presence_category", "presence_enabled", "presence_categories",
+               "presence_status", "recent_automation",
                "conversation_memory", "habits", "state", "voice_available",
                "tts_available", "proactive_enabled", "ready"} - stub
     check("the test stub covers the real bridge API", not missing, str(missing))
@@ -1083,6 +1272,12 @@ def section_interaction(app):
     check("pausing does not shut Kayra down", bridge.shutdown_called is False)
     check("the control now offers to START", "Start listening" in home.listen_button.text(),
           home.listen_button.text())
+    # The CAPTION is the voice state machine's, and it says PAUSED only because the
+    # microphone was deliberately closed. In the running application that transition is
+    # emitted by `app`; here it is emitted directly, which is the point — the view renders
+    # what it is told and derives nothing.
+    bridge.voiceStateChanged.emit("PAUSED", "Listening paused",
+                                  "Kayra is still running. Start listening to talk again.", 30)
     check("Home says listening is paused, in words",
           "paused" in home.prompt.text().lower(), home.prompt.text())
     check("and says Kayra is still running",
@@ -1091,8 +1286,17 @@ def section_interaction(app):
     home.listen_button.click()
     app.processEvents()
     check("clicking again resumes listening", bridge.listening is True)
+    bridge.voiceStateChanged.emit("LISTENING", "Listening", "Microphone open.", 31)
     check("resuming restores the normal prompt",
           "paused" not in home.prompt.text().lower(), home.prompt.text())
+
+    # A recovering session is RECONNECTING, never a false pause. This is the exact
+    # misreport the voice state machine was built to eliminate.
+    bridge.voiceStateChanged.emit("RECOVERING", "Reconnecting…",
+                                  "Reconnecting the microphone.", 32)
+    check("an STT recovery reads as reconnecting, not as paused",
+          "paused" not in home.prompt.text().lower()
+          and "econnect" in home.prompt.text(), home.prompt.text())
 
     # The three "stop"-shaped actions must stay separate.
     chat2 = ChatView(bridge)
@@ -1365,8 +1569,13 @@ def section_lifecycle_controls(app):
         check("the other controls are locked too",
               home.talk_button.isEnabled() is False
               and home.listen_button.isEnabled() is False)
+        # The view no longer writes this caption itself: `request_shutdown` moves the voice
+        # state to STOPPING, which is an ABSORBING state, and the machine paints it. Driving
+        # the signal here is what the real backend does a moment after `shutdown()` returns.
+        bridge.voiceStateChanged.emit("STOPPING", "Shutting down",
+                                      "Stopping services and closing the browser session.", 99)
         check("the screen says what is happening",
-              "hutting down" in home.prompt.text())
+              "hutting down" in home.prompt.text(), home.prompt.text())
     finally:
         QMessageBox.exec = real_exec
 
@@ -1382,13 +1591,20 @@ def section_lifecycle_controls(app):
     finally:
         QMessageBox.exec = real_exec
 
-    # SHUTTING_DOWN must win over every other caption, including the paused-microphone line.
+    # Shutdown must win over every other caption, including the paused-microphone line.
+    # It does so STRUCTURALLY now rather than by an ordering of `if` statements in the view:
+    # the voice state machine resolves shutdown first and STOPPING is absorbing, so a paused
+    # microphone simply cannot be the answer once teardown has begun. The view's job is only
+    # to render the newer revision, which is what this checks.
     bridge3 = StubBridge()
     home3 = HomeView(bridge3)
     home3._on_listening(False)
-    home3._on_state("SHUTTING_DOWN", "IDLE")
-    check("SHUTTING_DOWN overrides the paused-microphone caption",
-          "hutting down" in home3.prompt.text())
+    bridge3.voiceStateChanged.emit("PAUSED", "Listening paused",
+                                   "Kayra is still running.", 1)
+    bridge3.voiceStateChanged.emit("STOPPING", "Shutting down",
+                                   "Stopping services and closing the browser session.", 2)
+    check("shutdown overrides the paused-microphone caption",
+          "hutting down" in home3.prompt.text(), home3.prompt.text())
 
     check("Home still paints with the new control", paint(home3))
 
@@ -1498,8 +1714,16 @@ def section_lifecycle_controls(app):
           gpu_text)
 
     # Changing the selector reaches the backend, and is persisted on save.
-    view.device_combo.setCurrentIndex(2)          # CPU
-    check("choosing a device reaches the backend", view.bridge.device_mode == "CPU")
+    #
+    # The index is chosen RELATIVE to whatever the dropdown currently shows, never hardcoded.
+    # It was `setCurrentIndex(2)`, which is a silent no-op on any machine whose `.env` already
+    # says CPU — the signal only fires on a CHANGE — so the check passed or failed depending
+    # on the developer's configuration rather than on the code.
+    target = (view.device_combo.currentIndex() + 1) % view.device_combo.count()
+    expected = view.device_combo.itemData(target)
+    view.device_combo.setCurrentIndex(target)
+    check("choosing a device reaches the backend", view.bridge.device_mode == expected,
+          f"{view.bridge.device_mode} vs {expected}")
 
     check("Settings still paints with the new card", paint(view))
 
@@ -1510,9 +1734,471 @@ def section_lifecycle_controls(app):
     check("the GPU timer stops when Settings is hidden", view._gpu_timer.isActive() is False)
 
 
+def section_presence(app):
+    """
+    The contextual presence surfaces: the Settings card and the Home status card.
+
+    What is being checked here is not that widgets exist — it is the two properties that
+    have gone wrong before on this screen. Every presence toggle must reach the RUNNING
+    service (a settings row that only writes a file appears to do nothing for the rest of
+    the session), and reading the service back must not write to it (setting a checkbox
+    from its own value re-emits `toggled`, which turns every navigation into a redundant
+    service call).
+    """
+    from kayra.ui.views.settings import SettingsView
+    from kayra.ui.views.home import HomeView
+
+    print_system("\n── Proactive presence surfaces ───────────────────────────")
+
+    bridge = StubBridge()
+    view = SettingsView(bridge)
+
+    check("Settings has a presence master toggle",
+          getattr(view, "presence_toggle", None) is not None)
+    check("every presence category has a control",
+          set(view._presence_controls) ==
+          {"greetings", "context", "late_night", "work_session", "system", "humor"})
+
+    # Each category toggle reaches the live service.
+    bridge.presence_category_calls.clear()
+    view._presence_controls["humor"].setChecked(False)
+    check("a category toggle reaches the backend",
+          ("humor", False) in bridge.presence_category_calls)
+
+    # The master switch reaches the service AND disables the rows it governs — a row that
+    # can still be clicked while it cannot do anything is worse than a disabled one.
+    view.presence_toggle.setChecked(False)
+    check("the master toggle reaches the backend", bridge.presence is False)
+    check("the category rows are disabled when presence is off",
+          all(not c.isEnabled() for c in view._presence_controls.values()))
+    view.presence_toggle.setChecked(True)
+    check("and enabled again when it is back on",
+          all(c.isEnabled() for c in view._presence_controls.values()))
+
+    # Reading the live state back must not write it back.
+    bridge.presence_category_calls.clear()
+    view._sync_presence()
+    check("syncing from the service does not call back into it",
+          bridge.presence_category_calls == [])
+
+    # The presence settings are persisted as well as applied.
+    for env_key, _cat, _label, _help in SettingsView.PRESENCE:
+        check(f"'{env_key}' is saved with the other settings", env_key in view._controls)
+
+    check("Settings paints with the presence card", paint(view))
+
+    # ── Home ──
+    home = HomeView(bridge)
+    home._refresh_presence()
+    check("Home shows the presence card while the layer is running",
+          home.presence_card.isVisible() or not home.presence_card.isHidden())
+    check("the pill reports it as active", "Active" in home.presence_pill.text())
+    check("the last observation is named",
+          "work session" in home.presence_last.toolTip().lower(),
+          home.presence_last.toolTip())
+    check("the next eligible time is shown",
+          "minutes" in home.presence_next.toolTip(), home.presence_next.toolTip())
+    check("the day's budget is shown",
+          "1 of 8" in home.presence_budget.toolTip(), home.presence_budget.toolTip())
+
+    # Switched off: the empty state is SHOWN, not created — the card keeps its children.
+    bridge.presence = False
+    home._refresh_presence()
+    check("an off layer shows an empty state rather than stale numbers",
+          not home.presence_last.isVisible() and not home._presence_empty.isHidden())
+    check("and the pill says so", "Off" in home.presence_pill.text())
+
+    # Not running at all: the card hides itself rather than describing a service that does
+    # not exist — the same rule the Graphics card follows on a machine with no GPU.
+    bridge.presence_running = False
+    home._refresh_presence()
+    check("a card for a service that is not running is hidden", home.presence_card.isHidden())
+
+    check("Home paints with the presence card", paint(home))
+
+
+def section_speech_backend(app):
+    """
+    Settings: the speech-input card. REQUESTED and ACTIVE are separate lines, always.
+
+    A dropdown moving is not evidence that anything happened. These checks are all about the
+    case where the two disagree — a browser the user named that could not be started — because
+    that is the case a screen showing only the selection would render as a success.
+    """
+    print_system("\n[13] Settings — live speech backend, requested vs active")
+    from kayra.ui.views.settings import SettingsView
+
+    bridge = StubBridge()
+    with NoEnvWrites():
+        view = SettingsView(bridge)
+
+    check("Settings has a speech-input card", hasattr(view, "backend_combo"))
+    check("it offers Automatic", view.backend_combo.findData("auto") >= 0)
+    check("it offers Chrome", view.backend_combo.findData("chrome") >= 0)
+    check("it offers Edge", view.backend_combo.findData("edge") >= 0)
+    check("the options read as browser names, not keys",
+          "Google Chrome" in [view.backend_combo.itemText(i)
+                              for i in range(view.backend_combo.count())],
+          str([view.backend_combo.itemText(i) for i in range(view.backend_combo.count())]))
+
+    # The happy path: requested and active agree.
+    view._refresh_backend()
+    text = view.backend_active.text()
+    check("the card shows the requested backend", "Backend:" in text, text)
+    check("and the ACTIVE backend, separately", "Active:" in text, text)
+    check("and a status", "Status:" in text, text)
+    check("with everything agreeing, the pill reads Ready",
+          "Ready" in view.backend_pill.text(), view.backend_pill.text())
+
+    # Choosing a backend reaches the backend, not just the widget — and persists ONLY on
+    # success. The write is intercepted: a UI test must not rewrite the developer's `.env`.
+    target = view.backend_combo.findData("chrome")
+    if view.backend_combo.currentIndex() == target:
+        target = view.backend_combo.findData("edge")
+        bridge.backend_result = (True, "Microsoft Edge")
+    expected = view.backend_combo.itemData(target)
+
+    with NoEnvWrites() as guard:
+        view.backend_combo.setCurrentIndex(target)
+        app.processEvents()
+    check("choosing a backend reaches the backend, not just the widget",
+          bridge.backend_requests == [expected], str(bridge.backend_requests))
+    check("a committed switch is persisted",
+          guard.writes == [{"STT_BROWSER": expected}], str(guard.writes))
+
+    # A FAILED switch must NOT be written to .env. A setting that did not apply must not come
+    # back after a restart claiming to be the configuration.
+    bridge_fail = StubBridge()
+    bridge_fail.backend_result = (False, "Chrome could not reach a speech backend")
+    view_fail = SettingsView(bridge_fail)
+    failed_target = view_fail.backend_combo.findData("chrome")
+    if view_fail.backend_combo.currentIndex() == failed_target:
+        failed_target = view_fail.backend_combo.findData("brave")
+    with NoEnvWrites() as guard:
+        view_fail.backend_combo.setCurrentIndex(failed_target)
+        app.processEvents()
+    check("a failed switch is NOT persisted", guard.writes == [], str(guard.writes))
+    check("and the screen says so",
+          "Could not switch" in view_fail.status.text(), view_fail.status.text())
+
+    # THE CASE THAT MATTERS: a requested backend that could not start.
+    bridge2 = StubBridge()
+    bridge2.backend = dict(bridge2.backend,
+                           requested_backend="chrome", requested_label="Google Chrome",
+                           active_backend="edge", active_label="Microsoft Edge",
+                           status="LISTENING", matches=False,
+                           last_error="Chrome could not reach a speech backend")
+    view2 = SettingsView(bridge2)
+    view2._refresh_backend()
+    text = view2.backend_active.text()
+    check("a failed switch shows the requested browser",
+          "Backend: Google Chrome" in text, text)
+    check("and the DIFFERENT browser that is actually active",
+          "Active: Microsoft Edge" in text, text)
+    check("the pill says it was not applied",
+          "Not applied" in view2.backend_pill.text(), view2.backend_pill.text())
+    check("and the reason is on screen",
+          "could not reach" in view2.backend_detail.text(), view2.backend_detail.text())
+
+    # No live session at all.
+    bridge3 = StubBridge()
+    bridge3.backend = dict(bridge3.backend, active_backend=None, active_label="None",
+                           status="OFF", matches=False)
+    view3 = SettingsView(bridge3)
+    view3._refresh_backend()
+    check("with no session the active backend is None, never the selection",
+          "Active: None" in view3.backend_active.text(), view3.backend_active.text())
+    check("and the pill says it is not running",
+          "Not running" in view3.backend_pill.text(), view3.backend_pill.text())
+
+    # A live backend transition repaints the card without a timer.
+    bridge4 = StubBridge()
+    view4 = SettingsView(bridge4)
+    bridge4.backend = dict(bridge4.backend, active_backend="chrome",
+                           active_label="Google Chrome")
+    bridge4.sttBackendChanged.emit(bridge4.backend)
+    app.processEvents()
+    check("a backend change repaints the card from a signal, not a poll",
+          "Active: Google Chrome" in view4.backend_active.text(),
+          view4.backend_active.text())
+
+    check("Settings still paints with the speech card", paint(view))
+
+
+def section_memory_management(app):
+    """Memory: stable ids, real deletion, the store's location, and the confirmations."""
+    print_system("\n[14] Memory — ids, deletion, location")
+    from PySide6.QtWidgets import QMessageBox
+    from kayra.ui.views.memory import MemoryView, _MemoryRow
+
+    bridge = StubBridge()
+    view = MemoryView(bridge)
+    view.on_show()
+
+    check("the memory screen lists what is saved",
+          "2 items" in view.saved_pill.text(), view.saved_pill.text())
+    check("it shows the store's location",
+          "conversation.json" in view.location_label.text(), view.location_label.text())
+    check("the full path is available on hover",
+          view.location_label.toolTip() == view.location_label.text())
+    check("and the entry count beside it", "2 entries" in view.location_detail.text(),
+          view.location_detail.text())
+
+    rows = [view.saved_body.itemAt(i).widget() for i in range(view.saved_body.count())]
+    rows = [row for row in rows if isinstance(row, _MemoryRow)]
+    check("a row is built per memory", len(rows) == 2, str(len(rows)))
+    check("each row holds a stable id, not a position",
+          all(getattr(row, "_memory_id", "") for row in rows))
+    check("and the ids are the backend's",
+          {row._memory_id for row in rows} == {m["id"] for m in bridge.memories})
+
+    # Deleting confirms first, and cancelling changes nothing.
+    real_exec = QMessageBox.exec
+    QMessageBox.exec = lambda self: QMessageBox.Cancel
+    try:
+        view._delete_saved(rows[0]._memory_id)
+        check("cancelling a delete removes nothing", len(bridge.memories) == 2)
+        check("and deletes nothing on the backend", bridge.deleted == [])
+    finally:
+        QMessageBox.exec = real_exec
+
+    # Confirming deletes exactly that id.
+    QMessageBox.exec = lambda self: QMessageBox.Yes
+    try:
+        doomed = rows[0]._memory_id
+        view._delete_saved(doomed)
+        check("confirming deletes exactly one memory", len(bridge.memories) == 1)
+        check("and it is the one whose id was passed", bridge.deleted == [doomed],
+              str(bridge.deleted))
+        check("the screen refreshed", "1 item" in view.saved_pill.text(),
+              view.saved_pill.text())
+    finally:
+        QMessageBox.exec = real_exec
+
+    # A FAILED delete must not remove the row.
+    bridge2 = StubBridge()
+    bridge2.delete_ok = False
+    view2 = MemoryView(bridge2)
+    view2.on_show()
+    QMessageBox.exec = lambda self: QMessageBox.Yes
+    try:
+        view2._delete_saved(bridge2.memories[0]["id"])
+        check("a failed delete leaves the memory in place", len(bridge2.memories) == 2)
+        check("and says so on screen", "failed" in view2.saved_pill.text().lower(),
+              view2.saved_pill.text())
+    finally:
+        QMessageBox.exec = real_exec
+
+    # Clear all: stronger wording, and it only clears when confirmed.
+    bridge3 = StubBridge()
+    view3 = MemoryView(bridge3)
+    view3.on_show()
+    QMessageBox.exec = lambda self: QMessageBox.Cancel
+    try:
+        view3._clear_saved()
+        check("cancelling 'clear all' clears nothing", len(bridge3.memories) == 2)
+    finally:
+        QMessageBox.exec = real_exec
+    QMessageBox.exec = lambda self: QMessageBox.Yes
+    try:
+        view3._clear_saved()
+        check("confirming 'clear all' empties the store", bridge3.memories == [])
+        check("and reports how many went", bridge3.cleared == 2, str(bridge3.cleared))
+    finally:
+        QMessageBox.exec = real_exec
+    check("the empty state is shown, not created",
+          view3.saved_empty.isVisible() or not view3.isVisible())
+    check("the empty state is a permanent child, never destroyed",
+          view3.saved_empty.parent() is not None)
+
+    # Open location reaches the backend.
+    view3._open_location()
+    check("'open file location' reaches the backend", bridge3.opened_location == 1)
+
+    check("Memory still paints", paint(view))
+
+
+
+
+def section_boot_ordering(app):
+    """
+    THE BOOT WINDOW: a screen built before the backend is ready must not paint a guess.
+
+    The defect this pins, exactly as it was reported. `KayraWindow.__init__` builds every view
+    and shows Home several seconds before `KayraSession` finishes booting. Home painted its
+    microphone control from `bridge.listening_enabled()`, which answered False because
+    `self._runtime is None` — an ABSENCE OF INFORMATION reported as a NEGATIVE FACT. Then
+    nothing ever corrected it: `RuntimeState._listening` starts True and never changes, and
+    `set_listening` correctly does not emit for a value that did not change. So the button read
+    "Start listening" beside an orb that was listening, until the user toggled it twice.
+
+    Three properties are pinned here, because fixing only one of them leaves the bug reachable:
+
+      1. the pre-boot answer is not a positive claim that the microphone is closed;
+      2. the control is not presented as actionable while the answer is unknown;
+      3. the screen RE-READS when the answer becomes available (`bootFinished`).
+    """
+    print_system("\n[15] The boot window — no guessed microphone state")
+    from kayra.ui.views.home import HomeView
+    from kayra.ui.views.chat import ChatView
+
+    # ── 1. The session must not answer "off" when it means "not yet" ──
+    from kayra.ui.session import KayraSession
+    session = KayraSession(enable_voice=False)
+    check("before boot, listening_known() is False", session.listening_known() is False)
+    check("and listening_enabled() does NOT claim the microphone is closed",
+          session.listening_enabled() is True,
+          "False here is a positive claim, and it was the wrong one")
+
+    snapshot = session.voice_runtime_state()
+    check("the pre-boot snapshot says the microphone state is not known",
+          snapshot.get("listening_known") is False, str(snapshot.get("listening_known")))
+
+    # ── 2. Home during the boot window ──
+    bridge = StubBridge()
+    bridge.known = False                 # the backend has not booted yet
+    home = HomeView(bridge)
+    home.on_show()
+    app.processEvents()
+
+    check("during boot the control is not offered as actionable",
+          home.listen_button.isEnabled() is False)
+    check("and it does not claim listening is off",
+          "Pause listening" in home.listen_button.text(), home.listen_button.text())
+    check("the tooltip says why it cannot be used",
+          "starting" in home.listen_button.toolTip().lower(), home.listen_button.toolTip())
+
+    # ── 3. bootFinished corrects it, and NO listening_changed is fired ──
+    #
+    # The "no event" half is the point. In the real application `RuntimeState._listening`
+    # starts True and never changes, so `set_listening` correctly never emits — which is
+    # precisely why nothing corrected the button. Counting the events proves the fix does not
+    # secretly depend on one.
+    emitted = []
+    bridge.listeningChanged.connect(lambda value: emitted.append(value))
+
+    bridge.known = True
+    bridge.listening = True
+    bridge.bootFinished.emit(True, "voice input ready, speech output ready")
+    app.processEvents()
+
+    check("boot completing enables the control", home.listen_button.isEnabled() is True)
+    check("THE REPORTED BUG: the button says Pause, not Start, while listening",
+          "Pause listening" in home.listen_button.text(), home.listen_button.text())
+    check("and it got there with NO listeningChanged event at all",
+          emitted == [], str(emitted))
+
+    # ── 4. The state it was reported in: listening, never toggled ──
+    bridge2 = StubBridge()
+    bridge2.known = False
+    home2 = HomeView(bridge2)
+    home2.on_show()
+    bridge2.known = True
+    bridge2.bootFinished.emit(True, "ready")
+    bridge2.voiceStateChanged.emit("LISTENING", "Listening", "Microphone open.", 5)
+    app.processEvents()
+    check("caption and control agree after boot, with no toggle",
+          home2.prompt.text() == "Listening"
+          and "Pause listening" in home2.listen_button.text(),
+          f"{home2.prompt.text()!r} / {home2.listen_button.text()!r}")
+
+    # ── 5. And the toggle path still works, in both directions ──
+    home2.listen_button.click()
+    app.processEvents()
+    check("clicking still pauses", bridge2.listening is False)
+    check("and the label follows", "Start listening" in home2.listen_button.text(),
+          home2.listen_button.text())
+    home2.listen_button.click()
+    app.processEvents()
+    check("clicking again resumes", bridge2.listening is True)
+    check("and the label follows back", "Pause listening" in home2.listen_button.text(),
+          home2.listen_button.text())
+
+    # ── 6. A genuinely paused microphone at boot must still read as paused ──
+    bridge3 = StubBridge()
+    bridge3.known = False
+    home3 = HomeView(bridge3)
+    home3.on_show()
+    bridge3.known = True
+    bridge3.listening = False
+    bridge3.bootFinished.emit(True, "ready")
+    app.processEvents()
+    check("a microphone that really is paused at boot reads as paused",
+          "Start listening" in home3.listen_button.text(), home3.listen_button.text())
+
+    # ── 7. Shutdown must not be re-enabled by a late re-sync ──
+    from PySide6.QtWidgets import QMessageBox
+    bridge4 = StubBridge()
+    home4 = HomeView(bridge4)
+    real_exec = QMessageBox.exec
+    QMessageBox.exec = lambda self: QMessageBox.Yes
+    try:
+        home4._request_shutdown()
+    finally:
+        QMessageBox.exec = real_exec
+    bridge4.bootFinished.emit(True, "ready")
+    home4.on_show()
+    app.processEvents()
+    check("a late re-sync cannot re-enable controls during shutdown",
+          home4.listen_button.isEnabled() is False)
+
+    # ── 8. The composer's microphone has the same contract ──
+    bridge5 = StubBridge()
+    bridge5.known = False
+    chat = ChatView(bridge5)
+    bridge5.known = True
+    bridge5.listening = True
+    bridge5.bootFinished.emit(True, "ready")
+    app.processEvents()
+    check("the composer's microphone is re-read at boot too",
+          "Pause listening" in chat.mic_button.toolTip(), chat.mic_button.toolTip())
+    check("and the placeholder does not claim listening is paused",
+          "paused" not in chat.input.placeholderText().lower(),
+          chat.input.placeholderText())
+
+    # ── 9. The structural rule, asserted ──
+    import inspect
+    for module, label in ((HomeView, "Home"), (ChatView, "Chat")):
+        source = inspect.getsource(module)
+        check(f"{label} re-reads when the backend becomes ready",
+              "bootFinished" in source, label)
+
+
+def section_no_side_effects(before):
+    """
+    The suite must leave the developer's configuration exactly as it found it.
+
+    Belt and braces over `NoEnvWrites`, which only guards the blocks it wraps. This compares
+    the whole `.env` before and after the run, so ANY path that writes it — a control that
+    persists on change, a future screen that saves on close — is caught HERE, by name, rather
+    than being discovered days later as a mysteriously changed setting.
+    """
+    print_system("\n[16] The suite has no side effects")
+    if before is None:
+        check("no .env on this machine to protect", True)
+        return
+    from kayra.core.paths import env_file
+    try:
+        after = open(env_file(), "rb").read()
+    except OSError:
+        check("the .env is still readable", False)
+        return
+    # No `detail` on purpose: `check()` prints it on a PASS too, and "a UI test wrote the
+    # developer's configuration" beside a green PASS reads like a failure.
+    check("the suite did not modify the developer's .env", after == before)
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     print_banner("KAYRA UI", "Shell, views, state reflection and boundary discipline")
+
+    # Snapshotted before anything constructs a view, so section 16 can prove the suite changed
+    # nothing on the way through.
+    try:
+        from kayra.core.paths import env_file
+        env_before = open(env_file(), "rb").read()
+    except OSError:
+        env_before = None
 
     section_theme(app)
     section_components(app)
@@ -1525,6 +2211,11 @@ def main():
     section_refinement(app)
     section_interaction(app)
     section_lifecycle_controls(app)
+    section_presence(app)
+    section_speech_backend(app)
+    section_memory_management(app)
+    section_boot_ordering(app)
+    section_no_side_effects(env_before)
 
     print_system("\n" + "=" * 60)
     if FAILED:

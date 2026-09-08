@@ -208,9 +208,37 @@ class Sidebar(QWidget):
         if detail is not None:
             self.detail_label.setText(detail)
 
-    def set_listening(self, listening):
-        """Shows the microphone state, and only when it is OFF — silence is the normal case."""
-        self.listening_label.setText("" if listening else "Listening paused")
-        self.listening_label.setProperty("paused", not listening)
+    def set_voice(self, state, text, detail):
+        """
+        Renders the resolved voice state: the badge, the headline and the footer note.
+
+        THE FOOTER NOTE IS NOW DRIVEN BY THE STATE, NOT BY A BOOLEAN. It used to be written
+        from `listeningChanged` alone, so it said "Listening paused" for every reason the
+        microphone was not producing words — including an STT session being rebuilt, which is
+        the opposite of paused. Only the two states that genuinely mean "Kayra is not acting
+        on what you say" show it now.
+        """
+        from kayra.core.voice_state import ORB_STATE, VoiceState
+
+        self.badge.set_state(ORB_STATE.get(state, "IDLE"))
+        self.state_label.setText(text)
+        self.detail_label.setText(detail or "")
+
+        quiet = state in (VoiceState.PAUSED, VoiceState.STANDBY)
+        self.listening_label.setText("Listening paused" if quiet else "")
+        self.listening_label.setProperty("paused", quiet)
         repolish(self.listening_label)
-        self.listening_label.setVisible(not listening)
+        self.listening_label.setVisible(quiet)
+
+    def set_listening(self, listening):
+        """
+        Kept for the boot window, before the voice state machine has anything to say.
+
+        Not the caption's owner any more: `set_voice` is. A second writer to the same label is
+        precisely how this footer came to contradict the screen beside it.
+        """
+        quiet = not listening
+        self.listening_label.setText("Listening paused" if quiet else "")
+        self.listening_label.setProperty("paused", quiet)
+        repolish(self.listening_label)
+        self.listening_label.setVisible(quiet)

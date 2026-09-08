@@ -99,10 +99,10 @@ class SettingsView(View):
          "text", None),
         ("INPUT_LANGUAGE", "Recognition language", "Language code for speech input.",
          "choice", ["en-US", "en-GB", "en-IN", "hi-IN", "es-ES", "fr-FR", "de-DE"]),
-        ("STT_BROWSER", "Speech-input browser",
-         "Which browser runs recognition. 'auto' picks one that can actually transcribe.",
-         "choice", ["auto", "chrome", "edge", "brave", "chromium"]),
     )
+    # STT_BROWSER is deliberately NOT in the group above any more. Everything there is written
+    # to `.env` and applies at the next start; the speech backend now switches the LIVE
+    # session, so it has its own card and its own transactional handler — see `_build_speech`.
     MODELS = (
         ("FORCE_ONLINE", "Always use cloud models",
          "Skip the local model check entirely at startup.", "bool", None),
@@ -124,10 +124,12 @@ class SettingsView(View):
 
         self._build_group("General", self.GENERAL)
         self._build_group("Voice and speech", self.VOICE)
+        self._build_speech()
         self._build_device()
         self._build_group("Models", self.MODELS)
         self._build_keys()
         self._build_proactive()
+        self._build_presence()
         self._build_actions()
         self.content.addStretch(1)
 
@@ -179,6 +181,137 @@ class SettingsView(View):
             control = QLineEdit(str(value))
             control.setFixedWidth(Size.control_field)
         return control
+
+    # ──────────────────────────────────────────────────────────────────
+    #                          SPEECH INPUT
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_speech(self):
+        """
+        Which browser runs recognition — and, SEPARATELY, which one actually is.
+
+        THE TWO LINES ARE NOT REDUNDANT, for exactly the reason the speech-DEVICE card below
+        carries two. `Backend` is what the user asked for; `Active` is what the live session
+        reports. They agree on the happy path and disagree whenever a named browser could not
+        be started, which is the case this card exists to show. Rendering "Google Chrome"
+        because the dropdown says Chrome, while Edge holds the microphone, is the specific lie
+        the whole live-switching change was made to remove.
+        """
+        from kayra.input import stt_backend
+
+        card = Card("Speech input")
+        card.body.setSpacing(0)
+
+        current = stt_backend.normalize(self._current("STT_BROWSER", stt_backend.AUTO))
+        self.backend_combo = QComboBox()
+        self.backend_combo.setEditable(False)
+        for key in (stt_backend.AUTO, "chrome", "edge", "brave", "chromium"):
+            self.backend_combo.addItem(stt_backend.label_for(key), key)
+        index = self.backend_combo.findData(current)
+        if index < 0:
+            self.backend_combo.addItem(stt_backend.label_for(current), current)
+            index = self.backend_combo.count() - 1
+        self.backend_combo.setCurrentIndex(index)
+        self.backend_combo.setFixedWidth(Size.control_field)
+        self.backend_combo.currentIndexChanged.connect(self._on_backend)
+
+        card.body.addWidget(SettingRow(
+            "Backend",
+            "Which browser runs speech recognition. Automatic picks one that can actually "
+            "transcribe; naming one uses that browser and says so if it cannot start.",
+            self.backend_combo))
+        card.body.addWidget(RowRule())
+
+        self.backend_pill = StatusPill("Checking", "neutral")
+        card.add_header_widget(self.backend_pill)
+        self.backend_active = Secondary("Reading the live session…")
+        self.backend_active.setWordWrap(True)
+        self.backend_detail = Caption("")
+        self.backend_detail.setWordWrap(True)
+        card.body.addWidget(self.backend_active)
+        card.body.addWidget(self.backend_detail)
+
+        self.content.addWidget(card)
+        self.bridge.sttBackendChanged.connect(lambda _state: self._refresh_backend())
+        self._refresh_backend()
+
+    def _on_backend(self, _index):
+        """
+        Applies a backend change to the RUNNING session, then writes it to `.env`.
+
+        The dropdown is disabled for the duration. A second switch arriving while the first is
+        still tearing a browser down is the one genuinely unsafe thing here — the manager
+        rejects it as stale anyway, but a control that stays clickable during a multi-second
+        operation invites the user to think nothing happened.
+
+        `.env` is written ONLY on success. A setting that failed to apply must not come back
+        after a restart claiming to be the configuration.
+        """
+        target = self.backend_combo.currentData()
+        self.backend_combo.setEnabled(False)
+        self.backend_pill.set_status("Switching", "warning")
+        self.backend_active.setText("Switching the speech backend…")
+        try:
+            committed, detail = self.bridge.set_stt_backend(target)
+        finally:
+            self.backend_combo.setEnabled(True)
+
+        if committed:
+            from kayra.core.config import write_env_values
+            write_env_values({"STT_BROWSER": target})
+            self.status.setText(f"Speech input is now using {detail}.")
+        else:
+            self.status.setText(f"Could not switch speech input: {detail}")
+        self._refresh_backend()
+
+    def _refresh_backend(self):
+        """Repaints the card from the LIVE backend manager. Requested and active stay separate."""
+        from kayra.input import stt_backend
+
+        state = self.bridge.stt_backend_state() or {}
+        if not state:
+            self.backend_pill.set_status("Not running", "neutral")
+            self.backend_active.setText(
+                f"Backend: {self.backend_combo.currentText()}\n"
+                "Active: None\n"
+                "Status: speech input is not running")
+            self.backend_detail.setText(
+                "This applies at the next start. Speech input is unavailable in this session.")
+            return
+
+        status = state.get("status", stt_backend.BackendStatus.OFF)
+        matches = bool(state.get("matches"))
+        active_label = state.get("active_label", "None")
+
+        if status == stt_backend.BackendStatus.OFF:
+            self.backend_pill.set_status("Not running", "neutral")
+        elif status == stt_backend.BackendStatus.ERROR or not matches:
+            # "Requested one and got another" is a WARNING, not a neutral fact: the user asked
+            # for something they did not get, and the screen has to say so.
+            self.backend_pill.set_status("Not applied", "warning")
+        elif status in (stt_backend.BackendStatus.STARTING,
+                        stt_backend.BackendStatus.RECOVERING):
+            self.backend_pill.set_status("Starting", "warning")
+        elif status == stt_backend.BackendStatus.PAUSED:
+            self.backend_pill.set_status("Paused", "neutral")
+        else:
+            self.backend_pill.set_status("Ready", "success")
+
+        self.backend_active.setText(
+            f"Backend: {state.get('requested_label', 'Automatic')}\n"
+            f"Active: {active_label}\n"
+            f"Status: {status.title()}")
+
+        lines = []
+        if state.get("last_error"):
+            lines.append(f"Last failure: {state['last_error']}")
+        if state.get("requested_backend") == stt_backend.AUTO and active_label != "None":
+            lines.append(f"Automatic selected {active_label} because it can reach a speech "
+                         f"recognition backend.")
+        if state.get("browser_process_id"):
+            lines.append(f"Driver process: {state['browser_process_id']}")
+        self.backend_detail.setText("\n".join(lines) or
+                                    "Changes apply immediately. No restart is needed.")
 
     def _build_device(self):
         """
@@ -385,6 +518,69 @@ class SettingsView(View):
             "Enable at startup", "Whether the service starts with Kayra.", enabled_control))
         self.content.addWidget(card)
 
+    # (env key, category, label, help)
+    PRESENCE = (
+        ("PROACTIVE_GREETINGS_ENABLED", "greetings", "Greetings",
+         "Varies how Kayra greets you by time of day and how long you have been away."),
+        ("PROACTIVE_CONTEXT_ENABLED", "context", "Contextual observations",
+         "Lets Kayra notice patterns — repeated failures, long stretches, coming back."),
+        ("PROACTIVE_LATE_NIGHT_ENABLED", "late_night", "Late-night awareness",
+         "One quiet remark when you are still working in the small hours."),
+        ("PROACTIVE_WORK_SESSION_ENABLED", "work_session", "Work-session awareness",
+         "A gentle observation after a long unbroken stretch. Never repeated."),
+        ("PROACTIVE_SYSTEM_ENABLED", "system", "System observations",
+         "Sustained memory or processor pressure, and a low battery."),
+        ("PROACTIVE_HUMOR_ENABLED", "humor", "Dry humour",
+         "A rare observational remark. Hours between any two."),
+    )
+
+    def _build_presence(self):
+        """
+        The contextual layer's switches.
+
+        Each toggle is BOTH live and persisted, like the speech-device dropdown: it calls the
+        running service so the change is felt immediately, and `_save` writes it to `.env` so
+        the choice survives a restart. Writing only the file would mean a switch that appears
+        to do nothing for the rest of the session, which is the worst kind of setting.
+
+        The master `Unprompted suggestions` switch above stays authoritative — with it off,
+        nothing here can make Kayra speak, and the note on the card says so rather than
+        leaving the user to discover it.
+        """
+        card = Card("Proactive presence")
+        card.body.setSpacing(0)
+
+        self.presence_toggle = Toggle(self.bridge.presence_enabled())
+        self.presence_toggle.toggled.connect(self._on_presence)
+        card.body.addWidget(SettingRow(
+            "Contextual presence",
+            "Allows Kayra to occasionally initiate a short, context-aware remark when there "
+            "is a useful reason to do so. Silence is the default.",
+            self.presence_toggle))
+
+        live = self.bridge.presence_categories()
+        self._presence_controls = {}
+        for env_key, category, label, help_text in self.PRESENCE:
+            stored = str(self._current(env_key, "True")).strip().lower() in ("true", "1", "yes", "on")
+            control = Toggle(bool(live.get(category, stored)))
+            control.toggled.connect(
+                lambda checked, name=category: self.bridge.set_presence_category(name, checked))
+            self._controls[env_key] = (control, "bool")
+            self._presence_controls[category] = control
+            card.body.addWidget(RowRule())
+            card.body.addWidget(SettingRow(label, help_text, control))
+
+        note = Caption("Applies immediately. Saved settings also apply on the next start. "
+                       "Turning off Unprompted suggestions silences all of these.")
+        note.setContentsMargins(0, Space.sm, 0, 0)
+        card.body.addWidget(note)
+        self.content.addWidget(card)
+
+    def _on_presence(self, enabled):
+        self.bridge.set_presence(bool(enabled))
+        for control in getattr(self, "_presence_controls", {}).values():
+            control.setEnabled(bool(enabled))
+
     def _build_actions(self):
         row = QWidget()
         layout = QHBoxLayout(row)
@@ -428,7 +624,15 @@ class SettingsView(View):
             if typed:
                 updates[env_key] = typed
 
+        previous = {key: self._current(key) for key in updates}
+
         if write_env_values(updates):
+            # ONE announcement, from the ONE recorder. The settings screen does not print a
+            # line of its own: the recorder owns setting-change logging, skips the unchanged
+            # (this writes every control on Save whether or not it was touched) and refuses to
+            # print the value of anything it classifies as a credential.
+            from kayra.core.settings_log import get_settings_recorder
+            get_settings_recorder().record_many(updates, previous)
             for env_key, field in self._secret_fields.items():
                 if field.text().strip():
                     field.clear()
@@ -455,8 +659,31 @@ class SettingsView(View):
         self.proactive_toggle.blockSignals(True)
         self.proactive_toggle.setChecked(self.bridge.proactive_enabled())
         self.proactive_toggle.blockSignals(False)
+        self._sync_presence()
+        self._refresh_backend()
         self._refresh_device()
         self._gpu_timer.start()
+
+    def _sync_presence(self):
+        """
+        Re-reads the LIVE service so the screen cannot show a stale switch.
+
+        Signals are blocked around each write: setting a checkbox from the service's own
+        value would otherwise emit `toggled` and write that value straight back, which turns
+        a read into a redundant service call on every navigation.
+        """
+        enabled = self.bridge.presence_enabled()
+        self.presence_toggle.blockSignals(True)
+        self.presence_toggle.setChecked(enabled)
+        self.presence_toggle.blockSignals(False)
+
+        live = self.bridge.presence_categories()
+        for category, control in getattr(self, "_presence_controls", {}).items():
+            if category in live:
+                control.blockSignals(True)
+                control.setChecked(bool(live[category]))
+                control.blockSignals(False)
+            control.setEnabled(bool(enabled))
 
     def on_hide(self):
         # The only timer on this screen, stopped the moment it is not visible. Nothing else
