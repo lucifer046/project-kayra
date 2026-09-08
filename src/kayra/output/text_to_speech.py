@@ -34,6 +34,7 @@ import numpy as np
 import sounddevice as sd
 from collections import deque
 from kokoro_onnx import Kokoro
+from kayra.output import tts_device
 from kayra.core.config import env_values
 from kayra.core.paths import model_path as model_file
 from kayra.utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
@@ -52,10 +53,28 @@ WRITE_SLICE_MS = 40
 class KokoroOnnx(Kokoro):
     """
     Quantized Kokoro TTS ONNX wrapper with robust pathing and real-time streaming capability.
-    Extends standard Kokoro to support a synchronous streaming generator compatible with sounddevice.
+    Extends standard Kokoro to support a synchronous streaming generator compatible with
+    sounddevice, and to run on a provider this application chose rather than the one the
+    library would have picked.
+
+    WHY THE SESSION IS BUILT OUT HERE. `Kokoro.__init__` constructs its own InferenceSession
+    with a hardcoded `["CPUExecutionProvider"]`, upgraded to *every* available provider only if
+    the `onnxruntime-gpu` distribution happens to be importable, and overridable only through
+    an `ONNX_PROVIDER` environment variable read at import. None of that can express "prefer
+    CUDA, verify it actually took, fall back to CPU and say so". `from_session` is the
+    library's own supported hook for exactly this, so the session is built by
+    `tts_device.create_session` and handed over already verified.
     """
-    def __init__(self, model_path: str, voices_path: str):
-        super().__init__(model_path, voices_path)
+
+    def __init__(self, model_path: str, voices_path: str, device_mode=None):
+        session, status = tts_device.create_session(model_path, mode=device_mode)
+        instance = Kokoro.from_session(session, voices_path)
+        # `from_session` is a classmethod returning a bare `Kokoro`; adopt its state rather
+        # than re-running `Kokoro.__init__`, which would build a SECOND session for the same
+        # model. One session at a time is a hard rule here — two would double the resident
+        # weights for no benefit.
+        self.__dict__.update(instance.__dict__)
+        self.device_status = status
 
     def stream(self, text: str, voice: str, speed: float = 1.1, lang: str = "en-us"):
         """
@@ -113,10 +132,19 @@ class DynamicVoiceEngine:
         "enough", "cancel", "nevermind", "never mind",
     )
 
-    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin", warm_up=True):
+    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin",
+                 warm_up=True, device_mode=None):
         # Paths and configuration both come from the core, never from a local guess at
         # where the project root is relative to this file.
         env_vars = env_values()
+
+        # AUTO / GPU / CPU. Validated in `tts_device.normalize_mode`, so an invalid value in
+        # .env can never reach onnxruntime as a provider name.
+        self.device_mode = tts_device.normalize_mode(
+            device_mode if device_mode is not None else tts_device.configured_mode())
+        # Guards a device switch against the synthesis worker: `self.onnx` is swapped under it,
+        # and the worker takes a reference to the current engine before each sentence.
+        self._device_lock = threading.RLock()
 
         # Dynamic name and fallback gender mapping
         self.assistant_name = env_vars.get("ASSISTANT_NAME", "").strip()
@@ -156,7 +184,18 @@ class DynamicVoiceEngine:
             print_error(f"Core voice matrix components missing: Check {model_path}")
             sys.exit(1)
 
-        self.onnx = KokoroOnnx(model_path, voices_path)
+        self._model_path = model_path
+        self._voices_path = voices_path
+        self.onnx = KokoroOnnx(model_path, voices_path, device_mode=self.device_mode)
+        self.device_status = self.onnx.device_status
+        for line in tts_device.diagnostics(self.device_status):
+            print_info(f"[TTS] {line}")
+        if self.device_status.fallback:
+            # An explicit GPU request that did not happen is stated LOUDLY, once, at boot. A
+            # silent downgrade under an explicit request is the one outcome this whole
+            # subsystem exists to make impossible.
+            print_warning(f"[TTS] {self.device_status.reason}")
+
         self.sample_rate = SAMPLE_RATE
         self.last_spoken_text = ""
 
@@ -270,7 +309,11 @@ class DynamicVoiceEngine:
                     self._idle.clear()
 
                 try:
-                    for audio_samples, _rate in self.onnx.stream(text, voice=self.voice, speed=1.1):
+                    # One reference for the whole sentence. A device switch swaps `self.onnx`
+                    # between sentences; reading it once here means a switch can never replace
+                    # the engine underneath a generator that is mid-inference.
+                    onnx = self.onnx
+                    for audio_samples, _rate in onnx.stream(text, voice=self.voice, speed=1.1):
                         if epoch != self._epoch:
                             break  # Barge-in mid-sentence: abandon the rest of this sentence.
                         self._audio_queue.put((epoch, np.asarray(audio_samples, dtype=np.float32)))
@@ -554,6 +597,56 @@ class DynamicVoiceEngine:
         self._end_burst()
         self._idle.set()
 
+    def set_device_mode(self, mode):
+        """
+        Rebuilds the Kokoro session on a different device, at runtime. Returns a `DeviceStatus`.
+
+        THE SWITCH IS NEVER MADE UNDER LIVE AUDIO. Replacing `self.onnx` while the synthesis
+        worker holds a generator over the old session would leave that generator streaming out
+        of an object nothing else references, and disposing the session under it is undefined
+        behaviour inside onnxruntime's native code. So this stops speech first — the same
+        `stop()` a barge-in uses, with the same epoch bump — then waits for the pipeline to
+        drain before touching anything.
+
+        Building the new session BEFORE releasing the old one is deliberate too: if the new
+        provider cannot initialize, the assistant keeps the voice it already had rather than
+        being left mute by a settings change.
+        """
+        mode = tts_device.normalize_mode(mode)
+        with self._device_lock:
+            if mode == self.device_mode and self.device_status is not None:
+                return self.device_status
+
+            self.stop()
+            self.wait_until_idle(timeout=5.0)
+
+            try:
+                replacement = KokoroOnnx(self._model_path, self._voices_path, device_mode=mode)
+            except Exception as exc:
+                print_error(f"[TTS] Could not switch to {mode}: {exc}. Keeping the current "
+                            f"device.")
+                return self.device_status
+
+            previous = self.onnx
+            self.onnx = replacement
+            self.device_mode = mode
+            self.device_status = replacement.device_status
+            del previous            # the old session's weights are released here
+
+            for line in tts_device.diagnostics(self.device_status):
+                print_info(f"[TTS] {line}")
+
+            # The new graph pays the same first-inference optimization cost the original did.
+            # Warming it here means the user's next sentence is not the cold one.
+            threading.Thread(target=self._warm_up, daemon=True,
+                             name="kayra-tts-warmup").start()
+            return self.device_status
+
+    def device_report(self):
+        """What is ACTUALLY running, as a plain dict. Read by the UI; never cached there."""
+        status = getattr(self, "device_status", None)
+        return status.to_dict() if status is not None else {}
+
     def wait_until_idle(self, timeout: float = None) -> bool:
         """Blocks until the speech pipeline has fully drained (or the timeout elapses)."""
         return self._idle.wait(timeout=timeout)
@@ -579,8 +672,10 @@ class TextToSpeechEngine(DynamicVoiceEngine):
     used to request the full-precision files by name, so a quantized model sitting in
     models/ was never picked up.
     """
-    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin", warm_up=True):
-        super().__init__(model_filename=model_filename, voices_filename=voices_filename, warm_up=warm_up)
+    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin",
+                 warm_up=True, device_mode=None):
+        super().__init__(model_filename=model_filename, voices_filename=voices_filename,
+                         warm_up=warm_up, device_mode=device_mode)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

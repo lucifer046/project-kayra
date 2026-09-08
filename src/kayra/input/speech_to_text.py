@@ -53,24 +53,41 @@ from kayra.input import browsers
 from kayra.utils import print_info, print_warning, print_error, print_system, print_success, print_banner, console, now_ms
 
 
-# Interrupt vocabulary shared with the TTS engine's INTERRUPT_WORDS. Hindi entries are
-# included because INPUT_LANGUAGE is frequently 'hi-IN', in which case interim results
-# come back in Devanagari and would never match the English list alone.
-INTERRUPT_PHRASES = [
-    "stop", "wait", "shut up", "pause", "hold on", "quiet", "silence",
-    "enough", "cancel", "nevermind", "never mind",
-    "रुको", "रुक", "ठहरो", "बस", "चुप",
-    # English interrupt words as the hi-IN recognizer transliterates them. Users speak
-    # English commands to Kayra while INPUT_LANGUAGE is hi-IN, and Google returns
-    # Devanagari for them, which would never match the Latin entries above.
-    "स्टॉप", "वेट", "रुको जरा",
+# The control vocabulary lives in `core.voice_control` — one table, shared by the STT page
+# (which does the first-pass interim match in JavaScript), this module, and the orchestrator's
+# local control interpreter. It is re-exported here under its historical names because that is
+# where every caller and every test has always imported it from.
+#
+# `core` is a leaf package: importing it here cannot create a cycle, which is exactly why the
+# vocabulary was moved there rather than being duplicated.
+from kayra.core.voice_control import (          # noqa: F401  (re-exported)
+    INTERRUPT_PHRASES, INTERRUPT_FILLERS, ControlKind, ControlCommand,
+    PAUSE_LISTENING_PHRASES, RESUME_LISTENING_PHRASES, SLEEP_PHRASES,
+    WAKE_PHRASES, SHUTDOWN_PHRASES,
+    classify_control, is_interrupt_phrase, interrupt_in_tail,
+)
+
+# Named explicitly so the re-export is code rather than a side effect of an import statement —
+# a linter cannot tell the two apart, and "unused import" is the wrong answer for a name this
+# module deliberately publishes.
+CONTROL_VOCABULARY = (classify_control, is_interrupt_phrase, interrupt_in_tail,
+                      ControlKind, ControlCommand)
+
+# Lifecycle phrases the page publishes on `window.kayraControl`. These are matched EXACTLY on
+# the whole utterance (never on a tail), because unlike a barge-in they are not urgent enough
+# to justify any risk of a false positive: quitting the process on a misheard suffix would be
+# the worst failure this system could have.
+_CONTROL_PHRASE_TABLE = [
+    [phrase, kind]
+    for phrases, kind in (
+        (PAUSE_LISTENING_PHRASES, ControlKind.PAUSE_LISTENING),
+        (RESUME_LISTENING_PHRASES, ControlKind.RESUME_LISTENING),
+        (SLEEP_PHRASES, ControlKind.SLEEP),
+        (WAKE_PHRASES, ControlKind.WAKE),
+        (SHUTDOWN_PHRASES, ControlKind.SHUTDOWN),
+    )
+    for phrase in phrases
 ]
-
-# Words stripped before matching, so "Kayra, stop please" still reduces to "stop".
-INTERRUPT_FILLERS = {"kayra", "please", "just", "ok", "okay", "hey", "yo", "now"}
-
-_INTERRUPT_PHRASE_SET = set(INTERRUPT_PHRASES)
-_SINGLE_WORD_INTERRUPTS = {p for p in INTERRUPT_PHRASES if " " not in p}
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │        IN-BROWSER WEB SPEECH API & VAD SILENCE QUEUING HTML/JS         │
@@ -101,10 +118,24 @@ html_code = """<!DOCTYPE html>
         window.speechQueue = [];
         // Set the instant an interim result looks like an interruption: {text, at}
         window.kayraInterrupt = null;
+        // Set the instant an interim result IS a lifecycle command: {text, kind, at}
+        window.kayraControl = null;
         // Interrupt vocabulary, injected from Python so both sides share one list.
         window.kayraInterruptWords = [];
         window.kayraInterruptFillers = [];
         window.kayraSingleWordInterrupts = [];
+        // [[phrase, kind], ...] for the lifecycle commands (pause/sleep/wake/shutdown).
+        window.kayraControlPhrases = [];
+        // Whether Kayra's own voice is currently leaving the speakers. Written by Python on
+        // the barge-in watcher's existing poll, so it costs no extra round-trip.
+        //
+        // THIS FLAG IS WHY "stop" NOW WORKS RELIABLY. The microphone stays open during
+        // playback, so whatever echo of Kayra's own voice survives Chrome's canceller is
+        // already sitting in the recognizer's buffer when the user barges in. The probe is
+        // therefore not "stop" but "...and then the rollout takes ten minutes stop", which no
+        // whole-utterance test can ever match. While this flag is set — and ONLY while it is
+        // set — the trailing words are matched as well.
+        window.kayraSpeaking = false;
         // Recognition-backend health. `webkitSpeechRecognition` exists in every Chromium
         // derivative, but only builds carrying a speech backend can actually transcribe:
         // Chrome has Google's key, Edge has Microsoft's, Brave deliberately ships neither.
@@ -150,15 +181,33 @@ html_code = """<!DOCTYPE html>
             } catch (e) { /* non-fatal */ }
         }
 
-        function looksLikeInterrupt(text) {
-            const raw = (text || "").toLowerCase().replace(/[.,!?;:]/g, " ").trim();
-            if (!raw) return false;
-            // EXACT match on the whole utterance, filler words removed. A prefix test
-            // would fire on "stop the music", which is a real command, not a barge-in.
-            const words = raw.split(/\\s+/).filter(function (w) {
-                return w && window.kayraInterruptFillers.indexOf(w) === -1;
-            });
-            if (!words.length || words.length > 3) return false;
+        // Shared normalization. Mirrors `voice_control.normalize_utterance` on the Python
+        // side; the two must agree, and `tests/test_voice_control.py` compares them case for
+        // case against this exact table.
+        // mode "strip": every filler removed, the assistant's name included — the form the
+        //               interrupt vocabulary is matched against ("Kayra, please stop" -> "stop").
+        // mode "named": every filler removed EXCEPT the assistant's name, which is rewritten to
+        //               the canonical "kayra" the lifecycle table is written in
+        //               ("hey Vega, go to sleep" -> "kayra go to sleep").
+        function normalizeWords(text, mode) {
+            const raw = (text || "").toLowerCase().replace(/[.,!?;:'"]/g, " ").trim();
+            if (!raw) return [];
+            const words = raw.split(/\\s+/);
+            const out = [];
+            const name = window.kayraAssistantName || "kayra";
+            for (let i = 0; i < words.length; i++) {
+                const w = words[i];
+                if (!w) continue;
+                const isName = (w === name || w === "kayra");
+                if (mode === "named" && isName) { out.push("kayra"); continue; }
+                if (window.kayraInterruptFillers.indexOf(w) !== -1) continue;
+                out.push(w);
+            }
+            return out;
+        }
+
+        function isInterruptExactly(words) {
+            if (!words.length || words.length > 4) return false;
             if (window.kayraInterruptWords.indexOf(words.join(" ")) !== -1) return true;
             // "stop stop stop" is still a stop.
             return words.every(function (w) {
@@ -166,12 +215,51 @@ html_code = """<!DOCTYPE html>
             });
         }
 
-        function startContinuousRecognition(lang, silenceMs, interruptWords, fillers) {
+        function looksLikeInterrupt(text) {
+            // EXACT match on the whole utterance, filler words removed. A prefix test
+            // would fire on "stop the music", which is a real command, not a barge-in.
+            const words = normalizeWords(text, "strip");
+            if (isInterruptExactly(words)) return true;
+
+            // TAIL match, and ONLY while Kayra is audible. See `window.kayraSpeaking` above:
+            // during playback the buffer is polluted by echo, so the user's actual word is at
+            // the end of the probe rather than being the whole of it. Outside playback this
+            // branch is skipped entirely, which is what keeps "close this tab and stop" a
+            // normal command.
+            if (!window.kayraSpeaking) return false;
+            for (let size = 1; size <= 4 && size <= words.length; size++) {
+                if (window.kayraInterruptWords.indexOf(
+                        words.slice(words.length - size).join(" ")) !== -1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Lifecycle commands: whole-utterance only, no tail matching, ever. Returns the kind
+        // string or null.
+        function looksLikeControl(text) {
+            const words = normalizeWords(text, "named");
+            if (!words.length || words.length > 5) return null;
+            const joined = words.join(" ");
+            for (let i = 0; i < window.kayraControlPhrases.length; i++) {
+                if (window.kayraControlPhrases[i][0] === joined) {
+                    return window.kayraControlPhrases[i][1];
+                }
+            }
+            return null;
+        }
+
+        function startContinuousRecognition(lang, silenceMs, interruptWords, fillers,
+                                            controlPhrases, assistantName) {
             silenceLimit = silenceMs || 800;
             window.speechQueue = [];
             window.kayraInterrupt = null;
+            window.kayraControl = null;
             window.kayraInterruptWords = interruptWords || [];
             window.kayraInterruptFillers = fillers || [];
+            window.kayraControlPhrases = controlPhrases || [];
+            window.kayraAssistantName = (assistantName || "kayra").toLowerCase();
             window.kayraSingleWordInterrupts = window.kayraInterruptWords.filter(function (w) {
                 return w.indexOf(" ") === -1;
             });
@@ -230,6 +318,16 @@ html_code = """<!DOCTYPE html>
                 const probe = (currentText + " " + interimTranscript).trim();
                 if (!window.kayraInterrupt && looksLikeInterrupt(probe)) {
                     window.kayraInterrupt = { text: probe, at: Date.now(), start: utteranceStart };
+                }
+                // Same fast path for the lifecycle commands, so "exit" spoken over a long
+                // answer ends the process immediately instead of after the ~800ms VAD window
+                // and the translation round-trip. Whole-utterance match only.
+                if (!window.kayraControl) {
+                    const kind = looksLikeControl(probe);
+                    if (kind) {
+                        window.kayraControl = { text: probe, kind: kind, at: Date.now(),
+                                                start: utteranceStart };
+                    }
                 }
             };
 
@@ -300,6 +398,17 @@ html_code = """<!DOCTYPE html>
             }, 100);
         }
 
+        // Discards the partially-accumulated utterance without touching the session. Python
+        // calls this through `clear_queue()` after a barge-in: the buffer at that moment holds
+        // echo plus the interrupt word, and leaving it in place meant the silence timer
+        // delivered that string as the user's next command one VAD window later.
+        function resetUtteranceBuffer() {
+            currentText = "";
+            isSpeaking = false;
+            lastResultTime = Date.now();
+            utteranceStart = Date.now();
+        }
+
         function restartRecognition() {
             if (recognition) {
                 try { recognition.stop(); } catch(e) {}
@@ -320,6 +429,18 @@ html_code = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
+
+
+# `pause_listening()` / `resume_listening()` are a THIRD thing, separate from both the
+# lifecycle states above and from the audio barge-in:
+#
+#   barge-in          cancels what the assistant is SAYING          (tts_engine.stop)
+#   listening pause   stops what the assistant is HEARING           (this pair)
+#   shutdown          ends the process                              (app._force_shutdown)
+#
+# They are deliberately not expressed as lifecycle states: a paused engine is still READY or
+# LISTENING, still owns its browser, and still recovers from a crash. Pausing is a property of
+# the microphone, not a stage in the session's life.
 
 
 class SttState:
@@ -453,6 +574,8 @@ class SpeechToTextEngine:
 
     MAX_RECOVERY_ATTEMPTS = 3
 
+    _listening_paused = False           # class-level default: the engine starts listening
+
     def __init__(self, language=None, silence_limit=0.8, autostart=True, browser=None):
         """
         Prepares the engine and (by default) brings up the single browser session.
@@ -474,6 +597,14 @@ class SpeechToTextEngine:
 
         self.language = language
         self.silence_limit_ms = int(silence_limit * 1000)
+        # The name the user addresses the assistant by. The page needs it because "turn off
+        # Vega" has to reach the shutdown table with the same meaning "turn off Kayra" does,
+        # and the lifecycle phrases are stored in their canonical "kayra" form.
+        try:
+            from kayra.core.config import assistant_name as _assistant_name
+            self.assistant_alias = (_assistant_name() or "kayra").strip().lower()
+        except Exception:
+            self.assistant_alias = "kayra"
         self._driver_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
 
@@ -683,16 +814,82 @@ class SpeechToTextEngine:
         self._record_owned_processes()
 
         self.driver.get(page_url)
+        self._start_recognition()
+
+        # Late-spawning renderers/utilities are not children yet at driver creation.
+        self._record_owned_processes()
+
+    # ┌────────────────────────────────────────────────────────────────┐
+    # │                     LISTENING PAUSE / RESUME                   │
+    # └────────────────────────────────────────────────────────────────┘
+    # Pausing listening is NOT shutting the engine down, and the difference is the whole
+    # point of this pair. `shutdown()` tears the browser session down and reaps its processes;
+    # a user who pauses the microphone for a phone call and resumes a minute later would pay
+    # the full 1.3-2.5s session rebuild for it, and every recovery path would have to run.
+    #
+    # So: the browser session, the driver, the loopback page server and the owned-PID ledger
+    # all stay exactly as they are. Only the page's SpeechRecognition object is stopped, which
+    # is what actually releases the microphone — Chrome drops the capture when recognition
+    # ends, and the tab's recording indicator goes out.
+
+    def _start_recognition(self):
+        """(Re)starts continuous recognition on the page with this engine's configuration."""
         self.driver.execute_script(
-            "startContinuousRecognition(arguments[0], arguments[1], arguments[2], arguments[3]);",
+            "startContinuousRecognition(arguments[0], arguments[1], arguments[2], arguments[3],"
+            " arguments[4], arguments[5]);",
             self.language,
             self.silence_limit_ms,
             INTERRUPT_PHRASES,
             sorted(INTERRUPT_FILLERS),
+            _CONTROL_PHRASE_TABLE,
+            self.assistant_alias,
         )
 
-        # Late-spawning renderers/utilities are not children yet at driver creation.
-        self._record_owned_processes()
+    @property
+    def listening_paused(self):
+        return bool(getattr(self, "_listening_paused", False))
+
+    def pause_listening(self):
+        """
+        Stops recognition and releases the microphone, keeping the session alive.
+
+        Returns True when the engine is paused afterwards, whether or not this call is what
+        paused it — the caller wants the resulting STATE, not a report of who won a race.
+        """
+        if self.state in (SttState.STOPPING, SttState.STOPPED, SttState.FAILED):
+            return False
+        self._listening_paused = True
+        try:
+            self._raw_script("stopContinuousRecognition();")
+        except Exception:
+            # A failed script call still leaves the flag set, so `capture()` stops handing
+            # utterances upward. Better to be deaf than to claim a pause that did not happen
+            # in one place and did in another.
+            pass
+        try:
+            self.clear_queue()
+            self.set_assistant_status("Listening paused")
+        except Exception:
+            pass
+        return True
+
+    def resume_listening(self):
+        """Restarts recognition. Rebuilds the session first if it died while paused."""
+        self._listening_paused = False
+        if self.state in (SttState.STOPPING, SttState.STOPPED, SttState.FAILED):
+            return False
+        try:
+            if not self.is_session_alive():
+                # A browser that died during the pause is exactly the case `recover` exists
+                # for; resuming has to be able to survive it.
+                self.recover("resume after pause")
+            else:
+                self._start_recognition()
+            self.clear_queue()          # anything captured mid-restart is not a command
+            self.set_assistant_status("Listening...")
+            return True
+        except Exception:
+            return False
 
     def _switch_browser(self, reason):
         """
@@ -979,12 +1176,31 @@ class SpeechToTextEngine:
 
     def clear_queue(self):
         """
-        Purges the pending utterance queue and any latched interrupt.
+        Purges everything the recognizer is holding: the finalized queue, the latched
+        interrupt/control flags, AND the partially-accumulated sentence.
 
-        Called after a barge-in so the interrupt utterance itself (and any echo captured
-        just before it) can't be replayed as the user's next command.
+        RESETTING `currentText` IS THE PART THAT MATTERS. It used to be left alone, so after a
+        barge-in the recognizer still held the echo it had accumulated plus the interrupt word
+        itself — and the silence timer pushed that whole polluted string onto the queue ~800ms
+        later, where it arrived as the user's next "command". Clearing the queue without
+        clearing the buffer only delayed the problem by one VAD window.
         """
-        self._script("window.speechQueue = []; window.kayraInterrupt = null;")
+        self._script(
+            "window.speechQueue = [];"
+            " window.kayraInterrupt = null;"
+            " window.kayraControl = null;"
+            " if (typeof resetUtteranceBuffer === 'function') { resetUtteranceBuffer(); }"
+        )
+
+    def set_speaking(self, speaking):
+        """
+        Tells the page whether Kayra's own voice is currently audible.
+
+        This gates the tail-matching branch of `looksLikeInterrupt` — see the comment on
+        `window.kayraSpeaking` in the page source. Callers should prefer `poll_controls`,
+        which carries the flag in the same round-trip it uses to read the flags back.
+        """
+        self._script("window.kayraSpeaking = arguments[0];", bool(speaking))
 
     def poll_interrupt(self):
         """
@@ -1000,6 +1216,31 @@ class SpeechToTextEngine:
         if isinstance(payload, dict) and payload.get("text"):
             return payload
         return None
+
+    def poll_controls(self, speaking=None):
+        """
+        ONE round-trip that publishes the speaking flag and reads back both fast-path flags.
+
+        Returns `(interrupt, control)`, either of which may be None. Consuming clears them.
+
+        Combining the three is not micro-optimisation: the watcher runs this at ~17Hz while
+        Kayra is talking, and each Selenium command is an HTTP request over the driver lock
+        that the capture loop also needs. Three calls per tick would triple that contention
+        for information that is read and written at exactly the same instant.
+        """
+        payload = self._script(
+            "if (arguments[0] !== null) { window.kayraSpeaking = arguments[0]; }"
+            " var i = window.kayraInterrupt, c = window.kayraControl;"
+            " window.kayraInterrupt = null; window.kayraControl = null;"
+            " return {interrupt: i || null, control: c || null};",
+            None if speaking is None else bool(speaking),
+        )
+        if not isinstance(payload, dict):
+            return None, None
+        interrupt = payload.get("interrupt")
+        control = payload.get("control")
+        return (interrupt if isinstance(interrupt, dict) and interrupt.get("text") else None,
+                control if isinstance(control, dict) and control.get("kind") else None)
 
     # ──────────────────────────────────────────────────────────────────────
     #                             CAPTURE
@@ -1023,6 +1264,11 @@ class SpeechToTextEngine:
                 if self.state in (SttState.STOPPING, SttState.STOPPED):
                     return None
                 if self.state == SttState.FAILED:
+                    return None
+                # Paused: return immediately rather than blocking the caller's thread in a
+                # poll loop against a page that is not recognising anything. The caller waits
+                # on an event instead, so a paused microphone costs no polling at all.
+                if getattr(self, "_listening_paused", False):
                     return None
 
                 # Pop the oldest utterance AND read the engine status in a single
@@ -1324,33 +1570,11 @@ def translate_query(query, needs_translation=True):
     return english_query.capitalize()
 
 
-def is_interrupt_phrase(text: str) -> bool:
-    """
-    True when an utterance is *only* an interruption command ("stop", "wait", "hold on").
-
-    Matching is EXACT on the utterance with filler words removed, never a prefix test.
-    A prefix test would classify "stop the music" — a legitimate automation command that
-    must reach the DMM — as a barge-in and silently swallow it.
-    """
-    if not text:
-        return False
-
-    # Strip punctuation, then drop the assistant's name and politeness filler so
-    # "Kayra, stop please" reduces to "stop".
-    #
-    # Only explicit punctuation is removed — a `[^\w\s]` class would also eat Devanagari
-    # combining vowel signs (category Mn, which Python's \w excludes), turning "रुको"
-    # into "र क" and silently breaking every Hindi interrupt word.
-    cleaned = re.sub(r"[.,!?;:\"'()\[\]।]+", " ", text.lower())
-    words = [w for w in cleaned.split() if w not in INTERRUPT_FILLERS]
-    if not words or len(words) > 3:
-        return False
-
-    if " ".join(words) in _INTERRUPT_PHRASE_SET:
-        return True
-
-    # Repetition of a single-word interrupt ("stop stop stop") still means stop.
-    return all(w in _SINGLE_WORD_INTERRUPTS for w in words)
+# `is_interrupt_phrase`, `classify_control` and `interrupt_in_tail` are imported at the top of
+# this module from `core.voice_control` and re-exported here, which is where every caller and
+# every test has always found them. They used to be implemented in this file; the copy was
+# removed when the vocabulary moved, because two implementations of "is this a barge-in?" is
+# precisely the kind of drift the JS/Python pair in this module already has to guard against.
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

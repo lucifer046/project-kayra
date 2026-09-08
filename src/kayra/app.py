@@ -68,6 +68,7 @@ if sys.platform.startswith("win"):
 from kayra.core.config import (load_environment, env_values,
                                assistant_name as configured_assistant_name)
 from kayra.core.runtime_state import AssistantState, get_runtime_state
+from kayra.core.voice_control import ControlKind, classify_control
 from kayra.utils import (
     print_banner, print_system, print_info, print_error, print_success, print_warning,
     console, StageTimer, now_ms,
@@ -109,6 +110,18 @@ create_default_agent = None
 
 _BOOTSTRAPPED = False
 _barge_in_metrics = {}
+
+# Shutdown is idempotent and single-entry. Ctrl+C during teardown, a tray Quit that races the
+# spoken "exit", and the UI button pressed twice all arrive here; the first caller runs the
+# sequence and every later one returns immediately instead of tearing down a half-torn-down
+# process. An Event rather than a bool because the losing callers have to be able to WAIT.
+_shutdown_started = threading.Event()
+_shutdown_lock = threading.Lock()
+_pre_exit_hooks = []
+
+# Proactive state to restore on wake. Standby switches the service off; waking must put it back
+# the way the user had it, not switch it unconditionally on.
+_proactive_before_sleep = None
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -325,17 +338,138 @@ def bootstrap():
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
-# │                        BARGE-IN WATCHER THREAD                         │
+# │                     LOCAL CONTROL WATCHER THREAD                       │
 # └────────────────────────────────────────────────────────────────────────┘
+# The fast path for everything the user says ABOUT Kayra rather than TO it. This thread is the
+# reason those commands work at all while a response is in flight: `Main_Loop` is blocked
+# inside `Execute_Task` for the whole of a generated answer and cannot poll the microphone.
+#
+#   interim STT result -> local control check -> act
+#                                     |
+#                                     +-- nothing matched -> the utterance stays in the queue
+#                                         and reaches the DMM through Listen() as normal
+#
+# No LLM call, no network, no classification. See `core.voice_control` for the vocabulary and
+# for why the matching is exact.
 
-def _barge_in_watcher():
+
+def _dispatch_control(kind, text="", source="voice"):
     """
-    Watches for interruption words while the assistant is audible and cancels playback
-    immediately, independently of whatever the main loop is doing.
+    Executes one local control command. Returns True if it was handled.
 
-    The STT page flags interrupts from INTERIM recognition results, so this fires roughly a
-    VAD window (~800ms) earlier than a finalized transcript would, and without the translation
+    Every caller -- the watcher below, `Listen()`, the UI -- routes through this one function,
+    so a spoken "stop listening" and a clicked pause button cannot drift into two behaviours.
+    """
+    if kind == ControlKind.INTERRUPT:
+        return _interrupt_speech(text)
+
+    if kind == ControlKind.SHUTDOWN:
+        print_system(f"[CONTROL] '{(text or '').strip()}' -- shutting {assistant_name} down.")
+        request_shutdown(reason=f"{source}: {(text or '').strip()}", farewell=True)
+        return True
+
+    if kind == ControlKind.PAUSE_LISTENING:
+        # Silence first, then close the microphone. A user who says "stop listening" over a
+        # running answer wants both, and doing it the other way round would leave a sentence
+        # playing to a room where Kayra can no longer be told to stop it.
+        _interrupt_speech(text, announce=False)
+        _confirm(set_listening(False))
+        return True
+
+    if kind == ControlKind.RESUME_LISTENING:
+        _confirm(set_listening(True))
+        return True
+
+    if kind == ControlKind.SLEEP:
+        _confirm(set_sleeping(True))
+        return True
+
+    if kind == ControlKind.WAKE:
+        _confirm(set_sleeping(False))
+        return True
+
+    return False
+
+
+def _confirm(reply):
+    """
+    Speaks a one-line confirmation for a control command. NEVER blocking.
+
+    THE BLOCKING VERSION WAS A REAL BUG, caught by measurement rather than by reading. This runs
+    on the local control watcher, and `speak(..., blocking=True)` parks that thread until the
+    sentence has finished PLAYING — measured at ~5s for "Okay, listening is paused...". For
+    those five seconds the watcher polls nothing, so a "stop" or an "exit" spoken straight after
+    "stop listening" was not noticed at all. The thread whose entire purpose is to stay
+    responsive must never wait on audio.
+
+    Nothing is lost by not blocking: closing the microphone does not silence the speaker, so the
+    confirmation plays out in full either way. The one place a blocking farewell is genuinely
+    required is `request_shutdown`, where the audio device is disposed moments later — and it
+    blocks there, on the caller's thread, by design.
+
+    `begin_background_utterance()` clears the `_interrupted` latch that `_interrupt_speech` just
+    set, which is what lets this sentence through. It is safe here and only here: the epoch has
+    already moved, so a response stream cancelled a moment ago stays cancelled (it tests
+    `is_cancelled(token)`, not the latch), and there is no generator still feeding the queue.
+    """
+    if not (reply and TTS_ENABLED and tts_engine is not None):
+        return
+    tts_engine.begin_background_utterance()
+    tts_engine.speak(reply)
+
+
+def _interrupt_speech(text="", announce=True):
+    """
+    The barge-in itself: cancel the epoch, drop the recognizer's buffer, hand the floor back.
+
+    Kept separate from `_dispatch_control` because three other things call it -- the finalized
+    backstop in `Listen()`, the UI's stop button, and the pause-listening branch above -- and
+    each needs exactly this and nothing else.
+    """
+    if not (TTS_ENABLED and tts_engine is not None):
+        return False
+
+    t_detect = time.perf_counter()
+    set_state(STATE_INTERRUPTING)
+    if announce:
+        print_system(f"[BARGE-IN] '{(text or '').strip()}' -- cancelling speech.")
+
+    tts_engine.stop()
+    stop_latency = (time.perf_counter() - t_detect) * 1000.0
+
+    # The user has the floor. Everything that decides whether an unprompted line may be spoken
+    # keys off this timestamp, and a proactive suggestion that was mid-flight is cancelled by
+    # exactly this same path -- there is no separate interruption mechanism for proactive
+    # speech.
+    RUNTIME.note_interrupt()
+    RUNTIME.emit("barge_in", text=text or "")
+
+    # Drop everything the recognizer buffered up to this point: the interrupt word itself, plus
+    # the echo it is glued to. Without this the swallowed "stop" resurfaces as the user's next
+    # command one VAD window later.
+    if stt_engine is not None:
+        try:
+            stt_engine.clear_queue()
+        except Exception:
+            pass
+
+    _barge_in_metrics["stop_call_ms"] = stop_latency
+    set_state(STATE_LISTENING)
+    return True
+
+
+def _local_control_watcher():
+    """
+    Polls the STT page for control commands and acts on them, independently of the main loop.
+
+    The page flags both kinds from INTERIM recognition results, so this fires roughly a VAD
+    window (~800ms) earlier than a finalized transcript would, and without the translation
     round-trip.
+
+    THE SPEAKING FLAG IS PUBLISHED FROM HERE, in the same round-trip that reads the flags back.
+    That is not an optimisation detail, it is what makes "stop" reliable: the page only
+    tail-matches the interrupt vocabulary while Kayra is audible, and this loop is the only
+    thing that knows, at 17Hz, whether she is.
     """
     while True:
         try:
@@ -343,40 +477,30 @@ def _barge_in_watcher():
                 time.sleep(0.5)
                 continue
 
-            speaking = TTS_ENABLED and tts_engine is not None and tts_engine.is_playing
-            hit = stt_engine.poll_interrupt()
+            speaking = bool(TTS_ENABLED and tts_engine is not None and tts_engine.is_playing)
+
+            poll = getattr(stt_engine, "poll_controls", None)
+            if poll is not None:
+                hit, control = poll(speaking=speaking)
+            else:                     # pragma: no cover - an engine older than this change
+                hit, control = stt_engine.poll_interrupt(), None
+
+            # Lifecycle commands are acted on whatever Kayra is doing. They are the two
+            # categories -- silence yourself, end yourself -- that never need protecting from.
+            if control:
+                _dispatch_control(str(control.get("kind") or ""),
+                                  str(control.get("text") or ""))
 
             if hit and speaking:
-                t_detect = time.perf_counter()
-                set_state(STATE_INTERRUPTING)
-                print_system(f"[BARGE-IN] '{hit.get('text', '').strip()}' — cancelling speech.")
-
-                tts_engine.stop()
-                stop_latency = (time.perf_counter() - t_detect) * 1000.0
-
-                # The user has the floor. Everything that decides whether an unprompted line
-                # may be spoken keys off this timestamp, and a proactive suggestion that was
-                # mid-flight is cancelled by exactly this same path — there is no separate
-                # interruption mechanism for proactive speech.
-                RUNTIME.note_interrupt()
-                RUNTIME.emit("barge_in", text=hit.get("text", ""))
-
-                # Drop everything the recognizer buffered up to this point: the interrupt word
-                # itself plus any echo captured while she was still talking. Without this the
-                # swallowed "stop" would resurface as the next command.
-                stt_engine.clear_queue()
-
-                _barge_in_metrics.update({
-                    "detected_at_ms": now_ms(),
-                    "spoken_at_ms": float(hit.get("start") or now_ms()),
-                    "stop_call_ms": stop_latency,
-                })
+                spoken_at = float(hit.get("start") or now_ms())
+                _interrupt_speech(hit.get("text", ""))
+                _barge_in_metrics["detected_at_ms"] = now_ms()
+                _barge_in_metrics["spoken_at_ms"] = spoken_at
                 print_info(
                     f"[BARGE-IN] speech->detection "
-                    f"{(_barge_in_metrics['detected_at_ms'] - _barge_in_metrics['spoken_at_ms']):.0f}ms, "
-                    f"detection->silence {stop_latency:.0f}ms"
+                    f"{(_barge_in_metrics['detected_at_ms'] - spoken_at):.0f}ms, "
+                    f"detection->silence {_barge_in_metrics.get('stop_call_ms', 0.0):.0f}ms"
                 )
-                set_state(STATE_LISTENING)
 
             # `hit` while NOT speaking is discarded here on purpose: there is nothing to
             # interrupt, and leaving the flag latched would fire a phantom barge-in the instant
@@ -387,6 +511,12 @@ def _barge_in_watcher():
         except Exception:
             # A watcher crash must never take the assistant down or wedge playback.
             time.sleep(0.5)
+
+
+# The watcher answered to this name for its whole life and `ui.session` starts it by it. Kept
+# as an alias rather than renamed at the call sites, because a rename here would be a silent
+# behavioural change in a front end that would still import cleanly.
+_barge_in_watcher = _local_control_watcher
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -409,6 +539,130 @@ def _is_self_echo(result):
     return tts_engine.was_audible_between(result["start_ms"], result["end_ms"])
 
 
+def set_listening(enabled, announce=True):
+    """
+    Opens or closes the microphone WITHOUT touching anything else Kayra is running.
+
+    This is not a shutdown and it is not a barge-in. Nothing here stops the TTS engine, the
+    proactive agent, the automation layer, the model clients or the STT browser session — the
+    session stays up so resuming costs a script call instead of a 2.5s rebuild.
+
+    Returns the sentence to say, or "" when nothing changed. The caller decides whether to
+    speak it, because this is called from the DMM dispatch (which speaks) and from the UI
+    (which does not, and shows the state instead).
+
+    ASYMMETRY IS DELIBERATE. "Stop listening" can be spoken; "start listening" cannot, because
+    a paused microphone by definition cannot hear the command to un-pause. Resuming is a
+    manual action from the UI or the tray, and the vocabulary reflects that — there is no
+    `start listening` DMM token.
+    """
+    enabled = bool(enabled)
+    runtime = get_runtime_state()
+
+    if AUDIO_ENABLED and stt_engine is not None:
+        try:
+            if enabled:
+                stt_engine.resume_listening()
+            else:
+                stt_engine.pause_listening()
+        except Exception as exc:
+            print_warning(f"Could not change the microphone state: {exc}")
+
+    changed = runtime.set_listening(enabled)
+    if not changed:
+        return ""
+
+    if enabled:
+        reply = "Listening again."
+        print_success("[LISTENING] Microphone open.")
+    else:
+        reply = "Okay, listening is paused. Use the window to start it again."
+        print_system("[LISTENING] Microphone paused — Kayra is still running.")
+    return reply if announce else ""
+
+
+def listening_enabled():
+    """Whether the microphone is currently open. One source of truth, read by every surface."""
+    try:
+        return bool(get_runtime_state().listening)
+    except Exception:
+        return True
+
+
+def set_sleeping(enabled, announce=True):
+    """
+    Puts Kayra into standby, or brings it back. Returns the sentence to say, or "".
+
+    WHAT STANDBY ACTUALLY IS, AND THE ONE THING IT DELIBERATELY IS NOT
+    ------------------------------------------------------------------
+    Sleeping stops Kayra DOING things. It silences whatever is being spoken, switches the
+    proactive service off, and makes the listen loop discard every utterance that is not a
+    control command -- so no emotion analysis, no DMM call, no cloud round-trip, no automation.
+    That is the whole cost of the assistant, gone, for the price of one dictionary probe per
+    utterance.
+
+    It does NOT close the microphone, and that is a decision rather than an oversight. "Wake
+    up" is a spoken command; a closed microphone cannot hear it. The two requirements --
+    "standby releases the microphone" and "you can wake Kayra by speaking to it" -- are
+    mutually exclusive, and between them the one that makes standby useful is the second.
+    A user who genuinely wants the microphone released has a separate command for exactly
+    that: "stop listening", which does close it and which is undone from the window, the tray
+    or Ctrl+M (see `set_listening` for why THAT asymmetry is unavoidable).
+
+    So the two are orthogonal and composable:
+
+        sleeping   -> Kayra hears you, and ignores everything but "wake up"
+        listening  -> whether Kayra hears you at all
+
+    Standby is also not a value of `RuntimeState.state`. Overloading it there would make
+    "asleep" mutually exclusive with SPEAKING, which is wrong in both directions -- exactly the
+    argument that already keeps `listening` on its own axis.
+    """
+    global _proactive_before_sleep
+
+    enabled = bool(enabled)
+    runtime = get_runtime_state()
+
+    if enabled:
+        # Silence first. Falling asleep mid-sentence and continuing to talk is the one
+        # behaviour that would make this feature feel broken.
+        _interrupt_speech("sleep", announce=False)
+
+    changed = runtime.set_sleeping(enabled)
+    if not changed:
+        return ""
+
+    # The proactive service is the only thing that speaks unprompted, so standby has to switch
+    # it off -- and waking has to restore what the user had, not switch it unconditionally on.
+    if proactive_agent is not None:
+        try:
+            if enabled:
+                _proactive_before_sleep = bool(proactive_agent.enabled)
+                proactive_agent.set_enabled(False)
+            else:
+                if _proactive_before_sleep is not None:
+                    proactive_agent.set_enabled(_proactive_before_sleep)
+                _proactive_before_sleep = None
+        except Exception as exc:
+            print_warning(f"Could not change the proactive service while sleeping: {exc}")
+
+    if enabled:
+        reply = "Going to sleep. Say wake up when you need me."
+        print_system("[STANDBY] Asleep - listening only for a wake word.")
+    else:
+        reply = "I'm awake."
+        print_success("[STANDBY] Awake.")
+    return reply if announce else ""
+
+
+def sleeping():
+    """Whether the assistant is in standby. One source of truth, read by every surface."""
+    try:
+        return bool(get_runtime_state().sleeping)
+    except Exception:
+        return False
+
+
 def Listen():
     """
     Captures one usable user utterance.
@@ -417,6 +671,12 @@ def Listen():
     that the audio layer has already handled and must NOT be routed to the DMM).
     """
     if AUDIO_ENABLED and stt_engine is not None:
+        # Paused: report nothing heard rather than blocking. The console loop and the UI
+        # listener both wait between calls, so a paused microphone costs no polling.
+        if not listening_enabled():
+            time.sleep(0.2)
+            return ""
+
         set_state(STATE_LISTENING)
 
         while True:
@@ -430,19 +690,39 @@ def Listen():
 
             spoken_over_tts = _is_self_echo(result)
 
-            # ── A bare interruption command is handled here, not by the DMM ──
-            if is_interrupt_phrase(user_input):
-                if TTS_ENABLED and tts_engine is not None and tts_engine.is_playing:
-                    # The watcher normally beats us to this by ~800ms; this is the backstop for
-                    # the case where only the finalized transcript matched.
-                    print_system(f"[BARGE-IN] '{user_input}' — cancelling speech (finalized path).")
-                    tts_engine.stop()
-                    stt_engine.clear_queue()
+            # ── LOCAL CONTROL INTERPRETER ──
+            # Runs BEFORE the echo gate and before the DMM. Before the DMM because none of
+            # these commands should cost a cloud round-trip and several of them have to work
+            # with the network down; before the echo gate because "exit" and "stop" spoken over
+            # a running answer are exactly the cases that matter most, and the echo gate would
+            # discard them.
+            #
+            # The watcher normally beats this path by ~800ms (it reads INTERIM results). This
+            # is the backstop for the case where only the finalized transcript matched -- a
+            # short utterance the recognizer never emitted an interim result for, or a moment
+            # when the driver lock was busy.
+            control = classify_control(user_input)
+            if control is not None:
+                if control.kind == ControlKind.INTERRUPT:
+                    if TTS_ENABLED and tts_engine is not None and tts_engine.is_playing:
+                        print_system(f"[BARGE-IN] '{user_input}' — cancelling speech "
+                                     f"(finalized path).")
+                        _interrupt_speech(user_input, announce=False)
+                    return ""
+                _dispatch_control(control.kind, user_input)
                 return ""
+
+            # ── Standby ──
+            # Asleep, nothing but a control command is acted on -- and every control command
+            # was already handled above. Discarding here rather than in the caller is what
+            # makes standby genuinely cheap: no emotion analysis, no DMM call, no network.
+            if sleeping():
+                print_info(f"[STANDBY] Ignoring '{user_input}' — say \"wake up\" first.")
+                continue
 
             # ── Echo gate ──
             # While the assistant is audible the microphone is dominated by her own voice, so
-            # the only speech we trust is the interrupt vocabulary handled above.
+            # the only speech we trust is the control vocabulary handled above.
             if spoken_over_tts:
                 print_warning(f"[ECHO REJECTED] Ignoring own voice picked up by mic: '{user_input}'")
                 continue
@@ -456,25 +736,110 @@ def Listen():
 # │                        SHUTDOWN SIGNAL HANDLER                         │
 # └────────────────────────────────────────────────────────────────────────┘
 
-def _force_shutdown(signum=None, frame=None):
+def on_before_exit(hook):
     """
-    Instant hard-shutdown handler registered for SIGINT (Ctrl+C), SIGTERM and SIGBREAK.
+    Registers a callable to run just before the process ends, after every subsystem is down.
 
-    Terminates the ChromeDriver/Chrome processes the STT engine created — identified by the
-    PIDs it recorded at startup, never by process name. Name matching was actively dangerous
-    here: `automation.windows.OpenApp` opens applications through AppOpener, which uses
-    `subprocess.Popen`, so a Chrome window Kayra opened *for the user* is a child of this
-    process and a name-based sweep would close the user's browsing session on exit.
+    This exists for exactly one caller: the desktop UI, which has a window and a tray icon to
+    take off the screen. It is NOT an extension point for cleanup — every resource Kayra owns
+    is released by the sequence below, in an order that matters. A hook that raises, or that
+    takes longer than `HOOK_TIMEOUT`, is abandoned rather than allowed to hold the exit open.
     """
-    # 0. Announce the shutdown before touching anything. Every background worker polls this
-    #    flag, so the proactive agent stops producing candidates here rather than racing the
-    #    teardown of the engine it would have spoken through.
+    if callable(hook) and hook not in _pre_exit_hooks:
+        _pre_exit_hooks.append(hook)
+    return hook
+
+
+def shutdown_requested():
+    """True once shutdown has begun. Read by anything that must stop producing work."""
+    return _shutdown_started.is_set()
+
+
+def request_shutdown(reason="", farewell=False, exit_code=0):
+    """
+    THE authoritative shutdown. Every source ends up here: the spoken "exit", the UI button,
+    the tray's Quit, Ctrl+C, SIGTERM/SIGBREAK, `Execute_Task`'s exit token, and a fatal loop
+    failure. There is deliberately no second teardown anywhere in the codebase — the ordering
+    below is load-bearing and a duplicate would drift out of step with it.
+
+    IDEMPOTENT. Ctrl+C pressed during teardown, a tray Quit racing a spoken "exit", or the UI
+    button clicked twice all arrive here concurrently. The first caller runs the sequence; every
+    later one returns immediately rather than tearing down an already half-torn-down process
+    (which is how a second pass used to reach a disposed audio device and hang).
+
+    THE ORDER, AND WHY IT IS THIS ORDER
+    -----------------------------------
+      1. announce      — every background worker polls `shutdown_event`, so the proactive agent
+                         stops PRODUCING candidates here, before the engine it would speak
+                         through is disposed.
+      2. reject work   — SHUTTING_DOWN is a busy state; nothing unprompted may be spoken in it.
+      3. proactive     — stopped first among the services, for the reason in (1).
+      4. timers        — the only long-lived resource the automation layer owns. An uncancelled
+                         one used to fire a toast after the assistant had already exited.
+      5. speech        — silence the speakers so nothing keeps talking through the teardown.
+      6. microphone    — the browser session, torn down by PID.
+      7. verify        — belt and braces for the case where (6) was itself interrupted.
+      8. UI hooks      — the window and tray come off the screen last, so the user sees Kayra
+                         disappear only once it genuinely has.
+
+    THE FINAL `os._exit`. It is the last statement, reached only after every step above has
+    run — not a shortcut past cleanup. It is here because the process is full of daemon threads
+    parked in native code (PortAudio's callback, urllib3 sockets inside Selenium, ONNX Runtime's
+    intra-op pool) that a normal interpreter exit has to join or unwind, and several of them do
+    not come back promptly. Returning from `main()` instead reliably added seconds to a quit
+    the user had already asked for, and occasionally hung outright.
+    """
+    HOOK_TIMEOUT = 2.0
+
+    with _shutdown_lock:
+        first = not _shutdown_started.is_set()
+        if first:
+            _shutdown_started.set()
+
+    if not first:
+        # A second caller must not run the sequence again. Park briefly so it does not return
+        # into code that assumes a live engine, then get out of the way.
+        time.sleep(HOOK_TIMEOUT)
+        return
+
+    if reason:
+        print_system(f"Shutdown requested ({reason}).")
+
+    # 1-2. Announce, and stop accepting work.
     RUNTIME.shutdown_event.set()
     RUNTIME.set_state(AssistantState.SHUTTING_DOWN)
 
-    # 0b. Cancel outstanding timers and any pending confirmation. Timers are the only
-    #     long-lived resource the automation layer owns; an uncancelled one used to keep a
-    #     sleeping thread alive and fire a message box after the assistant had exited.
+    # A farewell is spoken BEFORE anything is disposed, and blocking, because the audio device
+    # is torn down four steps below. It is skipped for a signal-driven shutdown: someone
+    # pressing Ctrl+C wants the process gone, not a sentence first.
+    #
+    # THE `stop()` FIRST IS NOT OPTIONAL, and leaving it out was measured rather than guessed.
+    # "Exit" is most often said OVER a running answer, and `speak(..., blocking=True)` waits for
+    # the whole pipeline to drain — so without cancelling first the farewell queued BEHIND the
+    # rest of the response and the process took **26.6 seconds** to die instead of ~3. Bumping
+    # the epoch discards every queued sentence and every buffered audio chunk; the farewell is
+    # then the only thing in the pipeline.
+    if TTS_ENABLED and tts_engine is not None:
+        try:
+            tts_engine.stop()
+            if farewell:
+                # Clears the `_interrupted` latch `stop()` just set, so this one sentence is
+                # allowed through. Safe here because the epoch has already moved: a response
+                # stream cancelled a moment ago tests `is_cancelled(token)` and stays cancelled.
+                tts_engine.begin_background_utterance()
+                tts_engine.speak("Shutting down. Goodbye.", True)
+        except BaseException:
+            pass
+
+    # 3. Proactive service: stopped BEFORE the audio and browser teardown so it can never hand
+    #    text to an engine that is being disposed.
+    if proactive_agent is not None:
+        try:
+            proactive_agent.stop(timeout=2.0)
+        except BaseException:
+            pass
+
+    # 4. Outstanding timers and any pending confirmation.
     if shutdown_automation is not None:
         try:
             cancelled = shutdown_automation()
@@ -483,41 +848,66 @@ def _force_shutdown(signum=None, frame=None):
         except BaseException:
             pass
 
-    # 0c. Stop the proactive service and flush its habit counters. Done BEFORE the audio and
-    #     browser teardown so it can never hand text to an engine that is being disposed.
-    if proactive_agent is not None:
-        try:
-            proactive_agent.stop(timeout=2.0)
-        except BaseException:
-            pass
-
-    # 1. Silence the speakers so nothing keeps talking through the teardown.
+    # 5. Silence the speakers and release the audio device (and, with it, the ONNX session).
     if TTS_ENABLED and tts_engine is not None:
         try:
             tts_engine.shutdown()
         except BaseException:
             pass
 
-    # 2. Clean Selenium driver session.
+    # 6. The STT browser session.
+    #
+    #    Its processes are identified by the PIDs the engine recorded at startup, NEVER by
+    #    process name. Name matching is actively dangerous here: `automation.windows` opens
+    #    applications through AppOpener, which uses `subprocess.Popen`, so a Chrome window Kayra
+    #    opened FOR THE USER is a child of this process and a name-based sweep would close the
+    #    user's browsing session on exit.
     if AUDIO_ENABLED and stt_engine:
         try:
             stt_engine.shutdown()
         except BaseException:
             pass
 
-    # 3. Verify the browser processes Kayra owns are actually gone, force-killing by PID only.
-    #    `stt_engine.shutdown()` already does this; this is the belt-and-braces pass for the
-    #    case where shutdown() itself was interrupted.
-    if AUDIO_ENABLED and stt_engine:
+        # 7. Verify the browser processes Kayra owns are actually gone, force-killing by PID
+        #    only. `stt_engine.shutdown()` already does this; this is the belt-and-braces pass
+        #    for the case where shutdown() itself was interrupted.
         try:
             survivors = stt_engine.terminate_owned_processes(timeout=3.0)
             if survivors:
-                print_warning(f"Kayra-owned browser processes survived teardown: {sorted(survivors)}")
+                print_warning(f"Kayra-owned browser processes survived teardown: "
+                              f"{sorted(survivors)}")
         except BaseException:
             pass
 
+    # 8. Presentation last: the window and the tray icon come off the screen only once the
+    #    assistant behind them is genuinely gone.
+    for hook in list(_pre_exit_hooks):
+        done = threading.Event()
+
+        def run(target=hook):
+            try:
+                target()
+            except BaseException:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True, name="kayra-exit-hook").start()
+        done.wait(timeout=HOOK_TIMEOUT)
+
     print_system("System shutdown complete.")
-    os._exit(0)
+    os._exit(exit_code)
+
+
+def _force_shutdown(signum=None, frame=None):
+    """
+    Signal-handler entry point, and the historical name every other module calls.
+
+    Kept as a thin adapter rather than renamed: `ui.session`, `ui.application` and the test
+    suite all reach shutdown by this name, and a signal handler must accept (signum, frame).
+    No farewell — a Ctrl+C is a request for the process to be gone, not for a sentence first.
+    """
+    request_shutdown(reason=f"signal {signum}" if signum else "")
 
 
 def _install_signal_handlers():
@@ -561,14 +951,15 @@ async def Execute_Task(intent_array, original_query, mood=None):
             print_system("Turn cancelled by user interruption.")
             return
 
-        # 1. Exit protocol
+        # 1. Exit protocol.
+        #
+        #    The local control interpreter normally catches "exit" / "turn off Kayra" before
+        #    the classifier ever sees them, so this branch is the fallback for the phrasings
+        #    only the DMM recognises ("that's all", "bye jarvis"). Both routes converge on the
+        #    same `request_shutdown`, which speaks the farewell itself.
         if task_lower == "exit":
             print_system(f"Initiating shutdown sequence for {assistant_name}. Goodbye!")
-            if TTS_ENABLED:
-                # blocking=True: the process exits on the next line, so the farewell has to
-                # finish playing before we tear the audio device down.
-                await asyncio.to_thread(tts_engine.speak, "Shutting down. Goodbye.", True)
-            _force_shutdown()
+            await asyncio.to_thread(request_shutdown, "dmm: exit", True)
 
         # 2. Assistant self-control. This is NOT the audio interrupt: "stop" silences playback
         #    via the barge-in path and never reaches the DMM, whereas "stop proactive
@@ -585,6 +976,19 @@ async def Execute_Task(intent_array, original_query, mood=None):
             print_system(reply)
             if TTS_ENABLED:
                 tts_engine.speak(reply)
+
+        # 2b. Listening control. A THIRD kind of "stop", and the one most easily confused
+        #     with the other two: "stop" alone is a barge-in handled by the audio layer and
+        #     never reaches here, "exit" ends the process, and this closes the microphone and
+        #     nothing else.
+        #
+        #     The local control interpreter normally catches this before the classifier ever
+        #     sees it; this branch is the fallback for a phrasing only the DMM recognised. It
+        #     dispatches through the SAME function, so the two routes cannot drift into two
+        #     behaviours.
+        elif task_lower.startswith("stop listening"):
+            await asyncio.to_thread(_dispatch_control, ControlKind.PAUSE_LISTENING,
+                                    original_query, "dmm")
 
         # 3. General conversation (knowledge, math, logic)
         elif task_lower.startswith("general "):

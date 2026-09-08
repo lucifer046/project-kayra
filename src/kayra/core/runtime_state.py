@@ -87,6 +87,16 @@ class RuntimeState:
         self._now_ms = clock_ms or _now_ms
         self._lock = threading.RLock()
         self._state = AssistantState.IDLE
+        # Listening is a SEPARATE axis from the assistant state, not another value of it.
+        # Overloading `state` would make "paused" mutually exclusive with SPEAKING, which is
+        # wrong in both directions: Kayra can finish a sentence with the microphone already
+        # closed, and it can be idle while still listening. See `set_listening`.
+        self._listening = True
+        # Standby is a THIRD independent axis, for the same reason listening is a second one.
+        # A sleeping Kayra is not a state of the turn machine: it can be asleep while a final
+        # sentence drains, and it is emphatically not IDLE (idle means "ready for your next
+        # command", standby means "ignoring everything but 'wake up'").
+        self._sleeping = False
         self._state_since_ms = self._now_ms()
 
         # Timestamps describing how recently the user was involved. The proactive agent's
@@ -113,15 +123,90 @@ class RuntimeState:
             return self._state
 
     def set_state(self, new_state: str):
+        """
+        Moves the assistant to a new state and announces the transition.
+
+        The `state_changed` event exists so a presentation layer can be event-driven instead of
+        polling `state` on a timer. That distinction matters: the desktop UI renders an
+        assistant visual whose animation follows this value, and a 10Hz poll to discover
+        something the writer already knows is pure waste in a process that is meant to sit idle
+        most of the day.
+
+        The emit happens AFTER the lock is released. `_lock` is re-entrant, so emitting inside
+        it would not deadlock this thread — but `emit()` calls subscribers synchronously, and a
+        subscriber that touched the runtime from another thread would then block on a lock held
+        across arbitrary third-party code. Announcing a transition that has already been
+        committed is both safe and correct.
+        """
         with self._lock:
             if new_state == self._state:
                 return
-            self._state = new_state
+            previous, self._state = self._state, new_state
             self._state_since_ms = self._now_ms()
+
+        self.emit("state_changed", state=new_state, previous=previous)
 
     def seconds_in_state(self) -> float:
         with self._lock:
             return (self._now_ms() - self._state_since_ms) / 1000.0
+
+    # ──────────────────────────────────────────────────────────────────────
+    #                              LISTENING
+    # ──────────────────────────────────────────────────────────────────────
+    # A third, independent thing. The application has three "stop"-shaped concepts and they
+    # must never share a flag:
+    #
+    #   barge-in          cancels the sentence being spoken   -> note_interrupt() + tts.stop()
+    #   listening pause   closes the microphone               -> set_listening(False)
+    #   shutdown          ends the process                    -> shutdown_event + _force_shutdown
+    #
+    # Only the middle one lives here, because it is STATE that several surfaces have to agree
+    # on — the main window, the ambient window, the composer and the console loop all read it,
+    # and a second copy anywhere would let two of them disagree about whether Kayra can hear.
+
+    @property
+    def listening(self) -> bool:
+        with self._lock:
+            return self._listening
+
+    def set_listening(self, enabled: bool):
+        """
+        Records whether the microphone is open. Returns True if this call changed it.
+
+        Emits `listening_changed` outside the lock, for the same reason `set_state` does: a
+        subscriber that calls back in must not deadlock on a lock we are still holding.
+        """
+        enabled = bool(enabled)
+        with self._lock:
+            if enabled == self._listening:
+                return False
+            self._listening = enabled
+        self.emit("listening_changed", listening=enabled)
+        return True
+
+    # ──────────────────────────────────────────────────────────────────────
+    #                               STANDBY
+    # ──────────────────────────────────────────────────────────────────────
+
+    @property
+    def sleeping(self) -> bool:
+        with self._lock:
+            return self._sleeping
+
+    def set_sleeping(self, enabled: bool):
+        """
+        Records whether the assistant is in standby. Returns True if this call changed it.
+
+        Emitted outside the lock, like every other transition here, so a subscriber that calls
+        back in cannot deadlock on a lock we are still holding.
+        """
+        enabled = bool(enabled)
+        with self._lock:
+            if enabled == self._sleeping:
+                return False
+            self._sleeping = enabled
+        self.emit("sleeping_changed", sleeping=enabled)
+        return True
 
     def is_busy(self) -> bool:
         """True while the assistant is mid-turn on the user's behalf."""
@@ -193,6 +278,8 @@ class RuntimeState:
             now = self._now_ms()
             return {
                 "state": self._state,
+                "listening": self._listening,
+                "sleeping": self._sleeping,
                 "busy": self._state in BUSY_STATES,
                 "turn_active": self._turn_active,
                 "turn_id": self._turn_id,

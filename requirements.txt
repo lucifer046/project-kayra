@@ -29,7 +29,27 @@ kokoro-onnx>=0.4
 sounddevice>=0.4
 numpy>=1.26
 soundfile>=0.12
-onnxruntime>=1.17
+
+# ── ONNX Runtime is deliberately NOT pinned here. `setup.py` owns it. ──────────────────────
+#
+# There are three mutually exclusive distributions - onnxruntime, onnxruntime-gpu and
+# onnxruntime-directml - and they all install into the SAME `onnxruntime/` package directory.
+# Listing one here would mean:
+#
+#   * on an NVIDIA machine, every `pip install -r requirements.txt` silently overwrites the GPU
+#     build with the CPU one, and speech synthesis quietly stops using the GPU;
+#   * two distributions claiming the same files, so uninstalling either breaks the other.
+#
+# `kokoro-onnx` above already declares `onnxruntime>=1.20.1`, so the CPU wheel arrives as a
+# transitive dependency regardless. `setup.py::configure_speech_runtime` runs AFTER this file
+# is installed and repairs the environment: it selects the right variant for the detected
+# hardware, removes the conflicting ones, installs the matching NVIDIA CUDA/cuDNN runtime
+# wheels, and then PROVES a CUDA session can initialize before claiming GPU support.
+#
+# The package name is `onnxruntime-gpu`; the Python import is and remains `import onnxruntime`.
+# There is no module named `onnxruntime_gpu`.
+#
+# Run `python setup.py` rather than installing ONNX Runtime by hand.
 
 # Search & RAG
 ddgs>=9.0                  # Current package name for the DuckDuckGo search client
@@ -48,3 +68,10 @@ keyboard>=0.13
 # Air Cursor Engine (optional hand-gesture mouse control, src/kayra/input/gesture.py)
 opencv-python>=4.9
 mediapipe>=0.10
+
+# ── Desktop UI ────────────────────────────────────────────────────────────────
+# PySide6-ESSENTIALS, not the full PySide6 distribution. Essentials omits QtWebEngine and the
+# other add-on modules, which keeps the install ~200MB instead of ~1GB and — more importantly —
+# guarantees no browser runtime is shipped to render the interface. The UI is native Qt widgets.
+# Measured cost: +262ms to reach a painted window, +20MB RSS.
+PySide6-Essentials>=6.6   # Native desktop UI (src/kayra/ui). Kayra runs headless without it.

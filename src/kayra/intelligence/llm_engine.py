@@ -139,10 +139,15 @@ class CentralizedLLMEngine:
         self.funcs = [
             # conversation / retrieval / research
             "general", "realtime", "deep research", "exit",
-            # assistant self-control (handled in main.py, not by the automation router)
+            # assistant self-control (handled in app.py, not by the automation router)
             "proactive on", "proactive off",
+            # Closing the microphone. There is no matching "start listening" token on purpose:
+            # a paused microphone cannot hear the command to un-pause it, so resuming is a
+            # manual UI action. See `app.set_listening`.
+            "stop listening",
             # applications, windows, tabs
-            "open", "close", "close window", "close tab", "new tab",
+            "open", "close", "close all", "close everything",
+            "close window", "close tab", "new tab",
             "minimize", "minimize all", "maximize", "show desktop",
             "snap left", "snap right", "switch window", "alt tab", "task view",
             "action center", "notification", "emoji",
@@ -231,6 +236,10 @@ class CentralizedLLMEngine:
             -> 'open (app or website)'  — launch an application or site: "open chrome",
                "open github.com". Multiple: 'open chrome, open telegram'.
             -> 'close (app name)'       — close a NAMED application: "close spotify".
+                                          ONE window/instance, never all of them.
+            -> 'close all (app name)'   — ONLY when the user explicitly says all/every:
+                                          "close all chrome windows" -> 'close all chrome'.
+            -> 'close everything'       — ONLY for "close everything" / "close all windows".
             -> 'close window'           — close the CURRENT/THIS window (no app named).
             -> 'close tab'              — close the CURRENT/THIS browser tab.
             -> 'new tab'                — open a new browser tab (NOT 'open').
@@ -315,6 +324,8 @@ class CentralizedLLMEngine:
                 "stop proactive suggestions" / "don't interrupt me" / "disable proactive mode"
                 / "stop giving me suggestions" -> 'proactive off'
                 "enable proactive mode" / "you can suggest things again" -> 'proactive on'
+            -> 'stop listening' — close the microphone: "stop listening", "pause listening",
+               "pause the microphone". Not 'exit', which quits Kayra.
                 A bare "stop" is NOT this token — it is handled by the audio layer and never
                 reaches you. "stop the music" is 'stop media'.
             *** EXIT: goodbye / "that's all" / "exit" -> 'exit'

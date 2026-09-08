@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 from kayra.utils import (print_banner, print_info, print_success, print_error,
                           print_system, now_ms, SentenceStreamer, speech_safe_text)
 from kayra.output.text_to_speech import TextToSpeechEngine
-from kayra.input.speech_to_text import is_interrupt_phrase
+from kayra.input.speech_to_text import is_interrupt_phrase, interrupt_in_tail
 
 FAILURES = []
 
@@ -153,14 +153,33 @@ def section_echo_gate(tts):
 
 
 def section_interrupt_vocabulary():
+    """
+    The vocabulary and the tail rule. `tests/test_voice_control.py` covers the classifier
+    exhaustively and hardware-free; what is kept here is the part that belongs beside the live
+    audio pipeline, because these are the phrases the barge-in path is measured with.
+    """
     print_system("\n[4] Interrupt phrase classification")
 
-    for phrase in ["Stop.", "stop", "Wait.", "hold on", "Shut up.", "Kayra stop"]:
+    for phrase in ["Stop.", "stop", "Wait.", "wait", "Hold.", "hold", "hold on",
+                   "Shut up.", "Kayra stop", "please stop", "stop talking"]:
         check(f"'{phrase}' is an interruption", is_interrupt_phrase(phrase))
 
     for phrase in ["Stop the music.", "Open chrome.", "What is the weather today?",
-                   "Wait for the build to finish and then tell me."]:
+                   "Wait for the build to finish and then tell me.",
+                   "Hold the window there."]:
         check(f"'{phrase}' is a normal command", not is_interrupt_phrase(phrase))
+
+    # THE CASE THAT ACTUALLY BROKE BARGE-IN. The microphone stays open during playback, so when
+    # the user says "stop" the recognizer's buffer already holds echo of Kayra's own voice --
+    # the probe is the whole sentence with "stop" glued to the end, which no whole-utterance
+    # test can match. `interrupt_in_tail` is what matches it, and it is consulted only while
+    # she is audible.
+    polluted = "and then the rollout usually takes about ten minutes stop"
+    check("an echo-polluted probe is NOT a whole-utterance interrupt",
+          not is_interrupt_phrase(polluted))
+    check("but the tail rule finds the interrupt in it", interrupt_in_tail(polluted))
+    check("the tail rule is a separate, speaking-only path",
+          interrupt_in_tail is not is_interrupt_phrase)
 
 
 def section_speech_normalization():

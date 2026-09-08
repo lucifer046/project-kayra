@@ -96,4 +96,8 @@ Reports
 graphify-out/
 
 # OpenCode artifacts
-.opencode/
+.opencode/
+
+# Agentic coding tool
+.claude/
+.agents/

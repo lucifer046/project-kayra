@@ -63,6 +63,26 @@ from kayra.utils import print_info, print_warning
 # │                            RESOLUTION MODEL                            │
 # └────────────────────────────────────────────────────────────────────────┘
 
+class TargetType:
+    """
+    What a resolved target IS.
+
+    Modelled explicitly rather than as a bare string because the failure this fixes was
+    exactly a type confusion: "YouTube" was carried around as an untyped name, handed to an
+    application launcher, and launched as whatever the launcher's fuzzy matcher liked best.
+    A target that knows it is a WEBSITE cannot be opened as an APPLICATION by accident.
+    """
+    APPLICATION = "APPLICATION"
+    WEBSITE = "WEBSITE"
+    URL = "URL"
+    WINDOW = "WINDOW"
+    TAB = "TAB"
+    FILE = "FILE"
+    FOLDER = "FOLDER"
+    PROCESS = "PROCESS"
+    UNKNOWN = "UNKNOWN"
+
+
 class Resolution:
     """Outcome of a target lookup. `matches` is populated for RESOLVED and AMBIGUOUS."""
 
@@ -70,13 +90,18 @@ class Resolution:
     AMBIGUOUS = "AMBIGUOUS"
     NOT_FOUND = "NOT_FOUND"
     UNAVAILABLE = "UNAVAILABLE"       # the mechanism itself is missing (no pywin32, etc.)
+    UNSAFE = "UNSAFE"                 # a match exists but acting on it would be a guess
 
-    __slots__ = ("status", "matches", "reason")
+    __slots__ = ("status", "matches", "reason", "kind")
 
-    def __init__(self, status, matches=None, reason=""):
+    def __init__(self, status, matches=None, reason="", kind=None):
         self.status = status
         self.matches = matches or []
         self.reason = reason
+        # WHAT was resolved, not just whether. An "open X" that comes back RESOLVED is
+        # meaningless to the executor unless it also knows whether X turned out to be an
+        # application, a website or a path — those are three different actions.
+        self.kind = kind or TargetType.UNKNOWN
 
     @property
     def ok(self):
@@ -179,28 +204,101 @@ CURRENT_TARGET_WORDS = frozenset({
     "this tab", "the tab", "current tab", "active tab",
 })
 
-# Well-known sites, so a site target can be recognised without a network lookup. The values
-# are the fragments that plausibly appear in a browser window title for that site.
-SITE_HINTS = {
-    "youtube":   ("youtube", "youtu.be"),
-    "gmail":     ("gmail", "google mail", "inbox"),
-    "github":    ("github",),
-    "twitter":   ("twitter", "x.com"),
-    "reddit":    ("reddit",),
-    "netflix":   ("netflix",),
-    "linkedin":  ("linkedin",),
-    "instagram": ("instagram",),
-    "facebook":  ("facebook",),
-    "stackoverflow": ("stack overflow", "stackoverflow"),
-    "chatgpt":   ("chatgpt", "chat.openai"),
-    "claude":    ("claude",),
-    "whatsapp web": ("whatsapp",),
-    "amazon":    ("amazon",),
-    "wikipedia": ("wikipedia",),
-    "spotify web": ("spotify",),
-    "drive":     ("google drive", "drive.google"),
-    "docs":      ("google docs", "docs.google"),
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                        CANONICAL WEBSITE REGISTRY                      │
+# └────────────────────────────────────────────────────────────────────────┘
+# The table that makes "open YouTube" a website rather than a wild guess.
+#
+# THE BUG THIS EXISTS TO KILL. "open youtube" used to reach AppOpener, whose launcher is
+# `os.system("explorer shell:appsFolder\\" + id)` over a CACHED Start-Menu index, with
+# `difflib` fuzzy matching (cutoff 0.6) when the name is absent. Two ways that goes wrong,
+# both observed on this machine:
+#
+#   * a STALE index entry. `youtube` was cached as a Brave PWA AppsFolder id that no longer
+#     exists; `explorer shell:appsFolder\<dead id>` does not fail, it opens a plain FILE
+#     EXPLORER window. That is the reported "open YouTube opens File Explorer".
+#   * a FUZZY hit. `github` has no entry, so difflib matched "git gui" and launched Git GUI.
+#
+# Neither raised, so the assistant said it had opened YouTube. A local dictionary lookup is
+# both correct and cheaper than either: one hash lookup, no process spawn, no model call.
+#
+# `url` is where "open X" goes. `titles` are the fragments that plausibly appear in a browser
+# WINDOW TITLE when the site is on screen, which is what "close X" matches against — a
+# different question from the URL, which is why they are separate fields.
+#
+# Adding a service is one line. Keep it to services a person actually names out loud; this is
+# an alias table, not an attempt to mirror the web.
+
+WEBSITE_REGISTRY = {
+    "youtube":       {"url": "https://www.youtube.com/",
+                      "aliases": ("yt", "you tube"), "titles": ("youtube", "youtu.be")},
+    "youtube music": {"url": "https://music.youtube.com/",
+                      "aliases": ("yt music",), "titles": ("youtube music",)},
+    "google":        {"url": "https://www.google.com/",
+                      "aliases": (), "titles": ("google search",)},
+    "gmail":         {"url": "https://mail.google.com/",
+                      "aliases": ("google mail", "my mail", "my email", "email", "mail"),
+                      "titles": ("gmail", "google mail", "inbox")},
+    "github":        {"url": "https://github.com/",
+                      "aliases": ("git hub",), "titles": ("github",)},
+    "chatgpt":       {"url": "https://chatgpt.com/",
+                      "aliases": ("chat gpt", "openai", "open ai"),
+                      "titles": ("chatgpt", "chat.openai")},
+    "claude":        {"url": "https://claude.ai/",
+                      "aliases": ("claude ai",), "titles": ("claude",)},
+    "linkedin":      {"url": "https://www.linkedin.com/",
+                      "aliases": ("linked in",), "titles": ("linkedin",)},
+    "twitter":       {"url": "https://x.com/",
+                      "aliases": ("tweeter",), "titles": ("twitter", "x.com")},
+    "reddit":        {"url": "https://www.reddit.com/", "aliases": (), "titles": ("reddit",)},
+    "netflix":       {"url": "https://www.netflix.com/", "aliases": (), "titles": ("netflix",)},
+    "instagram":     {"url": "https://www.instagram.com/",
+                      "aliases": ("insta", "ig"), "titles": ("instagram",)},
+    "facebook":      {"url": "https://www.facebook.com/",
+                      "aliases": ("fb",), "titles": ("facebook",)},
+    "amazon":        {"url": "https://www.amazon.in/", "aliases": (), "titles": ("amazon",)},
+    "wikipedia":     {"url": "https://www.wikipedia.org/",
+                      "aliases": ("wiki",), "titles": ("wikipedia",)},
+    "stackoverflow": {"url": "https://stackoverflow.com/",
+                      "aliases": ("stack overflow",),
+                      "titles": ("stack overflow", "stackoverflow")},
+    "twitch":        {"url": "https://www.twitch.tv/", "aliases": (), "titles": ("twitch",)},
+    "maps":          {"url": "https://www.google.com/maps",
+                      "aliases": ("google maps",), "titles": ("google maps",)},
+    "translate":     {"url": "https://translate.google.com/",
+                      "aliases": ("google translate",), "titles": ("google translate",)},
+    "drive":         {"url": "https://drive.google.com/",
+                      "aliases": ("google drive",), "titles": ("google drive", "drive.google")},
+    "docs":          {"url": "https://docs.google.com/",
+                      "aliases": ("google docs",), "titles": ("google docs", "docs.google")},
+    "whatsapp web":  {"url": "https://web.whatsapp.com/",
+                      "aliases": ("web whatsapp",), "titles": ("whatsapp",)},
+    "spotify web":   {"url": "https://open.spotify.com/",
+                      "aliases": ("web spotify",), "titles": ("spotify",)},
 }
+
+# Backward-compatible view: canonical site -> title fragments. `looks_like_site` and
+# `site_fragments` have always read this, and `tests/test_automation.py` pins its behaviour
+# (notably that "spotify" is NOT a site key — the desktop app owns that name; the web player
+# is reachable as "spotify web").
+SITE_HINTS = {name: tuple(spec["titles"]) for name, spec in WEBSITE_REGISTRY.items()}
+
+# alias -> canonical website. Built once; O(1) at lookup time. Every canonical name, every
+# declared alias, and the bare "<name>.com" form of a single-word name all land here.
+_WEB_ALIAS_TO_CANONICAL = {}
+for _site, _spec in WEBSITE_REGISTRY.items():
+    _WEB_ALIAS_TO_CANONICAL[_site] = _site
+    _WEB_ALIAS_TO_CANONICAL[_site.replace(" ", "")] = _site
+    for _alias in _spec["aliases"]:
+        _WEB_ALIAS_TO_CANONICAL.setdefault(_alias, _site)
+    _host = _spec["url"].split("//", 1)[-1].split("/")[0]
+    _WEB_ALIAS_TO_CANONICAL.setdefault(_host, _site)
+    _WEB_ALIAS_TO_CANONICAL.setdefault(_host[4:] if _host.startswith("www.") else _host, _site)
+
+# Words stripped before a website lookup. Small and safe: "open the youtube website" is one
+# request, and mangling a real service name into a different one is the failure mode here.
+_WEB_FILLERS = {"the", "a", "an", "my", "up", "please", "website", "site", "page",
+                "just", "now"}
 
 _DOMAIN_RE = re.compile(
     r"\.(com|org|net|in|io|ai|co|dev|me|xyz|gov|edu|info|app|tech|site|online|live|pro|cc|tv|gg|us|uk|eu)"
@@ -273,6 +371,253 @@ def site_fragments(target: str):
     if stem in SITE_HINTS:
         fragments.update(SITE_HINTS[stem])
     return tuple(f for f in fragments if f)
+
+
+def is_explicit_url(text) -> bool:
+    """True for something the user clearly spoke AS a web address."""
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(("http://", "https://", "www.")):
+        return True
+    return bool(_DOMAIN_RE.search(lowered)) and " " not in lowered.strip()
+
+
+def normalize_url(text) -> str:
+    """'youtube.com/feed' -> 'https://youtube.com/feed'. Never builds a search query."""
+    raw = (text or "").strip().strip('"')
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return "https://" + raw.lstrip("/")
+
+
+def _normalize_web_name(name) -> str:
+    """Spoken service name -> the form the alias table is keyed on."""
+    lowered = (name or "").strip().lower()
+    lowered = re.sub(r"^https?://", "", lowered)
+    lowered = re.sub(r"^www\.", "", lowered).rstrip("/")
+    lowered = lowered.split("/")[0]
+    lowered = re.sub(r"[^\w\s.+-]", " ", lowered)
+    return " ".join(lowered.split())
+
+
+def canonical_website(name):
+    """
+    Spoken name -> canonical website key, or None.
+
+    O(1): at most four dictionary probes over a table built at import. There is deliberately
+    NO fuzzy matching here — a near-miss between two websites is a wrong destination, and the
+    whole point of this module is that a guess never gets executed.
+    """
+    if not name:
+        return None
+    cleaned = _normalize_web_name(name)
+    if not cleaned:
+        return None
+    if cleaned in _WEB_ALIAS_TO_CANONICAL:
+        return _WEB_ALIAS_TO_CANONICAL[cleaned]
+    filtered = " ".join(w for w in cleaned.split() if w not in _WEB_FILLERS)
+    if filtered and filtered in _WEB_ALIAS_TO_CANONICAL:
+        return _WEB_ALIAS_TO_CANONICAL[filtered]
+    # "youtube.com" / "github.com" — the host stem, only when the name really is host-shaped.
+    if "." in cleaned:
+        stem = cleaned.split(".")[0]
+        if stem in _WEB_ALIAS_TO_CANONICAL:
+            return _WEB_ALIAS_TO_CANONICAL[stem]
+    return None
+
+
+def website_url(name):
+    """Canonical URL for a spoken service name, or None. Pure lookup — no network, no model."""
+    canonical = canonical_website(name)
+    return WEBSITE_REGISTRY[canonical]["url"] if canonical else None
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                    INSTALLED-APPLICATION AVAILABILITY                  │
+# └────────────────────────────────────────────────────────────────────────┘
+# "Is X actually an application on this machine?" answered from metadata that already exists,
+# never by walking the disk. Three sources, cheapest first:
+#
+#   1. a running window belonging to it            (free — the window cache is already warm)
+#   2. the Windows "App Paths" registry key        (one registry read, the mechanism Windows
+#                                                   itself uses to resolve `chrome` in Run)
+#   3. AppOpener's cached Start-Menu index         (a 130-entry JSON already on disk)
+#
+# Source 3 is consulted for MEMBERSHIP only, and only on an EXACT name. Its fuzzy matcher and
+# its stale entries are precisely what broke "open YouTube", so nothing here lets it choose.
+
+_AVAILABILITY_TTL = 300.0             # installs are rare; a five-minute answer is truthful
+_availability_cache = {}              # canonical name -> (checked_at, bool)
+_appindex_cache = {"at": 0.0, "data": None}
+
+
+def _app_paths_registry(exe: str) -> bool:
+    """True when Windows itself knows how to launch this executable by bare name."""
+    if not exe or os.name != "nt":
+        return False
+    try:
+        import winreg
+    except Exception:
+        return False
+    key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths" + "\\" + exe
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, key):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _app_index():
+    """
+    AppOpener's cached Start-Menu index, as a plain dict. Read at most once per TTL.
+
+    Entries whose value is falsy are dropped: that value is what AppOpener interpolates into
+    `explorer shell:appsFolder\<id>`, and an empty id makes explorer open a FILE EXPLORER
+    WINDOW rather than failing. An unlaunchable entry is not an installed application.
+    """
+    now = time.time()
+    if _appindex_cache["data"] is not None and (now - _appindex_cache["at"]) < _AVAILABILITY_TTL:
+        return _appindex_cache["data"]
+    data = {}
+    try:
+        import json
+        from AppOpener import main_path
+        with open(os.path.join(main_path, "data.json"), "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        data = {str(k).lower(): v for k, v in raw.items() if v}
+    except Exception:
+        data = {}
+    _appindex_cache["at"] = now
+    _appindex_cache["data"] = data
+    return data
+
+
+def app_index_entry(name):
+    """The Start-Menu index id for an EXACT name, or None. Never a fuzzy match."""
+    if not name:
+        return None
+    return _app_index().get(str(name).strip().lower())
+
+
+def application_available(name) -> bool:
+    """
+    True when `name` names a real, launchable desktop application on this machine.
+
+    Cached for `_AVAILABILITY_TTL`, so the hot path of "open X" is a dict hit after the first
+    answer. This is the check that stops "open YouTube" from ever entering the application
+    branch on a machine that has no YouTube application.
+    """
+    if not name:
+        return False
+    canonical = canonical_app(name) or str(name).strip().lower()
+    now = time.time()
+    cached = _availability_cache.get(canonical)
+    if cached and (now - cached[0]) < _AVAILABILITY_TTL:
+        return cached[1]
+
+    available = False
+    spec = APP_REGISTRY.get(canonical)
+
+    # 1. Already running — the most certain evidence there is, and free.
+    if _WIN32:
+        for window in list_windows():
+            if not window.kayra_owned and window.app == canonical:
+                available = True
+                break
+
+    # 2. Windows' own launcher metadata.
+    if not available and spec and _app_paths_registry(spec["exe"]):
+        available = True
+
+    # 3. The Start-Menu index, exact names only.
+    if not available:
+        index = _app_index()
+        names = {canonical}
+        if spec:
+            names.update(spec["aliases"])
+        available = any(candidate in index for candidate in names)
+
+    if len(_availability_cache) > 256:
+        _availability_cache.clear()
+    _availability_cache[canonical] = (now, available)
+    return available
+
+
+def invalidate_availability_cache():
+    """Called after anything that could change what is installed or running."""
+    _availability_cache.clear()
+    _appindex_cache["at"] = 0.0
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                        OPEN-TARGET RESOLUTION                          │
+# └────────────────────────────────────────────────────────────────────────┘
+
+def resolve_open_target(name):
+    """
+    "open X" -> WHAT X is. The single decision point for the open pipeline.
+
+    Order, and the reason for it:
+
+        1. explicit URL / domain      the user said an address; there is nothing to interpret
+        2. installed application      "open Chrome" must never become a web page
+        3. canonical website          "open YouTube" on a machine with no YouTube application
+        4. known application name     in the curated registry but not detected as installed —
+                                      still worth a launch attempt, which verifies itself
+        5. exact Start Menu entry     a real installed app we simply do not curate
+        6. NOT_FOUND                  an honest miss
+
+    What is NOT here is the point: no step searches the machine for something whose name looks
+    a bit like X and runs it. A miss is reported, never guessed.
+
+    Returns a `Resolution` whose `kind` is a `TargetType` and whose single match is the URL
+    (URL / WEBSITE) or the canonical application key (APPLICATION).
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return Resolution(Resolution.NOT_FOUND, reason="nothing named")
+
+    if is_explicit_url(raw):
+        return Resolution(Resolution.RESOLVED, [normalize_url(raw)],
+                          reason="explicit address", kind=TargetType.URL)
+
+    canonical = canonical_app(raw)
+    if canonical and application_available(canonical):
+        return Resolution(Resolution.RESOLVED, [canonical],
+                          reason="installed application", kind=TargetType.APPLICATION)
+
+    url = website_url(raw)
+    if url:
+        return Resolution(Resolution.RESOLVED, [url],
+                          reason="known web service", kind=TargetType.WEBSITE)
+
+    if canonical:
+        # In the curated registry but not detected as installed. Worth attempting: the
+        # launcher verifies that a window actually appeared, so a wrong answer surfaces as an
+        # honest failure rather than as a silently opened File Explorer.
+        return Resolution(Resolution.RESOLVED, [canonical],
+                          reason="known application, availability unconfirmed",
+                          kind=TargetType.APPLICATION)
+
+    if app_index_entry(raw):
+        return Resolution(Resolution.RESOLVED, [str(raw).strip().lower()],
+                          reason="exact Start Menu entry", kind=TargetType.APPLICATION)
+
+    # A named user folder or a literal path. `resolve_path` checks the well-known folders by
+    # NAME and then the path as given — it deliberately does not walk the disk, so this stays
+    # a bounded lookup and cannot turn into the filesystem sweep this pipeline exists to
+    # avoid. It sits last because "open Chrome" must never be answered by a folder.
+    path = resolve_path(raw)
+    if path.ok:
+        return Resolution(Resolution.RESOLVED, [path.target], reason="existing path",
+                          kind=TargetType.FOLDER if os.path.isdir(path.target)
+                          else TargetType.FILE)
+
+    return Resolution(Resolution.NOT_FOUND, kind=TargetType.UNKNOWN,
+                      reason=f"{raw} is not an application I can find or a site I know")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -516,34 +861,92 @@ def resolve_window(target, windows=None):
     return _rank(scored)
 
 
-def resolve_application(name):
+def resolve_application(name, strict=False, windows=None):
     """
-    Resolves an application target.
+    Resolves an application target to its RUNNING windows.
 
-    Returns RESOLVED with the running windows of that app (all of them — closing an
-    application legitimately means all its windows), or NOT_FOUND when it is not running.
-    Whether the app is *installed* is a different question, answered by the launcher.
+    Returns RESOLVED with every window belonging to that application. That is deliberate and
+    is not the same thing as permission to close them all — `pick_single` is what turns a
+    multi-window RESOLVED into the ONE window an action may touch. Keeping the two separate is
+    what lets "focus Chrome" and "close all Chrome windows" share a resolver with "close
+    Chrome" without inheriting its blast radius.
+
+    `strict` controls how a name that is NOT in the curated registry is matched:
+
+        strict=False   the loose reading — the name may appear in the window's executable or
+                       anywhere in its title. Right for a FOCUS, where the cost of a near-miss
+                       is that the wrong window comes forward.
+        strict=True    executable/app-name equality only, never a title substring. Required
+                       for anything that CLOSES: "close youtube" once matched every window
+                       with "youtube" anywhere in its title and closed all of them.
+
+    Whether the application is *installed* is a different question — `application_available`.
     """
     if not name:
-        return Resolution(Resolution.NOT_FOUND, reason="no application named")
+        return Resolution(Resolution.NOT_FOUND, reason="no application named",
+                          kind=TargetType.APPLICATION)
     canonical = canonical_app(name)
     needle = str(name).strip().lower()
 
-    if not _WIN32:
-        return Resolution(Resolution.UNAVAILABLE, reason="application control needs pywin32")
+    if not _WIN32 and windows is None:
+        return Resolution(Resolution.UNAVAILABLE, reason="application control needs pywin32",
+                          kind=TargetType.APPLICATION)
 
+    pool = windows if windows is not None else list_windows()
     matches = []
-    for window in list_windows():
+    for window in pool:
         if window.kayra_owned:
             continue
-        if canonical and window.app == canonical:
-            matches.append(window)
-        elif not canonical and (needle in window.app or needle in (window.title or "").lower()):
+        if canonical:
+            if window.app == canonical:
+                matches.append(window)
+        elif strict:
+            # No curated alias, and this action destroys something. Only an exact match on
+            # the process identity counts.
+            if needle == window.app or needle == (window.exe or "").lower().removesuffix(".exe"):
+                matches.append(window)
+        elif needle in window.app or needle in (window.title or "").lower():
             matches.append(window)
 
     if not matches:
-        return Resolution(Resolution.NOT_FOUND, reason=f"{name} is not running")
-    return Resolution(Resolution.RESOLVED, matches)
+        return Resolution(Resolution.NOT_FOUND, reason=f"{name} is not running",
+                          kind=TargetType.APPLICATION)
+    return Resolution(Resolution.RESOLVED, matches, kind=TargetType.APPLICATION)
+
+
+def pick_single(resolution, prefer_foreground=True):
+    """
+    Narrows a multi-candidate resolution to the ONE target an action may act on.
+
+    This function is the single-target guarantee. Before it existed, a resolution holding four
+    Chrome windows was handed straight to a loop that posted WM_CLOSE to every one of them —
+    one spoken sentence, four windows gone. Now: one intent, one target, or a question.
+
+    The tie-break is the foreground window, and only when it is genuinely one of the
+    candidates. "Close Chrome" while looking at a Chrome window unambiguously means THAT
+    Chrome window; a person standing at their desk would not expect anything else. When the
+    foreground is somewhere else entirely and more than one candidate remains, there is no
+    honest answer but to ask.
+    """
+    if resolution is None or resolution.status != Resolution.RESOLVED:
+        return resolution
+    matches = [w for w in resolution.matches if not getattr(w, "kayra_owned", False)]
+    if not matches:
+        return Resolution(Resolution.NOT_FOUND, reason="only Kayra-owned windows matched",
+                          kind=resolution.kind)
+    if len(matches) == 1:
+        return Resolution(Resolution.RESOLVED, matches, resolution.reason, resolution.kind)
+
+    if prefer_foreground:
+        front = foreground_window()
+        if front is not None and not front.kayra_owned:
+            for window in matches:
+                if window.hwnd == front.hwnd:
+                    return Resolution(Resolution.RESOLVED, [window],
+                                      "the window you are looking at", resolution.kind)
+
+    return Resolution(Resolution.AMBIGUOUS, matches,
+                      f"{len(matches)} windows match", resolution.kind)
 
 
 def resolve_site(site, windows=None):
@@ -581,8 +984,11 @@ def resolve_site(site, windows=None):
             scored.append((best, window))
 
     if not scored:
-        return Resolution(Resolution.NOT_FOUND, reason=_TAB_ENUMERATION_NOTE)
-    return _rank(scored)
+        return Resolution(Resolution.NOT_FOUND, reason=_TAB_ENUMERATION_NOTE,
+                          kind=TargetType.TAB)
+    ranked = _rank(scored)
+    ranked.kind = TargetType.TAB
+    return ranked
 
 
 def resolve_browser(preferred=None):

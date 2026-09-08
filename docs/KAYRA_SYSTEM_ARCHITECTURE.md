@@ -32,7 +32,8 @@
 14. [Automation safety](#14-automation-safety)
 15. [Browser / STT Chrome lifecycle](#15-browser--stt-chrome-lifecycle)
 16. [TTS architecture](#16-tts-architecture)
-17. [Barge-in](#17-barge-in)
+16b. [TTS device selection (AUTO / GPU / CPU)](#16b-tts-device-selection)
+17. [Barge-in and the local control layer](#17-barge-in-and-the-local-control-layer)
 18. [Self-echo protection](#18-self-echo-protection)
 19. [Proactive agent](#19-proactive-agent)
 20. [Memory](#20-memory)
@@ -205,6 +206,7 @@ flowchart TB
 sequenceDiagram
     participant U as User
     participant S as STT (Chrome)
+    participant C as Local control
     participant M as Main loop
     participant E as Emotion
     participant D as DMM
@@ -212,7 +214,12 @@ sequenceDiagram
     participant T as TTS
 
     U->>S: speech
+    S->>C: INTERIM result (barge-in / lifecycle fast path)
+    C-->>T: stop() on "stop" / "wait" / "hold"
+    C-->>M: set_listening / set_sleeping / request_shutdown
     S->>M: transcript + capture window (start_ms/end_ms)
+    M->>C: classify_control(text) — backstop on the finalized text
+    M->>M: asleep? discard anything that is not a control command
     M->>M: _is_self_echo? (intersect with audible ledger)
     M->>M: pending confirmation? (answered BEFORE the DMM)
     M->>E: analyze(text, seconds_since_interrupt)
@@ -233,9 +240,15 @@ sequenceDiagram
     T->>U: audio (sentence-streamed)
 ```
 
-The ordering here contains three deliberate, non-obvious decisions.
+The ordering here contains four deliberate, non-obvious decisions.
 
-**Echo rejection happens before anything else.** An utterance captured while the assistant was
+**Local control comes before everything, including the echo gate.** Barge-in, listening pause,
+standby and shutdown are matched by `core.voice_control` with no model and no network. They run
+ahead of the echo gate on purpose: "stop" and "exit" spoken OVER a running answer are the cases
+that matter most, and the echo gate would discard them. See
+[§17](#17-barge-in-and-the-local-control-layer).
+
+**Echo rejection happens next.** An utterance captured while the assistant was
 audible is its own voice and is dropped, except for interrupt words. See
 [§18](#18-self-echo-protection).
 
@@ -774,8 +787,12 @@ an answer.
 
 ### 14.4 Target resolution
 
-`resolve_window`, `resolve_application`, `resolve_site`, `resolve_browser`, `resolve_path`.
-Every one returns a `Resolution`, never an action.
+`resolve_open_target`, `resolve_window`, `resolve_application`, `resolve_site`,
+`resolve_browser`, `resolve_path`, plus `pick_single`. Every one returns a `Resolution`, never
+an action. A `Resolution` carries a **status** (RESOLVED / AMBIGUOUS / NOT_FOUND / UNAVAILABLE
+/ UNSAFE) *and* a **kind** — a `TargetType` (APPLICATION, WEBSITE, URL, WINDOW, TAB, FILE,
+FOLDER, PROCESS, UNKNOWN). Knowing *what* was resolved is not a nicety: the bug this fixed was
+a type confusion, where "YouTube" travelled as an untyped string into an application launcher.
 
 - **Kayra-owned PID exclusion is the critical safety property.** `kayra_owned_pids()` reads the
   live STT engine's `owned_pids` out of `sys.modules` — it must **never** import or construct
@@ -792,6 +809,100 @@ Every one returns a `Resolution`, never an action.
 - `list_windows()` caches for 250ms — a multi-step command asks three or four times, and a
   quarter-second is far shorter than any user-visible window change. Call `invalidate_cache()`
   after anything that changes the window set.
+
+### 14.4a Opening: application vs website is a first-class distinction
+
+**The bug.** "Open YouTube" opened File Explorer. "Open GitHub" launched Git GUI.
+
+`OpenApp` sent every non-URL target to `AppOpener.open(..., match_closest=True)`, whose
+launcher is `os.system("explorer shell:appsFolder\\<id>")` over a **cached** Start-Menu index,
+with a `difflib` fuzzy fallback at cutoff 0.6. Both failures were reproduced on the dev
+machine:
+
+| Symptom | Mechanism |
+|---|---|
+| File Explorer opens | the cached index held `youtube -> Brave._crx_agimnkij...`, a PWA AppsFolder id that no longer exists. `explorer shell:appsFolder\<dead id>` does not fail — **it opens a plain File Explorer window** |
+| Git GUI opens | `github` was absent from the index, so `difflib` matched `git gui` at ≥0.6 and launched it |
+
+Neither raised, so the assistant reported success. When AppOpener *did* raise, the fallback was
+a DuckDuckGo `!ducky` redirect — routing a plain "open YouTube" through a search engine.
+
+**The fix.** `targets.resolve_open_target()` decides the target's *type* first, and each type
+has exactly one execution path:
+
+```
+"open X"
+  ├─ explicit URL / domain?          → URL        → default browser
+  ├─ installed application?          → APPLICATION → focus if running, else launch + verify
+  ├─ canonical website?              → WEBSITE    → registry URL in the default browser
+  ├─ curated app, install unconfirmed→ APPLICATION → launch attempt, verified
+  ├─ exact Start-Menu entry?         → APPLICATION → launch + verify
+  ├─ named user folder / real path?  → FOLDER|FILE → default handler
+  └─ NOT_FOUND                       → "I couldn't find X."
+```
+
+There is deliberately **no step that searches the machine for something whose name resembles X
+and runs it**. A miss is reported. `match_closest=True` no longer appears at any call site
+(AST-asserted), and the `!ducky` fallback is gone.
+
+- **`WEBSITE_REGISTRY`** (`targets.py`) maps ~23 canonical services to their URLs, with aliases
+  and the title fragments used for closing. Adding one is a single line. Lookup is one hash
+  probe — **1.7µs measured** — so nothing consults an LLM or the network to learn that YouTube
+  is a website.
+- **`application_available()`** answers "is X really installed?" from metadata that already
+  exists: a running window (free), the Windows *App Paths* registry key (what the Run box
+  uses), then the Start-Menu index **on exact names only**. Cached for 300s: **0.12ms cold,
+  1.2µs warm**. It never walks the disk.
+- **Application beats website** for a curated app name, so "open Chrome" is never a web page.
+  A curated app that fails to launch but has a web version (Spotify, WhatsApp) falls back to
+  the web player — and says so.
+- **"Open YouTube" ≠ "search the web for YouTube".** The first is `browser.open_url`, the
+  second `realtime`, and `google search X` / `youtube search X` remain their own tokens.
+
+### 14.4b Closing: one intent, one target
+
+**The bug.** "Close X" could close several windows. `resolve_application` returns *every*
+window of an application and the executor looped `WM_CLOSE` over all of them. A missed site
+lookup also fell through into a **loose** application lookup that matched the name anywhere in
+a window title, so "close YouTube" could reach a VS Code window editing `youtube-dl` notes.
+
+**The fix** is structural, not per-call-site care:
+
+- **`targets.pick_single()`** narrows a multi-candidate resolution to exactly one target. The
+  tie-break is the foreground window, and only when it is genuinely one of the candidates.
+  Otherwise: AMBIGUOUS, and the assistant asks. Nothing on the close path iterates a match set.
+- **Strictness scales with risk.** `resolve_application(name, strict=True)` is used for every
+  close: for a name Kayra does not curate, only exact process identity counts — never a title
+  substring. The loose reading is still used for *focus*, where a near-miss costs a window
+  coming forward.
+- **A pure site name that is not on screen is a miss**, not an invitation to hunt for a process
+  of that name. Only a name that is *also* a real application falls through to the app branch.
+- **Breadth is explicit, never inferred.** `close all <app>` (`app.close_all`) and
+  `close everything` / `close all windows` (`window.close_all`) are their own DMM tokens. A
+  plain "close chrome" can never widen into them. `window.close_all` is CONFIRM-gated — it is
+  the one close whose blast radius is the whole desktop.
+- **The semantics stay distinct:**
+
+  | Said | Action | Target |
+  |---|---|---|
+  | "close this" / "close this window" | `window.close` | the exact foreground HWND |
+  | "close this tab" | `browser.close_tab` | Ctrl+W to the focused browser (a browser must already be in front) |
+  | "close YouTube" | site → tab | the one browser window showing it |
+  | "close Chrome" | `app.close` | one window — foreground-preferred, else ask |
+  | "close that" | context referent | the last thing established, or the foreground window |
+  | "close all Chrome windows" | `app.close_all` | every Chrome window, explicitly |
+  | "close everything" | `window.close_all` | every window, CONFIRM-gated |
+
+- **Window close is still `WM_CLOSE` to a resolved HWND**, verified by polling until the handle
+  is gone. Nothing terminates by process name; nothing clicks a screen-coordinate X button; the
+  target is chosen by system identity, never by position. PID-scoped termination stays behind
+  `force_close_app` and its CONFIRM gate.
+- **Last-tab behaviour is the browser's, not a second close.** Ctrl+W on a single-tab window
+  makes the *browser* close that window. Kayra sent one keystroke to one window; that is the
+  guarantee, and `tests/test_target_resolution.py` pins it.
+- **Kayra's own STT Chrome remains invisible** to every one of these paths — `pick_single`
+  filters owned windows again, so a match set that somehow contained one still cannot be acted
+  on.
 
 ### 14.5 Audit
 
@@ -940,34 +1051,284 @@ exist deliberately and must stay consistent.
 
 ---
 
-## 17. Barge-in
+## 16b. TTS device selection
 
-Three independent pieces must hold. Removing any one silently breaks interruption.
+`src/kayra/output/tts_device.py`. The ONLY module in `src/` that imports `onnxruntime`, and the
+only place that decides whether CUDA is usable, loads a CUDA DLL, or names an execution
+provider. Asserted by `tests/test_environment.py`.
 
-```mermaid
-flowchart LR
-    A["STT page:<br/>interim result matches<br/>interrupt vocabulary"] --> B["window.kayraInterrupt"]
-    B --> C["_barge_in_watcher thread<br/>polls every 60ms"]
-    C --> D["tts.stop()<br/>bump epoch, drain queues,<br/>abort stream, latch _interrupted"]
-    C --> E["RUNTIME.note_interrupt()"]
+### Four different things, and conflating any two produces a lie
+
+| Fact | Read from | On the dev machine |
+|---|---|---|
+| 1. GPU hardware exists | `nvidia-smi` | **yes** — RTX 4060 Laptop, 8 GiB, driver 610.62 |
+| 2. A GPU provider is OFFERED | `get_available_providers()` | **yes** — Tensorrt, CUDA, CPU |
+| 3. Its DLLs actually LOAD | CUDA/cuDNN runtime **and** the DLL search path | **now yes** (was no) |
+| 4. A session actually USES it | `session.get_providers()[0]` | **now yes** |
+
+### The root cause, in two halves
+
+**Half one — the runtime was absent.** `onnxruntime-gpu 1.26.0` is built against CUDA 12.8 and
+cuDNN 9. The venv held no NVIDIA runtime packages, so:
+
+```
+Error loading "onnxruntime_providers_cuda.dll" which depends on
+"cublasLt64_12.dll" which is missing. (Error 126)
 ```
 
-1. **Detection off the main loop.** `_barge_in_watcher` polls; `Main_Loop` cannot, because it is
-   inside `Execute_Task` for the whole response. Before this watcher existed, barge-in could not
-   physically work — the "stop" was only read after the response had finished playing.
+**ONNX Runtime does not raise for this.** It logs, drops the provider, and returns a working CPU
+session. Anything trusting fact (2) therefore reported "GPU" while the CPU did all the work —
+exactly the `Mode: GPU / Active device: CPU` state the UI was showing.
+
+**Half two — installing the runtime is not sufficient.** The NVIDIA pip wheels place their DLLs
+in `site-packages/nvidia/*/bin`, which Windows does not search. Measured on this machine: with
+every required DLL present on disk, a session built **without** `ort.preload_dlls()` still
+returned `['CPUExecutionProvider']`. `prepare_runtime()` is mandatory and must run before the
+first `InferenceSession` in the process.
+
+```mermaid
+flowchart TD
+    A["TTS_DEVICE_MODE<br/>AUTO / GPU / CPU"] --> B{normalize_mode}
+    B -->|CPU| C["build([CPU])"]
+    B -->|AUTO or GPU| P["prepare_runtime()<br/>ort.preload_dlls(cuda, cudnn, msvc)<br/>idempotent, cached, failures recorded"]
+    P --> Q["probe_provider(CUDA)<br/>84-byte model, cached<br/>139ms cold / 0.002ms warm"]
+    Q -->|not usable| E["build([CPU])<br/>reason names the missing package<br/>fallback flagged for explicit GPU"]
+    Q -->|usable| F["build([CUDA, CPU])"]
+    F --> G{"session.get_providers()[0]<br/>is CUDA?"}
+    G -->|yes| H["DEVICE_GPU"]
+    G -->|no| I["dispose, build([CPU])<br/>DEVICE_CPU + reason"]
+    C --> J["Kokoro.from_session"]
+    E --> J
+    H --> J
+    I --> J
+```
+
+### The probe
+
+There is no ONNX Runtime API that answers "can the CUDA EP initialize?" without building a
+session — the provider's DLLs are loaded lazily by the session factory, which is precisely
+where the cuBLAS failure surfaces. Probing with the real 88 MB Kokoro graph would cost ~1.8 s
+and allocate VRAM to answer the same question, so the probe uses an **84-byte hand-encoded ONNX
+model** (one `Identity` node, written as raw protobuf so the module carries no dependency on the
+`onnx` package). The result is cached per provider for the process: neither the installed
+packages nor the DLL search path change while Kayra runs.
+
+### Mode semantics
+
+| Mode | Behaviour |
+|---|---|
+| `AUTO` | Prefer CUDA when it genuinely initializes; fall back to CPU **quietly** — the user asked for "whatever works". |
+| `GPU` | Require it. On failure, fall back to CPU and say so **loudly** — boot log, Settings, and `DeviceStatus.fallback`. |
+| `CPU` | Force CPU. The provider list is `[CPUExecutionProvider]` alone, so no GPU runtime is initialized at all. |
+
+### TensorRT is discoverable but never planned
+
+`_TTS_PROVIDER_PREFERENCE` is `(CUDAExecutionProvider,)`, so `plan_providers()` returns
+`[CUDA, CPU]`. TensorRT builds an engine for the graph on first run — tens of seconds — and a
+TensorRT plugin failure must never stand between Kokoro and CUDA, which is what the original
+startup did: TensorRT first, TensorRT fails, land on CPU. It is still reported in diagnostics
+and in Settings, labelled "available but not used for speech synthesis".
+
+### Kokoro cannot build its own session
+
+`Kokoro.__init__` hardcodes `["CPUExecutionProvider"]`, widens to *every* provider only if the
+`onnxruntime-gpu` distribution happens to be importable, and is otherwise overridable only by an
+`ONNX_PROVIDER` environment variable. None of that can express "prefer CUDA, verify it took,
+fall back and say so". `KokoroOnnx` never calls it — it adopts the verified session through
+`Kokoro.from_session`. **One session per process, always.**
+
+### Environment provisioning
+
+`setup.py::configure_speech_runtime()` owns the environment, in this order and each step for a
+reason:
+
+1. detect an NVIDIA GPU — without one, CPU is correct and a GPU wheel would be worse;
+2. keep exactly ONE ORT variant — the three distributions share one package directory;
+3. install `onnxruntime-gpu` — the CPU wheel can never use CUDA;
+4. read the wheel's CUDA **build** version — it decides which NVIDIA wheels are required;
+5. install those pinned wheels — `nvidia-cuda-runtime-cu12`, `nvidia-cublas-cu12`,
+   `nvidia-cufft-cu12`, `nvidia-cudnn-cu12`;
+6. **prove** a CUDA session initializes — every step above can succeed and this still fail.
+
+`requirements.txt` deliberately pins no ORT variant: `kokoro-onnx` hard-depends on the CPU
+`onnxruntime>=1.20.1`, so every requirements install drags it in on top of the GPU build. Setup
+lets that happen and repairs it by removing **every** variant and reinstalling the keeper —
+uninstalling only the loser would delete files the keeper still needs, because their RECORD
+manifests overlap.
+
+The package name is `onnxruntime-gpu`; the import is and remains `import onnxruntime`. There is
+no module named `onnxruntime_gpu`.
+
+### Measured, and not what you might assume
+
+RTX 4060 Laptop, full-precision `kokoro.onnx`:
+
+| | CPU | CUDA |
+|---|---|---|
+| session build | 1.14 s | 1.53 s |
+| RTF (synthesis / audio) | **0.888** | 0.934 |
+| pure `session.run` | 7.96 s | 7.70 s |
+| process RSS | +404 MB | +1021 MB |
+| VRAM | 0 | +181 MiB |
+
+**CUDA is not a speed-up for this model.** ONNX Runtime reports *547 Memcpy nodes added to the
+graph for CUDAExecutionProvider* — many operators the CUDA EP does not implement, so the graph
+round-trips between host and device throughout. Those warnings are left visible on the console
+deliberately: they are the evidence. GPU mode is correct, supported and truthfully reported; it
+is simply not faster here, and CPU remains a perfectly good choice. The numbers are stated in
+`.env.example` so the choice is informed rather than assumed.
+
+### Runtime switching
+
+`DynamicVoiceEngine.set_device_mode(mode)`: `stop()` (the same epoch bump a barge-in uses) →
+`wait_until_idle` → build the replacement → swap `self.onnx` → release the old session →
+re-warm. The replacement is built **before** the old one is released, so a provider that cannot
+initialize leaves Kayra with the voice it already had rather than mute. The synthesis worker
+takes one engine reference per sentence, so a switch cannot replace the engine underneath a
+generator that is mid-inference.
+
+### GPU telemetry
+
+Entirely optional and entirely separate: nothing about choosing or running a provider depends on
+it. `nvidia-smi` costs a process spawn (~120–250 ms measured), so it is **never** on a paint
+path. ONE shared sampler thread refreshes a cache every 5 s and **parks itself** 20 s after the
+last request; `gpu_metrics()` returns from the cache in 0.000 ms. No persistent monitor process,
+no per-refresh subprocess, no daemon.
+
+Home's **Graphics** card and the Settings **Speech device** card both read these values through
+the bridge from this one module, so they cannot disagree. **The physical GPU and the TTS device
+are reported separately, on purpose:** a machine can have a working GPU while speech runs on the
+CPU, and hiding the GPU then would be as misleading as claiming acceleration that is not
+happening.
+
+### Diagnostics
+
+`runtime_diagnostics()` returns one structured object — mode, active device, provider, every
+available provider, `cuda_available` vs `cuda_usable`, CUDA/cuDNN runtime status, failure
+reason, GPU name, VRAM used/free/total, utilization, temperature, ORT version/package/location,
+CUDA build version, missing packages, interpreter and environment path. `run.py --doctor`,
+`setup.py`'s report, the boot log and the UI all read those same fields.
+
+### Kokoro checkpoint
+
+Unchanged: the engine asks for the quantized `kokoro-v1.0.int8.onnx` / `voices-v1.0.bin` pair
+first and warns when it falls back. On this machine only the full-precision `kokoro.onnx`
+(88 MB) + `voices.bin` are installed, so the fallback warning is the normal path here. Nothing
+is downloaded automatically.
+
+---
+
+## 17. Barge-in and the local control layer
+
+Everything the user says **about** Kayra rather than **to** it — stop talking, stop listening,
+go to sleep, wake up, shut down — is matched locally, before the classifier, by
+`src/kayra/core/voice_control.py`.
+
+```mermaid
+flowchart TD
+    A["microphone"] --> B["STT page<br/>interim result"]
+    B --> C{"LOCAL CONTROL INTERPRETER<br/>core/voice_control.py"}
+    C -->|INTERRUPT| D["tts.stop() + clear_queue()"]
+    C -->|PAUSE / RESUME LISTENING| E["app.set_listening()"]
+    C -->|SLEEP / WAKE| F["app.set_sleeping()"]
+    C -->|SHUTDOWN| G["app.request_shutdown()"]
+    C -->|nothing matched| H["the utterance stays in the queue"]
+    H --> I["Listen() -> emotion -> DMM"]
+    I --> J["Execute_Task: chat / search / research / automation"]
+```
+
+**No LLM call, no network, no classification.** Every one of these commands is about the
+assistant's own lifecycle and every one is useless if it is slow or needs the network: "stop"
+has to silence playback in tens of milliseconds, and "exit" has to work with the network down,
+with no Cohere key, and while a response is still generating. Measured at **under 10 µs per
+utterance** — one normalization pass and a frozenset probe.
+
+### Why "stop", "wait" and "hold" were unreliable — the actual root cause
+
+Three separate defects, all in the recognizer's buffer rather than in the vocabulary:
+
+1. **The interim probe was polluted by echo.** The page matched
+   `looksLikeInterrupt(currentText + interimTranscript)` — the *whole accumulated utterance* —
+   against an exact phrase set. The microphone stays open during playback, so whatever echo
+   survived Chrome's canceller was already in `currentText` when the user spoke. The probe was
+   therefore not `"stop"` but `"...and then the rollout takes ten minutes stop"`, which no
+   whole-utterance test can ever match. This is why "stop" worked in a quiet room and failed
+   over a long answer — the two cases differ only in how much echo had accumulated.
+2. **`"hold"` was not in the vocabulary at all.** Only `"hold on"` was, so the bare word could
+   never match under any conditions.
+3. **`clear_queue()` cleared the queue but not the buffer.** After a barge-in the recognizer
+   still held the echo plus the interrupt word, and the silence timer pushed that whole
+   polluted string onto the queue ~800 ms later — where it arrived as the user's *next command*.
+   Clearing the queue alone only delayed the problem by one VAD window.
+
+### The fix: tail matching, scoped to playback
+
+`window.kayraSpeaking` is published from the watcher's existing poll, so it costs no extra
+round-trip. **While and only while it is set**, `looksLikeInterrupt` also tests the trailing
+1–4 words of the probe. Outside playback the match is whole-utterance and exact, exactly as
+before.
+
+That scoping is what preserves the prefix boundary. `interrupt_in_tail` exists as a separate
+function from `is_interrupt_phrase` precisely so it cannot be reached by accident: applied to a
+finalized transcript it would turn "close this tab and stop" into a barge-in.
+
+Verified live against a real Edge session (`scratchpad/live_js_check.py`, and
+`tests/test_voice_control.py` for the hardware-free half):
+
+| Probe | speaking | Interrupt? |
+|---|---|---|
+| `stop` / `wait` / `hold` | either | **yes** |
+| `kayra please stop` | either | **yes** |
+| `...takes about ten minutes stop` | yes | **yes** (tail) |
+| `...takes about ten minutes stop` | no | no |
+| `stop the music` | no | no → DMM → `stop media` |
+| `close this tab and stop` | no | no |
+
+**One documented consequence.** Interim results arrive incrementally, so at the instant the user
+has said only the first word of "stop the music" over a running answer, that word is
+indistinguishable from a barge-in and Kayra falls silent. That is the correct call — the user is
+talking over the assistant — but the rest of the sentence is then dropped by `clear_queue()` and
+has to be repeated. Spoken while Kayra is silent, "stop the music" reaches the DMM unchanged.
+
+### The three pieces of barge-in still hold
+
+1. **Detection off the main loop.** `_local_control_watcher` polls; `Main_Loop` cannot, because
+   it is inside `Execute_Task` for the whole response.
 2. **Detection on interim results**, skipping both the 800 ms VAD finalize and the `mtranslate`
-   network round-trip. Waiting for the finalized transcript costs ~1s.
-3. **Epoch cancellation in the TTS engine**, including the latch ([§16.2](#162-epoch-cancellation)).
+   round-trip.
+3. **Epoch cancellation in the TTS engine**, including the latch
+   ([§16.2](#162-epoch-cancellation)).
 
-### Interrupt phrases are matched exactly
+### Interrupt phrases are still matched exactly
 
-After stripping filler words, matching is **exact, never prefix**.
-`is_interrupt_phrase("stop the music")` must be `False`, or that automation command gets
-swallowed instead of reaching the DMM. Likewise "stop proactive suggestions" (3 words) is a
-command, not a barge-in.
+The same rule is implemented twice — `classify_control()` in Python and `looksLikeInterrupt()` /
+`looksLikeControl()` in the STT page — and **the two must agree**.
+`tests/test_voice_control.py` asserts the agreement case by case, and the page is injected with
+the Python list at recognition start so there is one vocabulary rather than two.
 
-The same rule is implemented twice — `is_interrupt_phrase()` in Python and `looksLikeInterrupt()`
-in the STT page — and **the two must agree**.
+### Standby (sleep / wake)
+
+`app.set_sleeping()`. Standby stops Kayra **doing** things: it silences speech, switches the
+proactive service off, and makes `Listen()` discard every utterance that is not a control
+command — so no emotion analysis, no DMM call, no cloud round-trip, no automation.
+
+**It deliberately does not close the microphone.** "Wake up" is a spoken command and a closed
+microphone cannot hear it; the two requirements "standby releases the microphone" and "you can
+wake Kayra by speaking" are mutually exclusive, and the second is what makes standby useful. A
+user who genuinely wants the microphone released has a separate command for exactly that —
+"stop listening" — which does close it and is undone from the window, the tray or Ctrl+M.
+
+Waking **restores** the proactive setting rather than switching it on, so a user who had
+suggestions disabled does not get them back by waking.
+
+### Three "stop"-shaped concepts, four now — and none of them share a flag
+
+| Concept | Cancels | Entry points | Runtime axis |
+|---|---|---|---|
+| **Barge-in** | the sentence being SPOKEN | "stop"/"wait"/"hold", the watcher, Ctrl+. , the composer's stop button | `note_interrupt()` |
+| **Listening pause** | the MICROPHONE | "stop listening", Home's button, Ctrl+M, the tray | `RuntimeState.listening` |
+| **Standby** | unprompted and classified WORK | "go to sleep" / "wake up" | `RuntimeState.sleeping` |
+| **Shutdown** | the PROCESS | "exit", "turn off Kayra", Home's Shut down, the tray's Quit, Ctrl+C | `shutdown_event` |
 
 ---
 
@@ -1219,7 +1580,7 @@ assistant just quietly stopped honouring the user's configuration.
 
 | Group | Keys |
 |---|---|
-| Speech | `INPUT_LANGUAGE`, `ASSISTANT_VOICE` |
+| Speech | `INPUT_LANGUAGE`, `ASSISTANT_VOICE`, `TTS_DEVICE_MODE` (`AUTO` \| `GPU` \| `CPU`) |
 | Model routing | `FORCE_ONLINE`, `LOCAL_BASE_URL`, `LOCAL_*`, `LOCAL_PROBE_TIMEOUT_SECONDS` |
 | Cloud keys | `CohereAPIKey`, `GROQ_API_KEY`, `GEMINI_API_KEY` |
 | Identity | `ASSISTANT_NAME`, `ASSISTANT_GENDER`, `USERNAME`, `USER_GENDER`, `LANGUAGE` |
@@ -1229,6 +1590,17 @@ assistant just quietly stopped honouring the user's configuration.
 
 **The automation knobs are all bounds, not behaviour switches.** There is deliberately no
 setting that disables the safety policy or the confirmation prompt.
+
+**`TTS_DEVICE_MODE` is validated and clamped** by `tts_device.normalize_mode`, which accepts the
+three modes, their display labels and a few obvious synonyms, and falls back to `AUTO` for
+everything else. That is not politeness: an unvalidated value would flow straight into
+`InferenceSession(providers=[...])` as a provider name. See
+[§16b](#16b-tts-device-selection).
+
+**`.env` beats the process environment.** `env()` reads the cached `.env` parse first and only
+then `os.environ`, so exporting a variable in the shell does NOT override a value present in the
+file — which is why `FORCE_ONLINE=True` on the command line does not move the DMM matrix onto
+Cohere while `.env` is silent about it.
 
 `ProactiveConfig` reads `os.environ` (not `dotenv_values`), so it depends on `load_environment()`
 having run first — which `bootstrap()` does before the module is imported. Every knob has a
@@ -1285,36 +1657,80 @@ TTS and STT complete inside the LLM stage, which is exactly what the overlap is 
 
 ## 25. Shutdown
 
-`app.py::_force_shutdown` is registered for SIGINT, SIGTERM and **SIGBREAK**. SIGBREAK is
-Windows-only and is the only signal a parent process can actually deliver to a child console
-app there, so registering it is what makes an externally-triggered shutdown run this handler
-instead of a hard kill that would orphan the STT Chrome processes.
-
-Order matters:
+**`app.py::request_shutdown()` is the one authoritative teardown.** Every source converges on
+it, and there is deliberately no second shutdown anywhere in the codebase — the ordering below
+is load-bearing and a duplicate would drift out of step with it.
 
 ```mermaid
 flowchart TD
-    A["signal / exit token / KeyboardInterrupt"] --> B["RUNTIME.shutdown_event.set()<br/>state = SHUTTING_DOWN"]
-    B --> C["shutdown_automation()<br/>cancel timers + pending confirmation"]
-    C --> D["proactive_agent.stop(timeout=2.0)<br/>flush habits"]
-    D --> E["tts_engine.shutdown()<br/>silence the speakers"]
-    E --> F["stt_engine.shutdown()<br/>clean Selenium teardown"]
-    F --> G["terminate_owned_processes()<br/>PID-scoped belt-and-braces"]
-    G --> H["os._exit(0)"]
+    V["voice: 'exit' / 'turn off Kayra'"] --> R
+    U["UI: Home's Shut down button"] --> R
+    T["tray: Quit Kayra"] --> R
+    S["SIGINT / SIGTERM / SIGBREAK<br/>via _force_shutdown"] --> R
+    D["DMM token 'exit'"] --> R
+    F["fatal loop failure"] --> R
+    R["request_shutdown(reason, farewell)<br/>idempotent, single-entry"]
+    R --> B["1-2. shutdown_event.set()<br/>state = SHUTTING_DOWN"]
+    B --> W["farewell (blocking, if requested)"]
+    W --> C["3. proactive_agent.stop()"]
+    C --> E["4. shutdown_automation()<br/>cancel timers + pending confirmation"]
+    E --> G["5. tts_engine.shutdown()<br/>silence + release the ONNX session"]
+    G --> H["6. stt_engine.shutdown()"]
+    H --> I["7. terminate_owned_processes()<br/>PID-scoped belt-and-braces"]
+    I --> J["8. pre-exit hooks<br/>window + tray come off screen"]
+    J --> K["os._exit(0)"]
 ```
 
-- The shutdown flag is set **first** so background workers stop producing rather than racing the
-  teardown of the engine they would have spoken through.
+### Why this order
+
+- The shutdown flag is set **first** so background workers stop *producing* rather than racing
+  the teardown of the engine they would have spoken through.
+- A farewell is spoken **before** anything is disposed, and blocking, because the audio device
+  is torn down four steps later. It is skipped for a signal-driven shutdown: someone pressing
+  Ctrl+C wants the process gone, not a sentence first.
 - The proactive agent stops **before** audio and browser teardown, so it can never hand text to
   an engine being disposed.
 - Timers are the only long-lived resource the automation layer owns; an uncancelled one used to
   keep a sleeping thread alive and fire a message box after the assistant had exited.
-- Signal handlers are installed from `bootstrap()` (main thread only) and guarded, so importing
-  the module from a worker cannot raise.
+- The STT browser's processes are reaped **by the PIDs the engine recorded at startup, never by
+  process name**. Name matching is actively dangerous here: `automation.windows` opens
+  applications through AppOpener, which uses `subprocess.Popen`, so a Chrome window Kayra opened
+  *for the user* is a child of this process and a name sweep would close their browsing session
+  on exit. Measured during this round: one orphaned run owned 8 processes while 6 other
+  `chrome.exe` processes on the same machine belonged to the user; a name sweep kills all 14.
+- **Presentation comes off the screen last, not first.** The window and tray icon disappear only
+  once the assistant behind them genuinely has. Hiding the UI first shows the user a finished
+  shutdown while nine browser processes are still being reaped — exactly the illusion that made
+  "did it actually quit?" a real question.
 
-**`os._exit(0)` skips every `finally` in the process.** This is deliberate — it guarantees the
-process dies — and it is why `run.py`'s lock staleness detection has to be exact rather than
-relying on cleanup ([§33](#runpy)).
+### Idempotency
+
+`request_shutdown` is guarded by an `Event` + lock. Ctrl+C pressed during teardown, a tray Quit
+racing a spoken "exit", or the Home button clicked twice all arrive concurrently: the first
+caller runs the sequence and every later one returns immediately, rather than re-entering a
+teardown that is already half done (which is how a second pass used to reach a disposed audio
+device and hang). `_force_shutdown(signum, frame)` remains as the signal-handler adapter and the
+historical name every other module calls; it delegates rather than duplicating.
+
+### Pre-exit hooks
+
+`on_before_exit(hook)` exists for exactly one caller: the desktop UI, which has a window and a
+tray icon to take off the screen. It is **not** an extension point for cleanup — every resource
+Kayra owns is released by the sequence above. Each hook gets a 2 s budget and is abandoned if it
+raises or overruns. The UI's hook checks thread affinity: a click runs it on the GUI thread
+(direct `hide()`), while a spoken shutdown runs it on the watcher thread and it posts the call
+across with `QMetaObject.invokeMethod(..., Qt.QueuedConnection)`.
+
+### Why it still ends in `os._exit(0)`
+
+It is the **last statement**, reached only after every step above has run — not a shortcut past
+cleanup. The process is full of daemon threads parked in native code (PortAudio's callback,
+urllib3 sockets inside Selenium, ONNX Runtime's intra-op pool) that a normal interpreter exit
+has to join or unwind, and several do not come back promptly; returning from `main()` instead
+reliably added seconds to a quit the user had already asked for, and occasionally hung outright.
+
+It skips every `finally` in the process, which is why `run.py`'s lock staleness detection has to
+be exact rather than relying on cleanup ([§33](#runpy)).
 
 ---
 
@@ -1496,6 +1912,28 @@ rather than acting on something else.
 **Speech model.** The quantized Kokoro pair is not installed on this host, so synthesis runs at
 full precision (RTF ~1.0–1.4) and warns on every boot.
 
+**GPU speech synthesis works, and is not faster.** `onnxruntime-gpu` plus the pinned CUDA 12.8
+/ cuDNN 9 runtime wheels are installed, `preload_dlls()` makes them loadable, and Kokoro really
+runs on `CUDAExecutionProvider` — verified end to end, not inferred. But measured on this RTX
+4060, CUDA is marginally SLOWER than the CPU for this graph (RTF 0.934 vs 0.888) and costs about
+600 MB more RAM and 181 MiB of VRAM, because ONNX Runtime adds *547 Memcpy nodes* for operators
+the CUDA EP does not implement. GPU mode is therefore correct and supported rather than
+recommended; the honest numbers are in `.env.example` and [§16b](#16b-tts-device-selection).
+
+**DirectML and ROCm are recognised but untested.** They are labelled correctly in diagnostics
+and would be selected by `gpu_providers()`, but `plan_providers()` only ever plans CUDA for the
+TTS session, and no non-NVIDIA machine has been available to exercise them.
+
+**Standby does not release the microphone.** "Wake up" is a spoken command, so it cannot. That
+is a deliberate trade — see [§17](#17-barge-in-and-the-local-control-layer) — and "stop
+listening" is the command for genuinely closing the microphone.
+
+**A leading "stop" over a running answer is a barge-in.** Interim results arrive incrementally,
+so at the instant the user has said only the first word of "stop the music" while Kayra is
+talking, that word is indistinguishable from an interruption. Kayra falls silent and the rest of
+the sentence is dropped by `clear_queue()`. Spoken while she is silent, "stop the music" reaches
+the DMM unchanged.
+
 **Emotion.** Text-only. It cannot hear "Fine." said angrily. Reaction classification in the
 proactive agent is keyword-based, so an unusual answer is recorded as "ignored".
 
@@ -1515,9 +1953,11 @@ policy layer.
 **Tests.** `tests/` are standalone diagnostic scripts, not a pytest suite. Four assert and exit
 non-zero; the rest are manual. Some make real API calls.
 
-**Not verified in this round:** interactive Ctrl+C shutdown from a real console (see
-[§35](#35-testing-strategy)), live microphone barge-in, deep research end-to-end, and the
-gesture engine.
+**Not verified in this round:** interactive Ctrl+C shutdown from a real console,
+**live microphone barge-in by a human voice** (every barge-in measurement injects the interim
+result rather than speaking — see [§35](#35-testing-strategy)), a from-scratch `setup.py` run
+against a deleted `.venv` (the repair and provisioning paths were exercised against the existing
+one), DirectML/ROCm, deep research end-to-end, and the gesture engine.
 
 ---
 
@@ -1560,7 +2000,8 @@ project-kayra/
 │       ├── core/               ← imports nothing from the rest of the package
 │       │   ├── paths.py        ← THE single source of truth for filesystem locations
 │       │   ├── config.py       ← one cached parse of .env
-│       │   └── runtime_state.py← state machine + event bus (singleton)
+│       │   ├── runtime_state.py← state machine + event bus (singleton)
+│       │   └── voice_control.py← the local control vocabulary (pre-DMM, offline)
 │       │
 │       ├── intelligence/
 │       │   ├── llm_engine.py   ← routing, DMM, chat streaming (singleton)
@@ -1571,7 +2012,8 @@ project-kayra/
 │       │   └── gesture.py      ← standalone; not in the main loop
 │       │
 │       ├── output/
-│       │   └── text_to_speech.py
+│       │   ├── text_to_speech.py
+│       │   └── tts_device.py   ← ONNX provider selection (AUTO / GPU / CPU)
 │       │
 │       ├── automation/
 │       │   ├── windows.py      ← the hands + normalizer + planner + executor
@@ -1734,6 +2176,11 @@ Run these first; they need no audio, no browser and no network.
 | `test_proactive_agent.py` | state model, safety gate, deferral, scoring, cooldowns, habits, reaction learning, LLM-failure fallback, TTS routing, shutdown, barge-in phrase regressions | **140 passed, 0 failed** |
 | `test_emotion_engine.py` | eight states, false positives, third person, negation, ambiguity, malformed input, thread-safety, repeated calls, memory growth, performance, integration contract | **119 passed, 0 failed** |
 | `test_browser_selection.py` | capability priors, candidate ordering, cache asymmetry, page-side dead-backend detection, probe budget, browser-switch path, engine integration | **64 passed, 0 failed** |
+| `test_target_resolution.py` | the website registry, open-target typing, single-target close, strict-vs-loose matching, close/tab semantics, AST proof that no call site fuzzy-matches, STT protection, resolution performance budget | **108 passed, 0 failed** |
+| `test_ui.py` | theme, components, views, state reflection, boundary discipline (AST), refinement regressions, interaction, the shutdown button, the TTS device card, and Home's Graphics card (GPU present / GPU absent / telemetry pending / speech on CPU while a GPU exists / three-card layout fits) | **322 passed, 0 failed** (Qt `offscreen`, backend fully stubbed) |
+| `test_voice_control.py` | interrupt / lifecycle vocabulary, the Kayra-vs-computer shutdown boundary, tail matching, the JS/Python vocabulary agreement, control dispatch, the three runtime axes, shutdown ORDER and idempotency against a stubbed backend with `os._exit` replaced, classification cost | **186 passed, 0 failed** |
+| `test_tts_device.py` | ORT variant sanity and the package-name/import-name distinction, CUDA DLL preparation, the real cached provider probe, mode validation, provider planning with TensorRT excluded, failure modes simulated by substituting the provider list, the structured diagnostic, a real Kokoro session in every mode plus a real runtime switch, telemetry cost | **143 passed, 0 failed** |
+| `test_environment.py` | `run.py` interpreter ownership and the sys.path rule (AST), a real refusal to run on the system interpreter, import origin, the single-ORT-import rule, `setup.py` provisioning / pins / repair, and agreement between setup's CUDA probe and the application's | **56 passed, 0 failed** |
 
 `test_automation.py` runs in DRY mode by default and touches nothing on the desktop; pass
 `--live` for the read-only Win32 checks.
@@ -1742,15 +2189,44 @@ Run these first; they need no audio, no browser and no network.
 
 | Suite | Needs | Result this session |
 |---|---|---|
-| `test_dmm_matrix.py` | Cohere; 53 intent-boundary cases, paced under the rate limit | **53/53 (100%)**, 0 duplicate-token cases, 0 unexecutable-token cases, mean classification 0.95 s. All 15 boundaries at 100%: app, exit, input, knowledge, long, media, multi, negative, realtime, research, sysinfo, system, tab, utility, window |
-| `test_audio_pipeline.py` | the TTS model; time-to-first-word, barge-in cancellation, echo gate, interrupt phrases, normalization | see below |
-| `test_stt_lifecycle.py` | a working browser; session reuse, no accumulation across cycles, crash recovery, PID-scoped shutdown — run it **with your own Chrome open**, that is the interesting case | not run this session |
+| `test_dmm_matrix.py` | the DMM; 53 intent-boundary cases, paced under the rate limit | See the note below — it follows the assistant's own local-first routing, so **with LM Studio running it measures the LOCAL model, not Cohere**. Against the local model: **50–51/53**, 0 duplicate-token cases, 0 unexecutable-token cases, mean classification 0.60–0.65 s |
+| `test_audio_pipeline.py` | the TTS model; time-to-first-word, barge-in cancellation, echo gate, interrupt phrases, tail matching, normalization | **44 passed, 0 failed**; first spoken word 1.41 s, `stop()` → silence 1 ms |
+| `test_stt_lifecycle.py` | a working browser; session reuse, no accumulation across cycles, crash recovery, PID-scoped shutdown — run it **with your own Chrome open**, that is the interesting case | 2 pre-existing failures on this host (`exactly one ChromeDriver is owned`, `still exactly one session after recovery`), confirmed pre-existing by re-running against `HEAD` with the tree stashed |
 | `test_DMM.py`, `test_engine.py`, `test_voice.py` | live API calls | not run this session |
+
+**The DMM matrix is not measuring Cohere on a machine running LM Studio.** The engine is
+local-first, and `core.config.env()` gives `.env` precedence over the process environment — so
+exporting `FORCE_ONLINE` in the shell does not change the route. To compare against the
+documented Cohere baseline, set `FORCE_ONLINE=True` in `.env` (or stop the local server) before
+running it. The classifier itself is unchanged by the local-control work: lifecycle commands are
+intercepted BEFORE the DMM rather than being added to it, and the `exit` and negative-control
+categories score 100% in every run.
+
+### Tier 2b — live integration, no human required
+
+These drive the real subsystems and verify from outside the process. They live in the
+scratchpad rather than `tests/` because they boot and then kill a real assistant.
+
+| What | Result |
+|---|---|
+| Local control against a real Edge session and real audio | **15/15**. Barge-in `stop` 70 ms, `wait` 41 ms, `hold` 48 ms, echo-polluted tail 72 ms from interim result to silence; nothing resumed afterwards. `stop listening` 187 ms, `start listening` 224 ms, `go to sleep` 74 ms, `wake up` 69 ms. "Open chrome." and "Stop the music." both still reached the DMM path unswallowed |
+| Shutdown, verified from outside the dead process | boot 5.8 s, `request_shutdown` → exit **~3.1 s**; all 8 owned browser PIDs gone, **0 of the user's 23 browser processes touched**, exit code 0 |
+| Shutdown spoken WHILE mid-answer | audible with 2 more chunks queued; `exit` → process gone **8.9 s** (of which ~5 s is speaking the farewell on CPU Kokoro); 8 owned PIDs reaped, 0 of the user's 25 touched. Before the fix that cancels playback first, this took **26.6 s** because the farewell queued behind the rest of the answer |
+| Live JS/Python vocabulary agreement in a real browser | 20 probes; the page and the Python classifier agreed on every one |
+| Real CUDA initialization on the Kokoro graph | `session.get_providers()` → `['CUDAExecutionProvider', 'CPUExecutionProvider']`; session build 1.53 s, 181 MiB VRAM |
+| Kokoro synthesis through Kayra's own engine, AUTO / GPU / CPU | AUTO → CUDA, GPU → CUDA, CPU → CPU; the reported provider equalled `session.get_providers()[0]` in all three, and audio was produced in each |
+| `setup.py` speech-runtime provisioning and report | CUDA runtime detected present, real CUDA EP initialization **PASS**, "Kayra TTS GPU readiness: READY (CUDAExecutionProvider)" |
+| `run.py --doctor` on the live environment | correct interpreter and venv, `onnxruntime-gpu 1.26.0` built for CUDA 12.8, CUDA VERIFIED usable, RTX 4060 / 4.2 of 8.0 GiB / 58 °C |
 
 ### Tier 3 — requires a human
 
 `test_barge_in_live.py` needs someone to speak, and checks the microphone is actually live
 first, because a muted input device looks exactly like broken barge-in.
+
+**It has NOT been run this session.** Every barge-in measurement above injects the interim
+result the way the page's own `onresult` handler does, which exercises the matching, the
+watcher, the epoch cancellation and the audio device — but not the microphone. A human saying
+"stop" out loud is still unverified for this change.
 
 ### What "verified" means in this document
 

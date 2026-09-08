@@ -245,9 +245,22 @@ def preflight():
         sys.path.insert(0, SRC_DIR)
 
     try:
-        import kayra                                        # noqa: F401
+        import kayra
     except Exception as e:
         problems.append(f"The kayra package could not be imported: {e}")
+    else:
+        # WHERE DID `kayra` ACTUALLY COME FROM?
+        #
+        # `running_inside_venv()` proves the INTERPRETER is right; it does not prove the
+        # MODULES are. A global `pip install kayra`, a stale `PYTHONPATH`, or a sibling
+        # checkout earlier on `sys.path` all produce an interpreter from .venv importing code
+        # from somewhere else entirely — and the symptom is edits that appear to do nothing.
+        # Half a millisecond to check beats an afternoon of that.
+        origin = os.path.dirname(os.path.dirname(os.path.abspath(kayra.__file__)))
+        if not _same_path(origin, SRC_DIR):
+            problems.append(
+                f"The kayra package is being imported from {origin}, not this project's "
+                f"{SRC_DIR}. Remove the other copy from PYTHONPATH or uninstall it.")
 
     if not os.path.isfile(ENV_FILE):
         # Not fatal: every setting has a default. But an assistant with no API keys and no
@@ -269,7 +282,118 @@ def preflight():
         hint("Try: python setup.py")
         return False
 
+    report_environment()
     return True
+
+
+def _distribution_version(name):
+    """A package version WITHOUT importing the package. Costs a metadata read, not a load."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            return version(name)
+        except PackageNotFoundError:
+            return None
+    except Exception:
+        return None
+
+
+def report_environment():
+    """
+    One line saying which interpreter and which ONNX Runtime this run is using.
+
+    Deliberately cheap: the ORT variant and version come from installed-package METADATA, not
+    from `import onnxruntime`, which costs ~200 ms and would land on the cold-start path for
+    information the TTS engine is about to print properly anyway. What this catches is the
+    class of problem that is invisible later — the wrong interpreter, or a CPU `onnxruntime`
+    sitting on top of `onnxruntime-gpu`.
+    """
+    info(f"Python  {sys.version.split()[0]}  {sys.executable}")
+
+    variants = [name for name in ("onnxruntime-gpu", "onnxruntime-directml", "onnxruntime")
+                if _distribution_version(name)]
+    if not variants:
+        info("ONNX Runtime is not installed — speech output will be unavailable.")
+        hint("Run: python setup.py")
+    elif len(variants) > 1:
+        # They share one package directory, so whichever was installed last wins and the other
+        # is a half-deleted ghost. setup.py repairs this; say so rather than letting it surface
+        # as a mystifying provider list.
+        fail(f"Conflicting ONNX Runtime packages installed: {', '.join(variants)}")
+        hint("Run `python setup.py` to repair the environment (it keeps exactly one).")
+    else:
+        info(f"ONNX Runtime  {variants[0]} {_distribution_version(variants[0])}")
+
+
+def print_doctor():
+    """
+    `python run.py --doctor` — the full runtime picture, then exit.
+
+    This is the thing to ask for when speech output is on the wrong device. It reports the
+    interpreter, the environment, the ORT build, every provider, whether CUDA has been VERIFIED
+    (a real session, not a provider name), and the GPU telemetry, all from the single authority
+    in `kayra.output.tts_device`.
+    """
+    if SRC_DIR not in sys.path:
+        sys.path.insert(0, SRC_DIR)
+    try:
+        from kayra.output import tts_device
+    except Exception as exc:
+        fail(f"Could not load the speech runtime layer: {exc}")
+        return 1
+
+    # Prime the GPU sampler and give it one sample. `runtime_diagnostics` deliberately does
+    # NOT start it (it is called from paint paths), but --doctor is an explicit request for the
+    # numbers, so waiting a moment for them here is the right trade.
+    if tts_device.gpu_metrics() is None:
+        import time as _time
+        deadline = _time.time() + 6
+        while tts_device.gpu_metrics() is None and _time.time() < deadline:
+            _time.sleep(0.25)
+
+    diag = tts_device.runtime_diagnostics()
+    rows = [
+        ("Python", f"{sys.version.split()[0]}"),
+        ("Executable", diag.python_executable),
+        ("Environment", diag.environment_path),
+        ("", ""),
+        ("ONNX Runtime package", diag.ort_package),
+        ("ONNX Runtime version", diag.ort_version),
+        ("Package location", diag.ort_location),
+        ("Built for CUDA", diag.ort_cuda_build or "not a CUDA build"),
+        ("Available providers", ", ".join(diag.available_providers) or "none"),
+        ("", ""),
+        ("CUDA offered", "yes" if diag.cuda_available else "no"),
+        ("CUDA VERIFIED usable", "yes" if diag.cuda_usable else "no"),
+        ("CUDA runtime status", diag.cuda_runtime_status),
+        ("cuDNN status", diag.cudnn_status),
+        ("TensorRT offered", ("yes (not used for TTS)" if diag.tensorrt_available else "no")),
+        ("", ""),
+        ("TTS mode", diag.mode),
+        ("Active device", diag.active_device),
+        ("Active provider", diag.provider),
+    ]
+    if diag.gpu_name:
+        rows += [("", ""), ("GPU", diag.gpu_name)]
+        if diag.gpu_memory_total:
+            rows.append(("VRAM", f"{(diag.gpu_memory_used or 0) / 1024:.1f} / "
+                                 f"{diag.gpu_memory_total / 1024:.1f} GiB"))
+        if diag.gpu_utilization is not None:
+            rows.append(("Utilization", f"{diag.gpu_utilization:.0f}%"))
+        if diag.temperature is not None:
+            rows.append(("Temperature", f"{diag.temperature:.0f} C"))
+
+    print()
+    for label, value in rows:
+        print("" if not label else f"  {label:<24} {value}")
+    if diag.failure_reason:
+        print()
+        print(f"  Reason: {diag.failure_reason}")
+    if diag.missing_packages:
+        print(f"  Missing: {', '.join(diag.missing_packages)}")
+        hint("Run: python setup.py")
+    print()
+    return 0
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -368,8 +492,10 @@ def acquire_lock(force=False):
 
 USAGE = """Kayra launcher
 
-  python run.py            start Kayra
+  python run.py            start Kayra with the desktop interface
+  python run.py --console  start without the interface (voice + terminal only)
   python run.py --force    start even if another instance holds the lock
+  python run.py --doctor   report the Python, ONNX Runtime and GPU state, then exit
   python run.py --help     this message
 
 First-time setup:  python setup.py
@@ -387,13 +513,33 @@ def main(argv=None):
     if force:
         argv.remove("--force")
 
+    console = "--console" in argv
+    if console:
+        argv.remove("--console")
+
+    doctor = "--doctor" in argv
+    if doctor:
+        argv.remove("--doctor")
+
     # ── Phase 1: not in the venv yet ──
     if not running_inside_venv():
-        return relaunch_in_venv(argv + (["--force"] if force else []))
+        passthrough = list(argv)
+        if force:
+            passthrough.append("--force")
+        if console:
+            passthrough.append("--console")
+        if doctor:
+            passthrough.append("--doctor")
+        return relaunch_in_venv(passthrough)
 
     # ── Phase 2: running the right interpreter ──
     if not preflight():
         return 1
+
+    # `--doctor` reports and exits. Placed AFTER preflight so it is guaranteed to describe the
+    # venv, and BEFORE the lock so it can be run while Kayra is already up.
+    if doctor:
+        return print_doctor()
 
     release = acquire_lock(force=force)
     if release is None:
@@ -403,8 +549,21 @@ def main(argv=None):
         # Imported here, not at module scope: phase 1 runs on an interpreter where this import
         # cannot succeed, and a module-level import would crash the launcher before it had a
         # chance to explain that setup has not been run.
-        from kayra.app import main as app_main
-        return app_main()
+        if console:
+            from kayra.app import main as app_main
+            return app_main()
+
+        # The desktop interface is the default front end. If Qt is not installed, Kayra is
+        # still perfectly usable — it simply falls back to the console loop and says why,
+        # rather than refusing to start over a presentation dependency.
+        try:
+            from kayra.ui.application import main as ui_main
+        except ImportError as exc:
+            info(f"Desktop interface unavailable ({exc}). Starting in console mode.")
+            hint("Install it with:  .venv\\Scripts\\python.exe -m pip install PySide6-Essentials")
+            from kayra.app import main as app_main
+            return app_main()
+        return ui_main(argv)
     except KeyboardInterrupt:
         # The application installs its own SIGINT handler and normally exits inside it. This is
         # the narrow window before that handler is registered.

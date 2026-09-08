@@ -49,11 +49,13 @@ WHAT CHANGED, AND WHY IT HAD TO
   CONFIRM actions.
 """
 
+import io
 import os
 import re
 import sys
 import time
 import ctypes
+import contextlib
 import platform
 import tempfile
 import asyncio
@@ -213,69 +215,202 @@ def PlayYoutube(query):
     return True
 
 def OpenApp(app):
-    """Opens local window executables or falls back to scraping links instantly."""
-    app_target = app.lower().strip()
-    print_info(f"Targeting system execution paths for: '{app_target}'")
+    """
+    Opens an application, a website or a URL — after deciding WHICH of those it is.
 
-    # Detect if the input is a URL or domain name (e.g. github.com, https://example.org, claude.ai)
-    domain_extensions = r'\.(com|org|net|in|io|ai|co|dev|me|xyz|gov|edu|info|app|tech|site|online|live|pro|cc|tv|gg|us|uk|eu)(/|$|\s)'
-    is_url = app_target.startswith("http://") or app_target.startswith("https://")
-    is_domain = bool(re.search(domain_extensions, app_target))
+    Backward compatible: same name, same argument, still returns a bool. The body is new,
+    because the old one had no notion of target TYPE and therefore no way to be right.
 
-    if is_url or is_domain:
-        # Parse multiple URLs/domains if separated by spaces, commas, or 'and'
-        if "," in app_target or " and " in app_target:
-            targets = [t.strip() for t in re.split(r',|\band\b', app_target) if t.strip()]
-        else:
-            targets = app_target.split()
+    What it used to do, and why "open YouTube" opened File Explorer
+    --------------------------------------------------------------
+    Anything that was not literally a URL went to `AppOpener.open(..., match_closest=True)`.
+    That launcher is `os.system("explorer shell:appsFolder\\" + id)` over a CACHED Start-Menu
+    index, with a `difflib` fuzzy match (cutoff 0.6) when the exact name is absent. Two
+    distinct ways it launched the wrong thing, both reproduced on this machine:
 
-        for target in targets:
-            url = target
-            if not url.startswith("http"):
-                url = f"https://{url}"
-            webbrowser.open(url)
-            print_success(f"Opened URL in default browser: {url}")
-            time.sleep(0.3)
-        return True
+      * a STALE index entry — `youtube` was cached as a Brave PWA AppsFolder id that no longer
+        exists. `explorer shell:appsFolder\<dead id>` does not fail; it opens a plain FILE
+        EXPLORER WINDOW. That is the reported bug, exactly.
+      * a FUZZY hit — `github` is absent from the index, difflib matched "git gui", and Git
+        GUI launched.
 
-    if app_target in ["file explorer", "file manager", "my computer", "this pc", "explorer"]:
-        os.startfile("explorer")
-        return True
+    Neither raised, so the assistant reported success. When AppOpener did raise, the fallback
+    was a DuckDuckGo `!ducky` redirect — routing a plain "open YouTube" through a search
+    engine. Both behaviours are gone.
 
+    Now: `targets.resolve_open_target` decides the type, and each type has exactly one
+    execution path. An unresolvable name is reported, never guessed at.
+    """
+    return open_target(app).ok
+
+
+def _split_open_targets(raw):
+    """
+    Splits "chrome and youtube" into two targets — but only when both halves really resolve.
+
+    The old code split on whitespace in its fallback path, which turns "visual studio code"
+    into three lookups and three wrong launches. Splitting only on an explicit separator, and
+    only when every part is independently resolvable, keeps the multi-open capability without
+    that failure: "open my documents and settings" stays one target because "my documents"
+    does not resolve on its own.
+    """
+    lowered = (raw or "")
+    if "," not in lowered and not re.search(r"\band\b", lowered, re.I):
+        return [raw]
+    parts = [p.strip() for p in re.split(r",|\band\b", raw, flags=re.I) if p.strip()]
+    if len(parts) < 2:
+        return [raw]
+    if all(targets.resolve_open_target(part).ok for part in parts):
+        return parts
+    return [raw]
+
+
+def _launch_from_index(name):
+    """
+    Launches an EXACT Start-Menu entry through AppOpener. Never `match_closest`.
+
+    `match_closest=True` is what turned "open github" into Git GUI. The exact-name path is
+    still useful — it is how a normal installed application that Kayra does not curate gets
+    launched — so it is kept, with the guessing removed.
+    """
     try:
-        _old_stdout = sys.stdout
-        sys.stdout = open(os.devnull, 'w')
+        with contextlib.redirect_stdout(io.StringIO()):
+            appopen(name, match_closest=False, output=False, throw_error=True)
+        return True
+    except Exception:
+        return False
+
+
+def _launch_application(canonical, spoken):
+    """
+    Starts a desktop application and VERIFIES that its window appeared.
+
+    Launch order is cheapest-and-most-exact first: `os.startfile` on the registered executable
+    (the same mechanism the Windows Run box uses), then the exact Start-Menu entry. There is
+    no third, fuzzy attempt — that is the whole bug.
+    """
+    spec = targets.APP_REGISTRY.get(canonical)
+    started = False
+
+    if spec:
         try:
-            appopen(app_target, match_closest=True, output=True, throw_error=True)
-        finally:
-            sys.stdout.close()
-            sys.stdout = _old_stdout
-        return True
-    except:
-        print_warning(f"Local app shortcut not resolved. Running fast web scraping link extraction...")
+            os.startfile(spec["exe"])
+            started = True
+        except Exception:
+            started = False
 
-        # Parse targets by commas or 'and'. If none, split by space to support multi-site space-separated lists
-        if "," in app_target or " and " in app_target:
-            targets = [t.strip() for t in re.split(r',|\band\b', app_target) if t.strip()]
-        else:
-            targets = app_target.split()
+    if not started:
+        candidates = [canonical]
+        if spec:
+            candidates.extend(spec["aliases"])
+        for candidate in candidates:
+            if targets.app_index_entry(candidate) and _launch_from_index(candidate):
+                started = True
+                break
 
-        for target in targets:
-            try:
-                # Use DuckDuckGo's !ducky bang ("I'm Feeling Lucky") to automatically and instantly
-                # redirect the user's browser to the primary official website (bypassing all scraping CAPTCHAs)
-                import urllib.parse
-                safe_target = urllib.parse.quote(target)
-                resolved_url = f"https://duckduckgo.com/?q=!ducky+{safe_target}"
-                
-                # Route exclusively through the system's natively configured default browser
-                webbrowser.open(resolved_url)
-                
-                # Small delay to prevent browser tab rendering bottlenecks
-                time.sleep(0.3)
-            except Exception as web_err:
-                print_error(f"Web fallback routing layer failed for '{target}': {web_err}")
-        return True
+    if not started:
+        return ActionResult.failure(f"I couldn't start {spoken}.", target=canonical)
+
+    targets.invalidate_cache()
+    if spec:
+        window = targets.wait_for_app_window(canonical, timeout=8.0)
+        if window is None:
+            return ActionResult.failure(f"I started {spoken}, but no window appeared.")
+        return ActionResult.success(f"{spoken.title()} is open.", hwnd=window.hwnd)
+
+    # Not a curated application, so there is no canonical window class to wait for. Verify
+    # that SOMETHING new appeared instead of claiming a success we did not observe.
+    if _wait_for_new_window(timeout=8.0):
+        return ActionResult.success(f"{spoken.title()} is open.")
+    return ActionResult.failure(f"I started {spoken}, but no window appeared.")
+
+
+def _wait_for_new_window(timeout=8.0, before=None):
+    """Bounded poll for any new non-Kayra window. Verification for an uncurated launch."""
+    baseline = before if before is not None else {w.hwnd for w in targets.list_windows(force=True)}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for window in targets.list_windows(force=True):
+            if window.hwnd not in baseline and not window.kayra_owned:
+                return window
+        time.sleep(0.15)
+    return None
+
+
+def open_target(name, context=None):
+    """
+    The open pipeline. Resolver-backed, typed, and verified — returns the spoken sentence.
+
+        normalize -> resolve_open_target -> {URL | WEBSITE | APPLICATION} -> execute -> verify
+
+    A website opens in the user's existing default browser through `webbrowser`, which reuses
+    a running browser rather than starting another one. An application is focused if it is
+    already running and launched otherwise, and either way a window has to be there before
+    this says it worked.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return ActionResult.failure("Open what?")
+
+    spoken = []
+    last = None
+    for part in _split_open_targets(raw):
+        last = _open_one(part)
+        if last.message:
+            spoken.append(last.message)
+        if not last.ok:
+            break
+    if len(spoken) > 1:
+        merged = ActionResult(last.status, " ".join(spoken))
+        return merged
+    return last
+
+
+def _open_one(name):
+    resolution = targets.resolve_open_target(name)
+    print_info(f"Open target '{name}' -> {resolution.kind} ({resolution.reason})")
+
+    if resolution.status == targets.Resolution.NOT_FOUND:
+        # Deliberately NOT a filesystem sweep or a web search. Saying "I couldn't find it" is
+        # the correct answer; launching the nearest-looking executable is how this broke.
+        return ActionResult.not_found(f"I couldn't find {name}.")
+
+    if resolution.kind in (targets.TargetType.URL, targets.TargetType.WEBSITE):
+        url = resolution.target
+        result = OpenUrl(url)
+        if not result.ok:
+            return result
+        label = targets.canonical_website(name) or name
+        return ActionResult.success(f"Opening {label.title()}.", url=url,
+                                    kind=resolution.kind)
+
+    if resolution.kind == targets.TargetType.APPLICATION:
+        canonical = resolution.target
+        running = targets.resolve_application(canonical)
+        if running.ok:
+            # Already open: "open Chrome" means "show me Chrome", not "start a second copy".
+            window = targets.pick_single(running).target or running.matches[0]
+            if targets.focus_window(window):
+                return ActionResult.success(f"{name.title()} is open.", focused=True,
+                                            hwnd=window.hwnd)
+        result = _launch_application(canonical, name)
+        if result.ok:
+            return result
+        # A curated application that would not start, but which also has a web version
+        # (Spotify, WhatsApp): the web player is what the user can actually use right now.
+        url = targets.website_url(name) or targets.website_url(f"{canonical} web")
+        if url:
+            web = OpenUrl(url)
+            if web.ok:
+                return ActionResult.success(f"Opening {name.title()} on the web.", url=url)
+        return result
+
+    if resolution.kind in (targets.TargetType.FILE, targets.TargetType.FOLDER):
+        return OpenPath(resolution.target)
+
+    return ActionResult.not_found(f"I couldn't find {name}.")
+
+
 
 def CloseApp(app):
     """
@@ -296,27 +431,27 @@ def CloseApp(app):
     return close_target(app).ok
 
 
-def close_target(app, context=None):
+def close_target(app, context=None, all_instances=False):
     """
     The resolver-backed close. Returns an `ActionResult` carrying the spoken sentence.
 
+    ONE INTENT, ONE TARGET. That is the contract, and it is enforced by `targets.pick_single`
+    rather than by care at each call site. The previous version resolved an application to
+    every one of its windows and then looped `close_window` over all of them: one sentence,
+    four windows gone, no question asked. It also fell through from a missed site lookup into
+    a LOOSE application lookup, so "close YouTube" with no YouTube window in front matched
+    every window with "youtube" anywhere in its title and closed those too.
+
     Order matters: a site is checked before an application, because "close YouTube" is a tab,
     not a process, and asking AppOpener for "youtube.exe" is how the old code got lost.
+
+    `all_instances=True` is the explicit broad form ("close all Chrome windows"). It is never
+    inferred — it arrives only from a token the user actually said.
     """
     name = (app or "").strip()
     if not name:
         return ActionResult.failure("I didn't catch what to close.")
     lowered = name.lower()
-
-    # ── Special surfaces that have no ordinary window to close ──
-    if lowered in ("file explorer", "explorer", "file manager", "this pc", "my computer"):
-        closed = 0
-        for window in targets.list_windows():
-            if window.app == "explorer" and not window.kayra_owned and window.title:
-                if targets.close_window(window):
-                    closed += 1
-        return (ActionResult.success("Closed File Explorer.", closed=closed) if closed
-                else ActionResult.not_found("File Explorer isn't open."))
 
     # ── 1. Website target ("close YouTube") ──
     if targets.looks_like_site(lowered):
@@ -336,47 +471,86 @@ def close_target(app, context=None):
             send_keys("ctrl+w", settle=0.3)
             targets.invalidate_cache()
             return ActionResult.success(f"{name.title()} is closed.", hwnd=window.hwnd)
-        # Fall through: it might also be an installed application (Spotify, WhatsApp).
+        # A pure site name that is not on screen is a MISS, not an invitation to look for a
+        # process of that name. Only a name that is ALSO a real application falls through.
+        if not (targets.canonical_app(lowered) or targets.app_index_entry(lowered)):
+            return ActionResult.not_found(
+                f"I don't see {name} open. If it's in a background tab I can't see it "
+                f"from here.")
 
-    # ── 2. Application target ("close Spotify") ──
-    resolution = targets.resolve_application(lowered)
+    # ── 2. Application target ("close Spotify", "close Chrome") ──
+    # strict=True: for a name Kayra does not curate, only an exact process-identity match
+    # counts. A title substring is enough to FOCUS the wrong window and far too little to
+    # close it.
+    resolution = targets.resolve_application(lowered, strict=True)
     if resolution.ok:
-        windows = [w for w in resolution.matches if not w.kayra_owned]
-        if not windows:
-            return ActionResult.not_found(f"I couldn't find {name}.")
-        handles = [w.hwnd for w in windows]
-        for window in windows:
-            targets.close_window(window)
-        gone = sum(1 for h in handles if targets.wait_until_gone(h, timeout=2.0))
-        if gone:
-            return ActionResult.success(f"{name.title()} is closed.", closed=gone)
-        return ActionResult.failure(
-            f"{name.title()} didn't respond, so it's still open.")
+        if all_instances:
+            windows = [w for w in resolution.matches if not w.kayra_owned]
+            handles = [w.hwnd for w in windows]
+            for window in windows:
+                targets.close_window(window)
+            gone = sum(1 for h in handles if targets.wait_until_gone(h, timeout=2.0))
+            if gone:
+                return ActionResult.success(
+                    f"Closed {gone} {name.title()} window{'s' if gone != 1 else ''}.",
+                    closed=gone)
+            return ActionResult.failure(f"{name.title()} didn't respond, so it's still open.")
 
-    # ── 3. Not running as a window. Ask AppOpener — it can close background/tray apps. ──
-    from AppOpener import close as appclose
-    try:
-        _old_stdout = sys.stdout
-        sys.stdout = open(os.devnull, "w")
+        single = targets.pick_single(resolution)
+        if single.status == targets.Resolution.AMBIGUOUS:
+            return ActionResult.ambiguous(
+                f"You have {len(single.matches)} {name.title()} windows open. "
+                f"Which one should I close?",
+                candidates=targets.describe_windows(single.matches))
+        if not single.ok:
+            return ActionResult.not_found(f"I couldn't find {name}.")
+        window = single.target
+        targets.close_window(window)
+        if targets.wait_until_gone(window.hwnd, timeout=2.0):
+            return ActionResult.success(f"{name.title()} is closed.", hwnd=window.hwnd)
+        return ActionResult.failure(f"{name.title()} didn't respond, so it's still open.")
+
+    # ── 3. Not running as a window. AppOpener can close a background/tray app — but only on
+    #      an EXACT name. `match_closest` here would close whatever it liked the look of. ──
+    if targets.app_index_entry(lowered):
+        from AppOpener import close as appclose
         try:
-            appclose(lowered, match_closest=True, output=True, throw_error=True)
-            success = True
-        except Exception:
-            success = False
-        finally:
-            sys.stdout.close()
-            sys.stdout = _old_stdout
-        if success:
+            with contextlib.redirect_stdout(io.StringIO()):
+                appclose(lowered, match_closest=False, output=False, throw_error=True)
             targets.invalidate_cache()
             return ActionResult.success(f"{name.title()} is closed.")
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     # ── 4. Give up honestly. The old code force-killed here; that is the bug, not the fix. ──
-    if resolution.status == targets.Resolution.NOT_FOUND and targets.looks_like_site(lowered):
+    if targets.looks_like_site(lowered):
         return ActionResult.not_found(
             f"I don't see {name} open. If it's in a background tab I can't see it from here.")
     return ActionResult.not_found(f"I couldn't find {name} open.")
+
+
+def close_all_windows():
+    """
+    Closes every visible user window. The explicit broad form of "close everything".
+
+    Reachable ONLY from a token the user actually said, and CONFIRM-gated by the policy layer,
+    because it is the one close in this module whose blast radius is the whole desktop.
+    Kayra's own windows and the shell are excluded by the same rules as everything else.
+    """
+    own_pid = os.getpid()
+    windows = [w for w in targets.list_windows(force=True)
+               if not w.kayra_owned and w.pid != own_pid]
+    if not windows:
+        return ActionResult.not_found("There are no windows open.")
+    handles = [w.hwnd for w in windows]
+    for window in windows:
+        targets.close_window(window)
+    gone = sum(1 for h in handles if targets.wait_until_gone(h, timeout=2.5))
+    targets.invalidate_cache()
+    if gone:
+        return ActionResult.success(f"Closed {gone} window{'s' if gone != 1 else ''}.",
+                                    closed=gone)
+    return ActionResult.failure("Nothing closed.")
 
 
 def force_close_app(app):
@@ -1591,6 +1765,12 @@ def _screenshot_folder():
 _EXACT_TOKENS = {
     # window
     "close window": ("window", "close"), "minimize": ("window", "minimize"),
+    # The BROAD close, and the only one. It exists as its own token precisely so that the
+    # ordinary "close X" can never widen into it by accident: nothing infers this, the user
+    # has to say it, and the policy layer confirms it.
+    "close everything": ("window", "close_all"),
+    "close all windows": ("window", "close_all"),
+    "close all": ("window", "close_all"),
     "minimize all": ("window", "minimize_all"), "show desktop": ("window", "minimize_all"),
     "maximize": ("window", "maximize"), "restore": ("window", "restore"),
     "snap left": ("window", "snap_left"), "snap right": ("window", "snap_right"),
@@ -1666,6 +1846,7 @@ _PREFIX_TOKENS = [
     ("system ", ("system", "raw")),
     ("write ", ("keyboard", "type")),
     ("type ", ("keyboard", "type")),
+    ("close all ", ("app", "close_all")),
     ("close ", ("app", "close")),
     ("open ", ("app", "open")),
     ("play ", ("media", "play")),
@@ -1787,17 +1968,43 @@ def _build_action(domain, action, payload, raw, context):
                       parameters={"command": payload}, confidence=0.6, raw=raw)
 
     if domain == "app" and action == "open":
-        # An "open X" whose X is a URL or a domain is a browser action, not an app launch.
-        if targets.looks_like_site(payload) and (
-                payload.lower().startswith(("http://", "https://", "www.")) or "." in payload):
-            return Action("browser", "open_url", target=payload,
-                          parameters={"url": payload}, raw=raw)
+        # TYPE THE TARGET HERE, not three layers down. "open X" is an application launch only
+        # when X is an application; when X is an address or a web service it is a browser
+        # navigation, and the two must not share an execution path. Two dictionary lookups,
+        # measured in microseconds — there is no reason to defer this decision.
+        if targets.is_explicit_url(target):
+            return Action("browser", "open_url", target=target,
+                          parameters={"url": targets.normalize_url(target)}, raw=raw)
+        if not targets.canonical_app(target):
+            url = targets.website_url(target)
+            if url:
+                return Action("browser", "open_url", target=target,
+                              parameters={"url": url, "site": targets.canonical_website(target)},
+                              confidence=confidence, raw=raw)
+
+    if domain == "app" and action == "close_all":
+        # "close all chrome windows" -> the application is "chrome". The trailing noun is
+        # grammar, not part of the target.
+        target = re.sub(r"\s+(windows|window|tabs|tab|instances)$", "", target or "",
+                        flags=re.I).strip()
+        if not target or target in ("windows", "window"):
+            return Action("window", "close_all", target="all", raw=raw)
+        return Action("app", "close_all", target=target, raw=raw)
 
     if domain == "app" and action == "close":
         # "close this"/"close it" with no referent means the foreground WINDOW, which is both
         # the safest reading and what a person actually means standing at their desk.
         if confidence < 1.0 and (payload or "").lower().strip(" .?!") in targets.CURRENT_TARGET_WORDS:
             return Action("window", "close", target="current", raw=raw)
+
+    if domain == "file" and action == "open_file":
+        # "open file explorer" is an APPLICATION, not a file called "explorer". The prefix
+        # table is longest-first, so `open file ` legitimately wins the literal match — what
+        # disambiguates is the target: a curated application name with no file extension was
+        # never a filename. Without this, "open file explorer" reached the filesystem
+        # resolver, missed, and reported that it could not find a file.
+        if targets.canonical_app(target) and not os.path.splitext(str(target))[1]:
+            return Action("app", "open", target=target, raw=raw)
 
     if domain == "file" and action in ("create_file", "create_folder", "rename", "delete"):
         if action == "rename" and " to " in payload.lower():
@@ -1866,6 +2073,7 @@ _CONFIRM_PROMPTS = {
     "system.wifi_off": "This will turn off Wi-Fi. Should I go ahead?",
     "file.delete": "That will delete it. Should I go ahead?",
     "app.kill": "That will force-close it and you may lose unsaved work. Should I go ahead?",
+    "window.close_all": "That will close every open window. Should I go ahead?",
 }
 
 
@@ -1956,6 +2164,8 @@ def _dispatch(action):
             if targets.wait_until_gone(window.hwnd, timeout=2.0):
                 return ActionResult.success("Closed.")
             return ActionResult.failure("That window didn't close.")
+        if verb == "close_all":
+            return close_all_windows()
         keymap = {"minimize": "win+down", "minimize_all": "win+d", "maximize": "win+up",
                   "restore": "win+down", "snap_left": "win+left", "snap_right": "win+right",
                   "alt_tab": "alt+tab", "task_view": "win+tab", "action_center": "win+a",
@@ -1972,6 +2182,9 @@ def _dispatch(action):
             return _open_app_verified(target)
         if verb == "close":
             return close_target(target, CONTEXT)
+        if verb == "close_all":
+            # Explicit and scoped to one named application. The user said "all".
+            return close_target(target, CONTEXT, all_instances=True)
         if verb == "kill":
             return force_close_app(target)
         if verb == "restart":
@@ -1984,7 +2197,15 @@ def _dispatch(action):
     # ── browser ──
     if domain == "browser":
         if verb == "open_url":
-            return OpenUrl(params.get("url") or target)
+            result = OpenUrl(params.get("url") or target)
+            if result.ok:
+                # Name what was opened. "Done." is technically true and tells the user
+                # nothing about WHICH of the several readings of their sentence was taken —
+                # which is exactly the information that was missing when this opened the
+                # wrong thing.
+                site = params.get("site") or targets.canonical_website(target)
+                result.message = f"Opening {site.title()}." if site else "Opening that link."
+            return result
         if verb == "search_web":
             WebSearch(target)
             return ActionResult.success("Searching.")
@@ -2147,33 +2368,15 @@ def _dispatch(action):
 
 def _open_app_verified(name):
     """
-    Launches or focuses an application, then verifies a window actually appeared.
+    The executor's entry point for `app.open`. Delegates to the one open pipeline.
 
-    Focus-if-running comes first on purpose: "open Chrome" when Chrome is already open means
-    "show me Chrome", not "start a second copy". The old path always launched.
+    Kept as a separate name because it is referenced by the dispatcher and by the test suite,
+    and because the guarantee it advertises — that nothing reports success without a verified
+    window or a verified navigation — is now `open_target`'s, in one place instead of two.
     """
     if not name:
         return ActionResult.failure("Open what?")
-    canonical = targets.canonical_app(name)
-
-    if canonical:
-        running = targets.resolve_application(canonical)
-        if running.ok:
-            window = running.matches[0]
-            if targets.focus_window(window):
-                return ActionResult.success(f"{name.title()} is open.", focused=True)
-
-    OpenApp(name)
-
-    if canonical:
-        window = targets.wait_for_app_window(canonical, timeout=8.0)
-        if window is not None:
-            return ActionResult.success(f"{name.title()} is open.")
-        return ActionResult.failure(f"I started {name}, but no window appeared.")
-    # Unknown application or a web fallback: AppOpener/webbrowser already reported, and there
-    # is no canonical window to wait for, so do not claim a verification we did not perform.
-    targets.invalidate_cache()
-    return ActionResult.success("Done.")
+    return open_target(name, CONTEXT)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

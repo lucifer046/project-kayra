@@ -118,3 +118,93 @@ def assistant_name(default: str = "Kayra") -> str:
 def reset_cache():
     """Forgets the cached parse. For tests and for `setup.py` rewriting `.env` in-process."""
     env_values.cache_clear()
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                          WRITING SETTINGS BACK                         │
+# └────────────────────────────────────────────────────────────────────────┘
+# Added for the desktop UI's Settings screen. `setup.py` has its own writer, but that script
+# runs on the SYSTEM interpreter before the virtual environment exists and deliberately imports
+# nothing from `kayra` — so it cannot be the shared implementation, and importing a root-level
+# setup script from inside the package to save a few lines would be worse than this.
+
+SECRET_KEYS = frozenset({
+    "CohereAPIKey", "GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "HF_TOKEN",
+})
+
+
+def is_secret(name: str) -> bool:
+    """
+    Whether a setting's VALUE must never be rendered.
+
+    Matched by explicit name and by shape, because a key added to `.env` later will not be in
+    the list above and the safe default for an unknown credential is to hide it.
+    """
+    if name in SECRET_KEYS:
+        return True
+    upper = name.upper()
+    return any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
+
+
+def write_env_values(updates: dict) -> bool:
+    """
+    Updates `.env` in place, preserving comments, ordering and untouched settings.
+
+    Rewriting the file from a parsed dict would silently delete every comment in it, and
+    `.env.example` is heavily annotated precisely so users can understand their own
+    configuration. So each key is rewritten on the line where it already lives, and only
+    genuinely new keys are appended.
+
+    Returns True on success. A value of None removes nothing — it is skipped — because an
+    absent key and an empty key mean different things to the readers above.
+    """
+    if not updates:
+        return True
+
+    path = env_file()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        else:
+            lines = []
+    except OSError:
+        return False
+
+    remaining = {k: v for k, v in updates.items() if v is not None}
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name = stripped.split("=", 1)[0].strip()
+        if name in remaining:
+            lines[index] = f"{name}={remaining.pop(name)}"
+
+    if remaining:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("# Added by the Kayra settings screen")
+        for name, value in remaining.items():
+            lines.append(f"{name}={value}")
+
+    # Written via a temporary file and swapped in, so an interrupted write cannot leave the
+    # user with a truncated `.env` and an assistant that has lost all its configuration.
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        return False
+
+    # The cached parse is now stale, and `os.environ` is what several subsystems read.
+    reset_cache()
+    for name, value in updates.items():
+        if value is not None:
+            os.environ[name] = str(value)
+    return True

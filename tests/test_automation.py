@@ -244,9 +244,10 @@ def section_token_coverage():
 
     from kayra.intelligence.llm_engine import CentralizedLLMEngine
     engine = CentralizedLLMEngine()
-    # Handled by main.py's router, not by the automation layer.
+    # Handled by app.Execute_Task's router, not by the automation layer. These are assistant
+    # SELF-control (what Kayra does with itself) as opposed to machine control.
     main_handled = {"general", "realtime", "deep research", "exit",
-                    "proactive on", "proactive off"}
+                    "proactive on", "proactive off", "stop listening"}
     context = AutomationContext()
     gaps = []
     for token in engine.funcs:

@@ -184,6 +184,8 @@ _CONFIRM_ACTIONS = {
     "file.delete",
     "file.move",                 # a move can silently overwrite
     "app.kill",                  # terminating a process by force, not asking it to close
+    "window.close_all",          # the whole desktop at once — the one close with a blast
+                                 # radius wider than the thing the user named
     "screen.brightness_set",     # can render the display unreadable at 0
 }
 

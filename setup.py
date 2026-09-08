@@ -421,6 +421,422 @@ def validate_package(python_exe):
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
+# │              4b. SPEECH-SYNTHESIS RUNTIME (ONNX / CUDA)                 │
+# └────────────────────────────────────────────────────────────────────────┘
+# WHAT THIS SECTION EXISTS TO PREVENT.
+#
+# `onnxruntime-gpu` reports CUDAExecutionProvider in `get_available_providers()` the moment it
+# is installed, whether or not the CUDA runtime it was built against is present. When it is
+# not, ONNX Runtime does NOT raise — it logs
+#
+#     Error loading "onnxruntime_providers_cuda.dll" which depends on
+#     "cublasLt64_12.dll" which is missing. (Error 126)
+#
+# drops the provider, and hands back a working CPU session. That is precisely the state this
+# machine was in: a real RTX 4060, a GPU-capable ORT wheel, and no CUDA runtime, so Kayra
+# reported "GPU requested / CPU active" forever.
+#
+# So setup does three things rather than one: it installs the right ORT variant, installs the
+# CUDA runtime WHEELS that variant needs, and then PROVES a CUDA session can be created.
+
+# The Python package name is `onnxruntime-gpu`; the IMPORT is and remains `import onnxruntime`.
+# There is no module called `onnxruntime_gpu`. Every mention below keeps that distinction.
+ORT_CPU_PACKAGE = "onnxruntime"
+ORT_GPU_PACKAGE = "onnxruntime-gpu"
+ORT_DIRECTML_PACKAGE = "onnxruntime-directml"
+ORT_VARIANTS = (ORT_CPU_PACKAGE, ORT_GPU_PACKAGE, ORT_DIRECTML_PACKAGE)
+
+# THE ONNX RUNTIME GPU VERSION IS PINNED, AND THAT IS THE WHOLE POINT.
+#
+# Installing an unpinned `onnxruntime-gpu` is how this went wrong once already: a plain
+# `pip install onnxruntime-gpu` pulled 1.29.0, which is built against CUDA **13**, silently
+# orphaning the CUDA 12.8 runtime wheels that had just been installed to match 1.26.0 — and
+# dragging protobuf from 4.x to 7.x with it, which broke mediapipe. "Latest" is not a
+# combination anyone has tested together.
+#
+# This pin and CUDA_RUNTIME_PINS below must move together, and only after verifying that a real
+# CUDA session initializes on the new pair.
+ORT_GPU_PIN = "onnxruntime-gpu==1.26.0"
+
+# Known-good NVIDIA runtime wheels for the CUDA line each ORT build targets, keyed by the major
+# version from `onnxruntime.cuda_version`.
+#
+# ONLY VERIFIED ENTRIES BELONG HERE. There is no CUDA 13 entry because the `-cu13` package
+# names were checked and are NOT the real ones: `nvidia-cuda-runtime-cu13`,
+# `nvidia-cublas-cu13` and `nvidia-cufft-cu13` on PyPI are 1.4 kB placeholder sdists at version
+# 0.0.1, and installing them achieves nothing while looking like success. The genuine CUDA 13
+# wheels are named without the suffix (`nvidia-cublas`, `nvidia-cuda-nvrtc`). Guessing package
+# names is exactly the class of mistake this file exists to prevent, so an unrecognised CUDA
+# major is REPORTED rather than guessed at.
+CUDA_RUNTIME_PINS = {
+    "12": [
+        "nvidia-cuda-runtime-cu12==12.8.90",
+        "nvidia-cublas-cu12==12.8.4.1",      # cublas64_12.dll + cublasLt64_12.dll
+        "nvidia-cufft-cu12==11.3.3.83",      # cufft64_11.dll
+        "nvidia-cudnn-cu12==9.13.1.26",      # cuDNN 9
+    ],
+}
+
+
+def _pip(python_exe, *args, quiet=False):
+    """
+    Runs pip inside the TARGET environment.
+
+    Always `<venv python> -m pip`, never a bare `pip`: this script runs in a shell that has NOT
+    activated the venv, and a bare `pip` installs into whatever is first on PATH — usually the
+    system Python. That is how "I installed it but it says the module is missing" happens.
+    """
+    command = [python_exe, "-m", "pip", "--disable-pip-version-check", "--no-input", *args]
+    if quiet:
+        return subprocess.run(command, capture_output=True, text=True)
+    return subprocess.run(command)
+
+
+def _installed_packages(python_exe):
+    """{normalised name: version} for the target environment. Empty dict on any failure."""
+    code = (
+        "import json\n"
+        "from importlib.metadata import distributions\n"
+        "out={}\n"
+        "for d in distributions():\n"
+        "    n=(d.metadata['Name'] or '').strip().lower()\n"
+        "    if n: out[n]=d.version\n"
+        "print(json.dumps(out))\n"
+    )
+    result = subprocess.run([python_exe, "-c", code], capture_output=True, text=True)
+    try:
+        return json.loads((result.stdout or "").strip() or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def _ort_report(python_exe):
+    """
+    Everything the installed ONNX Runtime says about itself, read INSIDE the target venv.
+
+    Includes the CUDA version the wheel was BUILT against, which is the number that decides
+    which NVIDIA runtime wheels are needed — guessing it from the ORT version would be wrong
+    the first time Microsoft changed it.
+    """
+    code = (
+        "import json\n"
+        "try:\n"
+        "    import onnxruntime as ort\n"
+        "    print(json.dumps({'ok': True,\n"
+        "        'version': ort.__version__,\n"
+        "        'package': getattr(ort, 'package_name', 'onnxruntime'),\n"
+        "        'cuda_build': getattr(ort, 'cuda_version', None) or None,\n"
+        "        'location': ort.__file__,\n"
+        "        'has_preload': hasattr(ort, 'preload_dlls'),\n"
+        "        'providers': list(ort.get_available_providers())}))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'error': type(e).__name__ + ': ' + str(e)[:160]}))\n"
+    )
+    result = subprocess.run([python_exe, "-c", code], capture_output=True, text=True)
+    try:
+        return json.loads((result.stdout or "").strip() or "{}")
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "onnxruntime could not be queried"}
+
+
+def _nvidia_gpu_present():
+    """(name, vram_mib) from nvidia-smi, or (None, None). One short call, never repeated."""
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8, shell=False)
+    except Exception:
+        return None, None
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None, None
+    parts = [p.strip() for p in completed.stdout.strip().splitlines()[0].split(",")]
+    if len(parts) < 2:
+        return None, None
+    try:
+        return parts[0], float(parts[1])
+    except ValueError:
+        return parts[0], None
+
+
+def _probe_cuda_session(python_exe):
+    """
+    THE ONLY CHECK THAT COUNTS: does a real ONNX Runtime session initialize on CUDA?
+
+    Runs inside the target venv, preloads the CUDA/cuDNN DLLs the way Kayra does, builds a
+    session on an 84-byte model and asks the SESSION which provider it got. Provider-name
+    detection is explicitly not trusted — see the section header.
+    """
+    code = (
+        "import json\n"
+        "probe = ("
+        "    b'\\x08\\x08\\x12\\x05kayra:C\\n\\x14\\n\\x01x\\x12\\x01y\\x1a\\x02id\\x22\\x08Identity\\x12\\x05probe'\n"
+        "    b'Z\\x11\\n\\x01x\\x12\\x0c\\n\\n\\x08\\x01\\x12\\x06\\n\\x04\\n\\x02\\x08\\x01'\n"
+        "    b'b\\x11\\n\\x01y\\x12\\x0c\\n\\n\\x08\\x01\\x12\\x06\\n\\x04\\n\\x02\\x08\\x01B\\x04\\n\\x00\\x10\\r')\n"
+        "out = {'ok': False, 'provider': None, 'error': '', 'preload': ''}\n"
+        "try:\n"
+        "    import onnxruntime as ort\n"
+        "    if hasattr(ort, 'preload_dlls'):\n"
+        "        try:\n"
+        "            ort.preload_dlls(cuda=True, cudnn=True, msvc=True)\n"
+        "            out['preload'] = 'ok'\n"
+        "        except Exception as e:\n"
+        "            out['preload'] = type(e).__name__ + ': ' + str(e)[:120]\n"
+        "    o = ort.SessionOptions()\n"
+        "    o.log_severity_level = 4\n"
+        "    s = ort.InferenceSession(probe, sess_options=o,\n"
+        "                             providers=['CUDAExecutionProvider','CPUExecutionProvider'])\n"
+        "    used = list(s.get_providers())\n"
+        "    out['provider'] = used[0] if used else None\n"
+        "    out['ok'] = bool(used and used[0] == 'CUDAExecutionProvider')\n"
+        "except Exception as e:\n"
+        "    out['error'] = type(e).__name__ + ': ' + str(e)[:200]\n"
+        "print(json.dumps(out))\n"
+    )
+    result = subprocess.run([python_exe, "-c", code], capture_output=True, text=True)
+    try:
+        return json.loads((result.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return {"ok": False, "provider": None,
+                "error": (result.stderr or "probe failed").strip()[:200], "preload": ""}
+
+
+def _ort_requirement(keep):
+    """
+    The exact requirement string to install for `keep`.
+
+    The GPU variant is PINNED. Reinstalling it unpinned is a real bug that was caught by
+    running setup for real: the repair below reinstalled `onnxruntime-gpu`, pip resolved the
+    newest (1.29.0, built for CUDA **13**), and that silently orphaned the CUDA 12.8 runtime
+    wheels installed moments earlier — turning a working GPU into a CPU fallback at the very
+    last step. Every path that installs ORT goes through this function so that cannot recur.
+    """
+    return ORT_GPU_PIN if keep == ORT_GPU_PACKAGE else keep
+
+
+# `pip check` ALWAYS reports this one, and it is the state we deliberately chose.
+#
+# `kokoro-onnx` declares a hard dependency on the CPU distribution `onnxruntime`, which we
+# replace with `onnxruntime-gpu`. Both install the same importable `onnxruntime` module, so the
+# requirement is satisfied in every way that matters — pip just cannot see it, because it
+# reasons about DISTRIBUTION names and the import name is not one. Treating this as a real
+# conflict made setup reinstall the requirements on every single run, which reintroduced the
+# CPU wheel, which triggered another repair: a loop that fixed nothing and cost a download.
+_EXPECTED_CONFLICTS = (
+    ("kokoro-onnx", "onnxruntime"),
+)
+
+
+def _expected_conflict(line):
+    lowered = line.lower()
+    return any(all(token in lowered for token in tokens) for tokens in _EXPECTED_CONFLICTS)
+
+
+def _ensure_ort_variant(python_exe, keep):
+    """
+    Guarantees exactly ONE onnxruntime variant, at the version this setup is verified against.
+
+    Idempotent, and safe to call repeatedly — which matters, because installing anything else
+    can drag a second variant back in. `kokoro-onnx` hard-depends on the CPU `onnxruntime`, so
+    every `pip install -r requirements.txt` reintroduces it on top of `onnxruntime-gpu`.
+
+    WHY THE LOSERS ARE NOT SIMPLY UNINSTALLED. Every ORT variant installs into the SAME
+    `onnxruntime/` package directory. When two are present the second overwrote the first's
+    files, and both distributions' RECORD manifests now claim the same paths — so uninstalling
+    the loser DELETES files the keeper still needs, leaving an `onnxruntime` that imports and
+    then fails at the first native call. That is worse than the state being repaired. So when
+    more than one is present: remove them all, then install the keeper fresh, at its pin.
+    """
+    installed = _installed_packages(python_exe)
+    present = installed_variants(installed)
+    requirement = _ort_requirement(keep)
+    wanted_version = requirement.split("==")[1] if "==" in requirement else None
+    have_version = installed.get(keep)
+
+    conflicting = [v for v in present if v != keep]
+    version_wrong = bool(wanted_version) and have_version != wanted_version
+
+    if not conflicting and not version_wrong and have_version:
+        return True
+
+    if conflicting:
+        warn(f"Conflicting ONNX Runtime variants installed: {', '.join(present)}")
+        info("    They share one package directory, so the keeper is reinstalled rather than")
+        info("    just uninstalling the others (that would delete files it still needs).")
+        if _pip(python_exe, "uninstall", "-y", *present, quiet=True).returncode != 0:
+            fail(f"Could not remove {', '.join(present)}.")
+            return False
+    elif version_wrong:
+        info(f"    {keep} {have_version or 'missing'} -> {wanted_version} "
+             f"(the version this CUDA runtime set is verified against) ...")
+
+    # `--upgrade-strategy only-if-needed` keeps pip from dragging shared transitive
+    # dependencies forward to satisfy ORT's newest metadata. It did exactly that once, taking
+    # protobuf from 4.25.9 to 7.36.1 and breaking mediapipe, which pins protobuf<5.
+    args = ["install", "--upgrade-strategy", "only-if-needed"]
+    if conflicting:
+        args.append("--force-reinstall")
+        args.append("--no-deps")     # the deps are already satisfied; do not re-resolve them
+    args.append(requirement)
+
+    if _pip(python_exe, *args).returncode != 0:
+        fail(f"Could not install {requirement}.")
+        return False
+
+    ok(f"ONNX Runtime: {requirement}")
+    return True
+
+
+def installed_variants(installed):
+    return [v for v in ORT_VARIANTS if v in installed]
+
+
+def configure_speech_runtime(python_exe, offer_gpu=True):
+    """
+    Provisions and VERIFIES the speech-synthesis runtime. Returns a status dict.
+
+    The order matters and each step exists because of a real failure mode:
+
+      1. Detect an NVIDIA GPU               — no GPU, nothing to install, CPU is correct.
+      2. Ensure exactly ONE ORT variant     — two variants overwrite each other's files.
+      3. Install onnxruntime-gpu if needed  — the CPU wheel can never use CUDA.
+      4. Read the wheel's CUDA BUILD version— it decides which NVIDIA wheels are required.
+      5. Install those NVIDIA runtime wheels— this is the missing cublasLt64_12.dll.
+      6. PROVE a CUDA session initializes   — everything above can succeed and this still fail.
+
+    Nothing here is silent, and a CPU outcome is reported as a supported outcome rather than as
+    a failure: Kokoro synthesizes at roughly real time on a modern CPU either way.
+    """
+    step("Configuring the speech-synthesis runtime")
+
+    state = {"gpu_name": None, "vram_mib": None, "ort": {}, "cuda_ok": False,
+             "cuda_reason": "", "variant": None, "ready": "cpu"}
+
+    gpu_name, vram = _nvidia_gpu_present()
+    state["gpu_name"], state["vram_mib"] = gpu_name, vram
+
+    installed = _installed_packages(python_exe)
+    present = installed_variants(installed)
+
+    # ── No NVIDIA GPU: CPU is the correct answer, and installing a GPU wheel would be worse ──
+    if not gpu_name or not offer_gpu:
+        if gpu_name is None:
+            info("    No NVIDIA GPU detected (nvidia-smi did not answer).")
+        if ORT_GPU_PACKAGE in present and ORT_CPU_PACKAGE not in present:
+            info("    Keeping the installed onnxruntime-gpu; it runs on the CPU perfectly well.")
+        elif not present:
+            info("    Installing CPU onnxruntime ...")
+            if _pip(python_exe, "install", ORT_CPU_PACKAGE, quiet=True).returncode != 0:
+                fail("Could not install onnxruntime.")
+                return state
+        _ensure_ort_variant(python_exe, ORT_GPU_PACKAGE if ORT_GPU_PACKAGE in present
+                            else ORT_CPU_PACKAGE)
+        state["ort"] = _ort_report(python_exe)
+        state["variant"] = state["ort"].get("package")
+        ok("Speech synthesis will run on the CPU (supported, and fast enough).")
+        return state
+
+    info(f"    NVIDIA GPU detected: {gpu_name}"
+         + (f" ({vram / 1024:.1f} GiB)" if vram else ""))
+
+    # ── Exactly one variant, at the verified pin ──
+    if not _ensure_ort_variant(python_exe, ORT_GPU_PACKAGE):
+        state["ort"] = _ort_report(python_exe)
+        return state
+
+    report = _ort_report(python_exe)
+    state["ort"] = report
+    state["variant"] = report.get("package")
+    if not report.get("ok"):
+        fail(f"onnxruntime could not be imported: {report.get('error')}")
+        return state
+
+    info(f"    onnxruntime {report['version']} ({report['package']}), "
+         f"built for CUDA {report.get('cuda_build') or 'n/a'}")
+    info(f"    providers: {', '.join(report.get('providers') or []) or 'none'}")
+
+    cuda_build = report.get("cuda_build")
+    if not cuda_build:
+        warn("This onnxruntime build has no CUDA support; speech synthesis will use the CPU.")
+        return state
+
+    # ── The NVIDIA runtime wheels this build needs ──
+    major = str(cuda_build).split(".")[0]
+    pins = CUDA_RUNTIME_PINS.get(major)
+    if not pins:
+        # Deliberately does NOT guess at package names. See CUDA_RUNTIME_PINS: the obvious
+        # `-cu13` guesses are placeholder sdists that install nothing while reporting success.
+        warn(f"onnxruntime-gpu here is built for CUDA {cuda_build}, and this setup has no "
+             f"VERIFIED runtime package set for CUDA {major}.x.")
+        info("    Not guessing at package names — the obvious ones are PyPI placeholders.")
+        info(f"    Either pin onnxruntime-gpu to a CUDA "
+             f"{', '.join(sorted(CUDA_RUNTIME_PINS))}.x build, or add a verified pin set to")
+        info("    CUDA_RUNTIME_PINS in setup.py. Speech synthesis will use the CPU meanwhile.")
+        state["cuda_reason"] = (f"no verified CUDA {major}.x runtime package set; "
+                                f"ORT is built for CUDA {cuda_build}")
+    else:
+        wanted = {spec.split("==")[0].lower() for spec in pins}
+        missing = sorted(wanted - set(installed))
+        if missing:
+            info(f"    Installing the CUDA {cuda_build} runtime for ONNX Runtime: "
+                 f"{', '.join(missing)}")
+            info("    (these are large wheels - roughly 1.4 GB - and are what supply "
+                 "cublasLt64_12.dll and cuDNN 9)")
+            if _pip(python_exe, "install", *pins).returncode != 0:
+                fail("The CUDA runtime packages could not be installed.")
+                state["cuda_reason"] = "pip could not install the NVIDIA runtime wheels"
+                return state
+        else:
+            info("    CUDA runtime packages already present.")
+
+    # ── Did installing ORT disturb anything else? ──
+    # Installing into a populated environment can move shared transitive dependencies. That is
+    # not hypothetical here: an unpinned ORT install once took protobuf from 4.25.9 to 7.36.1
+    # and broke mediapipe. Checking is cheap; discovering it at the next boot is not.
+    conflicts = _pip(python_exe, "check", quiet=True)
+    reported = [line for line in (conflicts.stdout or "").strip().splitlines()
+                if line.strip() and not _expected_conflict(line)]
+    if reported:
+        warn("Dependency conflicts were introduced or already present:")
+        for line in reported[:6]:
+            info(f"    {line}")
+        info("    Re-running the requirements install to reconcile them ...")
+        _pip(python_exe, "install", "--upgrade-strategy", "only-if-needed",
+             "-r", REQUIREMENTS, quiet=True)
+        # kokoro-onnx declares a hard dependency on the CPU `onnxruntime`, so that reconcile
+        # will have reinstalled it on top of the GPU build. Repair again, AT THE PIN — an
+        # unpinned repair here is precisely what turned a verified CUDA setup back into a CPU
+        # fallback on the previous run.
+        if not _ensure_ort_variant(python_exe, ORT_GPU_PACKAGE):
+            state["cuda_reason"] = "the ONNX Runtime variant could not be repaired"
+            return state
+        state["ort"] = _ort_report(python_exe)
+
+    # ── PROVE it. Everything above can succeed and this can still fail. ──
+    info("    Verifying that a CUDA session actually initializes ...")
+    probe = _probe_cuda_session(python_exe)
+    state["cuda_ok"] = bool(probe.get("ok"))
+
+    if probe.get("ok"):
+        ok(f"CUDA verified: a real ONNX Runtime session initialized on "
+           f"{probe.get('provider')}.")
+        state["ready"] = "gpu"
+        return state
+
+    # Failure: say exactly what is wrong, not "GPU unavailable".
+    reason = probe.get("error") or (
+        f"the session fell back to {probe.get('provider') or 'the CPU'}")
+    if probe.get("preload") and probe["preload"] != "ok":
+        reason = f"CUDA/cuDNN DLLs could not be preloaded ({probe['preload']})"
+    state["cuda_reason"] = reason
+    warn(f"CUDA could not be initialized: {reason}")
+    info("    Speech synthesis will use the CPU. Kayra reports this honestly rather than")
+    info("    claiming GPU acceleration that is not happening.")
+    info("    Most common cause: an NVIDIA driver older than the CUDA version above requires.")
+    return state
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
 # │                     5. CONFIGURATION (.env)                            │
 # └────────────────────────────────────────────────────────────────────────┘
 
@@ -807,6 +1223,68 @@ def _speech_browser_text():
     return "none found - install Microsoft Edge or Google Chrome"
 
 
+def speech_runtime_report(python_exe, state):
+    """
+    The full environment validation report for speech synthesis.
+
+    Prints FACTS, each read from the environment that will actually run Kayra, and marks the
+    single line that matters — whether a real CUDA session initialized — as PASS or FAIL. When
+    it is FAIL, the reason names the missing piece rather than saying "GPU unavailable", which
+    is not something a user can act on.
+    """
+    ort_info = state.get("ort") or {}
+    providers = ort_info.get("providers") or []
+
+    print()
+    print(_paint(_G["rule"] * 64, "1;36"))
+    print(_paint("  SPEECH SYNTHESIS RUNTIME", "1;37"))
+    print(_paint(_G["rule"] * 64, "1;36"))
+
+    def line(label, value, good=None):
+        mark = "  " if good is None else (f" {_G['yes']}" if good else f" {_G['no']}")
+        print(f" {mark} {label:<32} {value}")
+
+    line("Python executable", python_exe)
+    line("Environment", os.path.dirname(os.path.dirname(python_exe)))
+    print()
+    line("ONNX Runtime package", ort_info.get("package") or "not importable",
+         bool(ort_info.get("ok")))
+    line("ONNX Runtime version", ort_info.get("version") or "-")
+    line("Package location", os.path.dirname(ort_info.get("location") or "-"))
+    line("Built for CUDA", ort_info.get("cuda_build") or "not a CUDA build")
+    print()
+    line("Provider: CUDA", "offered" if "CUDAExecutionProvider" in providers else "not offered",
+         "CUDAExecutionProvider" in providers)
+    line("Provider: CPU", "offered" if "CPUExecutionProvider" in providers else "not offered",
+         "CPUExecutionProvider" in providers)
+    # TensorRT is reported for completeness and deliberately NOT used for Kokoro: it builds an
+    # engine on first run, and a TensorRT failure must never stand between Kokoro and CUDA.
+    line("Provider: TensorRT",
+         ("offered (not used for TTS)" if "TensorrtExecutionProvider" in providers
+          else "not offered"))
+    print()
+
+    gpu_name = state.get("gpu_name")
+    vram = state.get("vram_mib")
+    line("NVIDIA GPU", (f"{gpu_name}" + (f"  {vram / 1024:.1f} GiB" if vram else ""))
+         if gpu_name else "none detected", bool(gpu_name))
+
+    cuda_ok = bool(state.get("cuda_ok"))
+    line("CUDA runtime (cuBLAS / cuFFT / cudart)", "PASS" if cuda_ok else "FAIL", cuda_ok)
+    line("cuDNN 9", "PASS" if cuda_ok else "FAIL", cuda_ok)
+    line("Real CUDA EP initialization", "PASS" if cuda_ok else "FAIL", cuda_ok)
+    print()
+
+    if cuda_ok:
+        line("Kayra TTS GPU readiness", "READY (CUDAExecutionProvider)", True)
+    else:
+        line("Kayra TTS GPU readiness", "CPU FALLBACK", False)
+        if state.get("cuda_reason"):
+            print()
+            info(f"    Reason: {state['cuda_reason']}")
+    print(_paint(_G["rule"] * 64, "1;36"))
+
+
 def summary(state):
     print(_paint("\n" + _G["rule"] * 64, "1;36"))
     print(_paint("  KAYRA SETUP SUMMARY", "1;36"))
@@ -823,6 +1301,7 @@ def summary(state):
     row("Local LLM", state["local_llm"], True)
     row("Cloud keys", state["cloud"], state["cloud_ok"])
     row("Speech model", state["models"], state["models_ok"])
+    row("Speech device", state["tts_device"], state["tts_device_ok"])
     row("Audio output", state["audio"], state["audio_ok"])
     row("Speech-input browser", state["chrome"], state["chrome_ok"])
     row("Automation", state["automation"], state["automation_ok"])
@@ -861,6 +1340,10 @@ def main():
                                                                         "cohere": False,
                                                                         "chat": False})
     model_state = check_models()
+    speech_runtime = (configure_speech_runtime(python_exe) if deps_ok
+                      else {"gpu_name": None, "vram_mib": None, "ort": {}, "cuda_ok": False,
+                            "cuda_reason": "dependencies were not installed",
+                            "variant": None, "ready": "cpu"})
     platform_state = check_platform(python_exe)
 
     cloud_ok = (not cloud["required"]) or (cloud["cohere"] and cloud["chat"])
@@ -874,6 +1357,8 @@ def main():
 
     ready = bool(deps_ok and imports_ok and package_ok and env_ok
                  and model_state != "missing" and cloud_ok)
+
+    speech_runtime_report(python_exe, speech_runtime)
 
     summary({
         "python": f"{version_text(sys.version_info)} (venv: "
@@ -890,6 +1375,12 @@ def main():
         "models": {"quantized": "quantized (fast)", "full": "full precision",
                    "missing": "MISSING"}[model_state],
         "models_ok": model_state != "missing",
+        "tts_device": ("GPU ready (CUDAExecutionProvider verified)"
+                       if speech_runtime.get("cuda_ok")
+                       else "CPU"
+                            + (f" - {speech_runtime['cuda_reason']}"
+                               if speech_runtime.get("cuda_reason") else "")),
+        "tts_device_ok": True,      # CPU is a fully supported outcome, never a failure
         "audio": "ready" if platform_state.get("audio") else "not verified",
         "audio_ok": bool(platform_state.get("audio")),
         "chrome": _speech_browser_text(),
