@@ -52,7 +52,6 @@ from kayra.ui.components.primitives import Caption, GhostButton, _label
 from kayra.ui.components.backdrop import AmbientBackdrop, prefers_reduced_motion
 from kayra.ui.components.navigation import _motion_allowed
 from kayra.ui.components.dock import FloatingDock
-from kayra.ui.components.drawer import NavigationDrawer
 from kayra.ui.components.chrome import (AppWindowChrome, install_native_chrome,
                                         show_system_menu)
 from kayra.ui.views.home import HomeView
@@ -320,16 +319,13 @@ class _PageHost(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.dock = None
-        self.drawer = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.reposition_overlays()
 
     def reposition_overlays(self):
-        """Centres the dock over the CONTENT, and stretches the drawer over everything."""
-        if self.drawer is not None:
-            self.drawer.sync_geometry()
+        """Centres the dock over the CONTENT."""
         dock = self.dock
         # `isHidden()`, NOT `isVisible()`. A widget whose parent chain is not yet shown
         # reports `isVisible() == False` even when nobody hid it, so the visibility test would
@@ -436,14 +432,10 @@ class KayraWindow(QMainWindow):
             self.views[key] = view
             self.stack.addWidget(view)
 
-        # ── The two overlays ──
+        # ── The floating dock ──
         self.dock = FloatingDock(self.host)
-        self.drawer = NavigationDrawer(self.host)
         self.host.dock = self.dock
-        self.host.drawer = self.drawer
         self._wire_dock()
-        self.drawer.navigate.connect(self.navigate_to)
-        self.drawer.closed.connect(lambda: self.dock.set_menu_open(False))
 
         self._current = None
         self._current_key = None
@@ -471,7 +463,6 @@ class KayraWindow(QMainWindow):
         The dock emits intent and this connects it; the action itself lives in one place so
         the tray, the shortcuts and the dock cannot drift into three behaviours.
         """
-        self.dock.menuToggled.connect(self._toggle_drawer)
         # THE PRIMARY BUTTON IS THE MICROPHONE NOW, not a second way into Chat. It routes to
         # exactly the same action the keyboard shortcut and the tray use — there is no second
         # listening state anywhere, and `_toggle_listening` reads the runtime before it acts.
@@ -481,20 +472,6 @@ class KayraWindow(QMainWindow):
         self.dock.cameraToggled.connect(self._toggle_camera)
         self.dock.gestureToggled.connect(self._toggle_gesture)
         self.dock.shutdownRequested.connect(self._request_shutdown)
-
-    def _toggle_drawer(self):
-        """
-        Opens or closes the navigation drawer — but only on the screens that lack a rail.
-
-        `Ctrl+B` is reachable from every screen, and on a rail screen it would put TWO
-        navigation surfaces on one page, which is the one state `_apply_shell` exists to
-        prevent. The keyboard must not be a way around a rule the routing enforces.
-        """
-        if not self.uses_dock(self._current_key or "home"):
-            return
-        self.drawer.select(self._current_key or "home")
-        self.drawer.toggle()
-        self.dock.set_menu_open(self.drawer.is_open())
 
     def _toggle_listening(self):
         self.controls.toggle_listening()
@@ -556,12 +533,16 @@ class KayraWindow(QMainWindow):
         if view is None:
             return
         if view is self._current:
-            # Re-selecting the current screen is not a no-op for the SHELL: the drawer may
-            # have asked for the page it is already on, and it still has to close.
-            if self.drawer.is_open():
-                self.drawer.close_drawer()
             return
         outgoing = self._current_key
+        outgoing_view = self._current
+        snapshot = None
+        if (outgoing is not None and outgoing_view is not None
+                and _motion_allowed() and outgoing_view.isVisible()):
+            try:
+                snapshot = outgoing_view.grab()
+            except Exception:
+                snapshot = None
         if self._current is not None:
             self._current.on_hide()
         self.stack.setCurrentWidget(view)
@@ -570,8 +551,7 @@ class KayraWindow(QMainWindow):
         self._apply_shell(key)
         view.on_show()
         self.sidebar.select(key)
-        self.drawer.select(key)
-        self._animate_page_in(view, outgoing, key)
+        self._animate_page_in(view, outgoing, key, snapshot=snapshot)
 
     # ──────────────────────────────────────────────────────────────────
     #                        THE PAGE TRANSITION
@@ -582,9 +562,8 @@ class KayraWindow(QMainWindow):
     # the orb keeps its state, the camera keeps its frames — the transition is a repaint,
     # not a reload.
     #
-    # ONLY THE INCOMING PAGE MOVES. Cross-fading two views means compositing both through
-    # offscreen buffers at once, on the frame where the new screen is also doing its first
-    # layout — which is exactly where a stutter would show. One effect, one widget.
+    # A temporary snapshot of the outgoing page sits behind the incoming view during the
+    # transition so the screen never blinks empty or cuts abruptly. One effect, one widget.
 
     # Where a screen travels in from, so a route reads as having a direction. Home and Chat
     # sit side by side in the dock, so moving between them travels the way the eye expects.
@@ -597,9 +576,9 @@ class KayraWindow(QMainWindow):
         except ValueError:
             return 1
 
-    def _animate_page_in(self, view, outgoing, incoming):
+    def _animate_page_in(self, view, outgoing, incoming, snapshot=None):
         from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
-        from PySide6.QtWidgets import QGraphicsOpacityEffect
+        from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel
 
         if outgoing is None or not _motion_allowed():
             return                      # the first paint is an arrival, not a transition
@@ -609,25 +588,51 @@ class KayraWindow(QMainWindow):
         # drive the same opacity in opposite directions.
         self._end_page_animation()
 
+        group = QParallelAnimationGroup(self)
+
+        if snapshot is not None and not snapshot.isNull():
+            overlay = getattr(self, "_transition_overlay", None)
+            if overlay is None:
+                overlay = QLabel(self.stack)
+                overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                self._transition_overlay = overlay
+            overlay.setPixmap(snapshot)
+            overlay.setGeometry(0, 0, self.stack.width(), self.stack.height())
+            overlay_effect = QGraphicsOpacityEffect(overlay)
+            overlay_effect.setOpacity(1.0)
+            overlay.setGraphicsEffect(overlay_effect)
+            overlay.show()
+            overlay.lower()
+
+            overlay_fade = QPropertyAnimation(overlay_effect, b"opacity", self)
+            overlay_fade.setDuration(Motion.nav_transition)
+            overlay_fade.setEasingCurve(QEasingCurve.InOutCubic)
+            overlay_fade.setStartValue(1.0)
+            overlay_fade.setEndValue(0.0)
+            group.addAnimation(overlay_fade)
+
+        view.raise_()
         effect = QGraphicsOpacityEffect(view)
+        effect.setOpacity(0.0)
         view.setGraphicsEffect(effect)
 
         fade = QPropertyAnimation(effect, b"opacity", self)
         fade.setDuration(Motion.nav_transition)
-        fade.setEasingCurve(QEasingCurve.OutCubic)
+        fade.setEasingCurve(QEasingCurve.InOutCubic)
         fade.setStartValue(0.0)
         fade.setEndValue(1.0)
-
-        offset = Motion.nav_travel * self._travel_sign(outgoing, incoming)
-        travel = QPropertyAnimation(view, b"pos", self)
-        travel.setDuration(Motion.nav_transition)
-        travel.setEasingCurve(QEasingCurve.OutCubic)
-        travel.setStartValue(view.pos() + QPoint(offset, 0))
-        travel.setEndValue(QPoint(0, 0))
-
-        group = QParallelAnimationGroup(self)
         group.addAnimation(fade)
-        group.addAnimation(travel)
+
+        if Motion.nav_travel > 0:
+            offset = Motion.nav_travel * self._travel_sign(outgoing, incoming)
+            view.move(offset, 0)
+            travel = QPropertyAnimation(view, b"pos", self)
+            travel.setDuration(Motion.nav_transition)
+            travel.setEasingCurve(QEasingCurve.InOutCubic)
+            travel.setStartValue(QPoint(offset, 0))
+            travel.setEndValue(QPoint(0, 0))
+            group.addAnimation(travel)
+
         group.finished.connect(self._end_page_animation)
         self._page_animation = group
         self._page_view = view
@@ -651,30 +656,28 @@ class KayraWindow(QMainWindow):
             view.setGraphicsEffect(None)
             view.move(0, 0)
             self._page_view = None
+        overlay = getattr(self, "_transition_overlay", None)
+        if overlay is not None:
+            overlay.setGraphicsEffect(None)
+            overlay.hide()
+            overlay.clear()
 
     def _apply_shell(self, key):
         """
-        Swaps the two navigation surfaces. EXACTLY ONE of them is present at a time.
-
-        Home and Chat give up the rail so the content gets the full window width; every other
-        screen gives up the dock, because a pill floating over a settings form covers the last
-        row of it and those screens have no single interaction to build a dock around.
+        The sidebar is permanently and statically visible across ALL screens.
+        Home and Chat additionally show the floating dock centered over the content area.
         """
         docked = self.uses_dock(key)
-        self.sidebar.setVisible(not docked)
+        self.sidebar.setVisible(True)
         self.dock.setVisible(docked and not self._shutting_down)
-        if not docked and self.drawer.is_open():
-            # The drawer belongs to the dock's screens. Leaving it open over a screen that
-            # already shows the rail would put two navigation surfaces on one page.
-            self.drawer.close_drawer()
 
         # The chrome names the screen, EXCEPT on Home — there the orb is the heading and a
         # title bar repeating "Home" says nothing.
         self.chrome.set_subtitle("" if key == "home" else key.title())
 
-        # `content_left` is the rail's width when it is showing, so the dock centres on the
-        # content rather than on the window.
-        self.host.content_left = 0 if docked else self.sidebar.width()
+        # `content_left` is the rail's width so the dock centres on the content rather than
+        # on the full window width.
+        self.host.content_left = self.sidebar.width()
         self.dock.set_current_screen(key)
         if docked:
             self._sync_dock_state()
@@ -700,11 +703,6 @@ class KayraWindow(QMainWindow):
         # calling the bridge here, so the keyboard, the dock and the tray run one code path.
         mic = QShortcut(QKeySequence("Ctrl+M"), self)
         mic.activated.connect(self._toggle_listening)
-
-        # Ctrl+B opens and closes the navigation drawer, which is the shortcut every
-        # application with a collapsible rail uses for exactly this.
-        drawer = QShortcut(QKeySequence("Ctrl+B"), self)
-        drawer.activated.connect(self._toggle_drawer)
 
     def _focus_chat(self):
         self.navigate_to("chat")
@@ -740,7 +738,6 @@ class KayraWindow(QMainWindow):
             return
         self._voice_revision = revision
         self.sidebar.set_voice(state, text, detail)
-        self.drawer.set_voice(state, text, detail)
         from kayra.core.voice_state import ORB_STATE
         self.chrome.set_state(ORB_STATE.get(state, "IDLE"))
 

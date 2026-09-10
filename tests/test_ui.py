@@ -1676,9 +1676,10 @@ def section_interaction(app):
     home = window.views["home"]
     app.processEvents()
     check("listening starts on", bridge.listening_enabled())
+    check("tooltip popup cards are gone from the dock", not window.dock.mic_button.toolTip())
     check("the dock offers to PAUSE while listening",
-          "Pause listening" in window.dock.mic_button.toolTip(),
-          window.dock.mic_button.toolTip())
+          "Pause listening" in window.dock.mic_button.accessibleDescription(),
+          window.dock.mic_button.accessibleDescription())
     check("and its glyph is an open microphone", window.dock.mic_button._kind == "mic")
 
     dock_press(window.dock.mic_button)
@@ -1687,8 +1688,8 @@ def section_interaction(app):
     check("pausing does not interrupt speech", bridge.interrupted == 0)
     check("pausing does not shut Kayra down", bridge.shutdown_called is False)
     check("the dock now offers to START",
-          "Start listening" in window.dock.mic_button.toolTip(),
-          window.dock.mic_button.toolTip())
+          "Start listening" in window.dock.mic_button.accessibleDescription(),
+          window.dock.mic_button.accessibleDescription())
     check("and the glyph changes SHAPE, not just tint",
           window.dock.mic_button._kind == "mic_off")
     check("Home's readout agrees with the dock",
@@ -1973,9 +1974,10 @@ def section_lifecycle_controls(app):
           dock.power_button._tone == "danger"
           and all(b._tone != "danger" for b in (dock.mic_button, dock.camera_button,
                                                 dock.gesture_button, dock.talk_button,
-                                                dock.chat_button, dock.menu_button)))
+                                                dock.home_button, dock.chat_button)))
     check("it says what it shuts down",
-          "Kayra" in (dock.power_button.toolTip() or ""), dock.power_button.toolTip())
+          "Kayra" in (dock.power_button.accessibleName() or dock.power_button.accessibleDescription() or ""),
+          dock.power_button.accessibleName())
     check("Home carries no shutdown control of its own",
           not hasattr(home, "shutdown_button"))
 
@@ -2582,8 +2584,9 @@ def section_boot_ordering(app):
           dock.mic_button.isEnabled() is False)
     check("and it does not claim listening is off",
           dock.mic_button._kind == "mic", dock.mic_button._kind)
-    check("the tooltip says why it cannot be used",
-          "starting" in dock.mic_button.toolTip().lower(), dock.mic_button.toolTip())
+    check("the accessible description says why it cannot be used",
+          "starting" in dock.mic_button.accessibleDescription().lower(),
+          dock.mic_button.accessibleDescription())
     check("Home's readout does not claim it either",
           "starting" in home.mic_line.value_label.toolTip().lower(),
           home.mic_line.value_label.toolTip())
@@ -2604,7 +2607,8 @@ def section_boot_ordering(app):
 
     check("boot completing enables the control", dock.mic_button.isEnabled() is True)
     check("THE REPORTED BUG: the control offers Pause, not Start, while listening",
-          "Pause listening" in dock.mic_button.toolTip(), dock.mic_button.toolTip())
+          "Pause listening" in dock.mic_button.accessibleDescription(),
+          dock.mic_button.accessibleDescription())
     check("and it got there with NO listeningChanged event at all",
           emitted == [], str(emitted))
 
@@ -2619,22 +2623,22 @@ def section_boot_ordering(app):
     app.processEvents()
     check("caption and control agree after boot, with no toggle",
           home2.prompt.text() == "Listening"
-          and "Pause listening" in window2.dock.mic_button.toolTip(),
-          f"{home2.prompt.text()!r} / {window2.dock.mic_button.toolTip()!r}")
+          and "Pause listening" in window2.dock.mic_button.accessibleDescription(),
+          f"{home2.prompt.text()!r} / {window2.dock.mic_button.accessibleDescription()!r}")
 
     # ── 5. And the toggle path still works, in both directions ──
     dock_press(window2.dock.mic_button)
     app.processEvents()
     check("pressing still pauses", bridge2.listening is False)
-    check("and the tooltip follows",
-          "Start listening" in window2.dock.mic_button.toolTip(),
-          window2.dock.mic_button.toolTip())
+    check("and the accessible description follows",
+          "Start listening" in window2.dock.mic_button.accessibleDescription(),
+          window2.dock.mic_button.accessibleDescription())
     dock_press(window2.dock.mic_button)
     app.processEvents()
     check("pressing again resumes", bridge2.listening is True)
-    check("and the tooltip follows back",
-          "Pause listening" in window2.dock.mic_button.toolTip(),
-          window2.dock.mic_button.toolTip())
+    check("and the accessible description follows back",
+          "Pause listening" in window2.dock.mic_button.accessibleDescription(),
+          window2.dock.mic_button.accessibleDescription())
 
     # ── 6. A genuinely paused microphone at boot must still read as paused ──
     bridge3 = StubBridge()
@@ -2645,8 +2649,8 @@ def section_boot_ordering(app):
     bridge3.bootFinished.emit(True, "ready")
     app.processEvents()
     check("a microphone that really is paused at boot reads as paused",
-          "Start listening" in window3.dock.mic_button.toolTip(),
-          window3.dock.mic_button.toolTip())
+          "Start listening" in window3.dock.mic_button.accessibleDescription(),
+          window3.dock.mic_button.accessibleDescription())
 
     # ── 7. Shutdown must not be re-enabled by a late re-sync ──
     from PySide6.QtWidgets import QMessageBox
@@ -2988,12 +2992,12 @@ def section_shell(app):
     window = docked_window(bridge)
     app.processEvents()
 
-    # ── EXACTLY ONE navigation surface per screen ──
+    # ── Persistent rail across all screens, dock on Home and Chat ──
     for key in ("home", "chat"):
         window.navigate_to(key)
         app.processEvents()
         check(f"{key} shows the dock", not window.dock.isHidden())
-        check(f"{key} gives up the permanent rail", window.sidebar.isHidden())
+        check(f"{key} keeps the permanent rail", not window.sidebar.isHidden())
     for key in ("automation", "memory", "activity", "system", "settings"):
         window.navigate_to(key)
         app.processEvents()
@@ -3001,34 +3005,20 @@ def section_shell(app):
         check(f"{key} has no floating dock", window.dock.isHidden(),
               "a pill over a settings form covers the last row of it")
 
-    # ── The drawer opens, closes, navigates, and belongs to the dock's screens ──
+    # ── The sidebar is static and persistent; drawer is removed ──
     window.navigate_to("home")
     app.processEvents()
-    check("the drawer starts closed", not window.drawer.is_open())
-    window.dock.menuToggled.emit()
-    app.processEvents()
-    check("Menu opens the drawer", window.drawer.is_open())
-    check("and the Menu control shows as active", window.dock.menu_button.is_checked())
-    check("the drawer carries every destination",
-          set(window.drawer._items) == {key for key, _label, _glyph in DESTINATIONS})
-    window.dock.menuToggled.emit()
-    app.processEvents()
-    check("Menu closes it again", not window.drawer.is_open())
-
-    window.dock.menuToggled.emit()
-    app.processEvents()
-    window.drawer.navigate.emit("system")
+    check("the sidebar is permanently visible on Home", not window.sidebar.isHidden())
+    check("the sidebar carries every destination",
+          set(window.sidebar._items) == {key for key, _label, _glyph in DESTINATIONS})
+    window.sidebar.navigate.emit("system")
     app.processEvents()
     check("choosing a destination navigates", window.stack.currentWidget()
           is window.views["system"])
-    check("and closes the drawer behind it", not window.drawer.is_open(),
-          "the drawer exists to LEAVE these screens; two gestures for one intention is wrong")
-    check("a screen with a rail never leaves the drawer open", not window.drawer.is_open())
-    # And the keyboard is not a way around that rule: Ctrl+B reaches every screen.
-    window._toggle_drawer()
-    check("the drawer cannot be opened on a screen that already has a rail",
-          not window.drawer.is_open(),
-          "two navigation surfaces on one page is the state _apply_shell exists to prevent")
+    check("system still keeps the permanent rail", not window.sidebar.isHidden())
+    window.sidebar.navigate.emit("home")
+    app.processEvents()
+    check("navigating back to home keeps the permanent rail", not window.sidebar.isHidden())
 
     # ── The dock reflects BACKEND state, and remembers nothing ──
     window.navigate_to("home")
@@ -3050,14 +3040,18 @@ def section_shell(app):
     check("...and a gesture change", window.dock.gesture_button.is_checked())
 
     # ── Every control is reachable by keyboard, and says what it does ──
-    controls = (window.dock.menu_button, window.dock.talk_button, window.dock.chat_button,
+    check("Menu button is removed from dock", not hasattr(window.dock, "menu_button"))
+    controls = (window.dock.home_button, window.dock.chat_button,
                 window.dock.mic_button, window.dock.camera_button,
                 window.dock.gesture_button, window.dock.power_button)
     check("every dock control takes focus",
           all(c.focusPolicy() == Qt.StrongFocus for c in controls))
-    check("every dock control has a tooltip",
-          all((c.toolTip() or "").strip() for c in controls),
-          str([c._kind for c in controls if not (c.toolTip() or "").strip()]))
+    check("tooltip popup cards are completely gone from dock controls",
+          all(not (c.toolTip() or "").strip() for c in controls),
+          str([c._kind for c in controls if (c.toolTip() or "").strip()]))
+    check("every dock control has an accessible name",
+          all((c.accessibleName() or "").strip() for c in controls),
+          str([c._kind for c in controls if not (c.accessibleName() or "").strip()]))
     check("the dock is a true pill",
           window.dock.height() == 2 * Size.dock_radius,
           f"{window.dock.height()}px tall, radius {Size.dock_radius}px")
@@ -3071,6 +3065,35 @@ def section_shell(app):
     check("and no separate start/stop-listening control beside it",
           "listeningToggled" in dock_source
           and "muteToggled" not in dock_source and "startListening" not in dock_source)
+
+    # ── Focused regression checks: yellow button, Home/Chat navigation, transitions ──
+    window.navigate_to("home")
+    app.processEvents()
+    initial_listening = bridge.listening_enabled()
+    dock_press(window.dock.mic_button)
+    app.processEvents()
+    check("yellow button toggles listening instead of opening Chat",
+          window._current_key == "home" and bridge.listening != initial_listening)
+    dock_press(window.dock.mic_button)  # toggle back
+    app.processEvents()
+
+    dock_press(window.dock.chat_button)
+    app.processEvents()
+    check("Chat button navigates Chat", window._current_key == "chat")
+    check("Chat button is visually indicated as active", window.dock.chat_button.is_checked())
+
+    dock_press(window.dock.home_button)
+    app.processEvents()
+    check("Home button navigates Home", window._current_key == "home")
+    check("Home button is visually indicated as active", window.dock.home_button.is_checked())
+
+    check("tooltip popup cards are gone",
+          all(not (c.toolTip() or "").strip() for c in controls))
+    window._end_page_animation()
+    check("drawer and page transitions complete correctly",
+          window.stack.currentWidget().graphicsEffect() is None
+          and getattr(window, "_transition_overlay", None) is not None
+          and window._transition_overlay.isHidden())
 
     # ── Home fills its viewport, at every size, without scrolling ──
     home = window.views["home"]
@@ -3134,14 +3157,11 @@ def section_shell(app):
           not window.dock.findChildren(QTimer),
           "a dock that polled would run for the whole session; its hover lift is an "
           "animation that exists only while the pointer is arriving or leaving")
-    # The drawer's ONLY timer is the shared `OrbBadge`'s, which the rail already carries and
-    # which stops itself for every resting state. A closed drawer must not be running it.
-    drawer_timers = window.drawer.findChildren(QTimer)
-    check("the drawer adds no timer of its own",
-          all(t.parent().__class__.__name__ == "OrbBadge" for t in drawer_timers),
-          str([t.parent().__class__.__name__ for t in drawer_timers]))
-    check("and none of them runs while it is closed",
-          not window.drawer.is_open() and not any(t.isActive() for t in drawer_timers))
+    sidebar_timers = window.sidebar.findChildren(QTimer)
+    check("the sidebar adds no spurious timers",
+          all(t.parent().__class__.__name__ == "OrbBadge" for t in sidebar_timers),
+          str([t.parent().__class__.__name__ for t in sidebar_timers]))
+    check("the drawer is completely removed", getattr(window, "drawer", None) is None)
     check("and it is slower than the orb", Motion.backdrop_fps < Motion.orb_fps_idle,
           f"{Motion.backdrop_fps} fps vs {Motion.orb_fps_idle} fps")
     window.hide()

@@ -194,16 +194,13 @@ class NavigationDrawer(QWidget):
 
         slide = QPropertyAnimation(self.panel, b"geometry", self)
         slide.setDuration(Motion.drawer)
-        # OutCubic arriving, InCubic leaving: a panel should decelerate into place and
-        # accelerate away, which is what makes the two directions feel deliberate rather
-        # than symmetrical.
-        slide.setEasingCurve(QEasingCurve.OutCubic if to_open else QEasingCurve.InCubic)
+        slide.setEasingCurve(QEasingCurve.InOutCubic)
         slide.setStartValue(start if start.width() == width else (hidden if to_open else shown))
         slide.setEndValue(shown if to_open else hidden)
 
         fade = QPropertyAnimation(self.scrim, b"opacity_level", self)
         fade.setDuration(Motion.drawer)
-        fade.setEasingCurve(QEasingCurve.OutCubic)
+        fade.setEasingCurve(QEasingCurve.InOutCubic)
         fade.setStartValue(self.scrim.opacity_level)
         fade.setEndValue(1.0 if to_open else 0.0)
 
@@ -218,39 +215,28 @@ class NavigationDrawer(QWidget):
         # QGraphicsOpacityEffect means every repaint of those seven rows goes through an
         # offscreen buffer for the rest of the session.
         group.finished.connect(self._clear_items_effect)
-        # KEPT ON SELF. A QPropertyAnimation garbage-collected mid-flight simply stops, which
-        # looks exactly like a rendering glitch — the same reason `fade_in` returns its
-        # animation for the caller to hold.
         self._animation = group
         group.start()
 
     def _items_animation(self, to_open):
         """
-        The rows' fade, delayed on the way in and immediate on the way out.
-
-        Opening, the pause is what creates the sense of the panel arriving first and its
-        contents settling into it. Closing, there is nothing to stagger — the whole panel is
-        leaving, and holding the rows back would just make them visible against a wall that
-        has already moved.
+        The rows' smooth fade, synchronized with the panel slide so the drawer and its
+        content move as one unified, calm surface without delayed pop-in or premature exit.
         """
         effect = self._items_host.graphicsEffect()
         if not isinstance(effect, QGraphicsOpacityEffect):
             effect = QGraphicsOpacityEffect(self._items_host)
             self._items_host.setGraphicsEffect(effect)
-        effect.setOpacity(effect.opacity() if to_open else 1.0)
+
+        start_opacity = effect.opacity() if self._animation is not None else (0.0 if to_open else 1.0)
+        effect.setOpacity(start_opacity)
 
         fade = QPropertyAnimation(effect, b"opacity", self)
-        fade.setDuration(Motion.drawer_items)
-        fade.setEasingCurve(QEasingCurve.OutCubic)
-        fade.setStartValue(0.0 if to_open else 1.0)
+        fade.setDuration(Motion.drawer)
+        fade.setEasingCurve(QEasingCurve.InOutCubic)
+        fade.setStartValue(start_opacity)
         fade.setEndValue(1.0 if to_open else 0.0)
-        if not to_open:
-            return fade
-
-        sequence = QSequentialAnimationGroup(self)
-        sequence.addAnimation(QPauseAnimation(Motion.drawer_stagger, self))
-        sequence.addAnimation(fade)
-        return sequence
+        return fade
 
     def _clear_items_effect(self):
         """Drops the composite layer once the motion is over. Opacity is restored first."""
@@ -258,6 +244,7 @@ class NavigationDrawer(QWidget):
         if isinstance(effect, QGraphicsOpacityEffect):
             effect.setOpacity(1.0)
         self._items_host.setGraphicsEffect(None)
+        self._items_host.move(0, self._items_host.y())
 
     def _finish_close(self):
         if not self._open:

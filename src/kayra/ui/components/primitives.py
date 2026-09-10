@@ -907,6 +907,11 @@ def _icon_glyph(kind, color, size=16, dpr=None):
         painter.drawLine(QPointF(s * 0.18, s * 0.28), QPointF(s * 0.82, s * 0.28))
         painter.drawLine(QPointF(s * 0.18, s * 0.50), QPointF(s * 0.60, s * 0.50))
         painter.drawLine(QPointF(s * 0.18, s * 0.72), QPointF(s * 0.82, s * 0.72))
+    elif kind == "home":
+        m = s * 0.16
+        painter.drawPolyline([QPointF(m, s * 0.48), QPointF(s / 2, m),
+                              QPointF(s - m, s * 0.48)])
+        painter.drawRect(QRectF(s * 0.24, s * 0.46, s * 0.52, s * 0.36))
     elif kind == "power":
         # The IEC power mark: a broken ring with a vertical bar. Universally read as "off",
         # which is exactly what this control does — and it must never be mistaken for the

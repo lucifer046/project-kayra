@@ -313,14 +313,14 @@ class Motion:
     # reads as a jump cut, and the whole complaint this pass answers was that navigation felt
     # abrupt. Around a third of a second is where a movement stops being noticed as a delay
     # and starts being read as the thing moving.
-    drawer = 340              # panel slide + scrim fade
-    drawer_items = 220        # the nav rows, started after the panel is already moving
-    drawer_stagger = 90       # ...by this much, which is what makes it read as one gesture
-    nav_transition = 300      # a page arriving: opacity plus a short horizontal travel
-    nav_travel = 18           # px. Small: this is a hint of direction, not a slide show
-    indicator = 260           # the active-item rail moving between destinations
-    dock_hover = 160
-    press = 90
+    drawer = 360              # panel slide + scrim fade (300–450ms target)
+    drawer_items = 360        # synchronized with panel slide
+    drawer_stagger = 0        # unified drawer motion without delayed pop-in
+    nav_transition = 360      # a page arriving: smooth dual-surface crossfade (250–400ms target)
+    nav_travel = 0            # px. 0 for a seamless, calm crossfade without lateral twitching
+    indicator = 280           # the active-item rail moving between destinations
+    dock_hover = 180          # dock interaction hover transition
+    press = 100
     # The ambient backdrop. SLOW is the whole point: at 8fps and a 90-second cycle the
     # motion is felt rather than watched, which is what keeps it from competing with the
     # interface. It also means the backdrop costs less per second than the orb does.

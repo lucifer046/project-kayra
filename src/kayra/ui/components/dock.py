@@ -61,7 +61,7 @@ QVariantAnimation that runs only while the pointer is over them, and `sync()` is
 the events the rest of the UI already receives.
 """
 
-from PySide6.QtCore import Qt, Signal, QRectF, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, Signal, QRectF, QVariantAnimation, QEasingCurve, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QFrame, QSizePolicy,
                                QGraphicsDropShadowEffect)
@@ -115,11 +115,25 @@ class DockButton(QWidget):
         if label:
             from PySide6.QtGui import QFontMetrics
             font = self.font()
+            font.setFamily("Segoe UI")
             font.setPixelSize(Font.small)
+            font.setWeight(QFont.Weight.Medium)
+            # MUST match the letter-spacing used in paintEvent: +0.3px absolute.
+            # "Listening" is 9 chars × 0.3px = 2.7px extra; without this the
+            # rendered text overflows the allocated width and the last glyph clips.
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
             metrics = QFontMetrics(font)
             widest = max(metrics.horizontalAdvance(text)
                          for text in (label,) + tuple(label_alternatives))
-            width = Size.dock_button + widest + Space.md
+            # Symmetrical capsule: 14px left pad + 18px glyph + 8px gap + widest + 14px right pad
+            self._pad_h = 14
+            self._gap = 8
+            self._glyph_size = 18
+            width = self._pad_h + self._glyph_size + self._gap + widest + self._pad_h
+        else:
+            self._pad_h = 0
+            self._gap = 0
+            self._glyph_size = 18
         self.setFixedSize(width, Size.dock_button)
 
         # Runs ONLY while the pointer is arriving or leaving. An idle dock has no timers.
@@ -227,128 +241,182 @@ class DockButton(QWidget):
             return
         super().keyReleaseEvent(event)
 
+    def event(self, event):
+        # NO TOOLTIPS. Completely swallow and ignore any tooltip event so Qt never creates
+        # a floating popup card window. Accessible name and description handle accessibility.
+        # QEvent.Type.ToolTip (110) is used, NOT Qt.ToolTip (13, a mouse-button alias) —
+        # comparing against the wrong namespace triggers a PySide6 enum-mismatch SystemError.
+        if event.type() == QEvent.Type.ToolTip:
+            event.ignore()
+            return True
+        return super().event(event)
+
     # ── Painting ──
 
     def _plate_color(self):
         """
-        The plate under the glyph. Four states, in the order they take precedence.
-
-        Checked outranks hover: a microphone that is ON must look on whether or not the
-        pointer happens to be over it.
+        The plate under the glyph. Every plate uses clean translucent glass or rich filled accent.
+        Checked outranks hover: an active destination or on-air mic stays visible regardless of pointer.
         """
         if not self._enabled_look:
             return QColor(0, 0, 0, 0)
+
+        # PRIMARY CONTROL (Mic / Listening)
         if self._tone == "primary":
-            # FILLED WHEN ON, OUTLINED WHEN OFF. The two states of the one control that says
-            # whether Kayra can hear you, and they are told apart by fill before colour.
             if not self._checked:
-                neutral = QColor(255, 255, 255, 0)
-                neutral.setAlphaF(0.05 * self._hover + (0.09 if self._pressed else 0.0))
-                return neutral
+                # Paused: sleek dark glass plate with soft highlight on hover
+                alpha = int(10 + 16 * self._hover + (24 if self._pressed else 0))
+                return QColor(255, 255, 255, alpha)
+            # Listening: warm amber filled capsule
             base = QColor(Color.accent_press if self._pressed else Color.accent)
             if self._hover > 0 and not self._pressed:
                 base = _mix(base, QColor(Color.accent_hover), self._hover)
             return base
-        if self._checked:
-            tint = QColor(Color.danger if self._tone == "danger" else Color.accent)
-            tint.setAlphaF(0.20 + 0.10 * self._hover + (0.06 if self._pressed else 0.0))
+
+        # DANGER CONTROL (Shutdown)
+        if self._tone == "danger":
+            tint = QColor(Color.danger)
+            if self._hover > 0 or self._pressed:
+                tint.setAlphaF(0.12 + 0.10 * self._hover + (0.08 if self._pressed else 0.0))
+            else:
+                tint.setAlphaF(0.04)
             return tint
-        neutral = QColor(255, 255, 255, 0)
-        neutral.setAlphaF(0.05 * self._hover + (0.09 if self._pressed else 0.0))
-        return neutral
+
+        # ACTIVE NAVIGATION / DEVICES (Home, Chat, Camera ON, Gesture ON)
+        if self._checked:
+            # Luminous warm amber glass plate — sleek and clear, not muddy
+            tint = QColor(Color.accent)
+            tint.setAlphaF(0.14 + 0.08 * self._hover + (0.08 if self._pressed else 0.0))
+            return tint
+
+        # IDLE NEUTRAL CONTROLS
+        if self._hover > 0.01 or self._pressed:
+            alpha = int(22 * self._hover + (16 if self._pressed else 0))
+            return QColor(255, 255, 255, alpha)
+        return QColor(0, 0, 0, 0)
 
     def _glyph_color(self):
         if not self._enabled_look:
             return Color.text_disabled
         if self._tone == "primary":
-            # Dark ink on the filled plate; ordinary text on the outlined one. White on amber
-            # fails contrast, which is why `text_on_accent` exists.
-            return Color.text_on_accent if self._checked else (
-                Color.text if self._hover > 0.5 else Color.text_secondary)
+            # Dark ink on the filled amber plate; clear warm text on the paused glass plate.
+            # Paused uses full primary text (not secondary) — it is a status label, not decoration.
+            return Color.text_on_accent if self._checked else Color.text
         if self._tone == "danger":
             return Color.danger
         if self._checked:
             return Color.accent
-        # A hovered control brightens toward primary text; an idle one stays secondary, so
-        # the dock is quiet until it is being used.
-        return Color.text if self._hover > 0.5 else Color.text_secondary
+        # Hovered controls brighten toward primary text; idle stays secondary.
+        # Threshold at 0.3 (not 0.5) so the brightening feels early and responsive.
+        return Color.text if self._hover > 0.30 else Color.text_secondary
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # CONSTANT GEOMETRY. The plate no longer rises on hover: the brief asks for a colour
-        # change and at most a soft glow, and a control that translates under the pointer is
-        # a control whose icon appears to jump. Press insets the plate by half a pixel, which
-        # reads as depression without moving anything the eye can track.
-        inset = 1.0 + (0.5 if self._pressed else 0.0)
-        radius = Radius.lg + 2
+        # TRUE CONCENTRIC CAPSULE / CIRCLE GEOMETRY.
+        # Radius is exactly half the button height (e.g. 20px for a 40px button).
+        # A 40x40 button becomes a perfect circle; a labeled button becomes a perfect capsule.
+        # This aligns concentric with the outer dock pill's 28px circular end-caps,
+        # eliminating corner pinching and awkward crescent gaps.
+        #
+        # PRESS DEPTH: the plate compresses inward by 0.5px on each axis when pressed.
+        # The glyph shifts to follow it — without this, the icon appears to float forward
+        # while the plate sinks, which reads as a visual disconnect on a retina display.
+        press_offset = 0.5 if self._pressed else 0.0
+        inset = 1.0 + press_offset
         plate = QRectF(inset, inset, self.width() - 2 * inset, self.height() - 2 * inset)
+        radius = plate.height() / 2.0
 
-        # THE GLOW. One extra rounded rect at very low alpha, drawn OUTSIDE the plate, fading
-        # in with the hover. It is what gives the hover some presence on a neutral control
-        # whose plate is nearly transparent — without it, hovering an unchecked icon changed
-        # only the glyph and read as nothing happening.
-        if self._hover > 0.01 and self._enabled_look:
-            glow = QColor(Color.danger if self._tone == "danger" else Color.accent)
-            glow.setAlphaF(0.13 * self._hover)
-            pen = QPen(glow)
-            pen.setWidthF(2.0)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(plate.adjusted(-1.0, -1.0, 1.0, 1.0),
-                                    radius + 1, radius + 1)
-
+        # PLATE BACKGROUND (painted before glow so the glow rim reads as a top-edge highlight
+        # rather than a shadow behind — correct for light-from-above rendering model)
         color = self._plate_color()
         if color.alpha() > 0:
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(plate, radius, radius)
 
-        # A hairline edge, for the two tones that need an outline when they are NOT filled:
-        # the danger control, and the primary control while it is paused. On a neutral plate
-        # it would draw a box around every idle icon and turn the dock into a row of buttons.
+        # CRISP HAIRLINE BORDERS (Half-pixel inset for ultra-sharp rendering)
         edge = None
-        if self._tone == "danger" and (self._hover > 0 or self._checked):
-            edge = QColor(Color.danger_edge)
-        elif self._tone == "primary" and not self._checked and self._enabled_look:
-            # OUTLINED IS THE OFF STATE, and it has to be visible on its own — this is the
-            # button that says whether the microphone is open.
-            edge = QColor(Color.border_strong)
+        if self._tone == "primary":
+            if not self._checked and self._enabled_look:
+                edge = QColor(Color.border_strong)
+                if self._hover > 0:
+                    edge = _mix(edge, QColor(Color.text_secondary), self._hover * 0.4)
+        elif self._tone == "danger":
+            if self._hover > 0 or self._pressed:
+                edge = QColor(Color.danger_edge)
+                if self._hover > 0:
+                    edge = _mix(edge, QColor(Color.danger), self._hover * 0.4)
+        elif self._checked and self._enabled_look:
+            edge = QColor(Color.accent_subtle)
+            if self._hover > 0:
+                edge = _mix(edge, QColor(Color.accent), self._hover * 0.5)
+        elif self._hover > 0.05 and self._enabled_look:
+            # Subtle glass rim for hovered neutral buttons
+            edge = QColor(255, 255, 255, int(30 * self._hover))
+
         if edge is not None:
             pen = QPen(edge)
             pen.setWidthF(1.0)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(plate, radius, radius)
+            border_plate = plate.adjusted(0.5, 0.5, -0.5, -0.5)
+            border_radius = max(0.0, radius - 0.5)
+            painter.drawRoundedRect(border_plate, border_radius, border_radius)
 
-        # The focus ring: drawn, and in the accent, so keyboard users can see where they are.
+        # THE GLOW. Drawn AFTER the plate so it reads as a bright rim on top of the surface,
+        # not as a shadow lurking behind an opaque panel. Alpha is stronger for the filled
+        # listening state (amber glow) and lighter for danger, matching their visual weight.
+        if self._hover > 0.01 and self._enabled_look:
+            is_danger = self._tone == "danger"
+            is_listening = self._tone == "primary" and self._checked
+            glow_alpha = 0.18 if is_listening else (0.11 if is_danger else 0.13)
+            glow = QColor(Color.danger if is_danger else Color.accent)
+            glow.setAlphaF(glow_alpha * self._hover)
+            pen = QPen(glow)
+            pen.setWidthF(2.5)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(plate.adjusted(-1.25, -1.25, 1.25, 1.25),
+                                    radius + 1.25, radius + 1.25)
+
+        # FOCUS RING (accent, visible for keyboard navigation)
         if self.hasFocus():
             pen = QPen(QColor(Color.accent))
-            pen.setWidthF(1.4)
+            pen.setWidthF(1.5)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(plate.adjusted(-0.5, -0.5, 0.5, 0.5), radius, radius)
 
+        # GLYPH & LABEL RENDERING (Symmetrical, pixel-aligned, press-compensated)
         glyph_color = self._glyph_color()
-        icon = _icon_glyph(self._kind, glyph_color, 18)
-        glyph_x = (Size.dock_button - 18) / 2 if self._label else (self.width() - 18) / 2
-        icon.paint(painter, int(glyph_x), int((self.height() - 18) / 2), 18, 18)
+        icon = _icon_glyph(self._kind, glyph_color, self._glyph_size)
+        # Glyph tracks the press compression: shift 1px down+right with the plate.
+        glyph_y = int((self.height() - self._glyph_size) / 2) + (1 if self._pressed else 0)
 
         if self._label:
+            glyph_x = int(self._pad_h) + (1 if self._pressed else 0)
+            icon.paint(painter, glyph_x, glyph_y, self._glyph_size, self._glyph_size)
+
             painter.setPen(QColor(glyph_color))
             font = painter.font()
+            font.setFamily("Segoe UI")
             font.setPixelSize(Font.small)
-            # `QFont.Weight.Medium`, NOT the token's raw 500. In Qt 6 `setWeight` takes a
-            # scoped enum and a bare int reaches it as an unchecked value — which crashed the
-            # renderer outright rather than falling back to a nearby weight. The tokens carry
-            # CSS weights because the stylesheet is where they are normally used; painting
-            # code has to translate.
             font.setWeight(QFont.Weight.Medium)
+            # Subtle letter-spacing (+0.3px) lifts legibility of the short status label
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
             painter.setFont(font)
-            text_rect = QRectF(Size.dock_button - Space.xs, 0.0,
-                               self.width() - Size.dock_button, float(self.height()))
+
+            px_shift = 1.0 if self._pressed else 0.0
+            text_x = float(self._pad_h + self._glyph_size + self._gap) + px_shift
+            text_w = float(self.width() - text_x - self._pad_h)
+            text_rect = QRectF(text_x, 0.0, text_w, float(self.height()))
             painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, self._label)
+        else:
+            glyph_x = int((self.width() - self._glyph_size) / 2) + (1 if self._pressed else 0)
+            icon.paint(painter, glyph_x, glyph_y, self._glyph_size, self._glyph_size)
+
         painter.end()
 
 
@@ -362,16 +430,25 @@ def _mix(a, b, t):
 
 
 class DockDivider(QWidget):
-    """A hairline between groups of dock controls. Two primitives, no layout weight."""
+    """An airy, elegant separator between groups of dock controls."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(1)
-        self.setFixedHeight(Size.dock_button - Space.md)
+        self.setFixedWidth(14)
+        self.setFixedHeight(Size.dock_button)
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(Color.border))
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        line_x = self.width() / 2.0
+        line_h = 18.0
+        y1 = (self.height() - line_h) / 2.0
+        y2 = y1 + line_h
+        pen = QPen(QColor(255, 255, 255, 38))  # soft glass alpha ~0.15 — visible but non-assertive
+        pen.setWidthF(1.0)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(line_x, y1, line_x, y2)
         painter.end()
 
 
@@ -420,10 +497,9 @@ class FloatingDock(QFrame):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(Space.sm, Space.sm, Space.sm, Space.sm)
-        layout.setSpacing(Space.xxs)
+        layout.setSpacing(Space.xs)
 
         # ── NAVIGATION: where you are ──
-        self.menu_button = DockButton("menu", checkable=True)
         self.home_button = DockButton("home", checkable=True)
         self.chat_button = DockButton("chat", checkable=True)
 
@@ -435,11 +511,11 @@ class FloatingDock(QFrame):
         self.mic_button = DockButton("mic", tone="primary", checkable=True,
                                      label=self.LISTENING_LABEL,
                                      label_alternatives=(self.PAUSED_LABEL,))
+        self.talk_button = self.mic_button  # Load-bearing alias: same primary listening control
         self.camera_button = DockButton("camera_off", checkable=True)
         self.gesture_button = DockButton("hand", checkable=True)
         self.power_button = DockButton("power", tone="danger")
 
-        layout.addWidget(self.menu_button)
         layout.addWidget(self.home_button)
         layout.addWidget(self.chat_button)
         layout.addWidget(DockDivider())
@@ -449,7 +525,6 @@ class FloatingDock(QFrame):
         layout.addWidget(DockDivider())
         layout.addWidget(self.power_button)
 
-        self.menu_button.clicked.connect(self.menuToggled.emit)
         self.home_button.clicked.connect(self.homeRequested.emit)
         self.chat_button.clicked.connect(self.chatRequested.emit)
         self.mic_button.clicked.connect(self.listeningToggled.emit)
@@ -522,10 +597,7 @@ class FloatingDock(QFrame):
             else "Turn hand gesture control on")
 
     def set_menu_open(self, is_open):
-        self.menu_button.set_checked(bool(is_open))
-        self.menu_button.describe(
-            "Navigation open" if is_open else "Navigation",
-            "Hide navigation" if is_open else "Show navigation")
+        pass
 
     def set_current_screen(self, key):
         """
