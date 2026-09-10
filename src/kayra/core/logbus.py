@@ -117,6 +117,11 @@ class Subsystem:
     SETTINGS = "SETTINGS"
     UI = "UI"
     GPU = "GPU"
+    # Hand gesture control and the camera behind it are SEPARATE subsystems, for the same
+    # reason the speech backend and the microphone are: the camera can be on with gesture
+    # control off, and a single tag would make a camera failure read as a gesture failure.
+    GESTURE = "GESTURE"
+    CAMERA = "CAMERA"
     SYSTEM = "SYSTEM"
     SHUTDOWN = "SHUTDOWN"
 
@@ -183,6 +188,8 @@ _file_configured = False
 # Correlation. A short monotonic turn number, not a UUID: it exists so a human can follow one
 # interaction down the page, and a 36-character identifier on every line defeats that purpose.
 _turn = 0
+# Monotonic. See `begin_turn` for why this is separate from `_turn`.
+_turn_seq = 0
 
 
 def _resolve_initial_level():
@@ -236,15 +243,40 @@ def begin_turn(turn_id=None):
     Called once per user turn by the front ends; everything logged until `end_turn()` is
     attributed to it, which is what lets `[VOICE] Turn #184 …` and `[AUTO] Turn #184 …` be
     read as one interaction.
+
+    TWO COUNTERS, AND THE DISTINCTION IS LOAD-BEARING. `_turn_seq` only ever increases;
+    `_turn` is the turn currently OPEN, and is 0 between turns.
+
+    They used to be one variable, and `end_turn()` set it to 0 — so the next `begin_turn()`
+    computed `0 + 1` and EVERY turn was "Turn #1". The correlation the number exists for was
+    therefore absent, and worse, nothing could tell whether one turn was newer than another:
+    a background retry chain comparing its own turn against the current one always saw the
+    same value and could never notice it had been superseded.
     """
-    global _turn
+    global _turn, _turn_seq
     with _lock:
-        _turn = int(turn_id) if turn_id is not None else _turn + 1
+        if turn_id is not None:
+            _turn_seq = int(turn_id)
+        else:
+            _turn_seq += 1
+        _turn = _turn_seq
         return _turn
 
 
 def current_turn():
+    """The turn currently OPEN, or 0 between turns."""
     return _turn
+
+
+def latest_turn():
+    """
+    The highest turn number ever started, whether or not it is still open.
+
+    This is the one to compare against when asking "has my work been superseded?" —
+    `current_turn()` is 0 between turns, so a check against it would report every finished
+    turn as still current the moment its successor had not started yet.
+    """
+    return _turn_seq
 
 
 def end_turn():

@@ -103,6 +103,31 @@ class AssistantOrb(QWidget):
     def state(self):
         return self._state
 
+    def diameter(self):
+        return self._diameter
+
+    def set_diameter(self, diameter):
+        """
+        Resizes the orb. Home calls this on every window resize.
+
+        A FIXED 208px ORB IN A COLUMN THAT GROWS TO 770px is a small drawing in a large empty
+        space, and on a 1920px monitor that is most of what the middle of Home looks like.
+        The orb is the one element on the page that genuinely earns more room, so it takes it.
+
+        Everything here is already resize-safe: geometry is recomputed in `resizeEvent` and
+        the paint is proportional to `self._radius`, so this costs one relayout and one
+        repaint. Guarded on a real change, because a resize storm would otherwise call
+        `setFixedSize` on every intermediate pixel width.
+        """
+        diameter = max(96, int(diameter))
+        if diameter == self._diameter:
+            return
+        self._diameter = diameter
+        self.setFixedSize(diameter, diameter)
+        self._center = QPointF(diameter / 2, diameter / 2)
+        self._radius = diameter / 2
+        self.update()
+
     DEFAULT_LEVELS = {
         "IDLE": 0.26, "OFFLINE": 0.08, "STARTING": 0.45,
         "LISTENING": 0.85, "PROCESSING": 0.60, "SPEAKING": 0.95,

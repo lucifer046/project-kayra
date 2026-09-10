@@ -44,8 +44,15 @@ QWidget {{
     font-weight: {f.regular};
 }}
 
-QMainWindow, QDialog, #RootSurface {{
+QMainWindow, QDialog {{
     background-color: {c.base};
+}}
+
+/* The root surface is TRANSPARENT, not filled. `AmbientBackdrop` is the first child and
+   paints the ground; a filled root would sit on top of it and the backdrop would never be
+   seen. Everything layered above still declares its own background. */
+#RootSurface {{
+    background-color: transparent;
 }}
 
 QToolTip {{
@@ -167,9 +174,73 @@ QToolTip {{
 }}
 
 /* ─────────────────────────── SHELL ────────────────────────── */
+/* The rail is now TRANSLUCENT rather than a solid panel, so the ambient backdrop reads
+   continuously behind it and the whole window looks like one surface with a column drawn on
+   it — instead of two rectangles butted together, which is what made the old rail read as a
+   generic admin sidebar. The right edge is a hairline, not a border colour step. */
 #Sidebar {{
-    background-color: {c.surface};
-    border-right: 1px solid {c.border_subtle};
+    background-color: {c.glass};
+    border-right: 1px solid {c.glass_border};
+}}
+
+/* ─────────────────── WINDOW CHROME (frameless) ────────────── */
+#WindowChrome {{
+    background-color: {c.glass_strong};
+    border-bottom: 1px solid {c.glass_border};
+}}
+
+#ChromeBrand {{
+    font-family: {f.ui_display};
+    font-size: {f.caption}px;
+    font-weight: {f.semibold};
+    color: {c.text};
+    letter-spacing: 2.2px;
+}}
+
+/* The screen's name, deliberately quieter than the brand: a title bar should say which
+   application you are in first and which screen second. */
+#ChromeTitle {{
+    font-size: {f.caption}px;
+    font-weight: {f.regular};
+    color: {c.text_tertiary};
+    letter-spacing: 0.3px;
+}}
+
+/* ───────────────────── THE FLOATING DOCK ──────────────────── */
+/* Semi-transparent so the page shows through, a hairline border for the edge, and a radius
+   of exactly half the height so it is a true pill rather than a rounded rectangle. Qt does
+   not clamp an oversized border-radius the way CSS does — `999px` here would fall back to a
+   small radius and the dock would render as a box, which is the same trap StatusPill hit. */
+#FloatingDock {{
+    background-color: {c.glass};
+    border: 1px solid {c.glass_border_strong};
+    border-top: 1px solid {c.glass_rim};
+    border-radius: {z.dock_radius}px;
+}}
+
+/* ─────────────────── THE NAVIGATION DRAWER ────────────────── */
+#DrawerPanel {{
+    background-color: {c.glass_strong};
+    border-right: 1px solid {c.glass_border_strong};
+}}
+
+/* ───────────────────────── GLASS PANEL ────────────────────── */
+/* The dashboard surface on Home. A Card is opaque and sits IN the page; a GlassPanel is
+   translucent and floats OVER the backdrop, which is what lets the bloom behind the orb bleed
+   through the panels around it instead of stopping dead at their edges. */
+#GlassPanel {{
+    background-color: {c.glass};
+    border: 1px solid {c.glass_border};
+    border-top: 1px solid {c.glass_rim};
+    border-radius: {r.xl}px;
+}}
+
+#GlassPanelTitle {{
+    font-size: {f.caption}px;
+    font-weight: {f.semibold};
+    color: {c.text_tertiary};
+    letter-spacing: {f.tracking_label}px;
+    text-transform: uppercase;
 }}
 
 #TitleBar {{
@@ -185,8 +256,13 @@ QToolTip {{
     letter-spacing: 2.5px;
 }}
 
+/* TRANSPARENT, so the ambient backdrop is visible through every screen.
+   This was `background-color: base` and it was an opaque sheet covering the whole content
+   area — the backdrop painted correctly underneath it and not one pixel of it reached the
+   screen. Anything that needs a ground of its own (a card, a panel, an input well) declares
+   one; the page itself must not. */
 #ContentArea {{
-    background-color: {c.base};
+    background-color: transparent;
 }}
 
 /* ───────────────────────── NAVIGATION ─────────────────────── */
@@ -196,8 +272,11 @@ QPushButton#NavItem {{
     background-color: transparent;
     border: none;
     border-left: 2px solid transparent;
-    border-radius: 0px;
-    padding: 0px {s.base}px 0px {s.md}px;
+    /* ROUNDED, and inset from the rail's edge. The old full-bleed row with a hard left rule
+       is the shape every admin template ships; a rounded plate that floats inside a padded
+       column is what makes the rail match the dock and the drawer. */
+    border-radius: {r.lg}px;
+    padding: 0px {s.md}px 0px {s.md}px;
     text-align: left;
     color: {c.text_secondary};
     font-size: {f.body}px;
@@ -209,9 +288,14 @@ QPushButton#NavItem:hover {{
     color: {c.text};
 }}
 
+/* NO LEFT BORDER HERE ANY MORE. The active mark is `NavIndicator`, a real widget that
+   SLIDES between destinations — a property selector is applied instantly and there is
+   nothing in it to animate, which is what made changing screens feel like a jump cut. What
+   the stylesheet still owns is the fill and the weight, which are properties of the row
+   rather than of the mark. */
 QPushButton#NavItem:checked {{
     background-color: {c.accent_wash};
-    border-left: 2px solid {c.accent};
+    border-left: 2px solid transparent;
     color: {c.text};
     font-weight: {f.medium};
 }}
@@ -592,6 +676,12 @@ QProgressBar::chunk {{
     border: 1px solid {with_alpha(c.accent, 0.22)};
     border-radius: {r.lg}px;
     padding: {s.md}px {s.base}px;
+}}
+
+/* A reply that is still arriving carries an accent edge. Painted by a property selector, so
+   marking it costs one repolish and no timer — see `MessageRow.set_streaming`. */
+#BubbleAssistant[streaming="true"] {{
+    border-left: 2px solid {c.accent};
 }}
 
 #BubbleAssistant {{

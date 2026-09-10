@@ -36,11 +36,10 @@ mistake the automation layer already removed once.
 import os
 import sys
 import time
-import shutil
+
 import platform
 import threading
 import functools
-import subprocess
 
 try:
     import psutil
@@ -91,66 +90,16 @@ class Finding:
 # │                        STATIC DEVICE FACTS                             │
 # └────────────────────────────────────────────────────────────────────────┘
 
-def _powershell_once(script, timeout=6.0):
-    """
-    One short PowerShell read. Used ONLY for facts psutil cannot see, and only at first use.
-
-    A fixed argument vector with `shell=False` - there is no user text anywhere in these
-    commands, which is what keeps them outside the automation shell policy.
-    """
-    if not sys.platform.startswith("win"):
-        return ""
-    try:
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, shell=False, timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return (completed.stdout or "").strip()
-    except Exception:
-        return ""
-
-
-# `AdapterRAM` is a 32-bit WMI field and cannot express the VRAM of any modern card. It does
-# not fail cleanly: drivers CLAMP it, and the observed value on this host's 8GB RTX 4060 is
-# 4293918720 (4095 MiB) rather than the full-scale 0xFFFFFFFF. So a naive ceiling test does not
-# work - two earlier bounds (4 * 1024**3, then 0xFFFFFFFF - 1024) both let the clamped value
-# through, and the screen confidently reported "4.0 GB" for an 8GB card.
+# The GPU, the CPU name and the OS product used to be read here with one batched PowerShell
+# CIM call. That call measured **4.41 s** on this host and was wrong about the two facts users
+# actually look at: `Win32_VideoController.AdapterRAM` is a 32-bit field that drivers clamp
+# (an 8 GiB card reports 4095 MiB), and selecting the single highest-AdapterRAM adapter is a
+# coin toss on a switchable-graphics laptop where both are clamped.
 #
-# Anything at or above ~4000MB is therefore treated as clamped and reported as UNKNOWN. This
-# deliberately gives up on genuine 4GB cards: saying "unknown" about a card that has 4GB is a
-# far smaller error than telling someone with 8GB, 12GB or 16GB that they have 4GB, and this
-# module's whole contract is that it never invents a number.
-_ADAPTER_RAM_CEILING = 4000 * 1024 ** 2
-
-
-@functools.lru_cache(maxsize=1)
-def _windows_facts():
-    """
-    CPU name, OS edition, GPU name and VRAM - in ONE PowerShell call.
-
-    These are the only facts psutil cannot see. Collecting them separately measured 4.0s at
-    startup because each call pays a fresh PowerShell process launch (~1.3s apiece); batching
-    them into a single script pays that once. Called exactly once per process, and off the UI
-    thread - the profile is warmed by a worker, never by a paint.
-    """
-    raw = _powershell_once(
-        "$c = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name; "
-        "$o = (Get-CimInstance Win32_OperatingSystem).Caption; "
-        "$g = Get-CimInstance Win32_VideoController | "
-        "Sort-Object -Property AdapterRAM -Descending | Select-Object -First 1; "
-        "\"$c`n$o`n$($g.Name)`n$($g.AdapterRAM)\"")
-    lines = (raw or "").splitlines()
-    while len(lines) < 4:
-        lines.append("")
-    cpu, os_edition, gpu_name, vram = (line.strip() for line in lines[:4])
-    try:
-        vram_bytes = int(vram)
-    except (TypeError, ValueError):
-        vram_bytes = 0
-    if vram_bytes >= _ADAPTER_RAM_CEILING:
-        vram_bytes = 0                  # saturated, not measured
-    return {"cpu_name": cpu, "os_edition": os_edition,
-            "gpu_name": gpu_name or None, "vram_total": max(0, vram_bytes)}
+# `core.hardware` reads all of it from the registry instead: **0.4 ms**, the true 64-bit VRAM,
+# every adapter with its PCI vendor, and an OS product name corrected for the `ProductName`
+# staleness that made this screen say "Windows 10" on Windows 11. There is no PowerShell on
+# this path any more — see `core/hardware.py` for the full account.
 
 
 @functools.lru_cache(maxsize=1)
@@ -193,22 +142,117 @@ def device_profile():
     return _PROFILE
 
 
+_WARMING = None
+
+
+def profile_if_ready():
+    """
+    The static profile IF it has already been collected, else None. NEVER blocks.
+
+    Home reads the machine's identity on its 1.5s tick, and that tick runs on the GUI thread.
+    Collection is now dominated by one thing — enumerating audio devices through
+    `sounddevice`, measured at ~150 ms — and 150 ms on the GUI thread is a visible hitch on
+    the screen's first paint. So the paint path asks this, gets None on the first tick, and
+    gets the real answer a moment later. Nothing is displayed wrongly in the meantime; the
+    line is simply not painted until there is something true to put in it.
+    """
+    return _PROFILE
+
+
+def warm_profile():
+    """
+    Collect the static profile on a background thread, once.
+
+    A ONE-SHOT DAEMON THREAD, NOT A NEW PERSISTENT ONE. It runs the same collection any
+    caller would have run, exits, and is never started again — `device_profile()` is idempotent
+    behind its lock, so a caller that arrives first simply does the work itself and the warmer
+    finds it already done.
+    """
+    global _WARMING
+    if _PROFILE is not None or _WARMING is not None:
+        return
+    def work():
+        global _WARMING
+        try:
+            device_profile()
+        except Exception:
+            pass                        # a warmer must never take a screen down
+        finally:
+            _WARMING = None
+    _WARMING = threading.Thread(target=work, name="kayra-profile-warm", daemon=True)
+    _WARMING.start()
+
+
 def _collect_profile():
+    """
+    One dict describing this machine. Every value is measured or absent; none is assumed.
+
+    THE DICT IS THE CONTRACT and it is additive. The keys that existed before this pass
+    (`os_name`, `os_release`, `cpu_name`, `gpu_name`, `vram_total`, ...) all still exist and
+    still mean what they meant, so nothing that reads the profile had to change; the new keys
+    beside them carry what the old shape could not express — the OS build, the feature-update
+    version, the GPU's vendor, and the full adapter list on a machine with more than one.
+    """
+    from kayra.core import hardware
+
+    os_facts = hardware.os_info()
+    cpu_facts = hardware.cpu_info()
+    adapters = hardware.gpu_adapters()
+    gpu = hardware.primary_gpu()
+    monitors, screen_w, screen_h, screen_scale = hardware.displays()
+
     profile = {
+        # ── Operating system ──
+        # `os_name` stays the bare platform family ("Windows") because callers use it for
+        # branching. `os_product` is the corrected, user-facing product ("Windows 11").
         "os_name": platform.system(),
-        "os_release": platform.release(),
+        "os_product": os_facts.name,
+        "os_edition": os_facts.edition,
+        "os_display_version": os_facts.display_version,
+        "os_build": os_facts.build,
+        "os_build_revision": os_facts.revision,
+        "os_build_text": os_facts.build_text,
         "os_version": platform.version(),
-        "os_edition": "",
+        # RETAINED FOR COMPATIBILITY, AND NO LONGER SHOWN AS A BUILD. `platform.release()` is
+        # "10" on Windows 11 — the exact value that made the System screen read
+        # "(build 10)". It is kept because callers exist; `os_build` is what a screen shows.
+        "os_release": platform.release(),
+        "os_source": os_facts.source,
+        "is_server": os_facts.is_server,
+
         "architecture": platform.machine(),
         "hostname": platform.node(),
         "python_version": platform.python_version(),
-        "cpu_name": platform.processor() or "Unknown CPU",
-        "cpu_cores": 0,
-        "cpu_threads": 0,
-        "cpu_max_mhz": 0.0,
+
+        # ── Processor ──
+        "cpu_name": cpu_facts.model or "Unknown processor",
+        "cpu_vendor": cpu_facts.vendor,
+        "cpu_cores": cpu_facts.cores,
+        "cpu_threads": cpu_facts.threads,
+        "cpu_max_mhz": cpu_facts.max_mhz,
+        "cpu_source": cpu_facts.source,
+
+        # ── Memory ──
         "ram_total": 0,
-        "gpu_name": None,
-        "vram_total": 0,
+
+        # ── Graphics ──
+        # `gpu_name` / `vram_total` describe the PRIMARY adapter, so the existing single-GPU
+        # readers keep working unchanged. `gpus` is the whole list for anything that wants it.
+        "gpu_name": gpu.name if gpu else None,
+        "gpu_vendor": gpu.vendor if gpu else "",
+        "gpu_integrated": gpu.integrated if gpu else None,
+        "gpu_driver": gpu.driver_version if gpu else "",
+        "vram_total": gpu.vram_total if gpu else 0,
+        "gpus": [a.to_dict() for a in adapters],
+        "gpu_vendors": list(hardware.gpu_vendors()),
+        "has_nvidia": hardware.has_nvidia_gpu(),
+
+        # ── Displays ──
+        "monitor_count": monitors,
+        "screen_width": screen_w,
+        "screen_height": screen_h,
+        "screen_scale": screen_scale,
+
         "disks": [],
         "audio_outputs": 0,
         "audio_inputs": 0,
@@ -216,16 +260,6 @@ def _collect_profile():
     }
 
     if psutil is not None:
-        try:
-            profile["cpu_cores"] = psutil.cpu_count(logical=False) or 0
-            profile["cpu_threads"] = psutil.cpu_count(logical=True) or 0
-        except Exception:
-            pass
-        try:
-            freq = psutil.cpu_freq()
-            profile["cpu_max_mhz"] = float(getattr(freq, "max", 0) or 0)
-        except Exception:
-            pass
         try:
             profile["ram_total"] = int(psutil.virtual_memory().total)
         except Exception:
@@ -242,25 +276,62 @@ def _collect_profile():
                     "total": int(usage.total),
                     "used": int(usage.used),
                     "free": int(usage.free),
+                    "system": _is_system_drive(part.mountpoint),
                 })
         except Exception:
             pass
 
     profile["audio_outputs"], profile["audio_inputs"] = _audio_devices()
-
-    # One batched WMI read for everything psutil cannot see. platform.processor() returns a
-    # family/model/stepping string on Windows, which is accurate and unreadable, so the WMI
-    # name is preferred when it is available.
-    if sys.platform.startswith("win"):
-        facts = _windows_facts()
-        profile["cpu_name"] = (facts["cpu_name"]
-                               or os.environ.get("PROCESSOR_IDENTIFIER", "")
-                               or profile["cpu_name"])
-        profile["os_edition"] = facts["os_edition"]
-        profile["gpu_name"] = facts["gpu_name"]
-        profile["vram_total"] = facts["vram_total"]
-
     return profile
+
+
+def _is_system_drive(mountpoint):
+    """
+    Is this the drive the operating system is installed on?
+
+    Read from the environment rather than compared against a literal `C:`. Windows can be
+    installed anywhere, and on this developer's own machine the project lives on `D:` while
+    the system is on `C:` — a hardcoded drive letter would be right here by luck and wrong
+    for anyone who moved theirs.
+    """
+    try:
+        system_root = os.environ.get("SystemDrive") or os.path.splitdrive(sys.executable)[0]
+        if not system_root:
+            return False
+        return os.path.splitdrive(os.path.abspath(mountpoint))[0].upper() ==             os.path.splitdrive(system_root + os.sep)[0].upper()
+    except Exception:
+        return False
+
+
+def system_drive():
+    """
+    The mount point of the drive the OS is on, for anything that needs "the" disk.
+
+    `live_metrics` used `os.path.abspath(os.sep)`, which resolves against the CURRENT WORKING
+    DIRECTORY's drive — so running Kayra from `D:\` reported D:'s usage as the system disk.
+    """
+    root = os.environ.get("SystemDrive")
+    if root:
+        return root + os.sep
+    return os.path.abspath(os.sep)
+
+
+def os_summary():
+    """
+    The two lines a screen shows for the operating system, already formatted and never wrong.
+
+    Returns `(product, version)` — for example `("Windows 11 Home Single Language",
+    "Version 25H2  ·  Build 26200.9445")`. When the version could not be measured the second
+    string is empty and the caller shows only the product: an OS line with no build is
+    truthful, and "Windows 10" on a Windows 11 machine is not.
+    """
+    facts = _os_facts()
+    return facts.display_name, facts.version_text
+
+
+def _os_facts():
+    from kayra.core import hardware
+    return hardware.os_info()
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -343,7 +414,7 @@ def live_metrics():
     except Exception:
         pass
     try:
-        usage = psutil.disk_usage(os.path.abspath(os.sep))
+        usage = psutil.disk_usage(system_drive())
         metrics.update(disk_percent=float(usage.percent),
                        disk_used=int(usage.used), disk_total=int(usage.total))
     except Exception:
@@ -394,14 +465,15 @@ def _compatibility_findings(profile):
     out = []
 
     is_windows = profile["os_name"] == "Windows"
+    product, version = os_summary()
     out.append(Finding(
         "Operating system",
         READY if is_windows else LIMITED,
-        # The edition string already names the version ("Microsoft Windows 11 Home"), so
-        # appending platform.release() produced "…Home Single Language 10".
-        (profile.get("os_edition")
-         or f"{profile['os_name']} {profile['os_release']}").strip(),
-        "Kayra's automation layer is built on Win32 APIs.",
+        # The CORRECTED product name, never `platform.release()`. That value is "10" on a
+        # Windows 11 machine, and this finding used to fall back to it whenever the edition
+        # string was unavailable — which is how a Windows 11 laptop was told it ran Windows 10.
+        product,
+        version or "Kayra's automation layer is built on Win32 APIs.",
         "" if is_windows else
         "Voice and conversation work, but window and application control are Windows-only."))
 
@@ -493,11 +565,34 @@ def _performance_findings(profile):
     out.append(Finding("Speech synthesis model", verdict, summary,
                        "Synthesis runs on the CPU at roughly real time.", advice))
 
+    # VENDOR-NEUTRAL. The detail line states what was measured about whatever adapter is
+    # actually present — an AMD or Intel machine is described in its own terms rather than
+    # being compared against an NVIDIA card it does not have.
     gpu = profile["gpu_name"]
-    out.append(Finding(
-        "Graphics", GOOD if gpu else LIMITED, gpu or "Not detected",
-        "Kayra does not currently use the GPU; every model it runs locally is CPU-based.",
-        "" if gpu else "Not a problem - nothing in Kayra requires a GPU today."))
+    if gpu:
+        detail_bits = []
+        if profile["vram_total"]:
+            detail_bits.append(f"{_gib(profile['vram_total'])} video memory")
+        elif profile["gpu_integrated"]:
+            detail_bits.append("shared system memory")
+        if profile["gpu_driver"]:
+            detail_bits.append(f"driver {profile['gpu_driver']}")
+        others = [g["name"] for g in profile["gpus"][1:] if not g["software"]]
+        if others:
+            detail_bits.append("also present: " + ", ".join(others))
+        advice = ""
+        if not profile["has_nvidia"]:
+            # Speech synthesis is only GPU-accelerated through CUDA here, so a non-NVIDIA
+            # machine is told the truth about that rather than being shown a failure.
+            advice = ("Speech synthesis runs on the processor: GPU acceleration in Kayra is "
+                      "CUDA-only, and this machine has no NVIDIA adapter.")
+        out.append(Finding("Graphics", GOOD, gpu,
+                           "  ·  ".join(detail_bits) or "Detected.", advice))
+    else:
+        out.append(Finding(
+            "Graphics", LIMITED, "Not detected",
+            "No graphics adapter could be identified.",
+            "Not a problem - Kayra runs entirely on the processor without one."))
 
     return out
 

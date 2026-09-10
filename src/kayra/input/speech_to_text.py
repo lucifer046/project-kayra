@@ -182,9 +182,18 @@ html_code = """<!DOCTYPE html>
         let lastVoiceMs = 0;
         let noiseFloor = 0.006;
         let audioCtx = null, analyser = null, vadFrame = null, vadTimer = null;
+        // Hysteresis state for the voice detector. `vadVoice` is the DEBOUNCED verdict —
+        // the only one anything reads — and `vadQuietSince` is when the room first fell below
+        // the release threshold, or 0 while it has not.
+        let vadVoice = false;
+        let vadQuietSince = 0;
 
         // Endpointing tuning. Overridable from Python so there is one source of truth, with
         // these as the defaults every value was measured against.
+        // EVERY THRESHOLD BELOW IS OVERWRITTEN FROM PYTHON at recognition start, from
+        // `kayra.core.endpointing.tuning_payload()`. These are the defaults the endpointer was
+        // measured against and the values that apply if the injection ever fails; they are not
+        // a second source of truth, and the suite asserts the two sets correspond key for key.
         let tuning = {
             // A short, already-finalized command does not need the full silence window; the
             // recognizer has committed and waiting longer only makes the assistant feel slow.
@@ -193,16 +202,31 @@ html_code = """<!DOCTYPE html>
             // utterance here is how a spoken word becomes no word at all.
             interimGraceMs: 1400,
             // Nothing waits forever: if results keep arriving but the endpoint never settles,
-            // flush anyway rather than accumulating a paragraph.
+            // flush anyway rather than accumulating a paragraph. NEVER fires while the VAD
+            // still hears the user — see `endpointDecision`.
             maxWaitMs: 6000,
+            // The one bound that ignores every other rule, so a wedged VAD cannot make the
+            // assistant permanently deaf.
+            absoluteMaxMs: 30000,
             // How long the room must be quiet, in ENERGY terms, on top of the recognizer
             // going quiet. This is what stops a mid-sentence pause ending the utterance.
             vadHangoverMs: 500,
+            // A turn younger than this cannot end, whatever the transcript says.
+            minUtteranceMs: 350,
+            // Past this much speech, a one-word transcript means the recognizer is BEHIND, not
+            // that the user said one word. Such a turn never takes the fast path.
+            continuationSpeechMs: 1500,
+            truncatedHangoverScale: 2,
+            shortCommandWords: 3,
             // Voice is RMS above this multiple of the learned noise floor.
             vadMargin: 3.2,
             // ...and above this much higher multiple while Kayra is audible, so residual echo
             // of her own voice cannot hold the endpoint open or open a new utterance.
             vadEchoMargin: 7.0,
+            // Hysteresis: once speaking, the room must fall to this FRACTION of the enter
+            // threshold, and stay there for `vadReleaseMs`, before voice is considered over.
+            vadReleaseRatio: 0.6,
+            vadReleaseMs: 220,
             vadFloorMin: 0.004,
             vadIntervalMs: 50,
             maxAlternatives: 5
@@ -309,11 +333,36 @@ html_code = """<!DOCTYPE html>
             // The threshold is a multiple of the LEARNED floor, not a constant: a quiet room
             // and a noisy one need different numbers, and a fixed threshold is wrong in both.
             const margin = window.kayraSpeaking ? tuning.vadEchoMargin : tuning.vadMargin;
-            const threshold = Math.max(tuning.vadFloorMin, noiseFloor * margin);
-            const voice = rms > threshold;
+            const enterThreshold = Math.max(tuning.vadFloorMin, noiseFloor * margin);
 
+            // ── HYSTERESIS, AND WHY A SINGLE THRESHOLD WAS WRONG ─────────────
+            // Ordinary speech is not a plateau. Every stop consonant, every breath between
+            // clauses, dips the energy below any single threshold — so a bare `rms > t`
+            // comparator toggled `voice` several times a SECOND inside one continuous
+            // sentence. Downstream that produced the LISTENING -> USER_SPEAKING -> LISTENING
+            // churn in the logs and an orb that flickered per syllable.
+            //
+            // Once speech has been detected, leaving it requires falling to a LOWER threshold
+            // AND staying there for `vadReleaseMs`. Both halves are needed: hysteresis alone
+            // still flickers on a deep dip, and a hold alone still chatters around one
+            // threshold. Same discipline as the gesture layer's `Hysteresis` gate.
+            const exitThreshold = enterThreshold * tuning.vadReleaseRatio;
+            const now = Date.now();
+            const raw = vadVoice ? (rms > exitThreshold) : (rms > enterThreshold);
+
+            if (raw) {
+                vadQuietSince = 0;
+                vadVoice = true;
+            } else if (vadVoice) {
+                // Candidate release. The state does not change until the room has been below
+                // the exit threshold continuously for the hold.
+                if (!vadQuietSince) { vadQuietSince = now; }
+                if (now - vadQuietSince >= tuning.vadReleaseMs) { vadVoice = false; }
+            }
+
+            const voice = vadVoice;
             if (voice) {
-                lastVoiceMs = Date.now();
+                lastVoiceMs = now;
             } else if (!window.kayraSpeaking) {
                 // Adapt only on quiet frames, and NEVER while Kayra is audible. Learning the
                 // floor from her own voice would raise it until the detector went deaf.
@@ -322,7 +371,8 @@ html_code = """<!DOCTYPE html>
             window.kayraVad.rms = rms;
             window.kayraVad.floor = noiseFloor;
             window.kayraVad.voice = voice;
-            window.kayraVad.threshold = threshold;
+            window.kayraVad.threshold = enterThreshold;
+            window.kayraVad.exitThreshold = exitThreshold;
         }
 
         // Shared normalization. Mirrors `voice_control.normalize_utterance` on the Python
@@ -380,23 +430,32 @@ html_code = """<!DOCTYPE html>
             return false;
         }
 
-        // Lifecycle commands: whole-utterance only, no tail matching, ever. Returns the kind
-        // string or null.
-        function looksLikeControl(text) {
-            const words = normalizeWords(text, "named");
-            if (!words.length || words.length > 5) return null;
-            const joined = words.join(" ");
-            for (let i = 0; i < window.kayraControlPhrases.length; i++) {
-                if (window.kayraControlPhrases[i][0] === joined) {
-                    return window.kayraControlPhrases[i][1];
-                }
-            }
-            return null;
-        }
+        // THE PAGE NO LONGER CLASSIFIES LIFECYCLE COMMANDS AT ALL.
+        //
+        // `looksLikeControl()` used to live here and was the only consumer of
+        // `window.kayraControlPhrases`. It ran on the INTERIM transcript, and the flag it set
+        // was dispatched by Python at ~17Hz without ever consulting the endpointer — which is
+        // how a transient interim reading shut the assistant down while its owner was still
+        // speaking. Removing the classifier, rather than adding a guard to it, is what makes
+        // that class of bug unreachable from this page: there is nothing here that can name
+        // SHUTDOWN or SLEEP.
+        //
+        // Lifecycle commands are now classified in Python, from the COMMITTED utterance only,
+        // by `kayra.core.voice_control.classify_control` — and the dangerous ones are
+        // confirmation-gated on top of that. `tests/test_voice_turn.py` asserts this page
+        // contains no lifecycle vocabulary and never assigns `window.kayraControl`.
 
+        // `controlPhrases` is accepted and ignored, so an older Python calling into a newer
+        // page still starts recognition instead of throwing. Nothing reads it.
         function startContinuousRecognition(lang, silenceMs, interruptWords, fillers,
                                             controlPhrases, assistantName, tuningOverride) {
-            silenceLimit = silenceMs || 800;
+            // ONE SOURCE. `silenceMs` still arrives as its own argument for compatibility
+            // with any caller that predates the tuning payload, but the payload wins when it
+            // carries the value — otherwise the baseline could differ from the thresholds
+            // that are compared against it, which is the drift `core.endpointing` exists to
+            // prevent.
+            silenceLimit = (tuningOverride && tuningOverride.silenceMs)
+                           || silenceMs || 800;
             if (tuningOverride) {
                 for (const key in tuningOverride) {
                     if (Object.prototype.hasOwnProperty.call(tuning, key) &&
@@ -413,7 +472,9 @@ html_code = """<!DOCTYPE html>
             window.kayraControl = null;
             window.kayraInterruptWords = interruptWords || [];
             window.kayraInterruptFillers = fillers || [];
-            window.kayraControlPhrases = controlPhrases || [];
+            // Retained as an empty array so any leftover reference reads as "no phrases"
+            // rather than as undefined. NOTHING IN THIS PAGE MAY POPULATE IT.
+            window.kayraControlPhrases = [];
             window.kayraAssistantName = (assistantName || "kayra").toLowerCase();
             window.kayraSingleWordInterrupts = window.kayraInterruptWords.filter(function (w) {
                 return w.indexOf(" ") === -1;
@@ -502,22 +563,39 @@ html_code = """<!DOCTYPE html>
                 // word producing nothing at all.
                 interimText = interimTranscript;
 
-                // Fast path: publish an interruption the moment we see one, without
-                // waiting for the silence timer or for the sentence to be finalized.
+                // ── THE ONE THING INTERIM TEXT MAY STILL DO ──────────────────
+                // Publish a BARGE-IN, so "stop" silences playback without waiting for the
+                // silence timer. Silencing is not an action on the world: it hands the floor
+                // back to the person already talking, and its entire value is that it happens
+                // before the endpoint. It cannot start a turn, run automation, reach the DMM
+                // or end the process.
                 const probe = (currentText + " " + interimTranscript).trim();
                 if (!window.kayraInterrupt && looksLikeInterrupt(probe)) {
                     window.kayraInterrupt = { text: probe, at: Date.now(), start: utteranceStart };
                 }
-                // Same fast path for the lifecycle commands, so "exit" spoken over a long
-                // answer ends the process immediately instead of after the ~800ms VAD window
-                // and the translation round-trip. Whole-utterance match only.
-                if (!window.kayraControl) {
-                    const kind = looksLikeControl(probe);
-                    if (kind) {
-                        window.kayraControl = { text: probe, kind: kind, at: Date.now(),
-                                                start: utteranceStart };
-                    }
-                }
+
+                // ── THE LIFECYCLE FAST PATH IS GONE, AND THAT IS THE FIX ─────
+                // It used to sit here and read the same interim `probe`:
+                //
+                //     if (!window.kayraControl) {
+                //         const kind = looksLikeControl(probe);      // SHUTDOWN reachable
+                //         if (kind) { window.kayraControl = {...}; }
+                //     }
+                //
+                // `_local_control_watcher` polls that flag at ~17Hz and dispatches it, so a
+                // TRANSIENT interim reading — the sort an hi-IN recognizer produces constantly
+                // while a Hindi sentence is being spoken — reached `request_shutdown()`
+                // WITHOUT EVER PASSING THROUGH THE ENDPOINTER. The user was still mid-sentence
+                // and Kayra quit. The VAD was working perfectly and was simply not consulted,
+                // because this path did not go through it.
+                //
+                // There is now exactly ONE commit point (`flushUtterance`), and lifecycle
+                // commands are classified in Python from the COMMITTED utterance. The ~800ms
+                // that costs is the correct price: a lifecycle command is not worth
+                // acting on before we are sure the person finished saying it.
+                //
+                // Do not reintroduce this block. `tests/test_voice_turn.py` fails if
+                // `window.kayraControl` is ever assigned from a recognition result again.
             };
 
             recognition.onerror = (event) => {
@@ -562,41 +640,94 @@ html_code = """<!DOCTYPE html>
 
             recognition.start();
 
-            // ── ENDPOINTING ──────────────────────────────────────────
-            // TWO conditions, not one. The recognizer must have gone quiet AND the room must
-            // have gone quiet. Either alone is wrong in a way that costs words: results lag
-            // the sound, so recognizer-silence alone ends the utterance while the user is
-            // still speaking; and energy alone would wait out every background noise.
+            // ── ENDPOINTING: THE ONE COMMIT POINT ────────────────────
+            // This predicate MIRRORS `kayra.core.endpointing.decide()` rule for rule. The
+            // Python side is the specification and is where the scenario table lives; this is
+            // the implementation that can run at 60ms resolution next to the audio, where a
+            // Selenium round-trip per tick is not available. Same shape as the control
+            // vocabulary: one rule, two implementations, and a suite that asserts they agree.
+            //
+            // Nothing else in this page may end a turn. `flushUtterance` is called from here
+            // and from `stopContinuousRecognition`, and from nowhere else.
             if (checkInterval) clearInterval(checkInterval);
             checkInterval = setInterval(() => {
                 if (!isSpeaking) { return; }
-                const now = Date.now();
-                const sinceResult = now - lastResultTime;
-                // With no VAD (no WebAudio, or permission refused) this degrades exactly to
-                // the old recognizer-only behaviour rather than failing.
-                const sinceVoice = window.kayraVad.ready ? (now - lastVoiceMs) : sinceResult;
-
-                const pendingInterim = interimText.trim().length > 0;
-                const settled = currentText.trim();
-                const shortCommand = settled && settled.split(/\\s+/).length <= 3;
-
-                let quietNeeded = silenceLimit;
-                if (pendingInterim) {
-                    // Uncommitted words: wait for them. This is the whole reason short
-                    // commands used to vanish.
-                    quietNeeded = Math.max(silenceLimit, tuning.interimGraceMs);
-                } else if (shortCommand) {
-                    // Committed and short: answer promptly. "stop" should not cost 800ms.
-                    quietNeeded = Math.min(silenceLimit, tuning.fastEndpointMs);
-                }
-
-                const recognizerQuiet = sinceResult > quietNeeded;
-                const roomQuiet = sinceVoice > tuning.vadHangoverMs;
-                const hardTimeout = sinceResult > tuning.maxWaitMs;
-
-                if (!((recognizerQuiet && roomQuiet) || hardTimeout)) { return; }
-                flushUtterance(hardTimeout ? "timeout" : "endpoint");
+                const decision = endpointDecision();
+                window.kayraEndpoint = decision;
+                if (decision.commit) { flushUtterance(decision.reason); }
             }, 60);
+        }
+
+        // Returns {commit, reason, detail}. Pure: reads state, changes none.
+        function endpointDecision() {
+            const now = Date.now();
+            const sinceResult = now - lastResultTime;
+            // With no VAD (no WebAudio, or permission refused) this degrades EXACTLY to the
+            // old recognizer-only behaviour rather than failing: `sinceVoice` tracks
+            // `sinceResult`, so the room-quiet test becomes a tautology.
+            const vadReady = !!window.kayraVad.ready;
+            const sinceVoice = vadReady ? (now - lastVoiceMs) : sinceResult;
+            const speechDuration = now - utteranceStart;
+
+            const committed = currentText.trim();
+            const pendingInterim = interimText.trim().length > 0;
+            const hasText = !!(committed || pendingInterim);
+            const words = committed ? committed.split(/\\s+/).length : 0;
+
+            // 0. The absolute bound, before everything. A VAD wedged reporting voice forever
+            //    must not make the assistant deaf. The ONLY branch that commits while the user
+            //    is audible, and far out of the way of any real sentence.
+            if (hasText && speechDuration >= tuning.absoluteMaxMs) {
+                return { commit: true, reason: "absolute-timeout", detail: speechDuration };
+            }
+            // 1. Nothing to commit.
+            if (!hasText) { return { commit: false, reason: "no-speech", detail: 0 }; }
+
+            // 2. THE USER IS SPEAKING RIGHT NOW. This is the check the shutdown bug needed and
+            //    did not have: no transcript, however final-looking, ends a turn while the
+            //    acoustic detector still hears the person. It also gives "resuming speech
+            //    cancels a pending endpoint" for free — the window is re-evaluated from
+            //    scratch every tick, so speech that resumes simply answers WAIT again.
+            if (vadReady && window.kayraVad.voice && !window.kayraSpeaking) {
+                return { commit: false, reason: "voice-active", detail: 0 };
+            }
+            // 3. Too young to have ended.
+            if (speechDuration < tuning.minUtteranceMs) {
+                return { commit: false, reason: "min-duration", detail: speechDuration };
+            }
+            // 4. Hard timeout, reached only once the room is quiet (2 and 3 already ran), so
+            //    it can no longer flush a sentence out from under a speaker.
+            if (sinceResult >= tuning.maxWaitMs) {
+                return { commit: true, reason: "timeout", detail: sinceResult };
+            }
+
+            // A transcript that is implausibly short for how long the person spoke means the
+            // recognizer is behind. Knows nothing about WHICH word it is and cannot reject
+            // one — it only declines to end the turn yet.
+            const truncated = (!pendingInterim && words > 0 &&
+                               words < tuning.shortCommandWords &&
+                               speechDuration >= tuning.continuationSpeechMs);
+
+            let quietNeeded = silenceLimit;
+            if (pendingInterim) {
+                quietNeeded = Math.max(silenceLimit, tuning.interimGraceMs);
+            } else if (truncated) {
+                quietNeeded = silenceLimit;           // never the fast path
+            } else if (words > 0 && words <= tuning.shortCommandWords) {
+                quietNeeded = Math.min(silenceLimit, tuning.fastEndpointMs);
+            }
+            let hangover = tuning.vadHangoverMs;
+            if (truncated) { hangover *= Math.max(1, tuning.truncatedHangoverScale); }
+
+            if (sinceResult <= quietNeeded) {
+                return { commit: false, reason: "recognizer-busy", detail: sinceResult };
+            }
+            if (sinceVoice <= hangover) {
+                return { commit: false, reason: truncated ? "transcript-truncated"
+                                                          : "room-not-quiet",
+                         detail: sinceVoice };
+            }
+            return { commit: true, reason: "endpoint", detail: sinceResult };
         }
 
         // Publishes the assembled utterance. Everything the repair stage needs to be
@@ -688,27 +819,45 @@ html_code = """<!DOCTYPE html>
 
 def _capture_tuning():
     """
-    Endpointing and VAD tuning, resolved once from the environment.
+    The page's complete tuning: the endpoint thresholds plus the VAD's acoustic settings.
 
-    These are the numbers the capture pipeline is shaped by, and they are configurable for the
-    same reason the automation bounds are: a quiet office and a noisy room genuinely need
-    different hangovers, and the alternative to a setting is a user with no way to fix a
-    recognizer that keeps cutting them off. Every value is range-clamped, so a malformed
-    `.env` degrades to the measured defaults instead of producing an endpointer that never
-    fires.
+    Two owners, deliberately. `core.endpointing` decides WHEN A TURN ENDS and every threshold
+    that answer depends on lives there, because that decision is now the property that keeps a
+    mid-sentence fragment away from a control and it may not be defined twice. What is left
+    here is what the MICROPHONE needs — margins, the noise floor, the hysteresis — which is
+    about the room rather than about the turn.
+
+    Both halves are configurable for the same reason the automation bounds are: a quiet office
+    and a noisy room genuinely need different numbers, and the alternative to a setting is a
+    user with no way to fix a recognizer that keeps cutting them off. Every value is
+    range-clamped, so a malformed `.env` degrades to the measured defaults instead of
+    producing an endpointer that never fires.
     """
     from kayra.core.config import env_float, env_int
-    return {
-        "fastEndpointMs": env_int("STT_FAST_ENDPOINT_MS", 420, 150, 2000),
-        "interimGraceMs": env_int("STT_INTERIM_GRACE_MS", 1400, 300, 5000),
-        "maxWaitMs": env_int("STT_MAX_UTTERANCE_WAIT_MS", 6000, 1500, 30000),
-        "vadHangoverMs": env_int("STT_VAD_HANGOVER_MS", 500, 100, 3000),
+    from kayra.core.endpointing import tuning_payload
+
+    # THE ENDPOINT THRESHOLDS COME FROM `core.endpointing`, WHICH IS THE AUTHORITY.
+    # They used to be declared here as well, which made two places able to disagree about when
+    # a turn ends — and the endpoint decision is now the single safety property that stops a
+    # mid-sentence fragment reaching a control, so it may not have two definitions. This
+    # function still owns the VAD's ACOUSTIC settings, which are about the microphone rather
+    # than about the turn.
+    values = dict(tuning_payload())
+    values.update({
+        # Voice is RMS above this multiple of the learned noise floor...
         "vadMargin": env_float("STT_VAD_MARGIN", 3.2, 1.2, 20.0),
+        # ...and above this much higher multiple while Kayra is audible.
         "vadEchoMargin": env_float("STT_VAD_ECHO_MARGIN", 7.0, 1.5, 40.0),
+        # Hysteresis. Leaving the speaking state requires falling to this FRACTION of the
+        # enter threshold and staying there for `vadReleaseMs`. Both halves are needed:
+        # hysteresis alone still flickers on a deep dip, a hold alone still chatters.
+        "vadReleaseRatio": env_float("STT_VAD_RELEASE_RATIO", 0.6, 0.1, 0.95),
+        "vadReleaseMs": env_int("STT_VAD_RELEASE_MS", 220, 40, 1500),
         "vadFloorMin": env_float("STT_VAD_FLOOR_MIN", 0.004, 0.0001, 0.2),
         "vadIntervalMs": env_int("STT_VAD_INTERVAL_MS", 50, 10, 250),
         "maxAlternatives": env_int("STT_MAX_ALTERNATIVES", 5, 1, 10),
-    }
+    })
+    return values
 
 
 class SttState:

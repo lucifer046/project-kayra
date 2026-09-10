@@ -492,7 +492,7 @@ class TranscriptRepair:
 
 def _is_irreversible(term):
     """
-    True when substituting this word could END THE PROCESS.
+    True when substituting this word could reach a HIGH-IMPACT control.
 
     This is the guard that answers the obvious objection to any correction layer: sooner or
     later it turns a legitimate word into the wrong command, and the worst wrong command
@@ -500,14 +500,20 @@ def _is_irreversible(term):
     phonetic key, so without this the stage could shut Kayra down over a word the user said
     perfectly clearly.
 
+    WIDENED FROM SHUTDOWN TO EVERY DANGEROUS KIND. Standby is now confirmation-gated for the
+    same reason shutdown is, which makes it the same class of target: a stage that may not
+    invent "exit" must not be able to invent "sleep" either. The two are governed by one set
+    (`voice_control.DANGEROUS_KINDS`) so a kind added there is protected here automatically
+    rather than by remembering to.
+
     Note the asymmetry with re-ranking: an alternative the RECOGNIZER offered may be a
     shutdown, because the recognizer genuinely heard it. What is forbidden is this stage
     INVENTING one.
     """
     try:
-        from kayra.core.voice_control import classify_control, ControlKind
+        from kayra.core.voice_control import classify_control, DANGEROUS_KINDS
         control = classify_control(term)
-        return control is not None and control.kind == ControlKind.SHUTDOWN
+        return control is not None and control.kind in DANGEROUS_KINDS
     except Exception:
         # Cannot prove it is safe, so treat it as unsafe. A missing repair costs a repeated
         # command; a wrong one costs the session.

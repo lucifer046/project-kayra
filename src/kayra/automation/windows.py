@@ -105,6 +105,10 @@ from kayra.utils import print_banner, print_info, print_success, print_warning, 
 
 # Policy / structured-action layer and the target resolver. Both are pure-logic modules with
 # no hardware dependency, which is what lets the automation test suite run headless.
+# The whole module, not only the names below: the power-target gate reads
+# `policy.POWER_VERBS` / `policy.resolve_power_target` / `policy.TARGET_*`, and importing
+# them individually would mean a set added there is silently not enforced here.
+from kayra.automation import policy
 from kayra.automation.policy import (Action, ActionResult, Status, Risk, classify_action,
                                 classify_shell, ConfirmationManager, AutomationContext,
                                 audit, AUDIT_STARTED, AUDIT_SUCCESS, AUDIT_FAILED,
@@ -671,7 +675,13 @@ def ExecuteCommand(command):
     elif "lock" in cmd:
         ctypes.windll.user32.LockWorkStation()
     elif "sleep" in cmd or "turn off screen" in cmd:
-        subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], shell=False)
+        # Inert for the SAME reason shutdown is, below. Suspending the machine is a power
+        # action and every power action must pass the target gate in `normalize_command`;
+        # a route to it from here would be a way around that gate. The normalizer already
+        # sends every payload containing "sleep" through the gate, so this branch is
+        # unreachable from it — it stays as a refusal rather than a hole.
+        print_warning("Sleep goes through the power-target policy, not here.")
+        return False
     elif "shutdown" in cmd or "restart" in cmd:
         # Deliberately inert here. `os.system("shutdown /s /t 0")` used to fire the instant
         # this branch matched, with no confirmation of any kind — a misheard word could power
@@ -1867,12 +1877,75 @@ HOTKEY_MAP = {
 # "system X" sub-verbs. Shutdown/restart/sign-out become their own actions so the policy layer
 # can see them; previously they were a substring test inside ExecuteCommand and executed
 # instantly with no confirmation whatsoever.
+def _power_refusal_sentence(action):
+    """
+    What the user hears when a power request could not be targeted. "" for anything else.
+
+    Two situations, two different sentences, because they are different mistakes:
+
+      AMBIGUOUS — nothing in the sentence named a target. Ask which, naming both, so the
+                  answer is a choice rather than a yes/no about the wrong thing.
+      KAYRA     — the sentence named Kayra and reached the automation layer anyway, which
+                  means the transcript missed the local control vocabulary. Say what was
+                  understood and how to phrase it, rather than acting on a near-miss.
+    """
+    if action.domain != "system":
+        return ""
+    verb = action.parameters.get("verb") or action.action
+    word = {"shutdown": "shut down", "restart": "restart",
+            "sign_out": "sign out of", "sleep": "put to sleep"}.get(verb, "power off")
+
+    if action.action == "power_ambiguous":
+        return (f"Do you mean {word} {ASSISTANT_LABEL}, or {word} the computer? "
+                "They are different things, so please say which.")
+    if action.action == "power_kayra":
+        return (f"That sounded like you meant {ASSISTANT_LABEL} rather than the computer, "
+                f"and I did not hear it clearly enough to be sure. "
+                f"Say \"{word} {ASSISTANT_LABEL}\" and I will confirm it with you.")
+    return ""
+
+
+def _assistant_alias():
+    """
+    The name the user calls the assistant, lower-cased. "kayra" when it cannot be read.
+
+    Read lazily and defensively: this module must import without `.env`, and a configuration
+    failure must never widen the power-target gate.
+    """
+    try:
+        from kayra.core.config import assistant_name
+        return (assistant_name() or "kayra").strip().lower()
+    except Exception:
+        return "kayra"
+
+
+ASSISTANT_LABEL = "Kayra"
+
+
+# ORDER MATTERS: the first needle found in the payload wins, so the most specific phrasings
+# come first. "turn off screen" must beat "turn off the computer" for a payload containing
+# both, and neither may be beaten by a bare verb.
+#
+# These find the VERB. They do NOT decide the TARGET — `resolve_power_target` does, and for
+# everything in `policy.POWER_VERBS` the normalizer refuses to build an action without an
+# explicit one. See the power-target gate in `normalize_command`.
 _SYSTEM_VERBS = (
+    # Explicit computer-power phrasings, first so a bare verb cannot shadow them.
+    # TURNING THE DISPLAY OFF IS NOT SUSPENDING THE MACHINE, and mapping it to "sleep" was a
+    # pre-existing mislabel: the sleep branch calls `SetSuspendState`, so "turn off screen"
+    # suspended the whole session. It is its own verb now, it blanks the monitor, and it is
+    # therefore NOT a power action and needs no target — nothing is lost by getting it wrong.
+    ("turn off screen", "screen_off"), ("turn off the screen", "screen_off"),
+    ("turn off the display", "screen_off"), ("blank the screen", "screen_off"),
+    ("turn off the computer", "shutdown"), ("turn off my computer", "shutdown"),
+    ("turn off the pc", "shutdown"), ("turn off my pc", "shutdown"),
+    ("turn off the laptop", "shutdown"), ("turn off my laptop", "shutdown"),
+    ("power down the computer", "shutdown"), ("power down my computer", "shutdown"),
     ("sign out", "sign_out"), ("log out", "sign_out"), ("logout", "sign_out"),
     ("shutdown", "shutdown"), ("shut down", "shutdown"), ("power off", "shutdown"),
     ("restart", "restart"), ("reboot", "restart"),
     ("lock", "lock"),
-    ("sleep", "sleep"), ("turn off screen", "sleep"),
+    ("sleep", "sleep"),
     ("mute", "volume"), ("volume", "volume"), ("brightness", "brightness"),
 )
 
@@ -1961,9 +2034,57 @@ def _build_action(domain, action, payload, raw, context):
     if domain == "system" and action == "raw":
         lowered_payload = (payload or "").lower()
         for needle, verb in _SYSTEM_VERBS:
-            if needle in lowered_payload:
+            if needle not in lowered_payload:
+                continue
+
+            # ── THE POWER-TARGET GATE ──
+            # `needle in payload` is a SUBSTRING test, and for the power verbs a substring
+            # test was the whole of the safety logic. "system shutdown the engine car" — a
+            # malformed transcript of a request about KAYRA's engine — matched "shutdown" and
+            # became `Action("system", "shutdown")`, one reflexive "yes" away from ending the
+            # user's Windows session.
+            #
+            # The substring match is kept, because it is a fine way to find the VERB. What it
+            # may no longer do is decide the TARGET. Nothing infers a computer shutdown any
+            # more; the user has to name one.
+            if verb in policy.POWER_VERBS:
+                target_kind = policy.resolve_power_target(payload, _assistant_alias())
+                if target_kind == policy.TARGET_KAYRA:
+                    # A lifecycle request that reached the automation layer only because the
+                    # transcript missed the local control vocabulary. Hand it back; never
+                    # touch the machine for it.
+                    return Action("system", "power_kayra", target=payload,
+                                  parameters={"command": payload, "verb": verb,
+                                              "power_target": target_kind},
+                                  confidence=0.9, raw=raw)
+                if target_kind != policy.TARGET_COMPUTER:
+                    return Action("system", "power_ambiguous", target=payload,
+                                  parameters={"command": payload, "verb": verb,
+                                              "power_target": target_kind},
+                                  confidence=0.2, raw=raw)
                 return Action("system", verb, target=payload,
-                              parameters={"command": payload}, raw=raw)
+                              parameters={"command": payload,
+                                          "power_target": target_kind}, raw=raw)
+
+            return Action("system", verb, target=payload,
+                          parameters={"command": payload}, raw=raw)
+        # NO VERB MATCHED, but the payload may still be a power request phrased in a way the
+        # needle table does not carry — "turn off the engine", "power down". A bare "turn off"
+        # is deliberately NOT a needle above, because "turn off wifi" and "turn off the
+        # camera" are ordinary requests that must keep working; it becomes a power verb only
+        # when the sentence also NAMES a target, which is the same evidence the gate wants.
+        if any(word in lowered_payload for word in ("turn off", "power down", "turn it off")):
+            target_kind = policy.resolve_power_target(payload, _assistant_alias())
+            if target_kind == policy.TARGET_KAYRA:
+                return Action("system", "power_kayra", target=payload,
+                              parameters={"command": payload, "verb": "shutdown",
+                                          "power_target": target_kind},
+                              confidence=0.9, raw=raw)
+            if target_kind == policy.TARGET_COMPUTER:
+                return Action("system", "shutdown", target=payload,
+                              parameters={"command": payload,
+                                          "power_target": target_kind}, raw=raw)
+
         return Action("system", "raw", target=payload,
                       parameters={"command": payload}, confidence=0.6, raw=raw)
 
@@ -2066,8 +2187,11 @@ CONFIRMATIONS = ConfirmationManager()
 CONTEXT = AutomationContext()
 
 _CONFIRM_PROMPTS = {
-    "system.shutdown": "This will shut down your computer. Should I go ahead?",
-    "system.restart": "This will restart your computer. Should I go ahead?",
+    # These are reached ONLY once `resolve_power_target` has returned COMPUTER, so the
+    # wording can be specific about the target. It has to be: a prompt that says "your
+    # computer" about a request that never named one is how a reflexive "yes" ends a session.
+    "system.shutdown": "This will shut down your COMPUTER, not Kayra. Should I go ahead?",
+    "system.restart": "This will restart your COMPUTER, not Kayra. Should I go ahead?",
     "system.sign_out": "This will sign you out. Should I go ahead?",
     "system.sleep": "This will put the computer to sleep. Should I go ahead?",
     "system.wifi_off": "This will turn off Wi-Fi. Should I go ahead?",
@@ -2105,7 +2229,13 @@ def execute_action(action, skip_policy=False):
         verdict, reason = classify_action(action)
         if verdict == Risk.DENY:
             audit(AUDIT_BLOCKED, action, reason=reason)
-            return ActionResult.blocked(f"I won't do that — {reason}.")
+            # A POWER-TARGET REFUSAL IS A QUESTION, NOT A REFUSAL SENTENCE. "I won't do that —
+            # a power action needs the computer named explicitly" is accurate and useless: the
+            # user asked for something and the honest response is to find out which thing they
+            # meant. Every other DENY keeps the plain refusal, because every other DENY is
+            # something Kayra will not do however it is phrased.
+            spoken = _power_refusal_sentence(action)
+            return ActionResult.blocked(spoken or f"I won't do that — {reason}.")
         if verdict == Risk.CONFIRM:
             prompt = _confirm_prompt(action, reason)
             CONFIRMATIONS.request(action, prompt)
@@ -2336,6 +2466,11 @@ def _dispatch(action):
 
     # ── system ──
     if domain == "system":
+        # NEITHER OF THESE REACHES HERE IN PRACTICE — the policy DENIES them first and
+        # `_power_refusal_sentence` supplies what the user hears. They stay as a second wall
+        # so that a caller passing `skip_policy=True` still cannot touch the machine.
+        if verb in ("power_ambiguous", "power_kayra"):
+            return ActionResult.blocked(_power_refusal_sentence(action))
         if verb == "lock":
             ctypes.windll.user32.LockWorkStation()
             return ActionResult.success("Locking.")
@@ -2350,7 +2485,14 @@ def _dispatch(action):
             return ActionResult.success("Signing out.")
         if verb == "sleep":
             subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], shell=False)
-            return ActionResult.success("Going to sleep.")
+            return ActionResult.success("Putting the computer to sleep.")
+        if verb == "screen_off":
+            # WM_SYSCOMMAND / SC_MONITORPOWER, "off". Blanks the display and leaves everything
+            # running — which is what the user asked for and what "sleep" was doing wrong.
+            HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, MONITOR_OFF = 0xFFFF, 0x0112, 0xF170, 2
+            ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_SYSCOMMAND,
+                                              SC_MONITORPOWER, MONITOR_OFF)
+            return ActionResult.success("Screen off.")
         if verb in ("volume", "brightness", "raw"):
             ExecuteCommand(params.get("command") or target or "")
             return ActionResult.success("Done.")

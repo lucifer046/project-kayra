@@ -225,15 +225,32 @@ def section_page_agreement():
 
     check("the page injects the shared interrupt list",
           "window.kayraInterruptWords = interruptWords" in stt.html_code)
-    check("the page injects the shared control table",
-          "window.kayraControlPhrases = controlPhrases" in stt.html_code)
+    # THE PAGE NO LONGER CLASSIFIES LIFECYCLE COMMANDS, and that is a stronger property than
+    # the agreement this used to assert. `looksLikeControl()` ran on the INTERIM transcript and
+    # published a flag the watcher dispatched WITHOUT consulting the endpointer — which is how
+    # a transient fragment shut the assistant down mid-sentence. The classifier is gone, so
+    # what is checked now is its absence.
+    check("the page no longer classifies lifecycle commands",
+          "function looksLikeControl" not in stt.html_code)
+    check("the page never populates the control table",
+          "window.kayraControlPhrases = controlPhrases" not in stt.html_code)
+    # `window.kayraControl` may only ever be initialised to null. `kayraControlPhrases` is
+    # excluded because it is a different name that happens to share the prefix, and it is
+    # allowed to exist as an empty list so a leftover reference reads as "no phrases".
+    offenders = [line.strip() for line in stt.html_code.splitlines()
+                 if "window.kayraControl " in line + " "
+                 and "kayraControlPhrases" not in line
+                 and "=" in line and "null" not in line
+                 and not line.strip().startswith("//")]
+    check("nothing in the page assigns a control flag", not offenders, str(offenders[:2]))
+    check("the control phrase table is hard-coded empty",
+          "window.kayraControlPhrases = [];" in stt.html_code)
     check("the page has a speaking flag", "window.kayraSpeaking" in stt.html_code)
     check("the page tail-matches ONLY while speaking",
           "if (!window.kayraSpeaking) return false;" in stt.html_code)
-    check("lifecycle commands are never tail-matched",
-          "function looksLikeControl" in stt.html_code
-          and "kayraSpeaking" not in stt.html_code.split("function looksLikeControl")[1]
-              .split("function ")[0])
+    # Barge-in is the ONE thing interim text may still do, and it must still do it.
+    check("barge-in still runs off interim results",
+          "looksLikeInterrupt(probe)" in stt.html_code)
 
     # The clear-queue bug: clearing the queue without clearing the accumulated buffer only
     # delayed the polluted transcript by one VAD window.
@@ -391,7 +408,11 @@ def section_shutdown():
             return a in log and b in log and log.index(a) < log.index(b)
 
         check("the farewell is spoken BEFORE the audio device is disposed",
-              before("tts.speak('Shutting down. Goodbye.',True)", "tts.shutdown"))
+              before(f"tts.speak({app.SHUTDOWN_ANNOUNCEMENT!r},True)", "tts.shutdown"))
+        check("and the farewell is the fixed countdown announcement",
+              "Powering down in 3" in app.SHUTDOWN_ANNOUNCEMENT
+              and app.SHUTDOWN_ANNOUNCEMENT.strip().endswith("Goodbye."),
+              app.SHUTDOWN_ANNOUNCEMENT)
         check("the proactive agent stops BEFORE the engine it speaks through",
               before("proactive.stop", "tts.shutdown"))
         check("timers are cancelled before teardown",
@@ -451,9 +472,30 @@ def section_dispatch():
           log.count("stt.shutdown") == 0)
 
     # ── sleep / wake ──
+    # SLEEP IS NOW CONFIRMATION-GATED. `_dispatch_control` ASKS; only
+    # `resolve_lifecycle_confirmation` with an affirmative answer executes. The two-step is
+    # the whole point of this milestone, so the test walks it rather than asserting the old
+    # single-step contract.
     app.proactive_agent.set_enabled(True)
+    app.CONFIRMATIONS.clear()
     app._dispatch_control(ControlKind.SLEEP, "go to sleep")
-    check("'go to sleep' enters standby", app.RUNTIME.sleeping is True)
+    check("'go to sleep' does NOT immediately enter standby",
+          app.RUNTIME.sleeping is False)
+    check("it raises a confirmation instead",
+          app.CONFIRMATIONS.pending is not None
+          and app.CONFIRMATIONS.pending.kind == ControlKind.SLEEP)
+    check("an unrelated sentence does not confirm it",
+          app.resolve_lifecycle_confirmation("what is the weather") is False
+          and app.RUNTIME.sleeping is False)
+
+    app._dispatch_control(ControlKind.SLEEP, "go to sleep")
+    check("'no' cancels the sleep request",
+          app.resolve_lifecycle_confirmation("no") is True
+          and app.RUNTIME.sleeping is False)
+
+    app._dispatch_control(ControlKind.SLEEP, "go to sleep")
+    check("'yes' enters standby", app.resolve_lifecycle_confirmation("yes") is True
+          and app.RUNTIME.sleeping is True)
     check("standby switches the proactive service off",
           app.proactive_agent.enabled is False)
     check("standby does NOT close the microphone — a closed mic cannot hear 'wake up'",

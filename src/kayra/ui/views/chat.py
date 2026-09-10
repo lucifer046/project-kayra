@@ -31,24 +31,45 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLineEdit, QSizePolicy, QFrame,
 )
 
-from kayra.ui.theme import Color, Space, Size, Motion, repolish
+from kayra.ui.theme import Space, Size, repolish
 from kayra.ui.components.primitives import (
-    Card, Caption, StatusPill, AccentButton, GhostButton, EmptyState, Divider,
-    IconButton, _label,
+    Caption, AccentButton, EmptyState, IconButton,
 )
 from kayra.ui.components.chat_items import MessageRow, AutomationTrace, ThinkingRow
 from kayra.ui.views.base import View
 
 
 class ChatView(View):
-    title = "Chat"
-    subtitle = "Type or speak — both go through the same pipeline."
+    # NO PAGE TITLE. The window chrome already names the screen, and a 20px "Chat" heading
+    # above a transcript spends the most valuable row on the page restating what the user just
+    # clicked. The transcript starts at the top, which is what makes this read as a native
+    # assistant application rather than as a documentation page with a chat box on it.
+    title = ""
+    subtitle = ""
 
     def __init__(self, bridge, parent=None):
         super().__init__(bridge, parent)
 
         # Chat owns its own scrolling transcript, so the page-level scroll area is unused.
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        holder = self.scroll.widget()
+        if holder is not None:
+            holder.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+        # THE READABLE COLUMN, AND THE DOCK'S CLEARANCE.
+        #
+        # Chat is full-bleed now that the rail is gone, and "use the width" does NOT mean
+        # running text edge to edge: a 2560px monitor would give ~280 characters a line, which
+        # nobody can read. The transcript is centred in a bounded column instead, and the extra
+        # width becomes margin — which is what every application people actually read in does.
+        #
+        # The bottom margin clears the floating dock. The dock is an overlay owned by the
+        # window and is not in this layout, so without this the composer would sit underneath
+        # it — the one collision this page can have.
+        self.content.setContentsMargins(
+            Space.lg, Space.base, Space.lg,
+            Size.dock_height + Size.dock_margin_bottom + Space.md)
+        self.content.setSpacing(Space.sm)
 
         self._current_reply = None      # the assistant bubble currently being extended
         self._current_trace = None      # the automation trace for the turn in flight
@@ -57,8 +78,22 @@ class ChatView(View):
         # Follow the newest message until the user scrolls up to read something.
         self._following = True
 
+        # ONE column holds both the transcript and the composer, so their left and right
+        # edges line up exactly. Before, each was added to the page layout separately and the
+        # scroll area's own bar width offset one of them by ten pixels — visible as a composer
+        # that did not quite sit under the messages.
+        self.column = QVBoxLayout()
+        self.column.setSpacing(Space.sm)
+        self.column.setContentsMargins(0, 0, 0, 0)
         self._build_transcript()
         self._build_composer()
+
+        centred = QHBoxLayout()
+        centred.setContentsMargins(0, 0, 0, 0)
+        centred.addStretch(1)
+        centred.addLayout(self.column, 0)
+        centred.addStretch(1)
+        self.content.addLayout(centred, 1)
 
         # One shared timer drives the thinking indicator. It runs ONLY while a reply is
         # pending, so an idle chat screen has no timer at all.
@@ -87,8 +122,17 @@ class ChatView(View):
 
         holder = QWidget()
         self.transcript = QVBoxLayout(holder)
-        self.transcript.setContentsMargins(0, 0, Space.sm, Space.md)
-        self.transcript.setSpacing(Space.xs)
+        # NO SIDE MARGINS. An 8px right inset for the scrollbar left the bubbles ending eight
+        # pixels short of the composer beneath them, which is exactly the kind of near-miss
+        # that reads as sloppy without being obviously wrong. The scrollbar is narrow and
+        # only present when the transcript overflows; letting it sit over the gutter costs
+        # nothing and keeps the two edges of the column identical.
+        self.transcript.setContentsMargins(0, Space.md, 0, Space.md)
+        # ROOMIER. Turns were `Space.xs` apart, which put a user message and Kayra's reply
+        # closer together than the two lines inside a single bubble — so a long exchange read
+        # as one wall of text. At `Space.md` the eye separates turns without the transcript
+        # feeling sparse.
+        self.transcript.setSpacing(Space.md)
         # The stretch goes FIRST so messages settle against the bottom of the viewport, the way
         # a conversation does. With it at the end, a short exchange floated at the top of a
         # mostly-empty page and read as though the screen had failed to load.
@@ -100,8 +144,10 @@ class ChatView(View):
         # leaves a blank rectangle that is indistinguishable from a screen that failed to
         # paint. Visibility is also free; reparenting is not.
         self._empty = EmptyState(
-            "Nothing said yet",
-            "Ask Kayra a question, or tell it to do something on your machine.")
+            "Say something to Kayra",
+            "Ask a question, or tell it to do something on your machine — "
+            "\u201copen YouTube\u201d, \u201cwhat is on my calendar\u201d, "
+            "\u201cclose this window\u201d. Typing and speaking go through the same pipeline.")
         self.transcript.addWidget(self._empty)
 
         self.transcript_scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
@@ -109,7 +155,7 @@ class ChatView(View):
         # to survive that, or the newest message drifts out of view whenever the window moves.
         self.transcript_scroll.viewport().installEventFilter(self)
 
-        self.content.addWidget(self.transcript_scroll, 1)
+        self.column.addWidget(self.transcript_scroll, 1)
 
     def _build_composer(self):
         """
@@ -128,10 +174,10 @@ class ChatView(View):
         self.composer = QWidget()
         self.composer.setObjectName("Composer")
         self.composer.setAttribute(Qt.WA_StyledBackground, True)
-        self.composer.setFixedHeight(Size.control + 2 * Space.xs + 2)
+        self.composer.setFixedHeight(Size.control_lg + 2 * Space.sm)
         layout = QHBoxLayout(self.composer)
-        layout.setContentsMargins(Space.sm, Space.xs, Space.xs, Space.xs)
-        layout.setSpacing(Space.xs)
+        layout.setContentsMargins(Space.md, Space.sm, Space.sm, Space.sm)
+        layout.setSpacing(Space.sm)
 
         self.mic_button = IconButton("mic", "Voice input", checkable=True)
         self.mic_button.setCheckable(False)
@@ -157,11 +203,12 @@ class ChatView(View):
         layout.addWidget(self.stop_button)
         layout.addWidget(self.send_button)
 
-        self.content.addWidget(self.composer)
+        self.column.addWidget(self.composer)
 
         self.voice_note = Caption("")
         self.voice_note.setVisible(False)
-        self.content.addWidget(self.voice_note)
+        self.voice_note.setAlignment(Qt.AlignHCenter)
+        self.column.addWidget(self.voice_note)
 
     def _on_text_changed(self, text):
         # An accent-filled button that does nothing is the loudest dead control on a screen.
@@ -306,6 +353,12 @@ class ChatView(View):
 
     def _on_user_message(self, text, source):
         meta = "spoken" if source == "voice" else None
+        # A NEW USER TURN DEFINITIVELY ENDS THE PREVIOUS REPLY. `_on_state` normally clears
+        # the streaming mark when the assistant leaves SPEAKING, but a user who types again
+        # before that transition arrives would leave the old bubble wearing an accent edge
+        # that says "still arriving" for the rest of the session.
+        if self._current_reply is not None:
+            self._current_reply.set_streaming(False)
         self._add_row(MessageRow("user", text, meta))
         self._current_reply = None
         self._show_thinking()
@@ -314,6 +367,11 @@ class ChatView(View):
         self._hide_thinking()
         if self._current_reply is None:
             self._current_reply = self._add_row(MessageRow("assistant", text))
+            # A REPLY STILL ARRIVING LOOKS DIFFERENT FROM A FINISHED ONE, and it costs no
+            # timer: a dynamic property plus one repolish paints an accent edge on the bubble,
+            # and `_on_state` clears it when the turn ends. An animated caret would need a
+            # timer per bubble, which is the cost this UI does not pay for decoration.
+            self._current_reply.set_streaming(True)
         else:
             # A streamed sentence makes an EXISTING bubble taller. No widget is added, so the
             # scroll range still changes and the same follow rule has to run.
@@ -351,6 +409,8 @@ class ChatView(View):
             "listening", state == "LISTENING" and self.bridge.listening_enabled())
         repolish(self.mic_button)
         if state == "LISTENING" and previous in ("SPEAKING", "PROCESSING", "AUTOMATING"):
+            if self._current_reply is not None:
+                self._current_reply.set_streaming(False)
             self._current_reply = None      # the turn ended; the next reply starts a new bubble
             if self._current_trace is not None:
                 self._current_trace.complete_all("ok")
@@ -403,6 +463,26 @@ class ChatView(View):
     # ──────────────────────────────────────────────────────────────────
     #                            LIFECYCLE
     # ──────────────────────────────────────────────────────────────────
+
+    def resizeEvent(self, event):
+        """
+        Bounds the conversation column, responsively.
+
+        The column takes the width it is given up to `Size.chat_max`, and on a narrow window
+        it simply shrinks — there is no fixed pixel position anywhere, so the same layout
+        holds from the 1040px minimum to an ultrawide monitor. Above the maximum the surplus
+        becomes margin rather than longer lines.
+        """
+        super().resizeEvent(event)
+        available = max(320, self.width() - 2 * Space.lg)
+        width = min(Size.chat_max, available)
+        self.transcript_scroll.setFixedWidth(width)
+        self.composer.setFixedWidth(width)
+        self.voice_note.setFixedWidth(width)
+        # Bubbles wrap at a fraction of the column, not at a constant. On a narrow window a
+        # 560px bubble would be the whole width and the asymmetry that distinguishes the two
+        # speakers would be lost.
+        MessageRow.set_available_width(width)
 
     def eventFilter(self, watched, event):
         from PySide6.QtCore import QEvent

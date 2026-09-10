@@ -95,7 +95,7 @@ a local LLM server and it never touches the network.
 
 **Vision (standalone)**
 
-- `mediapipe` + `opencv-python` for the hand-gesture mouse
+- `mediapipe` + `opencv-python` for hand gesture control
 
 ---
 
@@ -405,21 +405,45 @@ Answered from in-process counters, in about a millisecond.
 - `"stop proactive suggestions"` / `"don't interrupt me"` - off for the session
 - `"enable proactive mode"` - back on
 
-### Gesture control (standalone)
+### Hand gesture control
 
-A separate MediaPipe hand-tracking mouse, not wired into the assistant:
+Your hand drives the mouse, through the webcam. It is **off by default** — something that moves
+your pointer should be something you asked for.
+
+| Gesture                 |                                        |
+| ----------------------- | -------------------------------------- |
+| Index finger extended   | Move the cursor                        |
+| Thumb + index pinch     | Left click — hold it to drag           |
+| Thumb + middle pinch    | Right click                            |
+| Thumb + index + middle  | Double click                           |
+| Index + middle, swept   | Scroll up or down                      |
+| Closed fist             | Pause — nothing happens until you open it |
+
+Three ways to turn it on:
+
+- the **Hand gesture** card on Home, which also shows a small live camera preview
+- say **"turn on hand gesture control"** (or "activate", "start", "open"). To stop it, say
+  **"turn off hand gesture control"**. The camera has its own commands: **"turn on the camera"**
+  / **"turn off the camera"**. All of these are matched locally, so they work with the network
+  down.
+- `GESTURE_ENABLED=True` in `.env`, to have it start with Kayra
+
+**The camera and gesture control are separate switches.** Turning the camera on shows the
+preview and starts nothing that can move your pointer. Turning gesture control on starts the
+camera for you if it is off; turning the camera off stops gesture control with it. Nothing is
+recorded and nothing leaves your machine.
+
+Three settings are worth knowing about, all in Settings under **Hand gesture control**:
+*gesture sensitivity* (how readily a pose is recognised), *cursor smoothing* (steadier when your
+hand is still — it does not add lag when you move) and *click sensitivity*. Everything else has
+a safe default and is documented in `.env.example`.
+
+It also runs on its own, without the assistant:
 
 ```bash
 .venv\Scripts\python.exe -m kayra.input.gesture
+.venv\Scripts\python.exe -m kayra.input.gesture --doctor   # camera and detector report
 ```
-
-| Gesture                 |                   |
-| ----------------------- | ----------------- |
-| Index finger extended   | Move the cursor   |
-| Thumb + index pinch     | Left click / drag |
-| Thumb + middle pinch    | Right click       |
-| Thumb + index + middle  | Double click      |
-| Index + middle extended | Joystick scroll   |
 
 ---
 
@@ -454,6 +478,25 @@ perfectly good choice**, and it is the default outcome when no GPU runtime is pr
 
 If you do want it, `setup.py` handles the whole thing: `onnxruntime-gpu`, the pinned CUDA 12.8
 and cuDNN 9 wheels (~1.4 GB), and a real session probe to prove it works. No CUDA Toolkit.
+
+### On a machine without an NVIDIA GPU
+
+**Kayra's only GPU acceleration path is CUDA.** An AMD, Intel or GPU-less machine runs speech
+on the processor, and that is a supported, correct outcome rather than a degraded one — see the
+measurements above, where CUDA is not faster anyway.
+
+`setup.py` reads the graphics hardware from the registry before it decides anything, so:
+
+- **no `nvidia-*` package of any kind is installed** on a machine with no NVIDIA GPU;
+- `nvidia-smi` is never even launched there;
+- an environment provisioned on an NVIDIA machine and carried to a non-NVIDIA one is
+  **reconciled** — `onnxruntime-gpu` is replaced with `onnxruntime` and the orphaned CUDA
+  runtime wheels are removed, rather than left on disk where nothing can load them;
+- the report reads **`NOT APPLICABLE (no NVIDIA GPU)`**, not `FAIL`. A failed check describes a
+  defect; there is no defect in not owning an NVIDIA card.
+
+Running `python setup.py` again is safe at any time. On a settled environment it installs and
+uninstalls nothing; if you later add or remove a GPU, the next run reconciles it.
 
 ---
 
@@ -693,21 +736,36 @@ Reports/                     deep-research output
 
 ## Testing
 
-`tests/` are standalone diagnostic scripts, not a pytest suite. Run each directly. They assert
-and exit non-zero.
+`tests/` are standalone scripts, not a pytest suite. Each prints `PASS`/`FAIL` per check and
+exits non-zero if anything failed. **`tests/TESTING.md` is the full guide** — every command,
+what a healthy run prints, what each failure symptom means, and a manual UI checklist.
 
-### Fast - no audio, browser or network
+### Everything safe, in one table
 
 ```bash
+.venv\Scripts\python.exe tests\run_all.py
+```
+
+22 suites, **3990 checks, ~3 minutes**. Nothing in this tier needs a GPU, a camera, a
+microphone, a browser, a network connection or an API key — and nothing in it can write your
+`.env`, your conversation history or your habit store. That is enforced by a guard that fails
+the run if any of them changed, not by convention.
+
+```bash
+.venv\Scripts\python.exe tests\run_all.py --list          # the inventory
+.venv\Scripts\python.exe tests\run_all.py --only gesture  # a subset
+.venv\Scripts\python.exe tests\run_all.py --integration   # + network / browser / model
+.venv\Scripts\python.exe tests\run_all.py --live          # + real-hardware checks
+```
+
+### The biggest ones, individually
+
+```bash
+.venv\Scripts\python.exe tests\test_ui.py                 # 553 checks
 .venv\Scripts\python.exe tests\test_automation.py         # 263 checks
-.venv\Scripts\python.exe tests\test_ui.py                 # 322 checks
-.venv\Scripts\python.exe tests\test_voice_control.py      # 186 checks
-.venv\Scripts\python.exe tests\test_tts_device.py         # 143 checks
-.venv\Scripts\python.exe tests\test_proactive_agent.py    # 140 checks
-.venv\Scripts\python.exe tests\test_emotion_engine.py     # 119 checks
-.venv\Scripts\python.exe tests\test_target_resolution.py  # 108 checks
-.venv\Scripts\python.exe tests\test_browser_selection.py  #  64 checks
-.venv\Scripts\python.exe tests\test_environment.py        #  63 checks
+.venv\Scripts\python.exe tests\test_gesture_control.py    # 248 checks
+.venv\Scripts\python.exe tests\test_hardware_profile.py   # 188 checks - OS, CPU, GPU
+.venv\Scripts\python.exe tests\test_setup_runtime.py      # 138 checks - installs nothing
 ```
 
 ### Needs hardware or network
@@ -716,17 +774,20 @@ and exit non-zero.
 .venv\Scripts\python.exe tests\test_audio_pipeline.py     # needs the TTS model
 .venv\Scripts\python.exe tests\test_stt_lifecycle.py      # needs a browser
 .venv\Scripts\python.exe tests\test_dmm_matrix.py         # needs a model endpoint
-.venv\Scripts\python.exe tests\test_voice.py              # TTS sandbox
 ```
 
 ### Needs a human
 
 ```bash
 .venv\Scripts\python.exe tests\test_barge_in_live.py      # you have to speak
+.venv\Scripts\python.exe tests\test_gesture_live.py       # you have to hold up a hand
 ```
 
+`test_gesture_live.py` is **safe by default** — the pointer records instead of moving, so you
+can run it while reading its output. `--real-mouse` moves your actual cursor and asks first.
+
 A passing UI suite does **not** mean the interface looks right. Render the screens and look at
-them.
+them — `tests/TESTING.md` §22 is the checklist.
 
 ---
 
@@ -749,7 +810,7 @@ project-kayra/
     ├── app.py              orchestrator: boot, listen/route loop, lifecycle
     ├── core/               paths, config, runtime state, local voice control
     ├── intelligence/       LLM routing + intent classifier, emotion engine
-    ├── input/              speech-to-text, browser selection, gesture
+    ├── input/              speech-to-text, browser selection, hand gestures
     ├── output/             Kokoro TTS, ONNX device manager
     ├── automation/         the "hands": actions, safety policy, target resolution
     ├── services/           chat, live search, deep research, proactive agent

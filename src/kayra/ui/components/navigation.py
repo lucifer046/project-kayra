@@ -17,16 +17,46 @@ eight primitives drawn with QPainter are sharp at any scale factor and cost noth
 
 import math
 
-from PySide6.QtCore import Qt, Signal, QSize, QRectF, QPointF
+from PySide6.QtCore import (Qt, Signal, QSize, QRect, QRectF, QPointF,
+                            QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import QPainter, QColor, QPen, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QButtonGroup, QLabel, QSizePolicy,
 )
 
-from kayra.ui.theme import (Color, Font, Space, Size, STATE_LABELS, STATE_COLORS,
+from kayra.ui.theme import (Color, Font, Space, Size, Motion, STATE_LABELS, STATE_COLORS,
                             repolish, glyph_dpr)
 from kayra.ui.components.primitives import Caption, Divider, _label
 from kayra.ui.components.orb import OrbBadge
+
+
+# THE ONE LIST OF DESTINATIONS. Both navigation surfaces read it: the persistent rail on the
+# five utility screens and the sliding drawer on Home and Chat. Two copies would be two places
+# to add a screen, and the second one would be forgotten.
+DESTINATIONS = (
+    ("home", "Home", "home"),
+    ("chat", "Chat", "chat"),
+    ("automation", "Automation", "automation"),
+    ("memory", "Memory", "memory"),
+    ("activity", "Activity", "activity"),
+    ("system", "System", "system"),
+    ("settings", "Settings", "settings"),
+)
+
+
+def _motion_allowed():
+    """
+    Whether shell transitions may animate.
+
+    Reads the SAME platform preference the ambient backdrop reads, so a user who has asked
+    for reduced motion gets one consistent answer across the whole interface rather than a
+    still backdrop beside a sliding rail.
+    """
+    try:
+        from kayra.ui.components.backdrop import prefers_reduced_motion
+        return not prefers_reduced_motion()
+    except Exception:
+        return True
 
 
 def _glyph(kind, color, size=16, dpr=None):
@@ -104,6 +134,73 @@ def _glyph(kind, color, size=16, dpr=None):
     return icon
 
 
+class NavIndicator(QWidget):
+    """
+    The amber rail marking the active destination, which SLIDES between items.
+
+    WHY THIS IS A WIDGET AND NOT A STYLESHEET RULE. The active item used to be marked by
+    `QPushButton#NavItem:checked { border-left: 2px solid accent }`. Qt applies a property
+    selector instantly and there is nothing to animate — so changing screens made the mark
+    vanish from one row and appear on another in the same frame, which is precisely the
+    "sudden" feel this pass is here to remove. A separate widget has a geometry, and a
+    geometry can be animated.
+
+    It is a SIBLING of the items, positioned over the rail's left edge, so it never
+    participates in the column's layout and cannot shift the rows it marks. Nothing here
+    polls: the animation runs only while it is travelling.
+    """
+
+    WIDTH = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedWidth(self.WIDTH)
+        self.hide()
+
+        self._animation = QPropertyAnimation(self, b"geometry", self)
+        self._animation.setDuration(Motion.indicator)
+        # OutCubic: fast away, settling in. A rail that decelerates into its destination
+        # reads as having arrived; a linear one reads as having been dragged.
+        self._animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def move_to(self, item, animate=True):
+        """
+        Travels to `item`. Pass `animate=False` for the first paint and for reduced motion —
+        an indicator that animates in from nowhere on startup is motion with nothing to say.
+        """
+        if item is None:
+            self.hide()
+            return
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        top_left = item.mapTo(parent, QPointF(0, 0).toPoint())
+        # Inset vertically so the rail marks the item rather than spanning it edge to edge.
+        inset = max(4, item.height() // 5)
+        target = QRect(top_left.x(), top_left.y() + inset,
+                       self.WIDTH, max(2, item.height() - 2 * inset))
+
+        self._animation.stop()
+        if not animate or self.isHidden():
+            self.setGeometry(target)
+            self.show()
+            self.raise_()
+            return
+        self._animation.setStartValue(self.geometry())
+        self._animation.setEndValue(target)
+        self._animation.start()
+        self.raise_()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(Color.accent))
+        painter.drawRoundedRect(self.rect(), 1.0, 1.0)
+        painter.end()
+
+
 class NavItem(QPushButton):
     """One destination. Checkable; the stylesheet paints the active rule and fill."""
 
@@ -135,15 +232,9 @@ class Sidebar(QWidget):
 
     navigate = Signal(str)
 
-    DESTINATIONS = (
-        ("home", "Home", "home"),
-        ("chat", "Chat", "chat"),
-        ("automation", "Automation", "automation"),
-        ("memory", "Memory", "memory"),
-        ("activity", "Activity", "activity"),
-        ("system", "System", "system"),
-        ("settings", "Settings", "settings"),
-    )
+    # Kept as a class attribute because callers reach for it there (the window builds its
+    # Ctrl+1..7 shortcuts from it). It IS the module-level tuple, not a second copy.
+    DESTINATIONS = DESTINATIONS
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -151,12 +242,15 @@ class Sidebar(QWidget):
         self.setFixedWidth(Size.sidebar)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, Space.base, 0, Space.md)
+        # Padded on both sides now, so the rail reads as a COLUMN OF CARDS floating in a
+        # panel rather than as full-bleed rows butted against the window edge. That single
+        # change is most of what separates the new rail from a generic admin sidebar.
+        layout.setContentsMargins(Space.md, Space.base, Space.md, Space.md)
         layout.setSpacing(0)
 
         # ── Brand ──
         brand_row = QHBoxLayout()
-        brand_row.setContentsMargins(Space.base, 0, Space.base, 0)
+        brand_row.setContentsMargins(Space.sm, 0, Space.sm, 0)
         brand_row.setSpacing(Space.sm)
         self.badge = OrbBadge(9)
         brand = _label("KAYRA", "BrandMark")
@@ -177,12 +271,17 @@ class Sidebar(QWidget):
             item.clicked.connect(lambda _=False, k=key: self.navigate.emit(k))
             layout.addWidget(item)
 
+        # A CHILD OF THE RAIL, not of the column: it is positioned over the items rather than
+        # laid out among them, so it can move without disturbing a single row.
+        self.indicator = NavIndicator(self)
+        self._indicator_placed = False
+
         layout.addStretch(1)
 
         # ── Status footer: always-visible answer to "is it working?" ──
         layout.addWidget(Divider())
         footer = QVBoxLayout()
-        footer.setContentsMargins(Space.base, Space.md, Space.base, 0)
+        footer.setContentsMargins(Space.sm, Space.md, Space.sm, 0)
         footer.setSpacing(Space.xxs)
         self.state_label = _label("Starting", "StatusName")
         self.detail_label = Caption("Bringing subsystems up")
@@ -199,8 +298,23 @@ class Sidebar(QWidget):
 
     def select(self, key):
         item = self._items.get(key)
-        if item is not None and not item.isChecked():
+        if item is None:
+            return
+        if not item.isChecked():
             item.setChecked(True)
+        # The FIRST placement is instant. An indicator that slides in from the top-left on
+        # startup is animating a transition that never happened.
+        self.indicator.move_to(item, animate=self._indicator_placed and _motion_allowed())
+        self._indicator_placed = True
+
+    def resizeEvent(self, event):
+        # The items move when the rail is resized, so the mark that points at one has to
+        # follow — without animating, because a window resize is not a navigation.
+        super().resizeEvent(event)
+        for key, item in self._items.items():
+            if item.isChecked():
+                self.indicator.move_to(item, animate=False)
+                break
 
     def set_state(self, state, detail=None):
         self.badge.set_state(state)

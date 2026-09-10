@@ -757,10 +757,36 @@ _metrics_thread = None
 _NVIDIA_SMI_MISSING = False
 
 
+def nvidia_telemetry_supported():
+    """
+    Is there any point asking `nvidia-smi` anything on this machine?
+
+    ASKED BEFORE THE FIRST SPAWN, NOT AFTER IT FAILS. The registry knows whether an NVIDIA
+    adapter exists and answers in microseconds, so a machine with an AMD or Intel GPU never
+    launches a process to discover that it has no NVIDIA one. Previously the absence was
+    learned from a `FileNotFoundError`, which is a correct answer arrived at the expensive way
+    — and on a machine that happens to have the tooling but not the card it was the WRONG
+    answer, because `nvidia-smi` would be found and then report nothing useful.
+    """
+    global _NVIDIA_SMI_MISSING
+    if _NVIDIA_SMI_MISSING:
+        return False
+    try:
+        from kayra.core import hardware
+        if not hardware.has_nvidia_gpu():
+            _NVIDIA_SMI_MISSING = True
+            return False
+    except Exception:
+        # Detection itself failing must not disable telemetry on a machine that has a GPU;
+        # fall through and let the spawn answer, exactly as before.
+        pass
+    return True
+
+
 def _run_nvidia_smi():
     """One sample, or None. Never raises; a missing tool is a normal outcome, not an error."""
     global _NVIDIA_SMI_MISSING
-    if _NVIDIA_SMI_MISSING:
+    if not nvidia_telemetry_supported():
         return None
     query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
     try:

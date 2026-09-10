@@ -45,9 +45,16 @@ from PySide6.QtWidgets import (
 from kayra.ui import theme
 from kayra.ui.theme import Color, Space, Size, Motion
 from kayra.ui.bridge import KayraBridge
+from kayra.ui.controls import KayraControls
 from kayra.ui.components.navigation import Sidebar
 from kayra.ui.components.orb import AssistantOrb, OrbBadge
 from kayra.ui.components.primitives import Caption, GhostButton, _label
+from kayra.ui.components.backdrop import AmbientBackdrop, prefers_reduced_motion
+from kayra.ui.components.navigation import _motion_allowed
+from kayra.ui.components.dock import FloatingDock
+from kayra.ui.components.drawer import NavigationDrawer
+from kayra.ui.components.chrome import (AppWindowChrome, install_native_chrome,
+                                        show_system_menu)
 from kayra.ui.views.home import HomeView
 from kayra.ui.views.chat import ChatView
 from kayra.ui.views.automation import AutomationView
@@ -292,15 +299,76 @@ class AmbientAssistant(QWidget):
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
+# │                            PAGE HOST                                   │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class _PageHost(QWidget):
+    """
+    The area below the title bar: the rail, the routed stack, and the two overlays.
+
+    THE OVERLAYS ARE CHILDREN, NOT LAYOUT ITEMS. The dock floats over the page and the
+    drawer covers it; neither may take space from the content, because the moment either did,
+    opening the drawer would relayout Home — the orb would slide, the backdrop's bloom would
+    move, and every elided caption would re-elide, twice per open. Children positioned in
+    `resizeEvent` cost two `setGeometry` calls and change nothing underneath them.
+
+    This class exists so that positioning lives in ONE place. Doing it from the window meant
+    reaching through two layers of layout to find the content rect, and getting a different
+    answer depending on whether the rail happened to be visible.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.dock = None
+        self.drawer = None
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.reposition_overlays()
+
+    def reposition_overlays(self):
+        """Centres the dock over the CONTENT, and stretches the drawer over everything."""
+        if self.drawer is not None:
+            self.drawer.sync_geometry()
+        dock = self.dock
+        # `isHidden()`, NOT `isVisible()`. A widget whose parent chain is not yet shown
+        # reports `isVisible() == False` even when nobody hid it, so the visibility test would
+        # skip positioning for the whole of construction and the dock would sit at (0, 0) in
+        # the corner until the first resize after the window was shown.
+        if dock is None or dock.isHidden():
+            return
+        dock.adjustSize()
+        # Centred on the content area rather than on the window, so the rail — when one is
+        # showing — does not push the dock visually off-centre. On Home and Chat there is no
+        # rail, so the two are the same; keeping the arithmetic honest means the dock stays
+        # correct if a rail is ever shown alongside it.
+        left = getattr(self, "content_left", 0)
+        width = max(1, self.width() - left)
+        dock.move(left + (width - dock.width()) // 2,
+                  self.height() - dock.height() - Size.dock_margin_bottom)
+        dock.raise_()
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
 # │                          CONTROL CENTRE                                │
 # └────────────────────────────────────────────────────────────────────────┘
 
 class KayraWindow(QMainWindow):
-    """The full application window: sidebar, routed content stack, status header."""
+    """The full application window: chrome, rail or dock, routed content stack."""
+
+    # The two screens that give up the permanent rail for the full window width and the
+    # floating dock. Everything else keeps the rail: those are dense utility screens where a
+    # visible list of destinations is worth its 224 pixels, and where a dock floating over a
+    # settings form would cover the last row of it.
+    DOCK_SCREENS = ("home", "chat")
 
     def __init__(self, bridge):
         super().__init__()
         self.bridge = bridge
+        # ONE action layer, shared by the dock, the shortcuts and anything else that acts.
+        # See `ui/controls.py`: the same press must not be implemented twice.
+        self.controls = KayraControls(bridge, self)
+        self._shutting_down = False
 
         self.setWindowTitle("Kayra")
         self.setWindowIcon(_app_icon())
@@ -311,7 +379,40 @@ class KayraWindow(QMainWindow):
         root.setObjectName("RootSurface")
         self.setCentralWidget(root)
 
-        layout = QHBoxLayout(root)
+        # ── The ambient ground ──
+        # A plain child, positioned by hand and lowered, rather than a layout item: it has to
+        # sit BEHIND everything including the rail, and a layout item would take space.
+        self.backdrop = AmbientBackdrop(root)
+        self.backdrop.setGeometry(0, 0, root.width(), root.height())
+        # Respect the platform's reduced-motion preference. The still frame is a complete
+        # picture, so nothing is lost except the drift.
+        self.backdrop.set_animated(not prefers_reduced_motion())
+
+        shell = QVBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        # ── Custom window chrome, WHERE THE PLATFORM SUPPORTS IT ──
+        # On anything but Windows — and under the offscreen platform the test suite uses —
+        # `install_native_chrome` declines and the native title bar stays. A degraded custom
+        # title bar is worse than the real one, so this falls back rather than half-working.
+        self.chrome = AppWindowChrome("Kayra")
+        self.chrome.minimizeRequested.connect(self.showMinimized)
+        self.chrome.maximizeRequested.connect(self._toggle_maximized)
+        self.chrome.closeRequested.connect(self.close)
+        self.chrome.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chrome.customContextMenuRequested.connect(
+            lambda point: show_system_menu(self, self.chrome.mapToGlobal(point)))
+        self.native_chrome = install_native_chrome(self, self.chrome)
+        if self.native_chrome:
+            shell.addWidget(self.chrome)
+        else:
+            self.chrome.setVisible(False)
+
+        self.host = _PageHost(root)
+        shell.addWidget(self.host, 1)
+
+        layout = QHBoxLayout(self.host)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -335,32 +436,249 @@ class KayraWindow(QMainWindow):
             self.views[key] = view
             self.stack.addWidget(view)
 
+        # ── The two overlays ──
+        self.dock = FloatingDock(self.host)
+        self.drawer = NavigationDrawer(self.host)
+        self.host.dock = self.dock
+        self.host.drawer = self.drawer
+        self._wire_dock()
+        self.drawer.navigate.connect(self.navigate_to)
+        self.drawer.closed.connect(lambda: self.dock.set_menu_open(False))
+
         self._current = None
+        self._current_key = None
         self.navigate_to("home")
         self.sidebar.select("home")
 
         self._voice_revision = -1
         bridge.stateChanged.connect(self._on_state)
         bridge.voiceStateChanged.connect(self._on_voice_state)
+        bridge.listeningChanged.connect(self._on_listening)
+        bridge.gestureStateChanged.connect(self.dock.set_gesture_status)
         bridge.bootStage.connect(lambda name: self.sidebar.set_state("STARTING", name))
         bridge.bootFinished.connect(self._on_boot_finished)
 
         self._install_shortcuts()
 
     # ──────────────────────────────────────────────────────────────────
+    #                              THE DOCK
+    # ──────────────────────────────────────────────────────────────────
+
+    def _wire_dock(self):
+        """
+        Every dock press routes to `self.controls` or to routing. NOTHING is decided here.
+
+        The dock emits intent and this connects it; the action itself lives in one place so
+        the tray, the shortcuts and the dock cannot drift into three behaviours.
+        """
+        self.dock.menuToggled.connect(self._toggle_drawer)
+        # THE PRIMARY BUTTON IS THE MICROPHONE NOW, not a second way into Chat. It routes to
+        # exactly the same action the keyboard shortcut and the tray use — there is no second
+        # listening state anywhere, and `_toggle_listening` reads the runtime before it acts.
+        self.dock.homeRequested.connect(lambda: self.navigate_to("home"))
+        self.dock.chatRequested.connect(lambda: self.navigate_to("chat"))
+        self.dock.listeningToggled.connect(self._toggle_listening)
+        self.dock.cameraToggled.connect(self._toggle_camera)
+        self.dock.gestureToggled.connect(self._toggle_gesture)
+        self.dock.shutdownRequested.connect(self._request_shutdown)
+
+    def _toggle_drawer(self):
+        """
+        Opens or closes the navigation drawer — but only on the screens that lack a rail.
+
+        `Ctrl+B` is reachable from every screen, and on a rail screen it would put TWO
+        navigation surfaces on one page, which is the one state `_apply_shell` exists to
+        prevent. The keyboard must not be a way around a rule the routing enforces.
+        """
+        if not self.uses_dock(self._current_key or "home"):
+            return
+        self.drawer.select(self._current_key or "home")
+        self.drawer.toggle()
+        self.dock.set_menu_open(self.drawer.is_open())
+
+    def _toggle_listening(self):
+        self.controls.toggle_listening()
+        self._sync_dock_state()
+
+    def _toggle_camera(self):
+        # RE-READ AFTERWARDS, never trust the request. A click that fails — the camera is
+        # unplugged, another application holds it — must leave the control showing OFF, not
+        # showing the state the user asked for.
+        self.controls.toggle_camera()
+        self.dock.set_gesture_status(self.bridge.gesture_status() or {})
+
+    def _toggle_gesture(self):
+        self.controls.toggle_gesture()
+        self.dock.set_gesture_status(self.bridge.gesture_status() or {})
+
+    def _request_shutdown(self):
+        """
+        Confirms, then hands over to the ONE authoritative shutdown path.
+
+        This does not stop threads, close browsers or silence audio itself: `controls`
+        delegates to `bridge.shutdown(hard=True)`, which is `app.request_shutdown` — the same
+        thing the spoken "turn off Kayra" and the tray's Quit call. A second teardown living
+        in the UI would inevitably drift out of step with the ordering the backend depends on.
+        """
+        if self._shutting_down:
+            return
+        if not self.controls.confirm_shutdown():
+            return
+        self._shutting_down = True
+        # Latched off and never re-enabled: teardown takes a couple of seconds and a second
+        # press during that window re-enters a shutdown that is already half done.
+        self.dock.set_shutting_down()
+        home = self.views.get("home")
+        if home is not None and hasattr(home, "mark_shutting_down"):
+            home.mark_shutting_down()
+
+    def _sync_dock_state(self):
+        """One synchronous read of everything the dock displays. It caches nothing."""
+        snapshot = self.bridge.voice_runtime_state() or {}
+        if snapshot:
+            self.dock.set_listening(snapshot.get("listening", True),
+                                    known=bool(snapshot.get("listening_known", True)))
+        else:
+            self.dock.set_listening(self.bridge.listening_enabled(),
+                                    known=self.bridge.listening_known())
+        self.dock.set_gesture_status(self.bridge.gesture_status() or {})
+
+    # ──────────────────────────────────────────────────────────────────
     #                             ROUTING
     # ──────────────────────────────────────────────────────────────────
 
+    def uses_dock(self, key):
+        """Home and Chat get the dock; every other screen keeps the permanent rail."""
+        return key in self.DOCK_SCREENS
+
     def navigate_to(self, key):
         view = self.views.get(key)
-        if view is None or view is self._current:
+        if view is None:
             return
+        if view is self._current:
+            # Re-selecting the current screen is not a no-op for the SHELL: the drawer may
+            # have asked for the page it is already on, and it still has to close.
+            if self.drawer.is_open():
+                self.drawer.close_drawer()
+            return
+        outgoing = self._current_key
         if self._current is not None:
             self._current.on_hide()
         self.stack.setCurrentWidget(view)
-        view.on_show()
         self._current = view
+        self._current_key = key
+        self._apply_shell(key)
+        view.on_show()
         self.sidebar.select(key)
+        self.drawer.select(key)
+        self._animate_page_in(view, outgoing, key)
+
+    # ──────────────────────────────────────────────────────────────────
+    #                        THE PAGE TRANSITION
+    # ──────────────────────────────────────────────────────────────────
+    # The destination fades and travels a short way into place. NOTHING IS TORN DOWN AND
+    # NOTHING IS REBUILT: `setCurrentWidget` has already happened, `on_show()` has already
+    # run, and this animates the widget that is now on screen. Chat keeps its transcript,
+    # the orb keeps its state, the camera keeps its frames — the transition is a repaint,
+    # not a reload.
+    #
+    # ONLY THE INCOMING PAGE MOVES. Cross-fading two views means compositing both through
+    # offscreen buffers at once, on the frame where the new screen is also doing its first
+    # layout — which is exactly where a stutter would show. One effect, one widget.
+
+    # Where a screen travels in from, so a route reads as having a direction. Home and Chat
+    # sit side by side in the dock, so moving between them travels the way the eye expects.
+    _ROUTE_ORDER = ("home", "chat", "automation", "memory", "activity", "system", "settings")
+
+    def _travel_sign(self, outgoing, incoming):
+        try:
+            return 1 if (self._ROUTE_ORDER.index(incoming)
+                         >= self._ROUTE_ORDER.index(outgoing)) else -1
+        except ValueError:
+            return 1
+
+    def _animate_page_in(self, view, outgoing, incoming):
+        from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
+        from PySide6.QtWidgets import QGraphicsOpacityEffect
+
+        if outgoing is None or not _motion_allowed():
+            return                      # the first paint is an arrival, not a transition
+
+        # A page already mid-transition is not re-animated from wherever it happened to be:
+        # the previous animation is stopped and its effect dropped first, so two runs cannot
+        # drive the same opacity in opposite directions.
+        self._end_page_animation()
+
+        effect = QGraphicsOpacityEffect(view)
+        view.setGraphicsEffect(effect)
+
+        fade = QPropertyAnimation(effect, b"opacity", self)
+        fade.setDuration(Motion.nav_transition)
+        fade.setEasingCurve(QEasingCurve.OutCubic)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+
+        offset = Motion.nav_travel * self._travel_sign(outgoing, incoming)
+        travel = QPropertyAnimation(view, b"pos", self)
+        travel.setDuration(Motion.nav_transition)
+        travel.setEasingCurve(QEasingCurve.OutCubic)
+        travel.setStartValue(view.pos() + QPoint(offset, 0))
+        travel.setEndValue(QPoint(0, 0))
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(fade)
+        group.addAnimation(travel)
+        group.finished.connect(self._end_page_animation)
+        self._page_animation = group
+        self._page_view = view
+        group.start()
+
+    def _end_page_animation(self):
+        """
+        Drops the composite layer and puts the page back on its exact pixel.
+
+        THE EFFECT MUST COME OFF. A QGraphicsOpacityEffect left in place routes every repaint
+        of that screen through an offscreen buffer for the rest of the session — which on
+        Home means the orb and the live camera preview, the two things in this application
+        that repaint most.
+        """
+        group = getattr(self, "_page_animation", None)
+        if group is not None:
+            group.stop()
+            self._page_animation = None
+        view = getattr(self, "_page_view", None)
+        if view is not None:
+            view.setGraphicsEffect(None)
+            view.move(0, 0)
+            self._page_view = None
+
+    def _apply_shell(self, key):
+        """
+        Swaps the two navigation surfaces. EXACTLY ONE of them is present at a time.
+
+        Home and Chat give up the rail so the content gets the full window width; every other
+        screen gives up the dock, because a pill floating over a settings form covers the last
+        row of it and those screens have no single interaction to build a dock around.
+        """
+        docked = self.uses_dock(key)
+        self.sidebar.setVisible(not docked)
+        self.dock.setVisible(docked and not self._shutting_down)
+        if not docked and self.drawer.is_open():
+            # The drawer belongs to the dock's screens. Leaving it open over a screen that
+            # already shows the rail would put two navigation surfaces on one page.
+            self.drawer.close_drawer()
+
+        # The chrome names the screen, EXCEPT on Home — there the orb is the heading and a
+        # title bar repeating "Home" says nothing.
+        self.chrome.set_subtitle("" if key == "home" else key.title())
+
+        # `content_left` is the rail's width when it is showing, so the dock centres on the
+        # content rather than on the window.
+        self.host.content_left = 0 if docked else self.sidebar.width()
+        self.dock.set_current_screen(key)
+        if docked:
+            self._sync_dock_state()
+        self.host.reposition_overlays()
 
     def _install_shortcuts(self):
         """Ctrl+1..7 for destinations; Ctrl+K jumps to Chat, the thing people want most."""
@@ -378,10 +696,15 @@ class KayraWindow(QMainWindow):
         stop.activated.connect(self.bridge.interrupt)
 
         # Ctrl+M is the MICROPHONE. A separate key for a separate concept, so neither can be
-        # reached by muscle memory for the other.
+        # reached by muscle memory for the other. Routed through `controls` rather than
+        # calling the bridge here, so the keyboard, the dock and the tray run one code path.
         mic = QShortcut(QKeySequence("Ctrl+M"), self)
-        mic.activated.connect(
-            lambda: self.bridge.set_listening(not self.bridge.listening_enabled()))
+        mic.activated.connect(self._toggle_listening)
+
+        # Ctrl+B opens and closes the navigation drawer, which is the shortcut every
+        # application with a collapsible rail uses for exactly this.
+        drawer = QShortcut(QKeySequence("Ctrl+B"), self)
+        drawer.activated.connect(self._toggle_drawer)
 
     def _focus_chat(self):
         self.navigate_to("chat")
@@ -405,10 +728,25 @@ class KayraWindow(QMainWindow):
         self.setWindowIcon(_app_icon(state))
 
     def _on_voice_state(self, state, text, detail, revision):
+        """
+        Fans the ONE resolved voice state out to every shell surface that shows it.
+
+        Three surfaces, one source. The rail, the drawer and the title-bar dot all render
+        what they are given and none of them re-derives it — which is the whole reason
+        `core.voice_state` exists, and why a stale revision is dropped here once rather than
+        in three places.
+        """
         if revision <= self._voice_revision:
             return
         self._voice_revision = revision
         self.sidebar.set_voice(state, text, detail)
+        self.drawer.set_voice(state, text, detail)
+        from kayra.core.voice_state import ORB_STATE
+        self.chrome.set_state(ORB_STATE.get(state, "IDLE"))
+
+    def _on_listening(self, listening, known=True):
+        """The dock's microphone control. A readout, never a remembered value."""
+        self.dock.set_listening(listening, known=known)
 
     def _detail_for(self, state):
         if state == "IDLE":
@@ -432,6 +770,21 @@ class KayraWindow(QMainWindow):
                 self.sidebar.set_state(self.bridge.state(), detail)
         else:
             self.sidebar.set_state("ERROR", "Startup failed")
+        # A SHELL BUILT BEFORE THE BACKEND IS READY MUST RE-READ WHEN IT BECOMES READY. The
+        # dock is constructed seconds before the session boots, and an event-driven control is
+        # never corrected for a value that never changed — so without this the microphone
+        # button keeps whatever it was painted with during the boot window, indefinitely. This
+        # is the same defect Home's control had, arriving at a new surface.
+        if not self._shutting_down:
+            self._sync_dock_state()
+
+    # ──────────────────────────────────────────────────────────────────
+    #                          WINDOW CHROME
+    # ──────────────────────────────────────────────────────────────────
+
+    def _toggle_maximized(self):
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+        self.chrome.set_maximized(self.isMaximized())
 
     # ──────────────────────────────────────────────────────────────────
     #                             WINDOW
@@ -478,9 +831,19 @@ class KayraWindow(QMainWindow):
     # The presentation swap has to follow the window however it is shown or hidden — the tray,
     # the close button, a minimise, or the taskbar. Hooking the events rather than every call
     # site is what stops the two surfaces from ever being visible together.
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # The backdrop is not a layout item — it has to sit behind the rail as well as the
+        # content — so its geometry follows the root by hand. Two integers per resize.
+        root = self.centralWidget()
+        if root is not None and getattr(self, "backdrop", None) is not None:
+            self.backdrop.setGeometry(0, 0, root.width(), root.height())
+            self.backdrop.lower()
+
     def showEvent(self, event):
         super().showEvent(event)
         self._sync_presentation()
+        self.chrome.set_maximized(self.isMaximized())
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -493,6 +856,8 @@ class KayraWindow(QMainWindow):
             # Minimising is "closed" as far as the presentation is concerned: the dashboard is
             # not on screen, so the compact form should be.
             self._sync_presentation()
+            # The middle caption button must never offer what the window has just done.
+            self.chrome.set_maximized(self.isMaximized())
 
     def closeEvent(self, event):
         """

@@ -360,9 +360,15 @@ def section_repair_refuses():
           repair.repair("").text == "" and not repair.repair("").changed)
 
     # Ambiguity is a refusal, not a coin toss.
+    #
+    # THE PAIR HAS TO BE ISOLATED FROM THE REAL VOCABULARY. This check used to use
+    # ("mute", "mate") against "moot", which stopped being ambiguous the moment "sleep mode"
+    # entered the control vocabulary — "mode" became a third, closer candidate and the stage
+    # correctly repaired to it. The check was right about the rule and wrong to assume the
+    # vocabulary would not grow, so the probe is now a nonsense word no real term is near.
     ambiguous = TranscriptRepair(context=ConversationContext(),
-                                 vocabulary=("mute", "mate"))
-    outcome = ambiguous.repair("moot", confidence=0.1)
+                                 vocabulary=("zorbik", "zarbik"))
+    outcome = ambiguous.repair("zurbik", confidence=0.1)
     check("two equally close candidates means no repair", not outcome.changed, repr(outcome))
 
     # A repair DOES happen when every guard is satisfied — otherwise the stage is dead code.
@@ -466,15 +472,48 @@ def section_page():
           "else if (!window.kayraSpeaking)" in js)
 
     # ── endpointing ──
-    check("endpointing needs BOTH recognizer silence and room silence",
-          "recognizerQuiet && roomQuiet" in js)
+    # The page now MIRRORS `kayra.core.endpointing.decide()`; the rules themselves are driven
+    # exhaustively in `tests/test_voice_turn.py` against the Python authority. What is checked
+    # here is that this page implements that decision and nothing else ends a turn.
+    check("the page has a single endpoint predicate",
+          "function endpointDecision" in js)
+    # ONE COMMIT POINT, counted in CODE rather than in prose — the page documents the removed
+    # bypass at length, so a raw substring count reads the explanation as an occurrence.
+    flush_lines = [line.strip() for line in js.splitlines()
+                   if "flushUtterance(" in line and not line.strip().startswith("//")]
+    check("only the endpoint decision commits an utterance",
+          len(flush_lines) == 2,
+          f"one definition + one call expected, got {flush_lines}")
+    check("and that one call is the endpoint decision's",
+          any("decision.commit" in line for line in flush_lines), str(flush_lines))
+    check("it needs BOTH recognizer silence and room silence",
+          "recognizer-busy" in js and "room-not-quiet" in js)
     check("it degrades to recognizer-only when there is no VAD",
-          "window.kayraVad.ready ? (now - lastVoiceMs) : sinceResult" in js)
+          "vadReady ? (now - lastVoiceMs) : sinceResult" in js)
     check("uncommitted words extend the wait rather than being cut",
           "interimGraceMs" in js)
     check("a short committed command is endpointed faster",
           "fastEndpointMs" in js)
-    check("nothing waits forever", "maxWaitMs" in js and "hardTimeout" in js)
+    check("nothing waits forever", "maxWaitMs" in js and "absoluteMaxMs" in js)
+
+    # THE CHECK THE SHUTDOWN BUG NEEDED. No transcript may end a turn while the acoustic
+    # detector still hears the person.
+    check("an audible speaker blocks the endpoint entirely",
+          "window.kayraVad.voice && !window.kayraSpeaking" in js
+          and "voice-active" in js)
+    check("a turn younger than the minimum cannot end", "minUtteranceMs" in js)
+    check("a transcript too short for the speech duration waits longer",
+          "continuationSpeechMs" in js and "transcript-truncated" in js)
+    check("the hard timeout is reached only after the voice check",
+          js.index("voice-active") < js.index('reason: "timeout"'),
+          "otherwise it can flush a sentence out from under a speaker")
+
+    # ── VAD hysteresis: a syllable-level dip must not end the speaking state ──
+    check("the detector has separate enter and exit thresholds",
+          "exitThreshold" in js and "vadReleaseRatio" in js)
+    check("and a release hold on top of them", "vadReleaseMs" in js)
+    check("the exit threshold is below the enter threshold",
+          "enterThreshold * tuning.vadReleaseRatio" in js)
 
     # ── the truncation bug this replaced ──
     check("an utterance that never finalized is still delivered",
@@ -510,10 +549,19 @@ def section_page():
           [{"text": "ok", "confidence": None}])
 
     tuning = stt._capture_tuning()
-    check("the tuning is complete",
-          set(tuning) == {"fastEndpointMs", "interimGraceMs", "maxWaitMs", "vadHangoverMs",
-                          "vadMargin", "vadEchoMargin", "vadFloorMin", "vadIntervalMs",
-                          "maxAlternatives"})
+    # TWO OWNERS, ONE PAYLOAD. The endpoint thresholds come from `core.endpointing`, which is
+    # the authority for when a turn ends; what `_capture_tuning` adds is what the MICROPHONE
+    # needs. Asserting the union catches either half silently losing a key.
+    from kayra.core.endpointing import tuning_payload
+    endpoint_keys = set(tuning_payload())
+    acoustic_keys = {"vadMargin", "vadEchoMargin", "vadReleaseRatio", "vadReleaseMs",
+                     "vadFloorMin", "vadIntervalMs", "maxAlternatives"}
+    check("the tuning is complete", set(tuning) == endpoint_keys | acoustic_keys,
+          str(sorted(set(tuning) ^ (endpoint_keys | acoustic_keys))))
+    check("the endpoint thresholds come from core.endpointing, not from here",
+          all(tuning[k] == tuning_payload()[k] for k in endpoint_keys))
+    check("the release ratio keeps the exit threshold below the enter threshold",
+          0.0 < tuning["vadReleaseRatio"] < 1.0, str(tuning["vadReleaseRatio"]))
     check("the echo margin is stricter than the ordinary one",
           tuning["vadEchoMargin"] > tuning["vadMargin"])
     check("more than one alternative is requested", tuning["maxAlternatives"] > 1)

@@ -63,6 +63,16 @@ class KayraBridge(QObject):
     # ── Speech backend ──
     sttBackendChanged = Signal(dict)        # the full requested/active snapshot
 
+    # ── Hand gesture control ──
+    # ONE signal carrying the whole resolved status, for the same reason `voiceStateChanged`
+    # carries the whole voice picture: a card that took its camera state from one signal and
+    # its gesture state from another would eventually render a combination that never existed.
+    #
+    # There is deliberately NO signal carrying camera frames. The preview PULLS from
+    # `camera_frame()` on its own timer — a per-frame queued signal is a queue, and a queue
+    # that the GUI thread drains more slowly than the camera fills it is unbounded latency.
+    gestureStateChanged = Signal(dict)
+
     # ── Conversation ──
     userMessage = Signal(str, str)          # text, source ("text" | "voice")
     assistantMessage = Signal(str)          # one spoken sentence, as it is produced
@@ -89,6 +99,8 @@ class KayraBridge(QObject):
         events.voice_state_changed = lambda state, text, detail, revision: (
             self.voiceStateChanged.emit(str(state), str(text), str(detail), int(revision)))
         events.stt_backend_changed = lambda state: self.sttBackendChanged.emit(dict(state or {}))
+        events.gesture_state_changed = lambda status: self.gestureStateChanged.emit(
+            dict(status or {}))
         events.mood_detected = lambda emotion, confidence: self.moodDetected.emit(str(emotion),
                                                                                   float(confidence))
         events.user_message = lambda text, source: self.userMessage.emit(str(text), str(source))
@@ -225,6 +237,10 @@ class KayraBridge(QObject):
         """
         return self._session.tts_device_report()
 
+    def intelligence_status(self):
+        """Which model tier is live, and what each route resolved to. `{}` before boot."""
+        return self._session.intelligence_status()
+
     def gpu_metrics(self):
         """
         Live GPU telemetry, or `{}`. Same source as the Settings device card, by construction.
@@ -241,6 +257,10 @@ class KayraBridge(QObject):
     def gpu_telemetry_pending(self):
         """True while GPU telemetry is still being fetched, as opposed to genuinely absent."""
         return self._session.gpu_telemetry_pending()
+
+    def graphics_profile(self):
+        """The physical graphics adapter on ANY machine, or `{}`. No telemetry, no vendor bias."""
+        return self._session.graphics_profile()
 
     # ──────────────────────────────────────────────────────────────────
     #                     VOICE PRESENCE AND BACKEND
@@ -279,6 +299,49 @@ class KayraBridge(QObject):
         implementation of the one operation that must not have two.
         """
         return self._session.set_stt_backend(backend)
+
+    # ──────────────────────────────────────────────────────────────────
+    #                       HAND GESTURE CONTROL
+    # ──────────────────────────────────────────────────────────────────
+
+    def set_gesture(self, enabled):
+        """
+        Turns hand gesture control on or off. Returns (committed, detail).
+
+        Enabling starts the camera first when it is off — the controller owns that ordering,
+        which is why no caller here has to check. A pass-through, like `set_tts_device`.
+        """
+        return self._session.set_gesture(enabled)
+
+    def set_camera(self, enabled):
+        """
+        Turns the camera on or off. Returns (committed, detail).
+
+        A SEPARATE axis from gesture control and it stays separate: seeing the preview and
+        having something move your pointer are different requests.
+        """
+        return self._session.set_camera(enabled)
+
+    def gesture_status(self):
+        """
+        Camera, gesture switch and runtime state. `{}` when nothing has ever been started.
+
+        Read live every time, never cached here — a cached copy in the UI would be a second
+        source of truth that could disagree with the controller, which is the failure this
+        whole layer is shaped to avoid.
+        """
+        return self._session.gesture_status()
+
+    def gesture_telemetry(self):
+        """Full diagnostics. Behind the advanced switch; never painted on the normal path."""
+        return self._session.gesture_telemetry()
+
+    def camera_frame(self):
+        """
+        The newest preview frame as `(rgb_bytes, width, height)`, or None. Cheap and
+        non-blocking: the conversion already happened on the gesture thread.
+        """
+        return self._session.camera_frame()
 
     # ──────────────────────────────────────────────────────────────────
     #                             MEMORY

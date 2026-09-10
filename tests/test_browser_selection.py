@@ -204,9 +204,46 @@ def section_engine():
         check("no browser is resolved without autostart", eng.browser is None)
         check("no processes are owned without autostart", eng.owned_pids == set())
 
-        for value in ("auto", "", "default", None):
+        # THE SENTINELS AND `None` ARE DIFFERENT INPUTS, and this check used to conflate them.
+        #
+        # "auto" / "" / "default" are the user SAYING "pick for me". `None` means the caller
+        # expressed nothing at all, so the engine reads `STT_BROWSER` from the configuration —
+        # which is the whole point of having that setting. Grouping them made this check read
+        # the developer's own `.env`: it passed on a machine with no `STT_BROWSER` and failed
+        # on one that had set it, on identical code. A tier-1 check must not do that.
+        for value in ("auto", "", "default"):
             e2 = SpeechToTextEngine(autostart=False, browser=value)
             check(f"{value!r} means no explicit preference", e2.preferred_browser is None)
+
+        # `None` defers to the CONFIGURATION, and both outcomes are pinned explicitly rather
+        # than inherited from whatever this machine happens to have configured.
+        #
+        # The configuration is substituted at the module's own `env` lookup, not through
+        # `os.environ`: `core.config.env()` gives `.env` PRECEDENCE over the process
+        # environment (documented, and deliberate), so setting a variable here would change
+        # nothing and the check would still be reading the developer's file.
+        import kayra.input.speech_to_text as stt_module
+        _saved_env = stt_module.env
+        try:
+            stt_module.env = lambda key, default=None: (
+                "edge" if key == "STT_BROWSER" else _saved_env(key, default))
+            e3 = SpeechToTextEngine(autostart=False, browser=None)
+            check("None defers to the configured STT_BROWSER",
+                  e3.preferred_browser == "edge", repr(e3.preferred_browser))
+
+            stt_module.env = lambda key, default=None: (
+                "auto" if key == "STT_BROWSER" else _saved_env(key, default))
+            e4 = SpeechToTextEngine(autostart=False, browser=None)
+            check("a configured 'auto' still means no explicit preference",
+                  e4.preferred_browser is None, repr(e4.preferred_browser))
+
+            stt_module.env = lambda key, default=None: (
+                None if key == "STT_BROWSER" else _saved_env(key, default))
+            e5 = SpeechToTextEngine(autostart=False, browser=None)
+            check("an unset STT_BROWSER means no explicit preference",
+                  e5.preferred_browser is None, repr(e5.preferred_browser))
+        finally:
+            stt_module.env = _saved_env
             SpeechToTextEngine._active_instance = None
 
         e3 = SpeechToTextEngine(autostart=False, browser="  EDGE  ")

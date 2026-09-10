@@ -128,6 +128,7 @@ class SettingsView(View):
         self._build_device()
         self._build_group("Models", self.MODELS)
         self._build_keys()
+        self._build_gesture()
         self._build_proactive()
         self._build_presence()
         self._build_actions()
@@ -497,6 +498,142 @@ class SettingsView(View):
             card.body.addWidget(SettingRow(label, help_text, control))
         self.content.addWidget(card)
 
+    # ──────────────────────────────────────────────────────────────────
+    #                       HAND GESTURE CONTROL
+    # ──────────────────────────────────────────────────────────────────
+
+    # THREE WORDS EACH, NOT FOURTEEN NUMBERS. Every one of these maps to a small table of
+    # thresholds in `kayra.input.gesture.config`; the numbers stay in `.env` for anyone who
+    # wants them, and the screen offers the three decisions a person can actually make. A
+    # settings page with a One Euro `min_cutoff` spin box on it is a page that teaches nothing
+    # and gets set wrong.
+    GESTURE = (
+        ("GESTURE_SENSITIVITY", "Gesture sensitivity",
+         "How readily a pose is recognised. Lower means you have to mean it.",
+         "choice", ["LOW", "MEDIUM", "HIGH"]),
+        ("GESTURE_CURSOR_SMOOTHING", "Cursor smoothing",
+         "Higher is steadier when your hand is still. It does not add lag when you move.",
+         "choice", ["LOW", "MEDIUM", "HIGH"]),
+        ("GESTURE_CLICK_SENSITIVITY", "Click sensitivity",
+         "How closed a pinch has to be, and how long it has to hold.",
+         "choice", ["LOW", "MEDIUM", "HIGH"]),
+        ("GESTURE_ENABLED", "Enable at startup",
+         "Whether hand gesture control starts with Kayra. Off by default — something that "
+         "moves your pointer should be something you asked for.",
+         "bool", None),
+        ("GESTURE_DIAGNOSTICS", "Advanced diagnostics",
+         "Logs frame rates, latency, stability and dropped frames at DEBUG level.",
+         "bool", None),
+    )
+
+    def _build_gesture(self):
+        """
+        The gesture card: two LIVE switches and the persisted preferences below them.
+
+        The two switches at the top behave exactly like the speech-device dropdown — they act
+        on the running controller immediately AND are reflected back from it, so a camera that
+        refuses to start leaves the switch off rather than showing what was asked for. The
+        rows underneath are ordinary `.env` settings that apply at the next start, and the
+        card says which is which rather than leaving the user to discover it.
+        """
+        card = Card("Hand gesture control")
+        self.gesture_pill = StatusPill("Off", "neutral")
+        card.add_header_widget(self.gesture_pill)
+        card.body.setSpacing(0)
+
+        self.camera_toggle = Toggle(False)
+        self.camera_toggle.toggled.connect(self._on_camera_toggle)
+        card.body.addWidget(SettingRow(
+            "Camera",
+            "Turns the camera on. Nothing is recorded and nothing leaves this machine. "
+            "The preview on Home reads this same stream.",
+            self.camera_toggle))
+        card.body.addWidget(RowRule())
+
+        self.gesture_toggle = Toggle(False)
+        self.gesture_toggle.toggled.connect(self._on_gesture_toggle)
+        card.body.addWidget(SettingRow(
+            "Hand gesture control",
+            "Lets your hand drive the pointer. Starts the camera if it is off. "
+            "Applies immediately.",
+            self.gesture_toggle))
+        card.body.addWidget(RowRule())
+
+        for index, (env_key, label, help_text, kind, options) in enumerate(self.GESTURE):
+            control = self._make_control(env_key, kind, options)
+            self._controls[env_key] = (control, kind)
+            if index:
+                card.body.addWidget(RowRule())
+            card.body.addWidget(SettingRow(label, help_text, control))
+
+        self.gesture_detail = Caption("The three settings above apply the next time Kayra "
+                                      "starts.")
+        self.gesture_detail.setContentsMargins(0, Space.sm, 0, 0)
+        card.body.addWidget(self.gesture_detail)
+        self.content.addWidget(card)
+
+        self.bridge.gestureStateChanged.connect(self._on_gesture_status)
+        # Built before the backend is ready, like every other screen — so it must re-read when
+        # it becomes ready. `gestureStateChanged` fires on transitions only, and there is no
+        # transition to correct a control that was painted from a pre-boot read.
+        self.bridge.bootFinished.connect(lambda ok, detail: self._refresh_gesture())
+
+    # NEITHER OF THESE LOGS ANYTHING, AND THAT IS THE RULE, NOT AN OMISSION. The settings
+    # recorder in `kayra.core.settings_log` is the ONE owner of "a setting changed", and
+    # `app.set_camera` / `app.set_gesture_control` already go through it transactionally —
+    # requested, run, committed only on success. A view that also announced the change would
+    # be the second of two lines for one event, and the two would eventually disagree about
+    # whether it took. No UI module imports the logger; `tests/test_logging.py` asserts it.
+
+    def _on_camera_toggle(self, enabled):
+        if getattr(self, "_gesture_syncing", False):
+            return
+        self.bridge.set_camera(bool(enabled))
+        self._refresh_gesture()
+
+    def _on_gesture_toggle(self, enabled):
+        if getattr(self, "_gesture_syncing", False):
+            return
+        self.bridge.set_gesture(bool(enabled))
+        self._refresh_gesture()
+
+    def _refresh_gesture(self):
+        self._on_gesture_status(self.bridge.gesture_status() or {})
+
+    def _on_gesture_status(self, status):
+        """
+        Reflects what the controller actually did. Never what the switch was set to.
+
+        This is the same requested-vs-active discipline the speech backend card follows, and
+        for the same reason: a screen showing "on" over a camera that failed to open is the one
+        thing a device setting must not do.
+        """
+        status = dict(status or {})
+        camera_state = str(status.get("camera", "OFF"))
+        camera_on = camera_state not in ("OFF", "ERROR")
+        gesture_on = bool(status.get("gesture_enabled"))
+        error = str(status.get("error", ""))
+
+        self._gesture_syncing = True
+        try:
+            self.camera_toggle.setChecked(camera_on)
+            self.gesture_toggle.setChecked(gesture_on)
+        finally:
+            self._gesture_syncing = False
+
+        if camera_state == "ERROR" or str(status.get("state")) == "ERROR":
+            self.gesture_pill.set_status("Error", "danger")
+        elif gesture_on:
+            self.gesture_pill.set_status("Active", "success")
+        elif camera_on:
+            self.gesture_pill.set_status("Camera on", "neutral")
+        else:
+            self.gesture_pill.set_status("Off", "neutral")
+
+        self.gesture_detail.setText(
+            error if error else
+            "The three settings above apply the next time Kayra starts.")
+
     def _build_proactive(self):
         card = Card("Proactive agent")
         self.proactive_toggle = Toggle(self.bridge.proactive_enabled())
@@ -656,6 +793,10 @@ class SettingsView(View):
         self.status.setText("Reloaded from .env.")
 
     def on_show(self):
+        # The gesture controls may have been changed by voice, or by Home, while this screen
+        # was hidden. `gestureStateChanged` fires on transitions only, so a screen returning to
+        # view has to take one synchronous read — the same rule Home follows for the microphone.
+        self._refresh_gesture()
         self.proactive_toggle.blockSignals(True)
         self.proactive_toggle.setChecked(self.bridge.proactive_enabled())
         self.proactive_toggle.blockSignals(False)

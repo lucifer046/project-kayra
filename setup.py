@@ -539,7 +539,105 @@ def _ort_report(python_exe):
         return {"ok": False, "error": "onnxruntime could not be queried"}
 
 
-def _nvidia_gpu_present():
+# +------------------------------------------------------------------------+
+# |                        GRAPHICS HARDWARE                               |
+# +------------------------------------------------------------------------+
+# THE DEPENDENCY DECISION IS MADE FROM THE HARDWARE, and this is where the hardware is read.
+#
+# Everything downstream -- which ONNX Runtime variant is installed, whether four NVIDIA CUDA
+# runtime wheels are downloaded, whether a CUDA session is probed, and whether the report says
+# PASS or NOT APPLICABLE -- follows from `detect_graphics()`. Nothing decides on the strength
+# of "this is Windows", "CUDA is on PATH", or "onnxruntime-gpu exists on PyPI".
+#
+# WHY THIS DUPLICATES `kayra.core.hardware` INSTEAD OF IMPORTING IT.
+# `setup.py` runs on the SYSTEM interpreter before `.venv` exists and imports nothing outside
+# the stdlib and nothing from `kayra` -- that is the rule this file is built on, and importing
+# the application in order to decide how to install the application would invert it. `winreg`
+# IS stdlib, so the same registry keys are read here directly. The two implementations are held
+# in agreement by `tests/test_setup_runtime.py`, which asserts that setup's verdict for this
+# machine matches `kayra.core.hardware.has_nvidia_gpu()`.
+
+try:
+    import winreg
+except ImportError:                     # pragma: no cover - non-Windows
+    winreg = None
+
+_GPU_CLASS_KEY = (r"SYSTEM\CurrentControlSet\Control\Class"
+                  r"\{4d36e968-e325-11ce-bfc1-08002be10318}")
+
+# PCI vendor ids -- the authoritative vendor answer. A driver's marketing string can be
+# rebranded or localised; a PCI vendor id cannot.
+_PCI_VENDORS = {0x10DE: "NVIDIA", 0x1002: "AMD", 0x1022: "AMD", 0x8086: "Intel",
+                0x5143: "Qualcomm", 0x1414: "Microsoft", 0x15AD: "VMware"}
+
+_SOFTWARE_ADAPTER_MARKERS = ("basic display adapter", "remote display", "remotefx",
+                             "virtual display", "citrix indirect display")
+
+
+def _registry_adapters():
+    """
+    [(vendor, name, vram_bytes)] for every graphics adapter, from the registry. [] off Windows.
+
+    Costs well under a millisecond and spawns nothing, so it is safe to call on a machine with
+    no GPU tooling of any kind -- which is exactly the machine whose answer matters most here.
+    """
+    if winreg is None:
+        return []
+    found = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _GPU_CLASS_KEY) as root:
+            index = 0
+            while True:
+                try:
+                    subkey = winreg.EnumKey(root, index)
+                except OSError:
+                    break
+                index += 1
+                if not subkey.isdigit():
+                    continue            # `Configuration`/`Properties` are not adapters
+                try:
+                    with winreg.OpenKey(root, subkey) as key:
+                        def value(name, default=None):
+                            try:
+                                return winreg.QueryValueEx(key, name)[0]
+                            except OSError:
+                                return default
+
+                        name = str(value("DriverDesc") or "").strip()
+                        if not name:
+                            continue
+                        if any(m in name.lower() for m in _SOFTWARE_ADAPTER_MARKERS):
+                            continue    # a display shim is not graphics hardware
+                        # The 64-bit field. `AdapterRAM` / `MemorySize` is 32-bit and clamped,
+                        # so an 8 GiB card reports 4095 MiB through it.
+                        try:
+                            vram = int(value("HardwareInformation.qwMemorySize") or 0)
+                        except (TypeError, ValueError):
+                            vram = 0
+                        device_id = str(value("MatchingDeviceId") or "").lower()
+                        vendor = ""
+                        match = re.search(r"ven_([0-9a-f]{4})", device_id)
+                        if match:
+                            vendor = _PCI_VENDORS.get(int(match.group(1), 16), "")
+                        if not vendor:
+                            provider = str(value("ProviderName") or "").lower()
+                            if "nvidia" in provider:
+                                vendor = "NVIDIA"
+                            elif "advanced micro" in provider or "amd" in provider:
+                                vendor = "AMD"
+                            elif "intel" in provider:
+                                vendor = "Intel"
+                        found.append((vendor, name, max(0, vram)))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    # Discrete-looking (more VRAM) first, so "the GPU" is the one a user would name.
+    found.sort(key=lambda item: item[2], reverse=True)
+    return found
+
+
+def _nvidia_smi_gpu():
     """(name, vram_mib) from nvidia-smi, or (None, None). One short call, never repeated."""
     try:
         completed = subprocess.run(
@@ -557,6 +655,143 @@ def _nvidia_gpu_present():
         return parts[0], float(parts[1])
     except ValueError:
         return parts[0], None
+
+
+def detect_graphics():
+    """
+    What graphics hardware is in this machine? Returns a dict; never raises.
+
+        {"adapters": [(vendor, name, vram_bytes), ...],
+         "vendors": ["NVIDIA", "AMD"],
+         "nvidia": True/False,          <- the ONLY gate for NVIDIA-specific provisioning
+         "nvidia_name": str or None,
+         "nvidia_vram_mib": float or None,
+         "primary": (vendor, name, vram_bytes) or None,
+         "driver_ready": True/False}    <- an NVIDIA card whose driver tooling answers
+
+    TWO SOURCES, AND THEY ANSWER DIFFERENT QUESTIONS. The registry says whether the CARD is
+    present; `nvidia-smi` says whether the DRIVER STACK is working. Both matter and neither
+    substitutes for the other:
+
+      * `nvidia-smi` alone was the previous gate. A machine with an NVIDIA card and a broken or
+        very old driver answers nothing, so setup concluded "no NVIDIA GPU" and quietly
+        provisioned CPU -- an accurate outcome reached by an inaccurate route, and one that
+        reports the wrong reason to a user who could have fixed it by updating a driver.
+      * The registry alone cannot say whether CUDA will work; only the session probe can, and
+        that step is unchanged.
+
+    `nvidia-smi` is only ever spawned when the registry has ALREADY found an NVIDIA adapter, so
+    an AMD or Intel machine launches no process at all to learn that it has no NVIDIA GPU.
+    """
+    adapters = _registry_adapters()
+    vendors = []
+    for vendor, _name, _vram in adapters:
+        if vendor and vendor not in vendors:
+            vendors.append(vendor)
+
+    nvidia_entry = next((a for a in adapters if a[0] == "NVIDIA"), None)
+    result = {
+        "adapters": adapters,
+        "vendors": vendors,
+        "nvidia": nvidia_entry is not None,
+        "nvidia_name": nvidia_entry[1] if nvidia_entry else None,
+        "nvidia_vram_mib": ((nvidia_entry[2] / (1024 ** 2))
+                            if (nvidia_entry and nvidia_entry[2]) else None),
+        "primary": adapters[0] if adapters else None,
+        "driver_ready": False,
+    }
+
+    if result["nvidia"]:
+        smi_name, smi_vram = _nvidia_smi_gpu()
+        if smi_name:
+            result["driver_ready"] = True
+            result["nvidia_name"] = smi_name
+            if smi_vram:
+                result["nvidia_vram_mib"] = smi_vram
+    elif not adapters and winreg is None:
+        # Off Windows there is no registry to read. Fall back to the tool, so a Linux
+        # developer with a real card is not told they have none.
+        smi_name, smi_vram = _nvidia_smi_gpu()
+        if smi_name:
+            result.update(nvidia=True, nvidia_name=smi_name, nvidia_vram_mib=smi_vram,
+                          driver_ready=True, vendors=["NVIDIA"],
+                          primary=("NVIDIA", smi_name, 0))
+
+    return result
+
+
+def _nvidia_gpu_present():
+    """
+    (name, vram_mib) when an NVIDIA GPU is present AND its driver answers, else (None, None).
+
+    Kept as a thin wrapper over `detect_graphics()` so the existing call sites read as before.
+    The gate is now the hardware, not the availability of a command-line tool.
+    """
+    graphics = detect_graphics()
+    if not graphics["nvidia"] or not graphics["driver_ready"]:
+        return None, None
+    return graphics["nvidia_name"], graphics["nvidia_vram_mib"]
+
+
+def describe_graphics(graphics):
+    """One line naming what was found, for the report. Never says NVIDIA on a machine without."""
+    if graphics["nvidia"]:
+        text = graphics["nvidia_name"] or "NVIDIA GPU"
+        vram = graphics.get("nvidia_vram_mib")
+        if vram:
+            text += f"  {vram / 1024:.1f} GiB"
+        if not graphics["driver_ready"]:
+            text += "  (driver tooling did not respond)"
+        return text
+    primary = graphics.get("primary")
+    if primary:
+        vendor, name, vram = primary
+        text = name or vendor or "graphics adapter"
+        if vram:
+            text += f"  {vram / 1024 ** 3:.1f} GiB"
+        return text
+    return "none detected"
+
+
+# The NVIDIA runtime wheels this setup installs, by distribution name. Listed separately from
+# `CUDA_RUNTIME_PINS` because reconciliation needs the NAMES without the versions: a machine
+# that no longer has an NVIDIA GPU should not keep carrying them, whatever version they are at.
+_NVIDIA_RUNTIME_DISTRIBUTIONS = (
+    "nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12",
+    "nvidia-cufft-cu12", "nvidia-cudnn-cu12",
+)
+
+
+def _reconcile_non_nvidia(python_exe, installed):
+    """
+    Undo an NVIDIA provisioning on a machine that does not have an NVIDIA GPU.
+
+    THE SCENARIO IS REAL AND WAS NOT HANDLED. A `.venv` provisioned on an NVIDIA laptop and
+    then carried to another machine -- or a machine whose card was removed -- kept
+    `onnxruntime-gpu` plus four CUDA runtime wheels. The previous behaviour was to KEEP them,
+    on the reasoning that `onnxruntime-gpu` "runs on the CPU perfectly well". That is true and
+    it is not the whole story: it leaves CUDA libraries on disk that nothing on this machine
+    can ever load, it makes the speech device card offer a GPU mode that cannot work, and
+    `run.py --doctor` then reports a CUDA build on a machine with no CUDA.
+
+    Removing the runtime wheels is safe in a way the ORT variant swap is not: the `nvidia-*`
+    distributions own their own files under `site-packages/nvidia/`, share no RECORD entries
+    with anything else, and are pure runtime payload -- so uninstalling one cannot leave a
+    half-deleted package behind, which is exactly the hazard `_ensure_ort_variant` documents.
+
+    Returns the list of distributions actually removed.
+    """
+    orphans = [name for name in _NVIDIA_RUNTIME_DISTRIBUTIONS if name in installed]
+    if not orphans:
+        return []
+    info("    This machine has no NVIDIA GPU, but CUDA runtime wheels are installed.")
+    for name in orphans:
+        info(f"        removing {name}")
+    if _pip(python_exe, "uninstall", "-y", *orphans, quiet=True).returncode != 0:
+        warn("Could not remove the orphaned CUDA runtime wheels; they are inert either way.")
+        return []
+    ok(f"Removed {len(orphans)} CUDA runtime wheel(s) this machine cannot use.")
+    return orphans
 
 
 def _probe_cuda_session(python_exe):
@@ -710,8 +945,16 @@ def configure_speech_runtime(python_exe, offer_gpu=True):
     step("Configuring the speech-synthesis runtime")
 
     state = {"gpu_name": None, "vram_mib": None, "ort": {}, "cuda_ok": False,
-             "cuda_reason": "", "variant": None, "ready": "cpu"}
+             "cuda_reason": "", "variant": None, "ready": "cpu",
+             # `cuda_applicable` is what separates "the CUDA check failed" from "there was
+             # never a CUDA check to run". Reporting FAIL on a machine with an AMD GPU
+             # describes a defect that does not exist and sends the user looking for a fix
+             # that has nothing to fix. See `speech_runtime_report`.
+             "cuda_applicable": False,
+             "graphics": None, "reconciled": []}
 
+    graphics = detect_graphics()
+    state["graphics"] = graphics
     gpu_name, vram = _nvidia_gpu_present()
     state["gpu_name"], state["vram_mib"] = gpu_name, vram
 
@@ -719,21 +962,46 @@ def configure_speech_runtime(python_exe, offer_gpu=True):
     present = installed_variants(installed)
 
     # ── No NVIDIA GPU: CPU is the correct answer, and installing a GPU wheel would be worse ──
-    if not gpu_name or not offer_gpu:
-        if gpu_name is None:
-            info("    No NVIDIA GPU detected (nvidia-smi did not answer).")
-        if ORT_GPU_PACKAGE in present and ORT_CPU_PACKAGE not in present:
-            info("    Keeping the installed onnxruntime-gpu; it runs on the CPU perfectly well.")
-        elif not present:
-            info("    Installing CPU onnxruntime ...")
-            if _pip(python_exe, "install", ORT_CPU_PACKAGE, quiet=True).returncode != 0:
-                fail("Could not install onnxruntime.")
-                return state
-        _ensure_ort_variant(python_exe, ORT_GPU_PACKAGE if ORT_GPU_PACKAGE in present
-                            else ORT_CPU_PACKAGE)
+    if not graphics["nvidia"] or not offer_gpu:
+        if not graphics["nvidia"]:
+            found = describe_graphics(graphics)
+            info(f"    Graphics: {found}")
+            info("    No NVIDIA GPU, so no CUDA or cuDNN wheels are installed.")
+
+        # RECONCILE, do not merely tolerate. A venv carried from an NVIDIA machine arrives
+        # with `onnxruntime-gpu` and four CUDA runtime wheels that this machine cannot load.
+        # Keeping them was the old behaviour and it is the wrong deterministic answer:
+        # the ORT variant here must match the hardware, not the machine it was built on.
+        if ORT_GPU_PACKAGE in present:
+            info("    Reconciling: replacing onnxruntime-gpu with the CPU build.")
+        if not _ensure_ort_variant(python_exe, ORT_CPU_PACKAGE):
+            state["ort"] = _ort_report(python_exe)
+            return state
+        state["reconciled"] = _reconcile_non_nvidia(python_exe,
+                                                    _installed_packages(python_exe))
+
         state["ort"] = _ort_report(python_exe)
         state["variant"] = state["ort"].get("package")
         ok("Speech synthesis will run on the CPU (supported, and fast enough).")
+        return state
+
+    # From here on an NVIDIA adapter is physically present, so CUDA is a question that has a
+    # meaningful answer and the report may mark it PASS or FAIL.
+    state["cuda_applicable"] = True
+
+    if not graphics["driver_ready"]:
+        # The card is here and its tooling is not. This is actionable and specific, unlike
+        # the old "no NVIDIA GPU detected" which sent the user looking for hardware they own.
+        warn(f"{graphics['nvidia_name'] or 'An NVIDIA GPU'} is installed, but nvidia-smi did "
+             "not respond.")
+        info("    That usually means the display driver needs installing or updating.")
+        info("    Provisioning the CPU runtime; re-run setup after updating the driver.")
+        if not _ensure_ort_variant(python_exe, ORT_CPU_PACKAGE):
+            state["ort"] = _ort_report(python_exe)
+            return state
+        state["ort"] = _ort_report(python_exe)
+        state["variant"] = state["ort"].get("package")
+        state["cuda_reason"] = "the NVIDIA driver did not respond to nvidia-smi"
         return state
 
     info(f"    NVIDIA GPU detected: {gpu_name}"
@@ -1253,8 +1521,16 @@ def speech_runtime_report(python_exe, state):
     line("Package location", os.path.dirname(ort_info.get("location") or "-"))
     line("Built for CUDA", ort_info.get("cuda_build") or "not a CUDA build")
     print()
-    line("Provider: CUDA", "offered" if "CUDAExecutionProvider" in providers else "not offered",
-         "CUDAExecutionProvider" in providers)
+    # NOT MARKED WRONG ON A MACHINE THAT HAS NO USE FOR IT. A red cross beside "Provider: CUDA
+    # — not offered" on a laptop with an Intel iGPU is the same false alarm as "CUDA: FAIL":
+    # the CPU wheel is the CORRECT thing to have installed there, and it does not offer CUDA
+    # by design. The mark is only meaningful when an NVIDIA GPU is present.
+    cuda_offered = "CUDAExecutionProvider" in providers
+    cuda_relevant = bool((state.get("graphics") or {}).get("nvidia"))
+    line("Provider: CUDA",
+         "offered" if cuda_offered else ("not offered (not needed here)" if not cuda_relevant
+                                         else "not offered"),
+         cuda_offered if cuda_relevant else None)
     line("Provider: CPU", "offered" if "CPUExecutionProvider" in providers else "not offered",
          "CPUExecutionProvider" in providers)
     # TensorRT is reported for completeness and deliberately NOT used for Kokoro: it builds an
@@ -1264,19 +1540,55 @@ def speech_runtime_report(python_exe, state):
           else "not offered"))
     print()
 
+    # ── The hardware this report is about ──
+    # Reported for EVERY machine and in its own terms. A user with a Radeon or an Intel iGPU
+    # is told what they have, not measured against a card they do not own.
+    graphics = state.get("graphics") or {"nvidia": False, "adapters": [], "vendors": []}
+    for index, (vendor, name, adapter_vram) in enumerate(graphics.get("adapters") or []):
+        label = "Graphics adapter" if index == 0 else "  also present"
+        detail = name or vendor or "unknown"
+        if adapter_vram:
+            detail += f"  {adapter_vram / 1024 ** 3:.1f} GiB"
+        line(label, detail)
+    if not graphics.get("adapters"):
+        line("Graphics adapter", "none detected")
+
     gpu_name = state.get("gpu_name")
     vram = state.get("vram_mib")
-    line("NVIDIA GPU", (f"{gpu_name}" + (f"  {vram / 1024:.1f} GiB" if vram else ""))
-         if gpu_name else "none detected", bool(gpu_name))
+    if graphics.get("nvidia"):
+        line("NVIDIA GPU", (f"{gpu_name}" + (f"  {vram / 1024:.1f} GiB" if vram else ""))
+             if gpu_name else f"{graphics.get('nvidia_name')} (driver not responding)",
+             bool(gpu_name))
+    else:
+        # NOT a failed check. There is no NVIDIA GPU here and nothing is wrong with that,
+        # so it is stated as a fact with no verdict mark beside it.
+        line("NVIDIA GPU", "not present on this machine")
 
+    # ── CUDA: PASS, FAIL, or NOT APPLICABLE ──
+    # The three-way distinction is the point. FAIL means "this machine could use CUDA and
+    # something is broken"; NOT APPLICABLE means "there is nothing here for CUDA to run on".
+    # Collapsing them, as this report used to, told every AMD and Intel user that three
+    # checks had failed and gave them nothing to act on.
+    applicable = bool(state.get("cuda_applicable"))
     cuda_ok = bool(state.get("cuda_ok"))
-    line("CUDA runtime (cuBLAS / cuFFT / cudart)", "PASS" if cuda_ok else "FAIL", cuda_ok)
-    line("cuDNN 9", "PASS" if cuda_ok else "FAIL", cuda_ok)
-    line("Real CUDA EP initialization", "PASS" if cuda_ok else "FAIL", cuda_ok)
+    if not applicable:
+        verdict, mark = "NOT APPLICABLE (no NVIDIA GPU)", None
+    else:
+        verdict, mark = ("PASS" if cuda_ok else "FAIL"), cuda_ok
+    line("CUDA runtime (cuBLAS / cuFFT / cudart)", verdict, mark)
+    line("cuDNN 9", verdict, mark)
+    line("Real CUDA EP initialization", verdict, mark)
     print()
+
+    if state.get("reconciled"):
+        line("Reconciled", f"removed {len(state['reconciled'])} orphaned CUDA wheel(s)", True)
 
     if cuda_ok:
         line("Kayra TTS GPU readiness", "READY (CUDAExecutionProvider)", True)
+    elif not applicable:
+        # A supported outcome, not a degraded one. Kokoro synthesizes at roughly real time on
+        # a modern CPU, which is why this is marked good rather than marked wrong.
+        line("Kayra TTS runtime", "CPU (correct for this hardware)", True)
     else:
         line("Kayra TTS GPU readiness", "CPU FALLBACK", False)
         if state.get("cuda_reason"):

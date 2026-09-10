@@ -83,6 +83,11 @@ class SessionEvents:
         self.voice_state_changed = lambda state, text, detail, revision: None
         # The speech backend: requested, active, and how that came to be.
         self.stt_backend_changed = lambda state: None
+        # Hand gesture control. A SEPARATE channel from every voice signal above, and it stays
+        # separate: the camera and the microphone are independent devices, and a screen that
+        # learned about one from the other's signal is the class of bug the voice state
+        # machine exists to end.
+        self.gesture_state_changed = lambda status: None
 
 
 class KayraSession:
@@ -225,7 +230,10 @@ class KayraSession:
             try:
                 request = getattr(self._app, "request_shutdown", None)
                 if request is not None:
-                    request(reason="ui")          # never returns: ends in os._exit(0)
+                    # `farewell=True`: the Home button confirms before it gets here, so
+                    # this is a CONFIRMED shutdown and gets the same spoken countdown the
+                    # spoken "shut down Kayra" gets. A signal handler still gets none.
+                    request(reason="ui", farewell=True)   # ends in os._exit(0)
                 else:                             # pragma: no cover - pre-rename backend
                     self._app._force_shutdown()
             except SystemExit:
@@ -332,6 +340,36 @@ class KayraSession:
         except Exception:
             return {}
 
+    def intelligence_status(self):
+        """
+        WHERE the thinking is happening: the tier, and the model behind each route.
+
+        READ FROM THE LIVE ENGINE, never from `.env`. A machine with cloud keys configured
+        and LM Studio running is a LOCAL machine, and a panel that recited the configuration
+        would name a provider that is answering nothing — the same rule the startup report
+        and the boot announcement already follow.
+
+        `{}` when the engine is not up yet, so a screen painted during the boot window shows
+        nothing rather than a plausible default. `dmm_status` / `chat_status` are the strings
+        the engine composes for its own diagnostics; reusing them is what keeps this panel
+        from becoming a second description of the routing.
+        """
+        engine = getattr(self._app, "engine", None) if self._app else None
+        if engine is None:
+            return {}
+        try:
+            online = bool(getattr(engine, "is_online", False))
+            return {
+                "tier": "Cloud" if online else "Local",
+                "decision": str(getattr(engine, "dmm_status", "") or ""),
+                "chat": str(getattr(engine, "chat_status", "") or ""),
+                # The DMM's own acceptance vocabulary. It is the honest measure of how much
+                # this assistant can be asked to DO, and it costs a `len()`.
+                "intents": len(getattr(engine, "funcs", ()) or ()),
+            }
+        except Exception:
+            return {}
+
     def gpu_metrics(self):
         """
         Live GPU telemetry, or `{}` when this machine has none.
@@ -350,6 +388,35 @@ class KayraSession:
             return dict(tts_device.gpu_metrics() or {})
         except Exception:
             return {}
+
+    def graphics_profile(self):
+        """
+        The PHYSICAL graphics adapter, for any machine — vendor-neutral and telemetry-free.
+
+        This is a different question from `gpu_metrics()`, and Home needs both. `gpu_metrics`
+        answers "what is the GPU doing right now", and only NVIDIA exposes that to us; this
+        answers "what graphics hardware is in this machine", which is knowable on every
+        machine and does not change. Keeping them apart is what lets the card name an AMD or
+        Intel adapter honestly and then say its utilization is not available, instead of
+        showing "No GPU detected" to somebody looking at their own graphics card.
+
+        Read from the cached static profile, so it costs a dict lookup per refresh.
+        """
+        try:
+            from kayra.core.system_profile import device_profile
+            profile = device_profile()
+        except Exception:
+            return {}
+        if not profile.get("gpu_name"):
+            return {}
+        return {
+            "name": profile["gpu_name"],
+            "vendor": profile.get("gpu_vendor") or "",
+            "vram_total": profile.get("vram_total") or 0,
+            "integrated": profile.get("gpu_integrated"),
+            "driver": profile.get("gpu_driver") or "",
+            "telemetry": bool(profile.get("has_nvidia")),
+        }
 
     def gpu_telemetry_pending(self):
         """
@@ -377,6 +444,76 @@ class KayraSession:
         """
         report = self.tts_device_report()
         return report.get("provider", "") if report else ""
+
+    # ──────────────────────────────────────────────────────────────────
+    #                     HAND GESTURE CONTROL
+    # ──────────────────────────────────────────────────────────────────
+    # Pass-throughs, for the same reason `set_tts_device` and `set_stt_backend` are: the
+    # controller owns the transaction (camera first, then the detector, then the pointer) and
+    # a session that sequenced it would be a second implementation of the one operation that
+    # must not have two.
+
+    def set_gesture(self, enabled):
+        """Turns hand gesture control on or off. Returns (ok, detail)."""
+        if not self._app:
+            return False, "not started"
+        try:
+            reply = self._app.set_gesture_control(bool(enabled), announce=False, source="ui")
+            status = self._app.gesture_status()
+            ok = bool(status.get("gesture_enabled")) == bool(enabled)
+            return ok, (reply or status.get("error", ""))
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def set_camera(self, enabled):
+        """Turns the camera on or off. Returns (ok, detail)."""
+        if not self._app:
+            return False, "not started"
+        try:
+            reply = self._app.set_camera(bool(enabled), announce=False, source="ui")
+            status = self._app.gesture_status()
+            active = str(status.get("camera", "OFF")) not in ("OFF", "ERROR")
+            return active == bool(enabled), (reply or status.get("error", ""))
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def gesture_status(self):
+        """
+        Camera, gesture switch and runtime state — three separate fields, read live.
+
+        `{}` when gesture control has never been started, which is what lets Home show the
+        genuinely-off state rather than a plausible-looking empty one. Never constructs a
+        controller: a status read must not be able to open a camera.
+        """
+        if not self._app:
+            return {}
+        try:
+            return self._app.gesture_status() or {}
+        except Exception:
+            return {}
+
+    def gesture_telemetry(self):
+        """Diagnostics. Behind the advanced switch; never on the normal path."""
+        if not self._app:
+            return {}
+        try:
+            return self._app.gesture_telemetry() or {}
+        except Exception:
+            return {}
+
+    def camera_frame(self):
+        """
+        The newest preview frame as `(rgb_bytes, width, height)`, or None.
+
+        PULLED, never pushed. See `ui.components.camera_preview` for why a signal carrying
+        frames would be a queue that can grow and this cannot.
+        """
+        if not self._app:
+            return None
+        try:
+            return self._app.gesture_preview()
+        except Exception:
+            return None
 
     def set_tts_device(self, mode):
         """
@@ -541,6 +678,13 @@ class KayraSession:
                 pass
 
             self._ready.set()
+            # AFTER every subsystem is verified and BEFORE the listener opens the
+            # microphone. Latched inside `app`, so a session that somehow boots twice, or a
+            # console loop running beside this one, still announces exactly once.
+            try:
+                kayra_app.speak_boot_announcement()
+            except Exception:
+                pass
             detail = self._boot_summary()
             self.events.boot_stage("Ready", 0.0)
             self.events.boot_finished(True, detail)
@@ -641,16 +785,62 @@ class KayraSession:
         """
         One complete turn, in the same order as `app.Main_Loop`.
 
-        confirmation gate -> runtime bookkeeping -> emotion -> DMM -> Execute_Task
+        lifecycle confirmation -> local control -> automation confirmation
+            -> runtime bookkeeping -> emotion -> DMM -> Execute_Task
 
-        The ordering is not incidental. The confirmation gate runs BEFORE the classifier
+        The ordering is not incidental. Both confirmation gates run BEFORE the classifier
         because a bare "yes" sent to the DMM comes back as `general yes` and is answered by the
-        chatbot, so a pending "should I restart your computer?" would never resolve.
+        chatbot, so a pending "should I restart your computer?" would never resolve. The
+        lifecycle gate runs before the automation one because it is the one that can be
+        answered from the other surface — a question asked about speech, answered by typing.
         """
         app = self._app
         self.events.user_message(text, source)
 
-        # ── Pending confirmation ──
+        # ── Pending LIFECYCLE confirmation (shutdown / sleep) ──
+        # FIRST, and before the automation confirmation, because it can be answered from
+        # either surface: the question may have been asked in response to something SPOKEN and
+        # answered by typing "yes", or the reverse. There is one manager for the process, so
+        # both surfaces resolve the same request rather than each holding their own.
+        #
+        # `resolve_lifecycle_confirmation` returns True only when the utterance was consumed
+        # as an answer. Anything else falls through and is handled as an ordinary turn.
+        resolve_lifecycle = getattr(app, "resolve_lifecycle_confirmation", None)
+        if resolve_lifecycle is not None:
+            try:
+                if resolve_lifecycle(text, source="ui"):
+                    self._runtime.note_user_utterance()
+                    self._context.note_user_turn(text)
+                    self._set_state("IDLE")
+                    return
+            except Exception:
+                pass                # a confirmation failure must never wedge the turn loop
+
+        # ── Local control vocabulary ──
+        # Typed input never reaches `Listen()`, so without this a typed "stop listening" would
+        # be classified by the DMM instead of being handled locally — and a typed "shut down
+        # Kayra" would take a different road from a spoken one. It routes through the SAME
+        # `_dispatch_control`, so the dangerous kinds ask here exactly as they do for speech.
+        #
+        # A typed command carries no transcription risk, so gating it buys no safety on its
+        # own. It is gated anyway because two roads to one irreversible action is the shape of
+        # the bug this milestone removed, and because the confirmation is what makes the
+        # request visible on screen before it happens.
+        classify = getattr(app, "classify_control", None)
+        dispatch = getattr(app, "_dispatch_control", None)
+        if classify is not None and dispatch is not None:
+            try:
+                command = classify(text)
+            except Exception:
+                command = None
+            if command is not None:
+                self._runtime.note_user_utterance()
+                self._context.note_user_turn(text)
+                dispatch(command.kind, text, source="ui", command=command)
+                self._set_state("IDLE")
+                return
+
+        # ── Pending AUTOMATION confirmation ──
         pending = getattr(app, "pending_confirmation", None)
         resolve = getattr(app, "resolve_confirmation", None)
         if pending and resolve and pending():
@@ -756,6 +946,12 @@ class KayraSession:
                     else "Kayra is awake.", "info")
             elif event == "barge_in":
                 self.events.system_message("Interrupted.", "warning")
+            elif event == "gesture_state":
+                # Forwarded verbatim. This layer does not decide what the status MEANS — the
+                # gesture controller resolved that already, exactly as the voice state machine
+                # resolves the microphone. A session that re-derived "is a hand visible?" from
+                # two fields would be a second writer to the one card that shows it.
+                self.events.gesture_state_changed(dict(payload))
         except Exception:
             pass
 

@@ -332,7 +332,23 @@ def section_environment_shapes():
         check("GPU-capable: the runtime status is OK",
               diag.cuda_runtime_status == td.RUNTIME_OK)
         check("GPU-capable: cuDNN is reported OK", diag.cudnn_status == td.RUNTIME_OK)
-        check("GPU-capable: no failure reason", not diag.failure_reason)
+
+        # `failure_reason` EXPLAINS WHY THE ACTIVE DEVICE IS NOT THE GPU, and "CPU was
+        # requested." is a perfectly good explanation — it is the user's own setting.
+        #
+        # This check used to assert the reason was EMPTY, which made it fail on any machine
+        # whose `.env` sets `TTS_DEVICE_MODE=CPU` — including this developer's. That is a
+        # tier-1 suite reading the host's configuration, which is the one thing a tier-1
+        # suite must never do. What actually matters is that a usable CUDA runtime is never
+        # described as BROKEN, so that is what is asserted.
+        reason = (diag.failure_reason or "").lower()
+        check("GPU-capable: a usable CUDA runtime is never reported as broken",
+              not any(word in reason for word in
+                      ("missing", "failed", "error", "could not", "unavailable")),
+              diag.failure_reason)
+        if diag.mode == td.MODE_CPU:
+            check("GPU-capable: choosing CPU is reported as a choice",
+                  "request" in reason or not reason, diag.failure_reason)
         check("GPU-capable: AUTO plans CUDA first",
               td.plan_providers("AUTO")[0] == td.CUDA_PROVIDER)
         print_info(f"live GPU: {diag.gpu_name} / {diag.ort_package} {diag.ort_version} "

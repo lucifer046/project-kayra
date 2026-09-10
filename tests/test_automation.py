@@ -193,8 +193,15 @@ def section_normalizer():
         ("take screenshot",     "screen.screenshot",    None),
         ("set timer 5 minutes", "timer.add",            None),
         ("cancel timer",        "timer.cancel",         None),
-        ("system shutdown",     "system.shutdown",      None),
-        ("system restart",      "system.restart",       None),
+        # A BARE POWER VERB NAMES NOTHING, so it no longer becomes a machine action. See the
+        # power-target gate: "system shutdown the engine car" — a malformed transcript of a
+        # request about KAYRA — used to reach `system.shutdown` through a substring test and
+        # produce "This will shut down your computer. Should I go ahead?".
+        ("system shutdown",     "system.power_ambiguous",  None),
+        ("system restart",      "system.power_ambiguous",  None),
+        ("system shutdown the computer", "system.shutdown", None),
+        ("system restart the computer",  "system.restart",  None),
+        ("system shutdown the engine car", "system.power_kayra", None),
         ("system lock",         "system.lock",          None),
         ("system volume up",    "system.volume",        None),
         ("wifi off",            "system.wifi_off",      None),
@@ -334,12 +341,77 @@ def section_confirm_allow():
     print_system("\n[5] Safety — CONFIRM and ALLOW")
 
     context = AutomationContext()
-    must_confirm = ["system shutdown", "system restart", "wifi off",
+    # A power action is CONFIRM only once the COMPUTER has been named explicitly. Without a
+    # target it is DENY, which is checked separately below.
+    must_confirm = ["system shutdown the computer", "system restart the computer",
+                    "system turn off my pc", "wifi off",
                     "delete file report.txt", "delete folder build"]
     for token in must_confirm:
         action = auto.normalize_command(token, context)
         verdict, _ = classify_action(action)
         check(f"CONFIRM '{token}'", verdict == Risk.CONFIRM, f"got {verdict}")
+
+    # ── THE POWER-TARGET BOUNDARY ──
+    # "shut down Kayra" and "shut down the computer" are different operations and this is
+    # where they are kept apart. The live failure: a malformed transcript reached
+    # `system.shutdown` and Kayra offered to end the user's Windows session.
+    from kayra.automation.policy import (resolve_power_target, TARGET_COMPUTER,
+                                         TARGET_KAYRA, TARGET_AMBIGUOUS, POWER_VERBS)
+
+    for payload, expected in (
+            ("shutdown the engine car", TARGET_KAYRA),
+            ("shut down the engine", TARGET_KAYRA),
+            ("shut down kayra", TARGET_KAYRA),
+            ("turn off yourself", TARGET_KAYRA),
+            ("shut down the computer", TARGET_COMPUTER),
+            ("turn off my pc", TARGET_COMPUTER),
+            ("power off the laptop", TARGET_COMPUTER),
+            ("shutdown windows", TARGET_COMPUTER),
+            ("shutdown", TARGET_AMBIGUOUS),
+            ("shut down", TARGET_AMBIGUOUS),
+            ("", TARGET_AMBIGUOUS),
+            ("shut down kayra and the computer", TARGET_AMBIGUOUS),
+    ):
+        got = resolve_power_target(payload)
+        check(f"power target of '{payload}' is {expected}", got == expected, got)
+
+    check("the power verbs are the session-wide ones",
+          POWER_VERBS == frozenset({"shutdown", "restart", "sign_out", "sleep"}))
+    check("locking is NOT a power verb — one keystroke undoes it",
+          "lock" not in POWER_VERBS)
+
+    # Nothing without an explicit computer target may reach a machine power action.
+    for token in ("system shutdown", "system shut down", "system restart",
+                  "system shutdown the engine car", "system shut down the engine",
+                  "system shutdown kayra", "system sleep", "system reboot"):
+        action = auto.normalize_command(token, context)
+        verdict, reason = classify_action(action)
+        check(f"'{token}' is DENIED, not confirmed", verdict == Risk.DENY,
+              f"{action.key} -> {verdict}")
+        check(f"'{token}' never becomes a machine power action",
+              action.action not in POWER_VERBS, action.key)
+
+    # A renamed assistant gets the same protection.
+    check("a renamed assistant is still recognised as the Kayra target",
+          resolve_power_target("shut down vega", assistant_alias="vega") == TARGET_KAYRA)
+
+    # The executor answers the two refusals with WORDS, and touches nothing.
+    for verb in ("power_ambiguous", "power_kayra"):
+        outcome = auto.execute_action(Action("system", verb, target="shutdown the engine car",
+                                             parameters={"verb": "shutdown"}))
+        check(f"'{verb}' does not execute", outcome.status != Status.OK, outcome.status)
+        check(f"'{verb}' explains itself", bool(outcome.message), outcome.message)
+    ambiguous = auto.execute_action(Action("system", "power_ambiguous", target="shutdown"))
+    check("an ambiguous power request asks which target",
+          "computer" in ambiguous.message.lower() and "kayra" in ambiguous.message.lower(),
+          ambiguous.message)
+
+    # Turning the display off is not suspending the machine.
+    screen = auto.normalize_command("system turn off screen", context)
+    check("'turn off screen' blanks the display rather than suspending",
+          screen.key == "system.screen_off", screen.key)
+    check("and therefore needs no power target",
+          classify_action(screen)[0] == Risk.ALLOW)
 
     for label, command in [("shutdown via shell", "shutdown /s /t 0"),
                            ("file delete", "del report.txt"),
@@ -430,10 +502,17 @@ def section_confirmation():
     # End-to-end through the module-level manager used by main.py.
     auto.CONFIRMATIONS.cancel()
     check("no confirmation is pending initially", auto.pending_confirmation() is None)
-    result = auto.execute_action(Action("system", "shutdown"))
+    # An EXPLICITLY TARGETED computer shutdown. A bare one is DENIED before it gets here,
+    # which is the point of the gate — so the confirmation flow is exercised with the only
+    # kind of power action that can legitimately reach it.
+    result = auto.execute_action(Action("system", "shutdown",
+                                        target="shut down the computer",
+                                        parameters={"power_target": "COMPUTER"}))
     check("a shutdown request asks instead of executing",
           result.status == Status.NEEDS_CONFIRMATION, result.status)
     check("the question mentions shutting down", "shut down" in result.message.lower())
+    check("and names the COMPUTER as the target, not Kayra",
+          "computer" in result.message.lower(), result.message)
     check("main.py can see the pending question", auto.pending_confirmation() is not None)
 
     handled, reply = auto.resolve_confirmation("open chrome")
@@ -765,9 +844,18 @@ def section_audit():
     clear_audit()
     auto.CONFIRMATIONS.cancel()
 
-    auto.execute_action(Action("system", "shutdown"))
+    auto.execute_action(Action("system", "shutdown", target="shut down the computer",
+                               parameters={"power_target": "COMPUTER"}))
     events = [entry["event"] for entry in recent_audit()]
     check("a confirmation-required action is logged", AUDIT_CONFIRM in events, str(events))
+
+    # An untargeted power request is BLOCKED, and the block is auditable.
+    clear_audit()
+    auto.CONFIRMATIONS.cancel()
+    auto.execute_action(auto.normalize_command("system shutdown"))
+    blocked = [entry["event"] for entry in recent_audit()]
+    check("an untargeted power request is logged as blocked",
+          AUDIT_BLOCKED in blocked, str(blocked))
     auto.CONFIRMATIONS.cancel()
 
     clear_audit()

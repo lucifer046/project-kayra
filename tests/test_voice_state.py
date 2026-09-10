@@ -89,13 +89,20 @@ def machine(clock=None, **facts):
     return m
 
 
-def resolve(**facts):
-    """The pure precedence function, with sensible defaults for anything unspecified."""
+def resolve(voice_age_ms=5000.0, **facts):
+    """
+    The pure precedence function, with sensible defaults for anything unspecified.
+
+    `voice_age_ms` is how long the VAD has been saying what it is saying. It defaults to a
+    large value — "this has been true for a while" — because that is the ordinary case and
+    the sustained-voice guard only exists for one branch. The branch that cares passes a
+    small value explicitly.
+    """
     base = {"assistant_state": "IDLE", "listening": True, "sleeping": False,
             "shutting_down": False, "voice_available": True,
             "backend_status": "LISTENING", "voice_active": False}
     base.update(facts)
-    return VoiceStateMachine._compute(base)[0]
+    return VoiceStateMachine._compute(base, voice_age_ms)[0]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -216,8 +223,39 @@ def section_silence():
 def section_barge_in():
     print_system("\n[3] Barge-in — the user takes the floor")
 
-    check("a voice arriving over playback is USER_SPEAKING, not 'interrupted'",
+    check("a SUSTAINED voice arriving over playback is USER_SPEAKING, not 'interrupted'",
           resolve(assistant_state="SPEAKING", voice_active=True) == VoiceState.USER_SPEAKING)
+
+    # ── TTS ECHO MUST NOT REPAINT THE STATE ──
+    # OBSERVED: while Kayra was speaking the visual flipped ASSISTANT_SPEAKING <->
+    # USER_SPEAKING repeatedly. The page already raises the VAD threshold during playback, but
+    # residual echo still crosses it in bursts and ANY crossing was enough. A person taking
+    # the floor speaks for a few hundred milliseconds; an echo spike does not.
+    check("a BRIEF voice spike over playback stays ASSISTANT_SPEAKING",
+          resolve(assistant_state="SPEAKING", voice_active=True, voice_age_ms=40.0)
+          == VoiceState.ASSISTANT_SPEAKING,
+          "a single VAD crossing is not evidence of a person while Kayra is audible")
+    check("and so does one just under the dwell",
+          resolve(assistant_state="SPEAKING", voice_active=True,
+                  voice_age_ms=VoiceStateMachine.BARGE_IN_VAD_DWELL_MS - 1)
+          == VoiceState.ASSISTANT_SPEAKING)
+    check("one just over it does take the floor",
+          resolve(assistant_state="SPEAKING", voice_active=True,
+                  voice_age_ms=VoiceStateMachine.BARGE_IN_VAD_DWELL_MS + 1)
+          == VoiceState.USER_SPEAKING)
+    check("the dwell is short enough not to feel laggy",
+          VoiceStateMachine.BARGE_IN_VAD_DWELL_MS <= 500.0,
+          f"{VoiceStateMachine.BARGE_IN_VAD_DWELL_MS} ms")
+
+    # THE DWELL DOES NOT SLOW A REAL BARGE-IN. A spoken "stop" reaches the turn machine as
+    # INTERRUPTING through the page's interim interrupt flag, and that branch is immediate.
+    check("an INTERRUPTING turn takes the floor with no dwell at all",
+          resolve(assistant_state="INTERRUPTING", voice_active=False, voice_age_ms=0.0)
+          == VoiceState.USER_SPEAKING)
+
+    # And it applies ONLY over playback: a voice while merely listening is immediate.
+    check("while listening, a voice is USER_SPEAKING immediately",
+          resolve(voice_active=True, voice_age_ms=0.0) == VoiceState.USER_SPEAKING)
     check("the turn machine's INTERRUPTING is USER_SPEAKING too",
           resolve(assistant_state="INTERRUPTING") == VoiceState.USER_SPEAKING)
     check("speaking with nobody talking over it is ASSISTANT_SPEAKING",
@@ -513,7 +551,8 @@ def section_sequences():
     step(voice_active=False)
     step(assistant_state="PROCESSING")
     step(assistant_state="SPEAKING")
-    step(voice_active=True)                       # barge-in
+    step(voice_active=True)                       # the voice starts...
+    step()                                        # ...and persists past the dwell
     step(assistant_state="PROCESSING", voice_active=False)
     step(assistant_state="IDLE")
 

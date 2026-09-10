@@ -22,28 +22,36 @@
 4. [High-level architecture](#4-high-level-architecture)
 5. [Complete data flow](#5-complete-data-flow)
 6. [Input architecture](#6-input-architecture)
+6b. [The utterance boundary — one commit point](#6b-the-utterance-boundary--one-commit-point)
 7. [Emotion engine](#7-emotion-engine)
 8. [Decision-Making Model](#8-decision-making-model-dmm)
 8b. [Model provider routing and failover](#8b-model-provider-routing-and-failover)
+8c. [The DMM empty-response retry bound](#8c-the-dmm-empty-response-retry-bound)
 9. [Context system](#9-context-system)
 10. [Chatbot](#10-chatbot)
 11. [Real-time search](#11-real-time-search)
 12. [Deep research](#12-deep-research)
 13. [Automation architecture](#13-automation-architecture)
 14. [Automation safety](#14-automation-safety)
+14b. [The power-target boundary](#14b-the-power-target-boundary--kayra-is-not-the-computer)
+17c. [Confirmation ownership and short answers](#17c-confirmation-ownership-and-short-answers)
+22b. [Turn ownership and stale work](#22b-turn-ownership-and-stale-work)
 15. [Browser / STT Chrome lifecycle](#15-browser--stt-chrome-lifecycle)
 15b. [Live speech-backend switching](#15b-live-speech-backend-switching)
 16. [TTS architecture](#16-tts-architecture)
 16b. [TTS device selection (AUTO / GPU / CPU)](#16b-tts-device-selection)
 17. [Barge-in and the local control layer](#17-barge-in-and-the-local-control-layer)
+17b. [Dangerous voice control is confirmation-gated](#17b-dangerous-voice-control-is-confirmation-gated)
 18. [Self-echo protection](#18-self-echo-protection)
 19. [Proactive agent](#19-proactive-agent)
 20. [Memory](#20-memory)
 20b. [Memory management](#20b-memory-management)
 21. [Runtime state](#21-runtime-state)
 21b. [Voice state and the assistant visual](#21b-voice-state-and-the-assistant-visual)
+21c. [Machine identity: OS, processor and graphics](#21c-machine-identity-os-processor-and-graphics)
 22. [Logging](#22-logging)
 23. [Configuration](#23-configuration)
+23b. [Hardware-conditional provisioning](#23b-hardware-conditional-provisioning)
 24. [Startup](#24-startup)
 25. [Shutdown](#25-shutdown)
 26. [Performance](#26-performance)
@@ -353,17 +361,341 @@ that default deliberately, and silently substituting another looks like a bug la
 Firefox is deliberately unsupported: recognition is disabled by default and there is no bundled
 backend, so listing it would only be a slower path to the same failure.
 
-### 6.3 Gesture (standalone, not wired in)
+### 6.3 Hand gesture control
 
-`input/gesture.py` is a complete MediaPipe hand-gesture mouse replacement (1-Euro filter,
-hysteresis pinch thresholds, FSM, scroll, double-click). It is **not** part of the main loop and
-is run directly:
+`input/gesture/`. Camera in, mouse pointer out — a full second input modality alongside speech,
+wired into the orchestrator, the desktop UI and the local voice-control vocabulary. It replaced
+a standalone 551-line `input/gesture.py` that was never part of the loop and was unreliable in
+five separate ways; the replacement is a package of eight modules with one clear owner each.
 
-```bash
-python -m kayra.input.gesture
+```
+camera ──▶ preprocess ──▶ detect ──▶ features ──▶ stabilise ──▶ FSM ──▶ arbitrate ──▶ pointer
+             │
+             └──▶ preview (the same frame, throttled, PULLED by the UI)
 ```
 
-It is documented here because it exists in the tree, not because the assistant uses it.
+| Module | Owns |
+|---|---|
+| `camera.py` | THE capture. One `VideoCapture`, one thread, a single-frame mailbox, bounded recovery |
+| `detector.py` | The MediaPipe graph, one hand, deterministic primary selection, the accelerator decision |
+| `features.py` | Scale-invariant geometry, and the stability score that gates actions |
+| `filters.py` | One Euro, dead-zone, outlier gate, speed ceiling, the `Hysteresis` gate, rate limiters |
+| `state_machine.py` | The temporal FSM and one-action-per-frame arbitration |
+| `pointer.py` | The only code that touches the desktop (`user32`) |
+| `controller.py` | Lifecycle, the two switches, the thread, the preview, telemetry, events |
+| `config.py` | Every threshold, read once from `.env`, clamped and invariant-checked |
+
+**The gesture map is unchanged from v1 and every gesture is preserved:** index finger moves the
+cursor, index+thumb is a left click, middle+thumb a right click, index+middle+thumb a double
+click, two fingers swept vertically scrolls, and a closed fist pauses. What changed is that each
+one now goes through a two-threshold gate with a dwell time, fires on a rising edge only, and is
+arbitrated against the others by a fixed priority.
+
+#### 6.3.1 Why it lives in `input/` and injects through `user32`
+
+The camera is a capture device and this package's job is to work out what the user MEANT, which
+is exactly what the speech package does. It reaches the desktop through `pointer.py` — twenty-five
+lines of `user32`, no shell, no subprocess, no target resolution — rather than through
+`automation.windows`, for two independent reasons.
+
+`automation` must never import `input` ([§4.2](#42-import-rules)), and putting a camera owner
+inside `automation` would invert that rule. And the automation pipeline's cost is the right cost
+for a sentence and the wrong cost for a 30Hz pointer update: `normalize_command` is 1.4us and
+`classify_action` 4.3us, which is ~0.2ms per frame of overhead for a decision the state machine
+has already made. `pyautogui.moveTo` is worse still — measured at 1.9ms against
+`user32.SetCursorPos`'s 0.012ms, a 160x difference on the call made most often in the system.
+
+A SPOKEN "click" still goes through `automation.windows.MouseControl`, unchanged.
+
+#### 6.3.2 The capture mailbox, and the freeze it removed
+
+v1 read the camera synchronously inside the same loop that ran inference and injected mouse
+events. `cap.read()` blocks, and frames the driver queued while inference was busy had to be
+dequeued one at a time before a fresh one could be reached. A 200ms hiccup therefore left the
+loop processing the past while six more frames accumulated, and it never caught up — latency
+grew without bound, which is what "delayed response", "occasional freezes" and "gestures
+sometimes stop working" all were.
+
+`CAP_PROP_BUFFERSIZE = 1` was already set in v1 and does not fix it: the Windows MSMF and DSHOW
+backends treat it as a hint. The capture is now its own thread writing into a **single-slot
+mailbox** that the processor reads; a frame nobody read is overwritten and counted as dropped.
+Measured with a consumer four times slower than the camera, staleness never exceeds one frame.
+
+This is a mailbox, not a queue, and that is the point: `queue.Queue(maxsize=N)` reintroduces
+staleness for small N and unbounded growth for large N.
+
+#### 6.3.3 Normalized thresholds
+
+Every geometric threshold is a ratio of `hand_scale` (wrist → middle MCP, the palm's rigid long
+axis), in width-normalized units so a vertical and a horizontal span of equal pixel length
+measure equal. v1's pixel thresholds (`pinch < 30px`, `release > 40px`, `SCROLL_DEADBAND = 20`)
+changed meaning with distance: at arm's length 30px is a third of the whole hand, and leaning in,
+a real pinch never gets under it. Both symptoms were reported and they are the same bug seen
+from two distances.
+
+#### 6.3.4 The GPU decision
+
+**CPU, and no GPU context is created.** `mediapipe 0.10.14`'s pip wheel builds `solutions.hands`
+CPU-only on Windows, and the Tasks API exposes a GPU delegate enum on every platform including
+ones with no GPU calculators compiled in — so testing for the enum proves nothing, the same trap
+[§9](#9-speech-output) documents for ONNX Runtime's `get_available_providers()`.
+
+It would be the wrong trade regardless, and this was measured rather than assumed. Inference at
+`model_complexity=0` is 10.5-13.5ms, which is three frames of headroom at 30 FPS, so the detector
+is not the bottleneck. Gesture control uses **0 MiB of VRAM** and holds no CUDA context, so there
+is no contention with the Kokoro ONNX session to have; running both, TTS synthesis went from
+13.01s to 13.30s per sentence (**+2.2%**) while gesture control held 19.8 FPS with 0 dropped
+frames. `GESTURE_GPU=ON` forces a delegate attempt for a platform where one exists and reports
+loudly when it fails.
+
+The change that actually mattered was `model_complexity`, not the device: v1 used complexity 1 at
+26-31ms, which on a 33ms budget leaves nothing, and a loop with no slack is a loop that falls
+behind on the first hiccup.
+
+#### 6.3.5 Two switches, and the state that cannot exist
+
+The camera and gesture control are separate axes, for the same reason listening and standby are
+([§5.4](#54-the-four-stop-shaped-concepts)): seeing the preview and having something move your
+pointer are different requests. `camera OFF, gesture ON` is prevented rather than repaired —
+enabling gesture control starts the camera first, and turning the camera off stops gesture
+control first. Both switches are transactional through `core.settings_log`, so a camera that
+fails to open leaves the switch OFF and reports the camera's own message.
+
+#### 6.3.6 It never touches voice state
+
+No call in the package reaches `set_listening`, `set_sleeping`, the STT engine, the TTS engine or
+the voice state machine, and `tests/test_gesture_control.py` asserts that by walking the parsed
+source. Camera activity must never be able to pause the microphone or repaint the orb. The two
+systems share only the runtime event bus, in one direction: the controller emits `gesture_state`
+and writes nothing.
+
+#### 6.3.7 Running it
+
+```bash
+python -m kayra.input.gesture            # gesture control alone, no UI
+python -m kayra.input.gesture --doctor   # camera, detector and accelerator report only
+```
+
+Both drive the same `GestureController` the UI and the voice commands drive. There is no second
+implementation — that duplication is exactly what the single-ownership rule exists to prevent,
+and the v1 standalone module was an instance of it.
+
+---
+
+## 6b. The utterance boundary — one commit point
+
+`src/kayra/core/endpointing.py`. The ONE authority for "has the user finished speaking?".
+
+### The failure it was written for
+
+A user said, in Hindi and English together, *"यार मेरी girlfriend मुझसे नाराज़ है, बताओ मैं क्या
+करूँ?"* — and Kayra shut down mid-sentence.
+
+The cause was not the recognizer and not a mis-heard word. It was **a second commit point**. The
+recognition page published lifecycle commands out of `recognition.onresult`, from a probe built
+from the INTERIM transcript, and `_local_control_watcher` dispatched that flag at ~17 Hz. A
+transient interim reading of "exit" therefore reached `request_shutdown()` **without ever
+passing through the endpointer**. The VAD was working correctly and was simply not consulted,
+because that path did not go through it.
+
+The fix is architectural. There is no word list, no "distrust the word exit", and no
+replacement dictionary — this codebase already refuses those elsewhere, and they would
+eventually mis-fire on a legitimate command. What changed is that only a COMMITTED utterance can
+reach a control.
+
+### The pipeline, and where it narrows
+
+```
+microphone -> AEC/NS -> VAD -> recognizer -> utterance accumulator
+   -> ENDPOINT DECISION       <-- core/endpointing.py
+   -> transcript repair -> conversation context -> control -> DMM
+```
+
+Above the arrow nothing may act on words; below it everything does. **Barge-in is the single
+documented exception**: interim text may still be inspected to SILENCE PLAYBACK. Silencing is
+not an action on the world — it hands the floor back — and its whole value is that it happens
+before the endpoint. It cannot start a turn, run automation, end the process or reach the DMM.
+
+* `looksLikeControl()` is **deleted** from the page, not guarded. `kayraControlPhrases` is
+  hard-coded `[]`; nothing assigns `window.kayraControl`.
+* `flushUtterance` has exactly one call site and it is the endpoint decision's.
+* `Listen()` logs `[VOICE] Transcribed: "…"` at the boundary — the ONE transcript line
+  per turn. The endpoint's own reasoning and the recognizer's drafts stay at DEBUG.
+
+### Two signals, and neither is sufficient
+
+| Signal | Why it is not enough alone |
+|---|---|
+| a FINAL recognition result | means "this SEGMENT is final". Several arrive per sentence, while the speaker keeps going |
+| a silence timer | results LAG the sound, so "no results for N ms" fires mid-sentence whenever the backend is slow. A clipped word is worse than a mis-heard one — there is nothing left to repair |
+
+Both were already required. What this milestone added is **continuation evidence** — three
+reasons to keep listening, all about acoustics and timing, none about which words were heard:
+
+1. **The user is audibly speaking right now.** `voice_active` blocks the commit outright. This
+   check alone would have prevented the reported failure.
+2. **The turn is younger than `min_utterance_ms`** (350 ms).
+3. **The transcript is implausibly short for the speech duration.** Past
+   `continuation_speech_ms` (1500 ms), a one- or two-word transcript means the recognizer is
+   behind. Such a turn never takes the fast path and waits out a doubled room hangover.
+
+**Rule 3 delays a commit; it never blocks one.** It knows nothing about which word it is and
+cannot reject one — asserted by a check that a lone word does still commit once the room stays
+quiet.
+
+### Adaptive, so short commands stayed fast
+
+| Condition | Required recognizer silence |
+|---|---|
+| interim words pending | `max(silence, interim_grace)` — uncommitted words are worth waiting for |
+| looks truncated | `silence` — never the fast path |
+| short and committed | `fast_endpoint` (420 ms) |
+| anything else | `silence` (800 ms) |
+
+Measured: a short control command endpoints **~500 ms** after the speaker stops (unchanged);
+`decide()` costs **1.68 µs** and is evaluated at 60 ms intervals.
+
+### One rule, two implementations
+
+The Python module is the specification and holds every threshold; the page mirrors the
+predicate because the decision must run at 60 ms resolution next to the audio, where a Selenium
+round-trip per tick is not available. `_capture_tuning()` composes `tuning_payload()` and adds
+only the microphone's acoustic settings, so the two cannot disagree about when a turn ends.
+
+**Verified live against the real headless Chrome: 10/10 scenarios agree**, including the
+reported-failure case.
+
+### VAD hysteresis
+
+Speech is not a plateau — every stop consonant dips below any single threshold, so a bare
+`rms > t` comparator toggled `voice` several times a second inside one sentence. That produced
+the `LISTENING -> USER_SPEAKING -> LISTENING` churn in the logs and an orb that flickered per
+syllable. Leaving the speaking state now requires falling to `vadReleaseRatio` (0.6×) of the
+enter threshold **and** staying there for `vadReleaseMs` (220 ms). Both halves are needed —
+hysteresis alone still flickers on a deep dip, a hold alone still chatters. Measured live:
+enter 0.01673, exit 0.01004.
+
+---
+
+## 17b. Dangerous voice control is confirmation-gated
+
+A single recognition must never end the process. The input is a probabilistic transcript of a
+room and the cost of being wrong once is the whole session.
+
+```
+"Okay Kayra, shut down the engine."
+  [VOICE] Control candidate: CONTROL_SHUTDOWN (explicit)
+  [VOICE] Confirmation required
+  "Just to confirm — should I shut down the Kayra engine?"
+"Yes."
+  [VOICE] Confirmation: YES
+  [SHUTDOWN] Executing confirmed Kayra shutdown
+```
+
+### What is gated, and what deliberately is not
+
+`DANGEROUS_KINDS = {SHUTDOWN, SLEEP}`.
+
+* **`PAUSE_LISTENING` is not gated.** It closes the microphone, is one button/hotkey/tray click
+  to undo, and a user who says "stop listening" wants it now. Asking first would be the wrong
+  trade.
+* **`INTERRUPT` is not gated.** Silencing is how the user takes the floor back; gating it would
+  defeat barge-in entirely.
+
+### Only one path executes
+
+`_dispatch_control` **cannot** run a dangerous kind — it asks. The only path is
+`_execute_confirmed`, reached solely from `resolve_lifecycle_confirmation` on an affirmative
+answer; the suite walks the AST for callers and asserts the list. The UI's Shut down button,
+the tray's Quit and the signal handler still call `request_shutdown` directly, and should: a
+button press is already unambiguous confirmed intent, and a transcript is not.
+
+The confirmation is answered **before** the classifier, for the reason the automation
+confirmation is answered before the DMM: a bare "yes" sent to a classifier comes back as
+conversation and the question would never resolve.
+
+### Three-way replies
+
+| Reply | Example | Outcome |
+|---|---|---|
+| `YES` | "yes", "yeah, go ahead", "yes please", "do it" | execute |
+| `NO` | "no", "cancel", "never mind", "not now" | cancel |
+| `UNCLEAR` | "yes, but first tell me my options" | re-ask once (`MAX_ASKS` 2 — a third is a loop) |
+| `None` | "what time is it" | not an answer: clear the request, process normally |
+
+Collapsing `UNCLEAR` into either neighbour is how a dangerous action gets executed off a
+sentence that was really a question. Matching is on the WHOLE normalized utterance, never a
+substring.
+
+Bounded window (`KAYRA_CONFIRMATION_TTL_SECONDS`, 20 s, evaluated on read): a late "yes" does
+nothing. One pending request at a time — a new one replaces the old, because two outstanding
+questions is a state nobody can answer unambiguously.
+
+### The echo interaction
+
+Kayra asks out loud, so the user's "Yes." lands within a second or two of her own voice and
+often overlaps it. If the confirmation resolved AFTER the echo gate, the reply that matters most
+would be the one most reliably discarded — and a broad post-speech mute window would do the
+same, which is why there is not one.
+
+So the confirmation resolves **before** the gate, and echo-flagged audio clears a HIGHER bar
+rather than being trusted or discarded: only a clean whole-utterance YES or NO is honoured from
+it. This is necessary because Kayra's own question opens with a word in the affirmative
+vocabulary — without the rule she re-asks herself in a loop, and with a naive "not an answer
+clears it" she cancels the confirmation she just asked. `"none-echo"` therefore leaves the
+request pending, which is a different outcome from `"none"` and deliberately so.
+
+### False-positive protection is structural, not a word list
+
+"Why did the program exit?", "The application exists.", "That is great.", "Why do people sleep
+so much?" — all reach the DMM untouched, because matching is exact on the whole normalized
+utterance. Verified live against the real assistant.
+
+Two supporting rules:
+
+* **Apostrophes are deleted in normalization, not turned into spaces.** The punctuation sweep
+  split "don't" into `["don", "t"]`, so every phrase containing one was unmatchable — silently,
+  because a phrase that cannot match looks exactly like a phrase that was not said.
+* **`transcript_repair._is_irreversible` widened from SHUTDOWN to every `DANGEROUS_KIND`.** A
+  stage that may not invent "exit" must not be able to invent "sleep" either, and one set
+  governs both.
+
+`"stop Kayra"` stays a **barge-in**, not a shutdown: the name is a filler for the interrupt
+vocabulary, so it and "Kayra, stop" are the same utterance. It was briefly added to the shutdown
+table during this work and the suite caught it immediately.
+
+---
+
+## 8c. The DMM empty-response retry bound
+
+`MAX_DMM_EMPTY_RETRIES = 5` (raised from 3), plus `DMM_RETRY_BUDGET_SECONDS = 15.0`.
+
+This governs **one** failure class — the provider answered and the answer parsed to zero usable
+tokens — and nothing else. Transport failures, rate limits, timeouts and auth errors belong to
+the provider router (§8b) and never reach it, so a rate-limited cloud key still costs exactly
+one call per provider per request.
+
+* **Five rather than three because the local path is where empty completions happen.** A small
+  local model that samples only stop-tokens, or one still warming, produces them regularly, and
+  each attempt is an in-process round-trip rather than a metered call.
+* **The wall-clock budget is the other half.** Measured against LM Studio on the reference host
+  an empty completion costs ~2.0 s, so five retries is ~10 s of silence for a request that ends
+  in "treat as conversation". The budget stops a slower backend turning that into half a
+  minute; whichever limit is reached first wins and the log says which.
+* **No sleep anywhere in the retry path**, and there must not be one. This is a deadline, not a
+  backoff: the model is up and merely produced nothing.
+* **No traceback for an expected empty response** — one WARNING line, once.
+
+Measured live, local model, cloud keys rate-limited throughout:
+
+```
+[DMM] Empty response. Retry 1/5
+...
+[DMM] Empty response. Retry 5/5
+[DMM] Model exhausted 5 retries. Treating this as conversation.
+```
+
+and `"what is the capital of France"` succeeded on attempt 2 — the retry earns its keep.
 
 ---
 
@@ -1001,6 +1333,108 @@ a window title, so "close YouTube" could reach a VS Code window editing `youtube
 Every automation decision is written to a bounded 200-entry ring and to `logs/automation.log`.
 Spoken output stays one short sentence; paths, status codes and detail go to `detail` and the
 audit log.
+
+---
+
+## 14b. The power-target boundary — Kayra is not the computer
+
+**Observed live.** The recognizer produced `"Shutdown the engine car."` — a malformed transcript
+of a request about KAYRA's engine — and Kayra offered to shut down Windows.
+
+The root cause was a **substring test with no target requirement**:
+
+```python
+for needle, verb in _SYSTEM_VERBS:
+    if needle in lowered_payload:            # "shutdown" in "shutdown the engine car"
+        return Action("system", verb, ...)   # -> system.shutdown -> CONFIRM -> "your computer"
+```
+
+`policy.resolve_power_target()` now resolves the target on **whole words** before the action is
+built, and **defaults to AMBIGUOUS** — nothing infers a computer shutdown.
+
+| | |
+|---|---|
+| `COMPUTER_TARGET_WORDS` | computer, pc, laptop, desktop, machine, windows, notebook, workstation, device |
+| `KAYRA_TARGET_WORDS` | kayra, engine, assistant, yourself, you, program, app, application (+ the configured alias) |
+| `POWER_VERBS` | shutdown, restart, sign_out, sleep. **Not** lock — a one-keystroke undo is not a session-wide blast radius. |
+
+`"system"` is deliberately absent from the computer set: it is the DMM's own token prefix, so it
+appears in every payload and would match all of them.
+
+Two DENIED actions carry the outcome: `system.power_ambiguous` (asks which, naming both) and
+`system.power_kayra` (says what it understood and how to phrase it). `classify_action`
+re-checks the target from the action itself — a verdict that depends on one function having been
+called correctly is not a policy. The genuine computer prompt now says "your COMPUTER, not
+Kayra". `"turn off screen"` became `system.screen_off` (it was mapped to `sleep`, which
+suspended the whole machine).
+
+---
+
+## 17c. Confirmation ownership, and short answers
+
+Three live defects, all about the turn AFTER a confirmation.
+
+**"Yes yes go to sleep" reached the DMM and was answered "Sleep well".** Five words, so the
+length rule sent it to UNCLEAR. `_restates()` now allows an utterance past that limit when every
+word beyond the polarity belongs to the pending kind's own phrases — narrow and checkable, so
+"yes, open chrome" is still not an answer to a sleep question.
+
+**Repeated "exit" asked the question over and over.** Each one was not an answer, so it cleared
+the request and then raised a fresh one. `answer()` checks for a restatement of the same kind
+BEFORE reading the reply and returns `"restated"`: the question stays, the reply is "Please say
+yes or no."
+
+**"Turn off listening" disabled proactive suggestions.** The phrase was not in the local
+vocabulary so it reached the DMM, which guessed `proactive off`. Added, with its mirrors.
+PAUSED and STANDBY stay distinct: `set_listening` touches nothing but the microphone.
+
+### "yes" recognised as "S"
+
+The recognizer catches only the sibilant of a short, quiet reply. The forbidden fix is
+`if transcript == "s": transcript = "yes"` — a global substitution corrupts ordinary
+conversation and is the replacement dictionary this codebase refuses everywhere else.
+
+`resolve_short_answer()` runs ONLY inside an active confirmation, and uses evidence a general
+corrector never has:
+
+1. **The recognizer's own N-best.** Preferring a reading it PROPOSED is re-ranking; producing
+   one it never proposed is invention. No length or confidence guard needed.
+2. **A strict affix** (prefix or suffix — not an edit distance, not a phonetic key, both of
+   which recover "yes" from "yet" and "guess") of a reply word, with: one token, ≤3 characters,
+   confidence low or unknown, and no candidate of the opposite polarity.
+
+The uniqueness that matters is **polarity, not the word**: "s" is the tail of "yes" and the head
+of "sure", both affirmative. A token that could be either polarity ("o" → "no"/"okay") is
+refused. Echo-flagged audio is never recovered. The raw transcript is always logged with the
+evidence.
+
+---
+
+## 22b. Turn ownership and stale work
+
+**Turn numbers were resetting to 1.** `end_turn()` set the only counter to 0, so every turn was
+"Turn #1" and nothing could tell whether one turn was newer than another. Two counters now:
+`_turn_seq` monotonic, `_turn` the open one. `latest_turn()` is what background work compares
+against — `current_turn()` is 0 between turns, exactly when a stale retry is most likely running.
+
+**The turn is opened at the COMMIT**, inside `Listen()`, because that is where a complete
+utterance exists and also where it may be consumed by a confirmation or a control without
+reaching the loop. Every consuming path closes it.
+
+**Stale DMM work stops.** `classify_intent` carries its turn and checks `_turn_superseded()` at
+entry and before every retry. Verified live against the real local model: undisturbed 4.5 s to
+exhaustion; interrupted at 1.2 s it stopped at **3.0 s and returned `[]`**.
+`_cancel_active_work()` runs first in the shutdown sequence.
+
+**Retry classification.** `TERMINAL_DMM_FAILURES` (invalid request, auth, model unavailable) are
+not retried — the next four attempts fail identically. Bounded LINEAR backoff, zero on the first
+retry. A health cooldown stands the local model down for 20 s after three consecutive empty
+REQUESTS. Retry progress is INFO; the WARNING is kept for the exhaustion.
+
+**Barge-in needs a sustained voice.** Over playback the VAD must hold its verdict for 320 ms
+before the visual accepts it; residual echo crosses the threshold in bursts and any crossing
+used to repaint the state. A real "stop" is unaffected — it arrives as INTERRUPTING through the
+page's interim flag, a different and immediate branch.
 
 ---
 
@@ -1866,6 +2300,216 @@ shutdown emit it too), and `set_sleeping` must silence AFTER setting the standby
 
 ---
 
+## 21c. Machine identity: OS, processor and graphics
+
+`src/kayra/core/hardware.py`. The single source of truth for what machine Kayra is running on.
+A LEAF — stdlib plus an optional psutil — so anything may import it; it spawns no process,
+opens no socket and imports nothing heavy.
+
+### The problem it was written for
+
+Two visible defects, both the same underlying mistake: the cheapest available source was
+consulted, and on Windows the cheapest sources lie.
+
+**The System screen said "Windows 10" on a Windows 11 machine.** Every cheap source agrees, and
+they are all wrong together:
+
+| Source | Reports on a Windows 11 machine |
+|---|---|
+| registry `ProductName` | `Windows 10 Home Single Language` |
+| `platform.release()` | `10` |
+| `platform.win32_ver()[0]` | `10` |
+| `sys.getwindowsversion().major` | `10` |
+
+Microsoft froze `ProductName` for application compatibility and has never updated it; the
+others report the kernel major version, which really is 10. The System screen additionally
+printed `(build {platform.release()})`, so the row read `(build 10)` — a build number that
+does not exist.
+
+**Video memory read "not reported by Windows" for every modern card.**
+`Win32_VideoController.AdapterRAM` is a 32-bit field and drivers CLAMP it. On the development
+host's 8 GiB RTX 4060 it reports `4293918720` (4095 MiB) rather than the full-scale
+`0xFFFFFFFF`, so a naive ceiling test does not catch it — two earlier bounds both let it
+through and the screen confidently reported "4.0 GB" for an 8 GiB card. The previous fix was to
+refuse anything at or above ~4000 MiB, which was honest and left the field blank.
+
+### What replaced it
+
+Everything is read from the registry:
+
+| Key | Facts |
+|---|---|
+| `SOFTWARE\Microsoft\Windows NT\CurrentVersion` | `CurrentBuildNumber`, `UBR`, `DisplayVersion`, `EditionID`, `InstallationType`, `ProductName` |
+| `HARDWARE\DESCRIPTION\System\CentralProcessor\0` | `ProcessorNameString`, `VendorIdentifier` |
+| `SYSTEM\CurrentControlSet\Control\Class\{4d36e968-…}\NNNN` | `DriverDesc`, `HardwareInformation.qwMemorySize`, `DriverVersion`, `ProviderName`, `MatchingDeviceId` |
+
+| | Before (one batched PowerShell / CIM call) | After (registry) |
+|---|---|---|
+| CPU name, OS product, GPU | **4410 ms** | **0.4 ms** |
+| VRAM on an 8 GiB card | "not reported" | `8585740288` bytes |
+| Adapters seen | 1 — the highest clamped `AdapterRAM`, a coin toss on a switchable-graphics laptop | all of them |
+| CPU string | `AMD Ryzen 9 8945HS w/ Radeon 780M Graphics` (correct, and 1.3 s of the 4.4 s) | the same string, free |
+
+### The product-name correction, and why it is narrow
+
+The build number is the one Windows fact that does not lie, and Windows 11 is documented as
+build **22000 and above**. `_windows_product_name()` uses that as a CORRECTION, not as a rule:
+
+| Recorded name | Build | Result |
+|---|---|---|
+| `Windows 10 Home Single Language` | 26200 | `Windows 11 Home Single Language` — corrected |
+| `Windows 10 Pro` | 19045 | unchanged — genuinely Windows 10 |
+| `Windows 11 Pro` | 26100 | unchanged — already correct |
+| `Windows Server 2025 Standard` | 26100 | unchanged — server builds are not client builds |
+| `Windows 12 Home` | 30000 | unchanged — a product that names itself honestly keeps its name |
+| anything | unreadable | unchanged |
+
+It fires only when the recorded name is one of the values Microsoft is known to leave stale.
+Server SKUs are excluded because the client thresholds do not describe them — Server 2022 is
+build 20348 and Server 2025 is 26100, so a client rule would mislabel both.
+
+**When the build cannot be read at all, the answer is `Windows` with no version.** Showing less
+is correct; a plausible default is the failure the whole module exists to end.
+
+### Design rules
+
+* **The vendor comes from the PCI id, not the name.** `pci\ven_10de` is NVIDIA whatever the
+  driver calls the card; a marketing string can be rebranded or localised.
+* **`integrated` is TRI-STATE** — True, False, or **None** when neither the name nor the vendor
+  settles it. A small VRAM figure is not sufficient evidence: plenty of discrete cards report a
+  carve-out, so an unrecognised adapter reports "unknown" rather than a guess.
+* **Software adapters are never "the GPU".** A machine whose only adapter is the Microsoft
+  Basic Display Adapter has no usable GPU, and saying so beats naming the shim.
+* **`displays()` uses `EnumDisplaySettingsW`, not `GetSystemMetrics`.** The metric returns the
+  DPI-virtualised size unless the process declared per-monitor awareness — measured as
+  1440x900 on a 2880x1800 panel at 200%. That is not a resolution, it is what a scaled window
+  thinks the desktop is. **1920x1080 is never a default**; an unmeasurable display reports 0.
+* **The system drive comes from `%SystemDrive%`.** `live_metrics` used
+  `os.path.abspath(os.sep)`, which resolves against the CURRENT WORKING DIRECTORY's drive — so
+  running Kayra from `D:\` reported D:'s usage as the system disk.
+* **Non-Windows degrades to `platform`/`psutil` and SAYS SO** in `source`, which is what lets a
+  caller and the test suite tell a measurement from a fallback. No branch assumes Windows.
+
+### How it reaches a screen
+
+`system_profile.device_profile()` composes it into one dict, and that dict is ADDITIVE: every
+key it had still exists and still means what it meant, so nothing that read the profile had to
+change. Alongside them are `os_product`, `os_build`, `os_display_version`, `cpu_vendor`,
+`gpu_vendor`, `gpu_integrated`, `gpu_driver`, `gpus` (the full adapter list), `has_nvidia`,
+`monitor_count`, `screen_*`, and a `system` flag per disk.
+
+* **`os_summary()` returns `(product, version)` already formatted**, so no screen composes an OS
+  line itself. Two writers to one fact is how the voice caption went wrong once already.
+* **`profile_if_ready()` never blocks; `warm_profile()` collects on a one-shot daemon thread.**
+  Home reads the machine identity on its 1.5 s tick, on the GUI thread. Collection is now
+  dominated by `sounddevice` device enumeration (**122 ms** measured, against 3.4 ms for
+  everything else), and 122 ms on the GUI thread is a visible hitch on first paint. Home asks
+  only once the profile is ready and does not paint the line until then — there is nothing true
+  to put in it yet.
+
+### Home's Graphics card is vendor-neutral
+
+THREE sources, answering three different questions, and none substitutes for another:
+
+| Source | Question | Availability |
+|---|---|---|
+| `graphics_profile()` | what hardware IS this | every vendor, registry, cached |
+| `gpu_metrics()` | what is it DOING right now | NVIDIA only (`nvidia-smi`) |
+| `tts_provider()` | what is SPEECH running on | the live engine |
+
+The card previously had only the second, so **a machine with an AMD or Intel GPU was told it
+had no GPU.** It now names the adapter from the profile, overlays live telemetry when there is
+any, and says "<vendor> telemetry unavailable" when there is not. The empty state is reached
+only when there is genuinely no adapter at all.
+
+**A missing measurement is never drawn as a zero.** An unreported utilization is captioned "not
+reported", because a 0% bar reads as an idle GPU rather than as one whose vendor does not tell
+us. Unmeasured VRAM shows the installed capacity, or "shared with system memory" for an
+integrated part.
+
+**`nvidia-smi` is gated on `hardware.has_nvidia_gpu()` before the first spawn.** The absence
+used to be learned from a `FileNotFoundError` — a correct answer reached the expensive way, and
+the WRONG answer on a machine that has the tooling but not the card.
+
+### Kayra's only GPU acceleration path is CUDA, and that is stated rather than implied
+
+An AMD, Intel or GPU-less machine runs speech on the processor. That is a supported, correct
+outcome — Kokoro synthesizes at roughly real time on a modern CPU, and §16b's measurements show
+CUDA is not faster for this model anyway. The Graphics finding says so in its advice rather
+than leaving the user to infer a fault, and `setup.py` reports CUDA as **NOT APPLICABLE**
+rather than FAIL (§23b).
+
+---
+
+## 23b. Hardware-conditional provisioning
+
+`setup.py`. `detect_graphics()` reads the same registry keys `core.hardware` reads, and
+everything downstream follows from it: which ONNX Runtime variant is installed, whether four
+CUDA runtime wheels are downloaded, whether a CUDA session is probed, and whether the report
+says PASS or NOT APPLICABLE.
+
+**The logic is duplicated rather than imported, deliberately.** `setup.py` runs on the SYSTEM
+interpreter before `.venv` exists and imports nothing outside the stdlib and nothing from
+`kayra` — importing the application in order to decide how to install the application would
+invert that rule. `winreg` is stdlib, so the same keys are read directly.
+`tests/test_setup_runtime.py` asserts setup's verdict for this machine matches
+`kayra.core.hardware.has_nvidia_gpu()`, its adapter count and its vendor list, which is what
+keeps the duplicate honest.
+
+### Two sources, two questions
+
+| | Answers | Failure mode when used alone |
+|---|---|---|
+| the registry | is the CARD present? | cannot say whether CUDA will work |
+| `nvidia-smi` | does the DRIVER STACK work? | a machine with an NVIDIA card and a stale driver is reported as having no GPU |
+
+`nvidia-smi` was the previous gate on its own. The outcome it produced was accurate — CPU is
+the right runtime for a card whose driver cannot load CUDA — but the REASON it reported sent
+the user looking for hardware they own. Setup now says the card is present and the driver did
+not answer, and provisions CPU meanwhile.
+
+**`nvidia-smi` is spawned only after the registry has already found an NVIDIA adapter**, so an
+AMD or Intel machine launches no process at all to learn it has no NVIDIA GPU.
+
+### Reconciliation, in both directions
+
+| Starting state | Machine | Action |
+|---|---|---|
+| `onnxruntime` only | NVIDIA | install `onnxruntime-gpu` at its pin + the four pinned CUDA wheels; probe a real session |
+| `onnxruntime-gpu` + CUDA wheels | non-NVIDIA | **replace with `onnxruntime` and REMOVE the four CUDA wheels** |
+| both ORT variants | either | remove both, reinstall the keeper at its pin |
+| already settled | either | **nothing** — no install, no uninstall |
+
+The non-NVIDIA row is the behaviour change. The old code KEPT an inherited `onnxruntime-gpu`
+because it "runs on the CPU perfectly well" — true, and not the whole story: it leaves CUDA
+libraries on disk that nothing on that machine can load, it makes the speech device card offer
+a GPU mode that cannot work, and `run.py --doctor` then reports a CUDA build on a machine with
+no CUDA.
+
+Removing the runtime wheels is safe in a way the ORT variant swap is not: the `nvidia-*`
+distributions own their own files under `site-packages/nvidia/`, share no RECORD entries with
+anything, and are pure runtime payload — so uninstalling one cannot leave a half-deleted
+package behind, which is exactly the hazard `_ensure_ort_variant` documents for ORT.
+
+### PASS / FAIL / NOT APPLICABLE
+
+| Verdict | Meaning |
+|---|---|
+| `PASS` | an NVIDIA GPU is present and a real CUDA session initialised |
+| `FAIL` | an NVIDIA GPU is present and something is broken; the reason names it |
+| `NOT APPLICABLE (no NVIDIA GPU)` | there is nothing here for CUDA to run on |
+
+Three lines used to read FAIL on every non-NVIDIA machine, describing a defect that does not
+exist and sending the user looking for a fix with nothing to fix.
+`state["cuda_applicable"]` is what separates "the CUDA check failed" from "there was never a
+CUDA check to run", and the CPU outcome is presented as "correct for this hardware" rather
+than as a fallback.
+
+The report also names whatever graphics hardware IS present, one line per adapter, on every
+machine — and never says NVIDIA on a machine without one.
+
+---
+
 ## 22. Logging
 
 ### The format
@@ -1998,7 +2642,7 @@ flowchart TD
     J --> K["STAGE 2: heavy imports<br/>LLM singleton, services, automation"]
     K --> L["STAGE 3: join both threads<br/>report boot errors"]
     L --> M["STAGE 4: proactive agent,<br/>signal handlers"]
-    M --> N["Main_Loop: barge-in watcher,<br/>boot report, 'Kayra online.'"]
+    M --> N["Main_Loop: barge-in watcher,<br/>boot report,<br/>speak_boot_announcement()"]
 ```
 
 **The ordering is load-bearing.** Headless Chrome (~2–4s) and the Kokoro ONNX session (~1–3s)
@@ -2235,8 +2879,9 @@ a proactive agent that makes every decision with integer arithmetic.
 Verified present in the source.
 
 **Input** — continuous voice (Web Speech in headless Chrome), keyboard fallback, VAD
-segmentation, interim-result interrupt detection, capture timestamps, standalone hand-gesture
-mouse (`input/gesture.py`, not wired into the loop).
+segmentation, interim-result interrupt detection, capture timestamps, and hand gesture control
+(`input/gesture/` — camera, MediaPipe landmarks, a temporal gesture FSM and pointer injection,
+wired into the orchestrator, the UI and the voice vocabulary).
 
 **Voice loop** — self-echo protection, barge-in ("stop"/"wait"), epoch-cancellable TTS,
 sentence/clause streaming, speech-safe text normalization, persistent audio output stream.
@@ -2330,7 +2975,9 @@ non-zero; the rest are manual. Some make real API calls.
 **live microphone barge-in by a human voice** (every barge-in measurement injects the interim
 result rather than speaking — see [§35](#35-testing-strategy)), a from-scratch `setup.py` run
 against a deleted `.venv` (the repair and provisioning paths were exercised against the existing
-one), DirectML/ROCm, deep research end-to-end, and the gesture engine.
+one), DirectML/ROCm, and deep research end-to-end. Hand gesture control IS measured here —
+inference latency, frame rates, CPU, RSS, VRAM and its effect on concurrent speech synthesis —
+but the ten live-hand scenarios need a person and live in `tests/test_gesture_live.py`.
 
 ---
 
@@ -2346,7 +2993,7 @@ Marked by status. **None of these are implemented.**
 | Vision / screen understanding | OPTIONAL | new `input/` module |
 | Multilingual output | OPTIONAL | `speech_safe_text` already preserves Devanagari; needs voice + prompt work |
 | Wiring habit acceptance back into `Automation` | OPTIONAL — deliberately not done | `services/proactive_agent.py` |
-| Gesture engine integrated into the main loop | OPTIONAL | `input/gesture.py` is standalone today |
+| Real tab enumeration for browser targets | OPTIONAL | `automation/targets.py`; needs UI Automation or a debugging port |
 | Smarter memory (semantic recall) | OPTIONAL | `memory/`; weigh against [§28](#28-alternatives-considered) |
 | Developer / code-assistant mode | OPTIONAL | new `services/` module |
 | Focus mode, journal, clipboard intelligence | OPTIONAL | `services/` |
@@ -2392,7 +3039,9 @@ project-kayra/
 │       │   ├── stt_backend.py  ← requested-vs-active backend + the live switch
 │       │   ├── transcript_repair.py
 │       │   ├── browsers.py     ← discovery and capability priors
-│       │   └── gesture.py      ← standalone; not in the main loop
+│       │   └── gesture/        ← hand gesture control: camera, detector, features,
+│       │       │                    filters, state_machine, pointer, controller, config
+│       │       └── (one camera owner, one gesture thread, never touches voice state)
 │       │
 │       ├── output/
 │       │   ├── text_to_speech.py
@@ -2526,7 +3175,8 @@ Other entry points, all landing in `kayra.app.main()`:
 ```bash
 python main.py           # backward-compatibility shim
 python -m kayra          # from within the venv, with src/ importable
-python -m kayra.input.gesture   # the standalone gesture engine
+python -m kayra.input.gesture   # hand gesture control alone, no UI
+python -m kayra.input.gesture --doctor   # camera, detector and accelerator report
 ```
 
 Before assuming a change is correct:
@@ -2550,49 +3200,97 @@ current.
 `tests/*.py` are **standalone diagnostic scripts, not a pytest suite** — run each directly.
 They fall into three tiers.
 
+### Running them
+
+```
+.venv/Scripts/python tests/run_all.py               # the unit tier, one table
+.venv/Scripts/python tests/run_all.py --integration # + network / browser / model
+.venv/Scripts/python tests/run_all.py --live        # + real-hardware checks
+.venv/Scripts/python tests/run_all.py --list        # the inventory; runs nothing
+```
+
+`tests/run_all.py` holds the ONE inventory — category, feature, what each suite needs, what
+real state it touches, roughly how long it takes — and runs each suite as its **own process**,
+exactly as a developer runs it by hand. It is not pytest and does not want to be: these suites
+boot real subsystems, take the single-instance lock and own browser processes, so a collector
+that imported them all into one interpreter would have them fighting over the microphone.
+`--list --markdown` prints the regression matrix that `tests/TESTING.md` embeds, so the
+document and the runner cannot drift.
+
+**`tests/TESTING.md` is the authoritative testing guide.** Exact commands, what a healthy run
+prints, what each failure symptom means, which logs to inspect, and the manual UI checklist.
+
+### Isolation is structural, not a convention
+
+`tests/_harness.py` supplies the scaffolding, and the guarantees in it are enforced rather than
+documented — because the convention has already failed twice here (see the next subsection).
+
+| Piece | Guarantees |
+|---|---|
+| `EnvironmentGuard` | snapshots `.env`, the conversation store, the habit store and the browser cache around a whole suite; RESTORES anything that changed and still FAILS the run for it. Silently repairing would hide the defect; refusing to repair would punish the developer for a test's mistake |
+| `HostPin` | replaces `pressure_sample()`, so no tier-1 suite can read the real battery or CPU load |
+| `RecordingInstaller` | replaces `setup._pip`; the setup suite exercises the real decision code and installs **nothing** |
+| `TemporaryProject` | redirects `core.paths` at a temp directory, so persistence code runs for real against a store nobody owns |
+| `FakeMouse` | records pointer calls instead of performing them |
+| `MACHINES` | seven synthetic machines nobody owns, in the shape both `core.hardware` and `setup.detect_graphics` produce |
+
 ### Tier 1 — hardware-free, assert, exit non-zero
 
-Run these first; they need no audio, no browser and no network.
+Run these first; they need no audio, no browser, no network, no GPU, no camera and no API key.
 
-| Suite | Covers | Result this session |
+| Suite | Covers | Checks |
 |---|---|---|
-| `test_automation.py` | normalizer table, DMM token coverage, DENY/CONFIRM/ALLOW policy, confirmation binding, target resolution and ambiguity, context referents, planner ordering, filesystem, timers, audit log, AST assertions (no `shell=True`, no name-based kill, no LLM on the exec path), performance | **261 passed, 0 failed** |
-| `test_proactive_agent.py` | state model, safety gate, deferral, scoring, cooldowns, habits, reaction learning, LLM-failure fallback, TTS routing, shutdown, barge-in phrase regressions. Pins a healthy host — see the host-isolation note below | **140 passed, 0 failed** |
-| `test_emotion_engine.py` | eight states, false positives, third person, negation, ambiguity, malformed input, thread-safety, repeated calls, memory growth, performance, integration contract | **119 passed, 0 failed** |
-| `test_browser_selection.py` | capability priors, candidate ordering, cache asymmetry, page-side dead-backend detection, probe budget, browser-switch path, engine integration | **64 passed, 0 failed** |
-| `test_target_resolution.py` | the website registry, open-target typing, single-target close, strict-vs-loose matching, close/tab semantics, AST proof that no call site fuzzy-matches, STT protection, resolution performance budget | **108 passed, 0 failed** |
-| `test_ui.py` | theme, components, views, state reflection, boundary discipline (AST), refinement regressions, interaction, the shutdown button, the TTS device card, Home's Graphics card, the speech-input card's requested-vs-active rendering, memory management by id, the boot-window contract (a screen built before the backend must not paint a guessed microphone state, and must re-read at `bootFinished` with no `listeningChanged` event), and a whole-run proof that the suite did not modify the developer's `.env` | **416 passed, 0 failed** (Qt `offscreen`, backend fully stubbed) |
-| `test_voice_control.py` | interrupt / lifecycle vocabulary, the Kayra-vs-computer shutdown boundary, tail matching, the JS/Python vocabulary agreement, control dispatch, the three runtime axes, shutdown ORDER and idempotency against a stubbed backend with `os._exit` replaced, classification cost | **186 passed, 0 failed** |
-| `test_tts_device.py` | ORT variant sanity and the package-name/import-name distinction, CUDA DLL preparation, the real cached provider probe, mode validation, provider planning with TensorRT excluded, failure modes simulated by substituting the provider list, the structured diagnostic, a real Kokoro session in every mode plus a real runtime switch, telemetry cost | **143 passed, 0 failed** |
-| `test_environment.py` | `run.py` interpreter ownership and the sys.path rule (AST), a real refusal to run on the system interpreter, import origin, the single-ORT-import rule, `setup.py` provisioning / pins / repair, and agreement between setup's CUDA probe and the application's | 63 checks, **1 pre-existing failure** |
-| `test_capture_pipeline.py` | conversation context and its bounds, the phonetic key and distance, N-best re-ranking, every condition the repair stage refuses on (including an AST proof that no word-replacement table exists and that a shutdown can never be invented), the page's capture/VAD/endpointing contract, turn-loop wiring | **132 passed, 0 failed** |
-| `test_proactive_presence.py` | greeting routing across the clock and across absences, every contextual candidate and its evidence, the suppression matrix, tier arithmetic, tone and phrasebook discipline, the zero-LLM claim asserted over 720 evaluations, integration with the real agent | **213 passed, 0 failed** |
-| `test_provider_router.py` | the two hierarchies and that they stay separate, all eight failure kinds plus `Retry-After`, exact fallback order with at most one call per provider per request, cooldown expiry on an injectable clock, a 20-request storm test proving ONE call to a rate-limited provider rather than twenty, streaming fallback and the no-splice rule, the fallback log lines, integration with the real engine and its unsliced DMM prompt | **124 passed, 0 failed** |
-| `test_stt_backend.py` | requested-vs-active, every transition (Automatic → Edge → Chrome → Edge → Automatic), a named backend that cannot start, switching while listening / paused / recovering, one teardown per switch with teardown BEFORE rebuild, rapid and re-entrant requests, the backend logs, an AST proof that the engine lookup never imports the STT module. `--live` adds real browser discovery | **127 passed, 0 failed** |
-| `test_memory_store.py` | stable content-derived ids and their persistence, listing an empty / missing / corrupted store, delete-by-id including the position bug it replaced, clear-all plus an AST proof that no file-removal call exists, atomicity through the existing helper, the Explorer argument vector, and that no memory content reaches a log. Sandboxed into a temp directory and restored | **138 passed, 0 failed** |
-| `test_voice_state.py` | all 1176 fact combinations resolving to a declared state, silence never becoming PAUSED, barge-in, recovery never becoming a false pause, standby vs pause, absorbing shutdown, revisions and staleness, the dwell table, every named sequence end to end, the orb amplitude contract, the leaf-module rule | **196 passed, 0 failed** |
-| `test_logging.py` | the one format, canonical subsystem names with an AST proof that no call site invents one, level thresholds and DEBUG staying out of INFO, nine shapes of secret redacted plus benign text left intact, one-owner-per-event asserted against every module that could duplicate it, the settings recorder's transactional shape, third-party noise control that disables nothing, cost | **149 passed, 0 failed** |
+| `test_ui.py` | theme, components, views, state reflection, boundary discipline (AST), refinement regressions, the shutdown button, the TTS device card, Home's Graphics card, requested-vs-active rendering, memory management by id, the boot-window contract, **five synthetic machines rendered through Home**, and a whole-run proof that the suite did not modify the developer's `.env` | **553** |
+| `test_automation.py` | normalizer table, DMM token coverage, DENY/CONFIRM/ALLOW policy, confirmation binding, target resolution and ambiguity, context referents, planner ordering, filesystem, timers, audit log, AST assertions (no `shell=True`, no name-based kill, no LLM on the exec path), performance | **263** |
+| `test_gesture_control.py` | configuration clamps, AST proof of exactly ONE `VideoCapture` and ONE hand-graph call site, AST proof that gesture code never touches voice state, the two switches, the whole capture→FSM→pointer path against a fake camera, failure paths, the pulled preview, the voice vocabulary, shutdown ORDER | **248** |
+| `test_proactive_presence.py` | greeting routing across the clock, every contextual candidate and its evidence, the suppression matrix, tier arithmetic, the zero-LLM claim asserted over 720 evaluations, integration with the real agent | **213** |
+| `test_voice_state.py` | all 1176 fact combinations resolving to a declared state, silence never becoming PAUSED, recovery never becoming a false pause, standby vs pause, absorbing shutdown, revisions and staleness, the dwell table | **196** |
+| `test_voice_control.py` | interrupt / lifecycle vocabulary, the Kayra-vs-computer shutdown boundary, tail matching, the JS/Python agreement, the three runtime axes, shutdown ORDER and idempotency with `os._exit` replaced | **190** |
+| `test_hardware_profile.py` | the Windows product-name correction across seven builds, PCI vendor parsing, tri-state integrated classification, the 32-bit VRAM clamp, the whole detector driven against seven synthetic machines through a substituted registry, the NVIDIA telemetry gate proving no spawn on a non-NVIDIA machine, and an AST walk over every module in `src/kayra` proving no runnable string names a device | **188** |
+| `test_gesture_state.py` | synthetic 21-landmark hands at two distances proving scale invariance, the stability score, One Euro / dead-zone / outlier gate, hysteresis and the rising edge, scroll direction under noise, one-action-per-frame arbitration, the pause gate | **174** |
+| `test_logging.py` | the one format, canonical subsystem names (AST), level thresholds, nine shapes of secret redacted, one-owner-per-event, the settings recorder's transactional shape, cost | **149** |
+| `test_tts_device.py` | ORT variant sanity and the package-name/import-name distinction, CUDA DLL preparation, the real cached provider probe, provider planning with TensorRT excluded, the structured diagnostic, a real Kokoro session in every mode plus a real runtime switch, telemetry cost | **144** |
+| `test_proactive_agent.py` | state model, safety gate, deferral, scoring, cooldowns, habits, reaction learning, LLM-failure fallback, TTS routing, shutdown. Pins a healthy host | **140** |
+| `test_memory_store.py` | stable content-derived ids, listing an empty / missing / corrupted store, delete-by-id, clear-all plus an AST proof that no file-removal call exists, the Explorer argument vector, and that no memory content reaches a log | **138** |
+| `test_setup_runtime.py` | `configure_speech_runtime()` per synthetic machine with a RECORDING installer, reconciliation both ways, idempotence both ways, a stale driver, a genuine CUDA failure, an unrecognised CUDA major, the three-way PASS/FAIL/NOT APPLICABLE report, and agreement between setup's registry logic and `core.hardware`. **Installs nothing** | **138** |
+| `test_capture_pipeline.py` | conversation context and its bounds, the phonetic key and distance, N-best re-ranking, every condition the repair stage refuses on (including AST proof that no word-replacement table exists), the page's capture/VAD/endpointing contract | **132** |
+| `test_stt_backend.py` | requested-vs-active, every transition, a named backend that cannot start, switching while listening / paused / recovering, one teardown per switch with teardown BEFORE rebuild, an AST proof that the engine lookup never imports the STT module | **127** |
+| `test_provider_router.py` | the two hierarchies, all eight failure kinds plus `Retry-After`, exact fallback order, cooldown expiry on an injectable clock, a 20-request storm proving ONE call to a rate-limited provider, streaming fallback and the no-splice rule | **124** |
+| `test_emotion_engine.py` | eight states, false positives, third person, negation, malformed input, thread-safety, memory growth, performance | **119** |
+| `test_target_resolution.py` | the website registry, open-target typing, single-target close, strict-vs-loose matching, AST proof that no call site fuzzy-matches, STT protection | **108** |
+| `test_browser_selection.py` | capability priors, candidate ordering, cache asymmetry, page-side dead-backend detection, probe budget, the browser-switch path | **66** |
+| `test_environment.py` | `run.py` interpreter ownership and the sys.path rule (AST), a real refusal to run on the system interpreter, import origin, the single-ORT-import rule, `setup.py` provisioning / pins / repair | **65** |
+| `test_camera_runtime.py` | start/stop idempotence, newest-frame mailbox semantics, the v1 freeze scenario with a 4×-slow consumer, unopenable and silent cameras, bounded recovery, release on every exit path, ten-times-on-off cycling | **64** |
 
-**Totals this session: 2578 tier-1 checks, 2574 passing.**
+**Totals: 3990 tier-1 checks across 22 suites, 3990 passing, 1 skipped, ~166 s.**
+
+The single skip is `test_tts_device`'s broken-CUDA simulation, which has nothing to simulate on
+a machine where CUDA genuinely works. **A skip is information, not a failure** — "this machine
+has no NVIDIA GPU" and "the NVIDIA path is broken" are different facts, and a suite reporting
+the first as the second teaches its readers to ignore red.
 
 `test_automation.py` runs in DRY mode by default and touches nothing on the desktop; pass
 `--live` for the read-only Win32 checks.
 
-### The four failures, and why they are not this work
+### The four long-standing failures are fixed, and they were all one bug
 
-All four were verified pre-existing by stashing the working tree and re-running against `HEAD`.
+Four checks had been red for several milestones and were each time verified pre-existing by
+stashing the tree and re-running against `HEAD`. That was accurate and it was the wrong
+conclusion to stop at: **all four were a tier-1 suite reading the developer's own
+configuration**, and none was a defect in the code under test.
 
-| Suite | Check | Cause |
-|---|---|---|
-| `test_browser_selection.py` | `'None' means no explicit preference` | reads `STT_BROWSER` from this machine's `.env`, which is `chrome` — the check depends on the developer's configuration rather than on the code |
-| `test_tts_device.py` ×2 | `with CUDA usable, the default engine runs on CUDA`, `switching replaced the session` | this machine's `.env` sets `TTS_DEVICE_MODE=CPU` |
-| `test_environment.py` | `GPU-capable: no failure reason` | same |
+| Suite | Check | What it was really asserting | Fix |
+|---|---|---|---|
+| `test_browser_selection.py` | `'None' means no explicit preference` | that this machine has no `STT_BROWSER` set. The sentinels `"auto"`/`""`/`"default"` are the user saying "pick for me"; `None` means the caller expressed nothing, so the engine reads the configuration — which is the entire purpose of that setting | the configuration is substituted at `speech_to_text.env` (NOT `os.environ`: `core.config.env()` gives `.env` precedence over the process environment) and all three outcomes are pinned |
+| `test_environment.py` | `GPU-capable: no failure reason` | that this machine's `TTS_DEVICE_MODE` is not `CPU`. `failure_reason` explains why the ACTIVE DEVICE is not the GPU, and `"CPU was requested."` is a good explanation — it is the user's setting | asserts the correct, weaker thing: a usable CUDA runtime is never described as BROKEN |
+| `test_tts_device.py` ×2 | `with CUDA usable, the default engine runs on CUDA`; `switching replaced the session` | the same setting. `TextToSpeechEngine()` with no argument reads `TTS_DEVICE_MODE`, and switching to CPU from CPU is correctly a no-op | the engine is constructed with `device_mode="AUTO"`, which is what those GPU assertions actually mean; the no-op case is checked separately |
 
-### Host isolation: three defects repaired in the suites themselves
+### Host isolation: the earlier defects, and why the harness now enforces it
 
 A tier-1 suite is hardware-free by contract, and its verdict must not depend on the machine.
-Three places broke that, and all three were found by a run going red on unchanged code — which
-is the only honest way this class of bug shows up.
+These were found by a run going red on unchanged code — which is the only honest way this class
+of bug shows up, and the reason `EnvironmentGuard` and `HostPin` now make it fail at the moment
+it happens rather than hours later.
 
 | Suite | What it read from the host | Fix |
 |---|---|---|

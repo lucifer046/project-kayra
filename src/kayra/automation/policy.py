@@ -168,6 +168,95 @@ class ActionResult:
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
+# │            THE POWER-TARGET BOUNDARY: KAYRA vs THE COMPUTER            │
+# └────────────────────────────────────────────────────────────────────────┘
+# "SHUT DOWN" NAMES TWO COMPLETELY DIFFERENT OPERATIONS, and confusing them is the worst
+# mistake this codebase can make.
+#
+#   A. shut down KAYRA        -> end one process. Reversible in five seconds.
+#   B. shut down the COMPUTER -> end the user's session, close everything they had open,
+#                                and lose anything unsaved. Reversible in two minutes if
+#                                they are lucky.
+#
+# THE FAILURE THIS EXISTS TO PREVENT, observed live:
+#
+#     transcript: "Shutdown the engine car."          <- a MALFORMED transcript. The user
+#                                                        meant Kayra's engine.
+#     DMM token : "system shutdown the engine car"
+#     normalizer: _SYSTEM_VERBS did `if "shutdown" in payload` — a SUBSTRING test with no
+#                 requirement that anything in the sentence names a computer
+#     result    : Action("system", "shutdown") -> "This will shut down your computer.
+#                 Should I go ahead?"
+#
+# One "yes" away from ending the user's session, from a sentence that never mentioned a
+# computer. The substring test was the whole of the safety logic.
+#
+# So the destructive power verbs now require an EXPLICIT TARGET, resolved here, before the
+# action is even constructed. Nothing infers a computer shutdown; the user has to name one.
+
+# Words that unambiguously name THE MACHINE. Matched as whole words, never as substrings —
+# "pc" must not match inside "pcap", and "system" is deliberately absent because it is the
+# DMM's own token prefix ("system shutdown") and would therefore match every single one of
+# these payloads, which is precisely the bug.
+COMPUTER_TARGET_WORDS = frozenset({
+    "computer", "pc", "laptop", "desktop", "machine", "windows", "notebook",
+    "workstation", "device",
+})
+
+# Words that unambiguously name KAYRA. A payload naming one of these is a LIFECYCLE request
+# that reached the automation layer by mistake — the local control interpreter should have
+# caught it before the DMM ever saw it — and the correct response is to hand it back, never
+# to touch the machine.
+KAYRA_TARGET_WORDS = frozenset({
+    "kayra", "engine", "assistant", "yourself", "you", "program", "app", "application",
+    "jarvis", "bot",
+})
+
+# Verbs whose blast radius is the whole session. These are the ones that need a target.
+# `lock`, `volume` and `brightness` are deliberately NOT here: locking is a one-keystroke
+# undo and the other two are not destructive at all.
+POWER_VERBS = frozenset({"shutdown", "restart", "sign_out", "sleep"})
+
+# The three answers, named so the caller reads as prose.
+TARGET_COMPUTER = "COMPUTER"
+TARGET_KAYRA = "KAYRA"
+TARGET_AMBIGUOUS = "AMBIGUOUS"
+
+_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def resolve_power_target(payload, assistant_alias="kayra"):
+    """
+    Whose power is this request about? Returns COMPUTER, KAYRA or AMBIGUOUS.
+
+    WHOLE-WORD MATCHING, and the default is AMBIGUOUS. A payload that names neither is not
+    quietly assumed to mean the computer — that assumption is exactly what turned "shutdown
+    the engine car" into a Windows shutdown prompt. Naming BOTH is also ambiguous: "shut down
+    Kayra and the computer" is two requests and the user must say which they meant.
+
+    `assistant_alias` folds a renamed assistant into the Kayra set, so a user who called it
+    "Vega" gets the same protection as one who did not.
+    """
+    words = {w for w in _WORD_SPLIT.split(str(payload or "").lower()) if w}
+    if not words:
+        return TARGET_AMBIGUOUS
+
+    kayra_words = set(KAYRA_TARGET_WORDS)
+    alias = str(assistant_alias or "").strip().lower()
+    if alias:
+        kayra_words.add(alias)
+
+    names_computer = bool(words & COMPUTER_TARGET_WORDS)
+    names_kayra = bool(words & kayra_words)
+
+    if names_computer and not names_kayra:
+        return TARGET_COMPUTER
+    if names_kayra and not names_computer:
+        return TARGET_KAYRA
+    return TARGET_AMBIGUOUS
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
 # │                        ACTION RISK CLASSIFICATION                      │
 # └────────────────────────────────────────────────────────────────────────┘
 # Ordinary computer control is ALLOW. Nothing here asks the user to confirm opening a tab —
@@ -194,6 +283,15 @@ _DENY_ACTIONS = {
     "file.delete_recursive_system",
     "system.disable_security",
     "system.registry_write",
+    # A power request whose target was never established. DENIED rather than confirmed:
+    # a confirmation would be asking "shall I shut down the computer?" about a sentence that
+    # may not have been about the computer at all, and a reflexive "yes" would end the
+    # session. The executor answers with a question naming BOTH options instead.
+    "system.power_ambiguous",
+    # A power request that named KAYRA. It reached the automation layer only because the
+    # transcript was malformed enough to miss the local control vocabulary; the machine must
+    # not be touched for it under any circumstances.
+    "system.power_kayra",
 }
 
 
@@ -212,6 +310,17 @@ def classify_action(action: Action):
     # Shell is special: the verdict depends on the command, not on the fact that it is shell.
     if action.domain == "shell":
         return classify_shell(action.parameters.get("command") or action.target or "")
+
+    # ── THE POWER-TARGET GATE ──
+    # Belt and braces. The normalizer already refuses to build `system.shutdown` without an
+    # explicit computer target, and this re-checks it from the action itself, because a
+    # verdict that depends on one function having been called correctly is not a policy.
+    if action.domain == "system" and action.action in POWER_VERBS:
+        target_kind = action.parameters.get("power_target")
+        if target_kind != TARGET_COMPUTER:
+            return (Risk.DENY,
+                    "a power action needs the computer named explicitly; "
+                    f"this one resolved to {target_kind or 'nothing'}")
 
     if key in _CONFIRM_ACTIONS:
         return Risk.CONFIRM, f"{key} is irreversible or affects the whole session"

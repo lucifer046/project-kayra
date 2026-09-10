@@ -595,7 +595,25 @@ def section_config():
     with Capture() as cap:
         logbus.info(Subsystem.BOOT, "ready")
     check("closing a turn stops the correlation", "Turn #" not in cap.text(), cap.text())
-    check("auto-incrementing works", logbus.begin_turn() == 1)
+    # ── THE COUNTER IS MONOTONIC ACROSS TURNS, and that is the fix, not a detail. ──
+    # `end_turn()` sets the OPEN turn to 0; it used to set the only counter there was, so the
+    # next `begin_turn()` computed 0 + 1 and every turn in a session was "Turn #1". The
+    # correlation the number exists for was absent, and nothing could tell whether one turn
+    # was newer than another — which is what a background retry chain needs in order to
+    # notice it has been superseded.
+    logbus.end_turn()
+    first = logbus.begin_turn()
+    logbus.end_turn()
+    second = logbus.begin_turn()
+    check("auto-incrementing works", isinstance(first, int) and first > 0, str(first))
+    check("the next turn is a LATER number, not 1 again", second > first,
+          f"{first} -> {second}")
+    check("current_turn is the open one", logbus.current_turn() == second)
+    check("latest_turn survives the turn ending", (logbus.end_turn() or True)
+          and logbus.latest_turn() == second and logbus.current_turn() == 0,
+          f"latest={logbus.latest_turn()} current={logbus.current_turn()}")
+    check("an explicit id still wins", logbus.begin_turn(184) == 184)
+    logbus.end_turn()
     logbus.end_turn()
 
     # Cost. A log call on a suppressed level must be close to free — the DEBUG lines on the

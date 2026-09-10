@@ -50,6 +50,32 @@ SAMPLE_RATE = 24000
 # actual silence is one slice plus the device latency, not one whole sentence.
 WRITE_SLICE_MS = 40
 
+# ── PRIMING THE DEVICE BEFORE THE FIRST WORD ─────────────────────────────
+# The first write of an utterance fills the sound card's ring buffer in ONE call instead of
+# in 40ms instalments. This is what stops the first word or two being clipped.
+#
+# THE MECHANISM, measured rather than guessed. Kokoro is asked for `trim=True`, which strips
+# the leading silence: the very first sample handed to the device is already a phoneme —
+# measured peak 0.09-0.28 in the first 50ms, against 0.0000 for the untrimmed audio. There is
+# no lead-in to absorb a device transient.
+#
+# Meanwhile the persistent output stream has been running (and idle) since boot, so its ring
+# is empty when speech finally arrives: measured 2560 frames of room, ~107ms, against a
+# reported stream latency of 93ms. Writing 40ms at a time meant the callback was assembling
+# its first block while only part of it had been delivered, and a partially-filled block is
+# padded — with real speech, not silence, at the position where the padding lands.
+#
+# So the fix is to hand over at least one full device period before the callback needs it.
+# It costs NOTHING in latency: the ring has room, so this write returns immediately (measured
+# 0.6ms) exactly as the two small writes it replaces did. It is not a delay before speaking,
+# it is the same audio delivered in one piece instead of three.
+#
+# The cap bounds the one thing it could cost: a `stop()` arriving mid-write cannot be noticed
+# until that write returns. In practice barge-in is unaffected because `stop()` calls
+# `abort()`, which discards the device buffer immediately rather than waiting for us.
+PRIME_MARGIN_MS = 40
+MAX_PRIME_MS = 250
+
 
 class KokoroOnnx(Kokoro):
     """
@@ -231,6 +257,9 @@ class DynamicVoiceEngine:
         # decide "was this the user, or was this me?".
         self._intervals = deque(maxlen=64)   # list of [start_ms, end_ms]
         self._burst_start_ms = None
+        # Whether this burst has already had its priming write. See `_take_prime`.
+        self._burst_primed = False
+        self._prime_frames = 0
         # Wall-clock of the last barge-in. Anything the microphone starts capturing after
         # this instant belongs to the user, by definition — they just took the floor.
         # Cleared the moment audio starts again (see `_begin_burst`).
@@ -282,11 +311,26 @@ class DynamicVoiceEngine:
                 latency="low",
             )
             self._stream.start()
+            # Sized from the stream PortAudio actually gave us, not from a guess: the same
+            # request yields very different latencies across host APIs and devices, and a
+            # hardcoded number would be too small on one machine and wasteful on another.
+            self._prime_frames = self._prime_frames_for(self._stream)
         except Exception as e:
             # No usable device / exclusive-mode conflict: degrade to the legacy path
             # rather than taking the whole assistant down over audio hardware.
             print_warning(f"Persistent audio stream unavailable ({e}). Falling back to buffered playback.")
             self._stream = None
+            self._prime_frames = 0
+
+    @staticmethod
+    def _prime_frames_for(stream):
+        """How many frames to hand over in the first write, from the stream's own latency."""
+        try:
+            latency_ms = float(getattr(stream, "latency", 0.0) or 0.0) * 1000.0
+        except Exception:
+            latency_ms = 0.0
+        millis = min(MAX_PRIME_MS, max(WRITE_SLICE_MS, latency_ms + PRIME_MARGIN_MS))
+        return int(SAMPLE_RATE * millis / 1000.0)
 
     def _warm_up(self):
         """Runs one throwaway synthesis so the first user-visible utterance is not the cold one."""
@@ -342,11 +386,25 @@ class DynamicVoiceEngine:
 
                 self._begin_burst()
                 if self._stream is not None:
-                    for start in range(0, len(audio), slice_len):
+                    start = 0
+                    while start < len(audio):
                         if epoch != self._epoch:
                             break
+                        # The FIRST write of an utterance fills the device ring in one go;
+                        # every write after it is the ordinary 40ms slice, so barge-in keeps
+                        # re-checking the epoch just as often as before. See PRIME_MARGIN_MS.
+                        if self._take_prime():
+                            # Sized to what the ring will ACTUALLY take right now, not to
+                            # the nominal latency: the two differ (measured 2560 frames of
+                            # room against a 133ms latency+margin figure), and writing more
+                            # than the ring holds simply blocks for the excess — filling it
+                            # no better while blocking longer than a slice.
+                            length = max(slice_len,
+                                         min(self._prime_frames, self._room()))
+                        else:
+                            length = slice_len
                         try:
-                            self._stream.write(audio[start:start + slice_len])
+                            self._stream.write(audio[start:start + length])
                         except Exception as e:
                             if epoch != self._epoch:
                                 # `stop()` aborted the device out from under this write.
@@ -356,6 +414,7 @@ class DynamicVoiceEngine:
                             print_warning(f"Audio write failed, reopening stream: {e}")
                             self._reopen_stream()
                             break
+                        start += length
                         self._touch_burst()
                 else:
                     # Legacy fallback path (no persistent stream available)
@@ -381,12 +440,37 @@ class DynamicVoiceEngine:
     #                    AUDIBLE-WINDOW (ECHO) BOOKKEEPING
     # ──────────────────────────────────────────────────────────────────────
 
+    def _room(self):
+        """Frames the device ring will accept right now. 0 if the stream cannot say."""
+        try:
+            return max(0, int(self._stream.write_available))
+        except Exception:
+            return 0
+
+    def _take_prime(self):
+        """
+        True exactly once per burst: the caller owns the priming write.
+
+        A LATCH, not a "is this the first chunk?" test. An utterance arrives as several audio
+        chunks and each is a separate trip through the playback worker, so priming per chunk
+        would hand the device an oversized write in the middle of a sentence — where the ring
+        is already full and it would simply block, coarsening barge-in for no benefit. The
+        device only needs filling once, at the point it is empty.
+        """
+        with self._lock:
+            if self._burst_primed or not self._prime_frames:
+                return False
+            self._burst_primed = True
+            return True
+
     def _begin_burst(self):
         with self._lock:
             self._playing = True
             self._idle.clear()
             self._last_stop_ms = None  # A new utterance re-arms the echo gate.
             if self._burst_start_ms is None:
+                # A genuinely new burst: the ring has drained, so the next write primes it.
+                self._burst_primed = False
                 self._burst_start_ms = now_ms()
                 self._intervals.append([self._burst_start_ms, self._burst_start_ms])
             if self._turn_t0 is not None:
@@ -406,6 +490,9 @@ class DynamicVoiceEngine:
                 if self._intervals:
                     self._intervals[-1][1] = now_ms()
                 self._burst_start_ms = None
+            # The ring drains when the burst ends, so the next one primes again. Set
+            # unconditionally: `stop()` calls this on a burst that may never have started.
+            self._burst_primed = False
             self._playing = False
 
     def _refresh_idle(self):

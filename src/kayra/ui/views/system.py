@@ -57,9 +57,14 @@ class _AnalysisLoader(QObject):
     """
     Runs the device analysis off the GUI thread and delivers it as a queued signal.
 
-    `device_profile()` makes a batched WMI call measured at roughly three seconds on first use.
-    On the GUI thread that is a three-second freeze; per visit it is a repeated one. It runs
-    once, here, and `system_profile` caches the result for the process.
+    `analysis()` is not free: it collects the static profile, enumerates audio devices through
+    `sounddevice` (~150 ms) and probes for a browser with a speech backend. On the GUI thread
+    that is a visible freeze on entry; per visit it is a repeated one. It runs once, here, and
+    `system_profile` caches the result for the process.
+
+    The hardware half of that used to dominate it — one batched PowerShell/CIM call measured
+    at 4.41 s. `core.hardware` reads the same facts from the registry in under a millisecond,
+    so this thread now exists for the audio and browser probes rather than for the WMI call.
 
     WHY NOT QThread. The obvious implementation — a QObject moved onto a QThread parented to the
     view — crashes when the view is destroyed while the worker is still running: Qt destroys the
@@ -325,7 +330,14 @@ class SystemView(View):
             self.findings_pill.set_status("All clear", "success")
 
     def _render_device(self, profile):
-        from kayra.core.system_profile import human_bytes
+        """
+        The device sheet. EVERY value here is read from the profile — there is no literal
+        model name, capacity or resolution anywhere in this method, and the test suite
+        asserts that by rendering the screen against synthetic machines.
+        """
+        from kayra.core.system_profile import human_bytes, os_summary
+
+        product, version = os_summary()
 
         rows = [
             StatRow("Processor", profile["cpu_name"] or "unknown", mono=False),
@@ -334,22 +346,50 @@ class SystemView(View):
             StatRow("Base clock", f"{profile['cpu_max_mhz']:.0f} MHz"
                                   if profile["cpu_max_mhz"] else "unknown"),
             StatRow("Memory", human_bytes(profile["ram_total"])),
-            StatRow("Graphics", profile["gpu_name"] or "not detected", mono=False),
-            # Honest about the WMI limitation rather than printing a wrong number.
-            StatRow("Video memory",
-                    human_bytes(profile["vram_total"]) if profile["vram_total"]
-                    else "not reported by Windows"),
-            StatRow("Operating system",
-                    f"{profile['os_edition'] or profile['os_name']} "
-                    f"(build {profile['os_release']})", mono=False),
+        ]
+
+        # One row per real adapter, so a switchable-graphics laptop shows both rather than
+        # whichever one happened to win a sort. Virtual adapters are omitted: naming the
+        # Microsoft Basic Display Adapter as "your graphics" helps nobody.
+        real = [g for g in profile.get("gpus") or [] if not g.get("software")]
+        if real:
+            for adapter in real[:3]:
+                label = "Graphics" if adapter is real[0] else "Graphics (also)"
+                rows.append(StatRow(label, adapter["name"], mono=False))
+                rows.append(StatRow("  Video memory", adapter["memory_text"]))
+                if adapter.get("driver_version"):
+                    rows.append(StatRow("  Driver", adapter["driver_version"]))
+        else:
+            rows.append(StatRow("Graphics", "not detected", mono=False))
+
+        rows.extend([
+            # The CORRECTED product name and the REAL build. This row used to read
+            # "(build 10)" from `platform.release()`, which is 10 on every Windows 11
+            # machine — see `core/hardware.py` for why every cheap source lies here.
+            StatRow("Operating system", product, mono=False),
+            StatRow("OS version", version or "unknown", mono=False),
             StatRow("Architecture", profile["architecture"] or "unknown"),
+        ])
+        if profile.get("screen_width") and profile.get("screen_height"):
+            scale = profile.get("screen_scale") or 1.0
+            monitors = profile.get("monitor_count") or 1
+            detail = f"{profile['screen_width']} x {profile['screen_height']}"
+            if scale and abs(scale - 1.0) > 0.01:
+                detail += f" at {scale:g}x"
+            if monitors > 1:
+                detail += f"  ·  {monitors} monitors"
+            rows.append(StatRow("Display", detail))
+        rows.extend([
             StatRow("Audio devices", f"{profile['audio_outputs']} output / "
                                      f"{profile['audio_inputs']} input"),
             StatRow("Python", profile["python_version"]),
-        ]
+        ])
         for disk in profile["disks"][:4]:
+            label = f"Drive {disk['mount']}"
+            if disk.get("system"):
+                label += " (system)"
             rows.append(StatRow(
-                f"Drive {disk['mount']}",
+                label,
                 f"{human_bytes(disk['free'])} free of {human_bytes(disk['total'])}"))
         self._replace(self.device_body, rows)
 

@@ -72,6 +72,40 @@ class Color:
     surface_hover = "#212126"
     surface_active = "#282830"
 
+    # ── Glass: the floating layer ──
+    # A FIFTH surface concept, and a different KIND from the four above. Those are opaque
+    # steps of a lightness ladder and they describe things that sit IN the page. These
+    # describe things that float OVER it — the dock, the navigation drawer, the window
+    # chrome — and they are semi-transparent so the ambient backdrop shows through.
+    #
+    # WHY NOT JUST A LIGHTER OPAQUE GREY. Qt has no backdrop-filter, so a real frosted blur
+    # is not available in a stylesheet; what sells "glass" here is the transparency itself
+    # plus a hairline top edge that reads as a lit rim. An opaque panel over a moving
+    # backdrop reads as a hole punched in the page, which is the opposite of floating.
+    #
+    # The alpha values are deliberately high (0.72-0.88). Anything more transparent stops
+    # being a surface: text on it competes with whatever is behind, and the whole point of
+    # the dock is that its controls stay instantly readable over any content.
+    glass = "rgba(26, 27, 30, 0.82)"
+    glass_strong = "rgba(20, 20, 22, 0.92)"
+    glass_hover = "rgba(40, 40, 48, 0.90)"
+    glass_active = "rgba(52, 52, 62, 0.94)"
+    glass_border = "rgba(255, 255, 255, 0.08)"
+    glass_border_strong = "rgba(255, 255, 255, 0.14)"
+    # The lit top edge. One hairline, brighter than the border, is what makes a translucent
+    # panel read as a physical object catching light rather than as a tinted rectangle.
+    glass_rim = "rgba(255, 255, 255, 0.10)"
+
+    # ── The ambient backdrop ──
+    # Painted behind everything by `components/backdrop.py`. Very low contrast on purpose:
+    # the requirement is that text stays highly readable, so these sit within a few points
+    # of the base ground and are visible as depth rather than as pattern.
+    backdrop_top = "#101013"      # the faint vertical wash, top
+    backdrop_bottom = "#0B0B0D"   # ... and bottom
+    backdrop_grid = "#17171C"     # the geometric hairlines
+    backdrop_bloom = "#2A1F10"    # the warm radial bloom behind the orb
+    backdrop_particle = "#3A3630"  # drifting motes
+
     # ── Lines ──
     border = "#2A2A30"        # default separator: visible, never assertive
     border_strong = "#3A3A43" # focused inputs, active card edges
@@ -226,10 +260,27 @@ class Size:
     # The readable measure. Body text past roughly this width stops scanning cleanly, and a
     # 2560px monitor should not produce 2000px-long lines. Pages centre their column in it.
     content_max = 1180
+    # Chat's own measure, narrower than a document page. A transcript alternates left- and
+    # right-aligned bubbles, so the eye travels the FULL width on every turn rather than
+    # returning to a fixed left margin — which makes a wide column tiring long before a
+    # document one would be.
+    chat_max = 900
     # Every settings control is this wide. Ragged right edges down a settings page are the
     # single most obvious sign that a form was assembled rather than designed.
     control_field = 300
     settings_label_max = 460
+    # ── The floating dock (Home and Chat only) ──
+    dock_height = 56
+    dock_radius = 28              # exactly half the height: a true pill
+    dock_button = 40
+    dock_margin_bottom = 28       # clearance from the window edge
+    # ── The navigation drawer (Home and Chat only) ──
+    drawer_width = 268
+    # ── Custom window chrome ──
+    chrome_height = 40
+    chrome_button = 46            # Windows caption buttons are wider than they are tall
+    resize_margin = 6             # the grab band Windows hit-tests for resizing
+
     min_window_width = 1040
     min_window_height = 680
     default_window_width = 1280
@@ -255,12 +306,43 @@ class Motion:
     metrics_interval = 2000
     activity_interval = 1500
 
+    # ── The shell's motion ──
+    # SLOWER THAN THE REST OF THE UI, DELIBERATELY. The durations above govern a control
+    # responding to a press, where anything over ~250ms reads as lag. These govern a SURFACE
+    # arriving or leaving, which is a different event: a panel that snaps into place at 140ms
+    # reads as a jump cut, and the whole complaint this pass answers was that navigation felt
+    # abrupt. Around a third of a second is where a movement stops being noticed as a delay
+    # and starts being read as the thing moving.
+    drawer = 340              # panel slide + scrim fade
+    drawer_items = 220        # the nav rows, started after the panel is already moving
+    drawer_stagger = 90       # ...by this much, which is what makes it read as one gesture
+    nav_transition = 300      # a page arriving: opacity plus a short horizontal travel
+    nav_travel = 18           # px. Small: this is a hint of direction, not a slide show
+    indicator = 260           # the active-item rail moving between destinations
+    dock_hover = 160
+    press = 90
+    # The ambient backdrop. SLOW is the whole point: at 8fps and a 90-second cycle the
+    # motion is felt rather than watched, which is what keeps it from competing with the
+    # interface. It also means the backdrop costs less per second than the orb does.
+    backdrop_fps = 8
+    backdrop_cycle_s = 90.0
+
 
 class Elevation:
     """Shadows are used for genuinely floating things only: menus, the ambient window."""
     none = "none"
     popover = "0 8px 24px rgba(0, 0, 0, 0.55)"
     floating = "0 12px 40px rgba(0, 0, 0, 0.65)"
+    # The dock sits above content and must read as lifted off it, not stuck to it. Drawn with
+    # a QGraphicsDropShadowEffect rather than QSS (Qt does not honour `box-shadow`), so this
+    # string is documentation of the intent; `dock_shadow_*` are the values actually used.
+    dock = "0 18px 48px rgba(0, 0, 0, 0.70)"
+    dock_shadow_blur = 44
+    dock_shadow_y = 14
+    dock_shadow_alpha = 170
+    drawer_shadow_blur = 56
+    drawer_shadow_x = 18
+    drawer_shadow_alpha = 190
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

@@ -32,7 +32,8 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 
 from kayra.utils import (print_banner, print_info, print_success, print_error,
                           print_system, now_ms, SentenceStreamer, speech_safe_text)
-from kayra.output.text_to_speech import TextToSpeechEngine
+from kayra.output.text_to_speech import (TextToSpeechEngine, SAMPLE_RATE,
+                                        WRITE_SLICE_MS, MAX_PRIME_MS)
 from kayra.input.speech_to_text import is_interrupt_phrase, interrupt_in_tail
 
 FAILURES = []
@@ -70,6 +71,104 @@ def section_tts_latency(tts):
     check("speech starts while the response is still generating", first_audio < 3.0,
           f"({first_audio:.2f}s)")
     return first_audio
+
+
+def section_first_word_not_clipped(tts):
+    """
+    The first word must not be clipped, and nothing may be added or lost to achieve it.
+
+    THE BUG. Kokoro is asked for `trim=True`, which strips the leading silence — the very
+    first sample handed to the device is already a phoneme (measured peak 0.09-0.28 in the
+    first 50ms, against 0.0000 untrimmed). The persistent output stream has meanwhile been
+    running and idle since boot, so its ring is empty when speech arrives: 2560 frames of
+    room against a 93ms reported latency. Writing 40ms at a time took THREE writes to fill
+    it while the callback was already consuming, so the callback assembled its first block
+    from a partially-filled ring — and with no lead-in silence, what got mangled was the
+    first word.
+    """
+    print_system("\n[1b] First word is not clipped")
+
+    if tts._stream is None:
+        print_info("no persistent output stream on this host — priming does not apply")
+        return
+
+    # Start from silence, BEFORE the stream is captured. `section_tts_latency` may still be
+    # draining, and a spy installed mid-burst would record writes for an utterance that was
+    # primed before it. `stop()` can also REPLACE the stream object, so capturing first would
+    # leave the spy on one stream and the original `write` on another.
+    tts.stop()
+    tts.wait_until_idle(timeout=10)
+    time.sleep(0.3)
+
+    writes = []
+    real_write = tts._stream.write
+
+    def spy(data):
+        room = tts._stream.write_available
+        underflowed = real_write(data)
+        writes.append((len(data), room, bool(underflowed)))
+
+    tts._stream.write = spy
+    try:
+        tts.begin_turn()
+        tts.speak("Certainly sir, the deployment finished about ten minutes ago.")
+        tts.wait_until_idle(timeout=30)
+        first_run = list(writes)
+
+        writes.clear()
+        tts.begin_turn()
+        tts.speak("Yes, the file has been saved.")
+        tts.wait_until_idle(timeout=30)
+        second_run = list(writes)
+    finally:
+        tts._stream.write = real_write
+
+    check("audio reached the device", bool(first_run) and bool(second_run))
+    if not (first_run and second_run):
+        return
+
+    slice_frames = int(SAMPLE_RATE * WRITE_SLICE_MS / 1000)
+
+    # ── 1. THE FIRST WRITE FILLS THE RING ──
+    # The check that actually pins the fix: the device must be full after ONE write, not
+    # after three. `write_available` before the second write is what says so.
+    first_len, first_room, _ = first_run[0]
+    check("the first write covers at least one device period",
+          first_len >= min(first_room, tts._prime_frames),
+          f"wrote {first_len} frames into {first_room} of room")
+    if len(first_run) > 1:
+        _len2, room_after_first, _u = first_run[1]
+        check("the ring is full after the FIRST write, not after three",
+              room_after_first < slice_frames,
+              f"{room_after_first} frames still free — the callback can assemble a "
+              f"partial block, and with trim=True that eats the first word")
+    check("no write underflowed", not any(u for _l, _r, u in first_run))
+
+    # ── 2. PRIMING ONLY EVER HAPPENS INTO A DRAINED RING ──
+    # A long sentence arrives as several bursts — the audio queue empties between them and
+    # the ring genuinely drains — so more than one write can be oversized. What must never
+    # happen is an oversized write into a ring that is already full: that would block for
+    # longer than a slice and coarsen barge-in for no benefit.
+    cap = int(SAMPLE_RATE * MAX_PRIME_MS / 1000)
+    oversized = [(length, room) for length, room, _u in first_run + second_run
+                 if length > slice_frames]
+    check("every oversized write went into a ring with room for it",
+          all(room >= length for length, room in oversized),
+          f"{[(l, r) for l, r in oversized if r < l][:3]}")
+    check("no priming write exceeds the cap",
+          all(length <= cap for length, _room in oversized),
+          f"max {max((l for l, _r in oversized), default=0)} against a {cap}-frame cap")
+    check("most writes are still ordinary slices",
+          len(oversized) * 4 <= len(first_run) + len(second_run),
+          f"{len(oversized)} oversized of {len(first_run) + len(second_run)}")
+
+    # ── 3. PRIMING IS PER UTTERANCE, NOT PER PROCESS ──
+    # The latch resets when the burst ends, or the second sentence of a session would be
+    # the one that gets clipped.
+    second_len, second_room, _ = second_run[0]
+    check("a later utterance primes the device again",
+          second_len >= min(second_room, tts._prime_frames),
+          f"wrote {second_len} frames into {second_room} of room")
 
 
 def section_barge_in(tts):
@@ -227,6 +326,7 @@ if __name__ == "__main__":
 
     try:
         section_tts_latency(tts)
+        section_first_word_not_clipped(tts)
         section_barge_in(tts)
         section_echo_gate(tts)
         section_interrupt_vocabulary()

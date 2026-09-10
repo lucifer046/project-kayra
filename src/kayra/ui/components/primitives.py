@@ -129,12 +129,28 @@ class Card(QFrame):
         outer.setContentsMargins(Space.base, Space.base, Space.base, Space.base)
         outer.setSpacing(Space.md)
 
+        self._title_text = title or ""
         if title:
             header = QHBoxLayout()
             header.setSpacing(Space.sm)
             self.title_label = _label(title, "CardTitle")
-            header.addWidget(self.title_label)
-            header.addStretch(1)
+            # THE TITLE MUST NOT SET THE CARD'S MINIMUM WIDTH.
+            #
+            # A non-wrapping QLabel reports its full text width as its minimum, so a card
+            # titled "Hand gesture" could not be narrower than that text plus its padding —
+            # measured at 180px for those twelve characters. In a row of cards those minima
+            # ADD, and the row's minimum then exceeds the window: Home's bottom strip needed
+            # 1330px at a `min_window_width` of 1040, and the last card was simply pushed off
+            # the right edge. That is the same defect the System card's footprint caption
+            # caused once already, arriving from a different direction.
+            #
+            # The title is therefore elided to the width it is actually given and keeps its
+            # full text in a tooltip. Nothing about the card's content changes; what changes is
+            # that a card can now be as narrow as its content genuinely needs.
+            self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.title_label.setMinimumWidth(0)
+            self.title_label.setToolTip(title)
+            header.addWidget(self.title_label, 1)
             self.header_slot = header
             outer.addLayout(header)
         else:
@@ -153,6 +169,92 @@ class Card(QFrame):
         """Puts a control (pill, button) on the card's title row."""
         if self.header_slot is not None:
             self.header_slot.addWidget(widget)
+
+    def resizeEvent(self, event):
+        # Elided against the width the title ACTUALLY got, not a guessed character count —
+        # the same rule Home's activity rows and captions already follow. A fixed truncation
+        # would cut a short title on a wide card and overflow a long one on a narrow card.
+        super().resizeEvent(event)
+        if self.title_label is None or not self._title_text:
+            return
+        from PySide6.QtGui import QFontMetrics
+        metrics = QFontMetrics(self.title_label.font())
+        self.title_label.setText(metrics.elidedText(
+            self._title_text, Qt.ElideRight, max(24, self.title_label.width())))
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                            GLASS PANEL                                 │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class GlassPanel(QFrame):
+    """
+    A translucent floating surface. The dashboard equivalent of `Card`, for Home.
+
+    WHY A SECOND PANEL TYPE RATHER THAN RESTYLING `Card`.
+    They are different objects. A `Card` is OPAQUE and sits IN a page — it is what Automation,
+    Memory, Activity, System and Settings are built from, where content is dense and a solid
+    ground is what makes a table readable. A `GlassPanel` is TRANSLUCENT and floats OVER the
+    ambient backdrop, which is the whole point on Home: the warm bloom behind the orb bleeds
+    through the panels around it instead of stopping dead at their edges, and that continuity
+    is most of what separates "one lit surface" from "five rectangles on a dark page".
+
+    Restyling `Card` to be translucent would have applied that to all five utility screens,
+    where a moving backdrop behind a settings form is a distraction rather than depth.
+
+    THE TITLE IS AN OVERLINE, not a heading. Small, tracked, uppercase, tertiary — it names
+    the panel without competing with the values inside it. That is the difference between a
+    dashboard that reads as instrumentation and one that reads as a stack of headed boxes.
+    """
+
+    def __init__(self, title=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("GlassPanel")
+        # A plain QFrame honours a stylesheet background, but the attribute is set anyway so
+        # a future change of base class cannot silently lose the fill — the trap that once
+        # rendered the System score tiles as bare text.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(Space.base, Space.md, Space.base, Space.base)
+        outer.setSpacing(Space.md)
+
+        self._title_text = title or ""
+        if title:
+            header = QHBoxLayout()
+            header.setSpacing(Space.sm)
+            self.title_label = _label(title, "GlassPanelTitle")
+            # Same rule as `Card`: a non-wrapping QLabel reports its full text width as its
+            # minimum, and in a row of panels those minima ADD until the row cannot fit the
+            # window. Elide to the width actually given, keep the full text in a tooltip.
+            self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.title_label.setMinimumWidth(0)
+            self.title_label.setToolTip(title)
+            header.addWidget(self.title_label, 1)
+            self.header_slot = header
+            outer.addLayout(header)
+        else:
+            self.title_label = None
+            self.header_slot = None
+
+        self.body = QVBoxLayout()
+        self.body.setSpacing(Space.sm)
+        self.body.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(self.body)
+
+    def add_header_widget(self, widget):
+        """Puts a control (a pill, a small button) on the panel's title row."""
+        if self.header_slot is not None:
+            self.header_slot.addWidget(widget)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.title_label is None or not self._title_text:
+            return
+        from PySide6.QtGui import QFontMetrics
+        metrics = QFontMetrics(self.title_label.font())
+        self.title_label.setText(metrics.elidedText(
+            self._title_text, Qt.ElideRight, max(24, self.title_label.width())))
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -770,6 +872,28 @@ def _icon_glyph(kind, color, size=16, dpr=None):
                         180 * 16, 180 * 16)
         painter.drawLine(QPointF(s * 0.5, s * 0.72), QPointF(s * 0.5, s * 0.88))
         painter.drawLine(QPointF(s * 0.16, s * 0.84), QPointF(s * 0.84, s * 0.16))
+    elif kind == "camera":
+        painter.drawRoundedRect(QRectF(s * 0.12, s * 0.28, s * 0.62, s * 0.44), 2.0, 2.0)
+        painter.drawPolyline([QPointF(s * 0.78, s * 0.42), QPointF(s * 0.90, s * 0.32),
+                              QPointF(s * 0.90, s * 0.68), QPointF(s * 0.78, s * 0.58)])
+    elif kind == "camera_off":
+        # The camera with a slash, for the same reason `mic_off` exists: whether a camera is
+        # watching must be readable as a SHAPE, never as a shade of the same shape. This one
+        # is the more important of the two — a user cannot hear a camera being on.
+        painter.drawRoundedRect(QRectF(s * 0.12, s * 0.28, s * 0.62, s * 0.44), 2.0, 2.0)
+        painter.drawPolyline([QPointF(s * 0.78, s * 0.42), QPointF(s * 0.90, s * 0.32),
+                              QPointF(s * 0.90, s * 0.68), QPointF(s * 0.78, s * 0.58)])
+        painter.drawLine(QPointF(s * 0.10, s * 0.86), QPointF(s * 0.90, s * 0.14))
+    elif kind == "hand":
+        # Four fingers and a thumb, at the same stroke weight as the rest of the set. Drawn
+        # rather than a glyph font: the navigation rail's icons are all drawn, and one font
+        # emoji among them reads as a different application's artwork.
+        for i, x in enumerate((0.34, 0.48, 0.62)):
+            painter.drawLine(QPointF(s * x, s * (0.20 + i * 0.02)), QPointF(s * x, s * 0.62))
+        painter.drawLine(QPointF(s * 0.74, s * 0.34), QPointF(s * 0.74, s * 0.62))
+        painter.drawArc(int(s * 0.26), int(s * 0.46), int(s * 0.52), int(s * 0.46),
+                        180 * 16, 180 * 16)
+        painter.drawLine(QPointF(s * 0.26, s * 0.58), QPointF(s * 0.16, s * 0.46))
     elif kind == "pause":
         # Two filled bars. A PAUSE, not the stop square used for barge-in — the two actions
         # are different and must not share a symbol.
@@ -777,6 +901,45 @@ def _icon_glyph(kind, color, size=16, dpr=None):
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(QRectF(s * 0.32, s * 0.24, s * 0.11, s * 0.52), 1.2, 1.2)
         painter.drawRoundedRect(QRectF(s * 0.57, s * 0.24, s * 0.11, s * 0.52), 1.2, 1.2)
+    elif kind == "menu":
+        # Three rules, the middle one short. A plain hamburger is three equal lines and reads
+        # as a list; the stepped version reads as a panel that slides, which is what it does.
+        painter.drawLine(QPointF(s * 0.18, s * 0.28), QPointF(s * 0.82, s * 0.28))
+        painter.drawLine(QPointF(s * 0.18, s * 0.50), QPointF(s * 0.60, s * 0.50))
+        painter.drawLine(QPointF(s * 0.18, s * 0.72), QPointF(s * 0.82, s * 0.72))
+    elif kind == "power":
+        # The IEC power mark: a broken ring with a vertical bar. Universally read as "off",
+        # which is exactly what this control does — and it must never be mistaken for the
+        # pause bars beside it.
+        painter.drawArc(int(s * 0.22), int(s * 0.22), int(s * 0.56), int(s * 0.56),
+                        -60 * 16, 300 * 16)
+        painter.drawLine(QPointF(s * 0.5, s * 0.14), QPointF(s * 0.5, s * 0.46))
+    elif kind == "talk":
+        # A speech burst: three rising strokes inside a soft arc. Distinct from `chat`, which
+        # is a bubble and means "go to the transcript"; this one means "say something now".
+        for index, (x, height) in enumerate(((0.36, 0.16), (0.50, 0.26), (0.64, 0.20))):
+            painter.drawLine(QPointF(s * x, s * (0.5 - height)),
+                             QPointF(s * x, s * (0.5 + height)))
+        painter.drawArc(int(s * 0.14), int(s * 0.14), int(s * 0.72), int(s * 0.72),
+                        120 * 16, 120 * 16)
+        painter.drawArc(int(s * 0.14), int(s * 0.14), int(s * 0.72), int(s * 0.72),
+                        -60 * 16, 120 * 16)
+    elif kind == "chat":
+        painter.drawRoundedRect(QRectF(s * 0.14, s * 0.18, s * 0.72, s * 0.50),
+                                s * 0.12, s * 0.12)
+        painter.drawPolyline([QPointF(s * 0.32, s * 0.68), QPointF(s * 0.32, s * 0.86),
+                              QPointF(s * 0.54, s * 0.68)])
+    elif kind == "minimize":
+        painter.drawLine(QPointF(s * 0.24, s * 0.52), QPointF(s * 0.76, s * 0.52))
+    elif kind == "maximize":
+        painter.drawRoundedRect(QRectF(s * 0.24, s * 0.24, s * 0.52, s * 0.52), 1.5, 1.5)
+    elif kind == "restore":
+        # Two offset rectangles: the standard "this window is maximised, click to restore"
+        # mark. A different SHAPE from `maximize`, not a different tint of it.
+        painter.drawRoundedRect(QRectF(s * 0.20, s * 0.32, s * 0.44, s * 0.44), 1.5, 1.5)
+        painter.drawPolyline([QPointF(s * 0.34, s * 0.32), QPointF(s * 0.34, s * 0.22),
+                              QPointF(s * 0.78, s * 0.22), QPointF(s * 0.78, s * 0.64),
+                              QPointF(s * 0.66, s * 0.64)])
     painter.end()
     return QIcon(pixmap)
 

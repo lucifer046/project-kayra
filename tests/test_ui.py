@@ -19,6 +19,8 @@ Run:  .venv\\Scripts\\python.exe tests/test_ui.py
 """
 
 import os
+import ast
+import io
 import sys
 
 # Must precede any Qt import: selects the headless platform plugin.
@@ -27,7 +29,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from PySide6.QtCore import Qt, QObject, Signal, QSize
+from PySide6.QtCore import Qt, QObject, Signal, QSize, QPoint, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -115,6 +117,10 @@ class StubBridge(QObject):
     # a dead view, and this is where that has to fail loudly.
     voiceStateChanged = Signal(str, str, str, int)
     sttBackendChanged = Signal(dict)
+    # Hand gesture control, on its own signal. The camera and the microphone are independent
+    # devices and their state travels separately — a screen that learned about one from the
+    # other's signal is the class of bug the voice state machine exists to end.
+    gestureStateChanged = Signal(dict)
 
     def __init__(self, ready=True):
         super().__init__()
@@ -133,8 +139,12 @@ class StubBridge(QObject):
         self.device_mode = None
         # Telemetry the stub hands back. Overwritten per-test to exercise the GPU-present,
         # GPU-absent and telemetry-pending branches without needing a graphics card.
+        # DELIBERATELY SYNTHETIC, and deliberately NOT the developer's own card. A stub that
+        # names the machine the suite happens to run on is how a screen full of that machine's
+        # values passes review: every number below is invented, so anything the UI renders
+        # that matches this host came from the UI reading the host, which is the bug.
         self.gpu = {
-            "name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+            "name": "SYNTHETIC Test Graphics 9000",
             "utilization": 18.0,
             "memory_used_mb": 4300.0,
             "memory_total_mb": 8188.0,
@@ -143,8 +153,22 @@ class StubBridge(QObject):
             "temperature_c": 58.0,
             "source": "stub",
         }
+        # The PHYSICAL adapter, which is a different question from telemetry — see
+        # `KayraSession.graphics_profile`. Machines with an AMD or Intel GPU have this and
+        # have no `gpu` telemetry at all, and `MACHINES` below drives exactly that case.
+        self.graphics = {
+            "name": "SYNTHETIC Test Graphics 9000", "vendor": "SYNTHETIC",
+            "vram_total": 8188 * 1024 ** 2, "integrated": False,
+            "driver": "0.0.0.1", "telemetry": True,
+        }
         self.provider = "CUDAExecutionProvider"
         self.telemetry_pending = False
+        # WHERE THE THINKING HAPPENS, as the real bridge reports it. Synthetic model names,
+        # so a rendered screen carrying the developer's own routing would be visible as a
+        # failure rather than passing for a correct one.
+        self.intelligence = {"tier": "Local", "intents": 102,
+                             "decision": "Decision routing: Local (synthetic-decider)",
+                             "chat": "Chat routing: Local (synthetic-chatter)"}
         # Voice presence, as the real bridge reports it.
         self.voice = {"state": "LISTENING", "revision": 1, "text": "Listening",
                       "detail": "Microphone open.", "orb_state": "LISTENING",
@@ -173,6 +197,17 @@ class StubBridge(QObject):
         # Whether the backend has booted. False reproduces the window in which
         # `KayraWindow` has built and shown every screen but the session has not started.
         self.known = True
+        # Hand gesture control. THREE SEPARATE FIELDS, as the real controller reports them —
+        # the camera, the switch, and the runtime state answer different questions, and a stub
+        # that collapsed them would let a screen collapse them too and still pass.
+        self.gesture = {"camera": "OFF", "camera_device": "", "gesture_enabled": False,
+                        "state": "OFF", "state_label": "Disabled", "hand": False,
+                        "gesture": "No hand", "gesture_state": "NO_HAND", "error": ""}
+        self.gesture_calls = []
+        self.camera_calls = []
+        self.gesture_result = (True, "")
+        self.camera_result = (True, "")
+        self.frames_served = 0
 
     @property
     def ready(self):
@@ -269,8 +304,23 @@ class StubBridge(QObject):
     def gpu_metrics(self):
         return dict(self.gpu) if self.gpu else {}
 
+    def graphics_profile(self):
+        """
+        The PHYSICAL adapter, which every machine has and only NVIDIA reports telemetry for.
+
+        Defaults to `{}` -- the "no graphics hardware at all" case -- so a test that says
+        nothing about graphics still exercises the empty state. `section_hardware_portability`
+        substitutes real synthetic machines through this.
+        """
+        return dict(self.graphics) if self.graphics else {}
+
     def tts_provider(self):
         return self.provider
+
+    def intelligence_status(self):
+        # Substitutable per test, so a screen can be rendered against a cloud machine and a
+        # local one without either being the developer's own configuration.
+        return dict(self.intelligence)
 
     def gpu_telemetry_pending(self):
         return self.telemetry_pending
@@ -296,6 +346,53 @@ class StubBridge(QObject):
     def set_stt_backend(self, backend):
         self.backend_requests.append(backend)
         return self.backend_result
+
+    # ── Hand gesture control ──
+    # The stub models the real CONTROLLER'S ordering, not the caller's request: enabling
+    # gesture control starts the camera, turning the camera off turns gesture control off. A
+    # stub that simply recorded the boolean would let a screen that got the ordering wrong
+    # pass, and the ordering is the thing worth testing here.
+
+    def set_gesture(self, enabled):
+        self.gesture_calls.append(bool(enabled))
+        ok, detail = self.gesture_result
+        if ok:
+            self.gesture["gesture_enabled"] = bool(enabled)
+            if enabled:
+                self.gesture["camera"] = "ACTIVE"
+                self.gesture["state"] = "ACTIVE"
+            else:
+                self.gesture["state"] = "OFF"
+        else:
+            self.gesture["error"] = detail
+        self.gestureStateChanged.emit(dict(self.gesture))
+        return ok, detail
+
+    def set_camera(self, enabled):
+        self.camera_calls.append(bool(enabled))
+        ok, detail = self.camera_result
+        if ok:
+            self.gesture["camera"] = "ACTIVE" if enabled else "OFF"
+            if not enabled:
+                self.gesture["gesture_enabled"] = False
+                self.gesture["state"] = "OFF"
+        else:
+            self.gesture["error"] = detail
+        self.gestureStateChanged.emit(dict(self.gesture))
+        return ok, detail
+
+    def gesture_status(self):
+        return dict(self.gesture)
+
+    def gesture_telemetry(self):
+        return {}
+
+    def camera_frame(self):
+        if self.gesture.get("camera") != "ACTIVE":
+            return None
+        self.frames_served += 1
+        width, height = 16, 12
+        return (bytes(width * height * 3), width, height)
 
     # ── Memory ──
 
@@ -366,6 +463,37 @@ def paint(widget, width=900, height=700):
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                        1. DESIGN SYSTEM                                │
 # └────────────────────────────────────────────────────────────────────────┘
+
+def docked_window(bridge=None):
+    """
+    A shown window on Home, so the dock is the thing being driven.
+
+    THE CONTROLS MOVED. Home is pure status since the redesign — talk, microphone, camera,
+    gestures and shutdown all live in the floating dock the window puts over Home and Chat,
+    and the actions behind them live in `ui.controls`. So the checks that used to click
+    `home.listen_button` click `window.dock.mic_button` instead: same state, same backend
+    call, one surface.
+
+    Shown rather than merely constructed, because `isVisible()` is False for any widget whose
+    parent chain is hidden, and the dock's own positioning skips a hidden dock.
+    """
+    from kayra.ui.application import KayraWindow
+    window = KayraWindow(bridge if bridge is not None else StubBridge())
+    window.resize(1440, 900)
+    window.show()
+    return window
+
+
+def dock_press(button):
+    """
+    Activates a self-painted `DockButton`, which is not a QAbstractButton.
+
+    Named `dock_press` rather than `press` because `section_interaction` already has a local
+    `press(x, y)` that builds a mouse event, and a module-level name it shadows is a
+    confusing failure to read.
+    """
+    button.clicked.emit()
+
 
 def section_theme(app):
     print_system("\n[1] Design system")
@@ -587,21 +715,27 @@ def section_state(app):
     check("falling silent returns to Listening, never to paused",
           "paused" not in home.prompt.text().lower(), home.prompt.text())
 
-    # Home's secondary control is the MICROPHONE, not an interrupt. It used to be a ghost
-    # "Stop", which is the same word barge-in uses and one reading away from "quit" — three
-    # unrelated ideas on one button. Barge-in now lives in the composer and on Ctrl+.
+    # HOME IS A READOUT, NOT A CONTROL SURFACE. Since the redesign every control lives in the
+    # floating dock, and Home shows the microphone as a state rather than offering a button
+    # for it — which is what makes it impossible for a control on this page to disagree with
+    # the same control two inches below it.
     bridge.stateChanged.emit("IDLE", "AUTOMATING")
-    check("home offers a listening control, not a stop",
-          hasattr(home, "listen_button") and not hasattr(home, "stop_button"))
-    check("it reads as a pause while listening",
-          "Pause listening" in home.listen_button.text(), home.listen_button.text())
-    home.listen_button.click()
-    check("clicking it closes the microphone", bridge.listening is False)
-    check("it does NOT interrupt speech", bridge.interrupted == 0)
-    check("it does NOT shut Kayra down", bridge.shutdown_called is False)
-    check("it then reads as a way back", "Start listening" in home.listen_button.text(),
-          home.listen_button.text())
-    home.listen_button.click()
+    check("home carries no controls of its own",
+          not hasattr(home, "listen_button") and not hasattr(home, "stop_button")
+          and not hasattr(home, "shutdown_button"))
+    # ONE synchronous read, exactly as `on_show` takes: a screen that has missed every
+    # transition so far paints from a snapshot rather than waiting for the next event.
+    home._sync_voice()
+    check("it reports the microphone as open",
+          "open" in home.mic_line.value_label.toolTip().lower(),
+          home.mic_line.value_label.toolTip())
+    bridge.set_listening(False)
+    app.processEvents()
+    check("and as paused once it is closed",
+          "paused" in home.mic_line.value_label.toolTip().lower(),
+          home.mic_line.value_label.toolTip())
+    bridge.set_listening(True)
+    app.processEvents()
     check("clicking again reopens the microphone", bridge.listening is True)
 
     # Voice and TTS availability must be REPRESENTED, not assumed.
@@ -642,6 +776,7 @@ def section_state(app):
 def section_system(app):
     print_system("\n[5] System analysis")
     from kayra.core import system_profile as sp
+    from kayra.core import hardware
 
     profile = sp.device_profile()
     check("device profile returns a dict", isinstance(profile, dict))
@@ -649,17 +784,136 @@ def section_system(app):
         check(f"profile exposes '{field}'", field in profile)
     check("the profile is cached", sp.device_profile() is profile)
 
+    # The fields this milestone added. Each exists because the old shape could not express
+    # something a screen has to show without guessing.
+    for field in ("os_product", "os_build", "os_display_version", "gpu_vendor", "gpus",
+                  "has_nvidia", "cpu_vendor", "screen_width", "monitor_count"):
+        check(f"profile exposes '{field}'", field in profile)
+
     metrics = sp.live_metrics()
     for field in ("cpu_percent", "ram_percent", "kayra_processes", "kayra_memory"):
         check(f"metrics expose '{field}'", field in metrics)
     check("live metrics spawn no subprocess",
           "subprocess" not in sp.live_metrics.__code__.co_names)
 
-    # VRAM honesty: the 32-bit WMI field saturates, and a saturated read must not be reported
-    # as a real measurement.
-    check("a clamped VRAM reading is treated as unknown",
-          4293918720 >= sp._ADAPTER_RAM_CEILING,
-          "observed 4095MiB clamp on an 8GB card")
+    # ── NO SUBPROCESS ANYWHERE IN THE STATIC PROFILE EITHER ──
+    # This is the change that took collection from 4.41s to well under a millisecond. The
+    # module used to batch one PowerShell/CIM call for the CPU name, the OS caption and the
+    # GPU; `core.hardware` reads the same facts from the registry.
+    # Parsed, not grepped. Both modules DOCUMENT the PowerShell call they replaced, so a
+    # text search over the whole file finds the explanation and calls it the defect. Walking
+    # the AST for real imports and real calls is the only way to ask the question properly —
+    # the same reasoning the transcript-repair suite gives for proving there is no
+    # word-replacement dictionary.
+    for module in (sp, hardware):
+        tree = ast.parse(io.open(module.__file__, encoding="utf-8").read())
+        imported = set()
+        called = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Call):
+                target = node.func
+                if isinstance(target, ast.Attribute):
+                    called.add(target.attr)
+                elif isinstance(target, ast.Name):
+                    called.add(target.id)
+        name = module.__name__.rsplit(".", 1)[-1]
+        check(f"{name} imports no subprocess module", "subprocess" not in imported)
+        # `platform.system()` is a legitimate call whose attribute name collides with
+        # `os.system`, so the call NAME alone cannot answer this — the qualified form is what
+        # matters, and it is checked against code lines with the commentary stripped.
+        code = chr(10).join(line for line in io.open(module.__file__, encoding="utf-8")
+                         .read().splitlines() if not line.lstrip().startswith("#"))
+        check(f"{name} calls neither os.system nor os.popen",
+              "os.system(" not in code and "os.popen(" not in code
+              and "subprocess." not in code,
+              "static hardware facts must cost no process spawn")
+        # Both modules DOCUMENT the PowerShell call they replaced and why, so the word is
+        # expected in the prose. What must not exist is a runnable one — every string
+        # constant that is not a docstring is checked, which is the difference between
+        # "explains the old design" and "still contains it".
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                first = node.body[0] if node.body else None
+                if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    docstrings.add(id(first.value))
+        literals = [n.value.lower() for n in ast.walk(tree)
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                    and id(n) not in docstrings]
+        check(f"{name} contains no runnable PowerShell command",
+              not any("powershell" in text or "get-ciminstance" in text
+                      for text in literals),
+              "the batched CIM call this replaced cost 4.41s")
+
+    # ── THE WINDOWS 10 / WINDOWS 11 BUG ──
+    # `platform.release()` is "10" on Windows 11 and the System screen used to print it as the
+    # build. These checks pin the replacement rather than the symptom.
+    check("os_release is retained but is not the build",
+          profile["os_release"] != str(profile["os_build"] or ""),
+          "platform.release() is a compatibility value, not a build number")
+    product, version = sp.os_summary()
+    check("os_summary returns a product and a version", isinstance(product, str)
+          and isinstance(version, str))
+    if sys.platform.startswith("win"):
+        check("the OS build is a real build number",
+              isinstance(profile["os_build"], int) and profile["os_build"] > 1000,
+              str(profile["os_build"]))
+        check("the OS product is not the stale registry name",
+              not (profile["os_build"] >= hardware.WINDOWS_11_MIN_BUILD
+                   and product.lower().startswith("windows 10")),
+              product)
+        check("the version line carries the build", str(profile["os_build"]) in version,
+              version)
+
+    # ── THE PRODUCT-NAME CORRECTION, ON SYNTHETIC BUILDS ──
+    # Driven directly so the rule is proved on builds this machine does not have.
+    correct = hardware._windows_product_name
+    check("a stale Windows 10 name on a Windows 11 build is corrected",
+          correct("Windows 10 Home Single Language", 26200, False)
+          == "Windows 11 Home Single Language")
+    check("a genuine Windows 10 build keeps its name",
+          correct("Windows 10 Pro", 19045, False) == "Windows 10 Pro")
+    check("an already-correct name is left alone",
+          correct("Windows 11 Pro", 26100, False) == "Windows 11 Pro")
+    check("a server SKU is never renamed by a client build rule",
+          correct("Windows Server 2025 Standard", 26100, True)
+          == "Windows Server 2025 Standard")
+    check("an unknown product name is not rewritten",
+          correct("Windows 12 Home", 30000, False) == "Windows 12 Home")
+    check("an unreadable build leaves the name untouched",
+          correct("Windows 10 Pro", None, False) == "Windows 10 Pro")
+
+    # ── VRAM ──
+    # The old contract was "a clamped 32-bit read is reported as unknown", which was honest
+    # and left every modern card blank. The new contract is stronger: read the 64-bit field
+    # and report the real number.
+    adapters = hardware.gpu_adapters()
+    check("gpu_adapters returns a hashable tuple", isinstance(adapters, tuple))
+    for adapter in adapters:
+        check(f"'{adapter.name}' reports a vendor or says nothing",
+              isinstance(adapter.vendor, str))
+        check(f"'{adapter.name}' VRAM is never the 32-bit clamp",
+              adapter.vram_total != 4293918720,
+              "4095MiB is the saturated AdapterRAM value, not a measurement")
+    if adapters:
+        check("the primary adapter is never a software shim",
+              hardware.primary_gpu() is None or not hardware.primary_gpu().software)
+
+    check("has_nvidia_gpu agrees with the adapter list",
+          hardware.has_nvidia_gpu() == any(a.is_nvidia and not a.software for a in adapters))
+
+    # ── DISPLAY ──
+    monitors, width, height, scale = hardware.displays()
+    check("display metrics are measured or zero, never a default",
+          (width, height) != (1920, 1080) or width == 0,
+          f"{width}x{height}")
+    check("the display scale is a positive number", scale > 0)
 
     result = sp.analysis()
     check("analysis produces three separate scores",
@@ -673,8 +927,166 @@ def section_system(app):
     check("grades are derived, not invented",
           sp.grade(100) == "EXCELLENT" and sp.grade(0) == "POOR" and sp.grade(80) == "VERY GOOD")
 
+    os_finding = next(f for f in result["groups"]["compatibility"]
+                      if f.subsystem == "Operating system")
+    check("the OS finding names the corrected product", os_finding.summary == product,
+          os_finding.summary)
+
     check("human_bytes formats", sp.human_bytes(0) == "0 B" and "GB" in sp.human_bytes(2**31))
 
+    # The system drive is read from the environment, never assumed to be C:.
+    check("system_drive is derived, not hardcoded",
+          "C:" not in io.open(sp.__file__, encoding="utf-8").read().split(
+              "def system_drive(")[1].split("def ")[0])
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                 5b. HARDWARE PORTABILITY (SYNTHETIC MACHINES)          │
+# └────────────────────────────────────────────────────────────────────────┘
+# The screens are rendered against machines that do not exist, and then searched for values
+# that could only have come from the machine the suite is running on.
+#
+# THIS IS THE CHECK THAT ACTUALLY PROVES PORTABILITY. A UI reading the real profile passes
+# every other check in this file on any machine, because it renders whatever it is given —
+# what it cannot do, if it is hardcoded, is render something ELSE.
+
+MACHINES = {
+    "A: Windows 11 / Intel i5 / RTX 3050": {
+        "graphics": {"name": "NVIDIA GeForce RTX 3050 Laptop GPU", "vendor": "NVIDIA",
+                     "vram_total": 4 * 1024 ** 3, "integrated": False,
+                     "driver": "31.0.15.3623", "telemetry": True},
+        "gpu": {"name": "NVIDIA GeForce RTX 3050 Laptop GPU", "utilization": 7.0,
+                "memory_used_mb": 900.0, "memory_total_mb": 4096.0,
+                "memory_percent": 22.0, "temperature_c": 44.0, "source": "fixture"},
+        "expect": ["RTX 3050"], "forbid": ["RTX 4060", "Radeon", "Iris"],
+    },
+    "B: Windows 11 / Ryzen 7 / RTX 4060": {
+        "graphics": {"name": "NVIDIA GeForce RTX 4060 Laptop GPU", "vendor": "NVIDIA",
+                     "vram_total": 8 * 1024 ** 3, "integrated": False,
+                     "driver": "32.0.16.1062", "telemetry": True},
+        "gpu": {"name": "NVIDIA GeForce RTX 4060 Laptop GPU", "utilization": 31.0,
+                "memory_used_mb": 2100.0, "memory_total_mb": 8188.0,
+                "memory_percent": 25.6, "temperature_c": 61.0, "source": "fixture"},
+        "expect": ["RTX 4060"], "forbid": ["RTX 3050", "Radeon", "Iris"],
+    },
+    "C: Windows 11 / Intel i7 / Iris Xe (integrated only)": {
+        "graphics": {"name": "Intel(R) Iris(R) Xe Graphics", "vendor": "Intel",
+                     "vram_total": 0, "integrated": True,
+                     "driver": "31.0.101.5333", "telemetry": False},
+        "gpu": {},
+        # No NVIDIA telemetry exists on this machine, so the card must still name the adapter
+        # and must not present an NVIDIA figure of any kind.
+        "expect": ["Iris"], "forbid": ["RTX", "NVIDIA", "GeForce"],
+    },
+    "D: Windows 11 / Ryzen / Radeon discrete": {
+        "graphics": {"name": "AMD Radeon RX 7600M XT", "vendor": "AMD",
+                     "vram_total": 8 * 1024 ** 3, "integrated": False,
+                     "driver": "32.0.11038.5002", "telemetry": False},
+        "gpu": {},
+        "expect": ["Radeon"], "forbid": ["RTX", "NVIDIA", "GeForce", "Iris"],
+    },
+    "E: no graphics telemetry and no adapter": {
+        "graphics": {}, "gpu": {},
+        "expect": [], "forbid": ["RTX", "Radeon", "Iris", "NVIDIA"],
+    },
+}
+
+
+def _visible_text(widget):
+    """
+    Every string a rendered widget tree is ACTUALLY SHOWING, including elided tooltips.
+
+    HIDDEN LABELS ARE EXCLUDED, and that is not a convenience. Home's empty states are
+    permanent children that are shown and hidden rather than created and destroyed — a
+    deliberate design, because a `takeAt` leaves the widget painted underneath the new
+    content. So "No GPU detected" is always a child of the card, and a search that did not
+    filter on `isHidden()` would report it as visible on every machine.
+    """
+    from PySide6.QtWidgets import QLabel
+    # A HIDDEN WIDGET SHOWS NOTHING, including its children. `isVisibleTo(ancestor)` is
+    # relative to the ancestor passed, so asking it about the receiver's own children returns
+    # True even when the receiver itself is hidden — which leaked the "No GPU detected" empty
+    # state's text on every machine that has a GPU.
+    if widget.isHidden():
+        return ""
+    chunks = []
+    # The widget ITSELF counts when it is a label. `findChildren` does not include the
+    # receiver, so scoping this helper to a single QLabel — which the graphics check now does,
+    # since the adapter line is one label inside a panel that also renders the real host —
+    # returned an empty string and failed every machine.
+    labels = list(widget.findChildren(QLabel))
+    if isinstance(widget, QLabel):
+        labels.insert(0, widget)
+    for label in labels:
+        # `isHidden()` is the widget's OWN flag — a label inside a hidden parent reports
+        # False. `isVisibleTo(root)` is the question actually being asked: would this text be
+        # on screen if the root were shown? Getting this wrong made every machine look as
+        # though it were rendering the "No GPU detected" empty state.
+        if label is not widget and not label.isVisibleTo(widget):
+            continue
+        if label is widget and label.isHidden():
+            continue
+        chunks.append(label.text() or "")
+        chunks.append(label.toolTip() or "")
+    return " | ".join(chunks)
+
+
+def section_hardware_portability(app):
+    print_system("\n[5b] Hardware portability (synthetic machines)")
+    from kayra.ui.views.home import HomeView
+
+    for name, machine in MACHINES.items():
+        bridge = StubBridge()
+        bridge.graphics = dict(machine["graphics"])
+        bridge.gpu = dict(machine["gpu"])
+        bridge.telemetry_pending = False
+        # An Intel/AMD machine runs speech on the processor, because Kayra's only
+        # acceleration path is CUDA. Say so, so the provider text is exercised too.
+        bridge.provider = ("CUDAExecutionProvider" if machine["graphics"].get("telemetry")
+                           else "CPUExecutionProvider")
+
+        view = HomeView(bridge)
+        view.on_show()
+        check(f"[{name}] renders", paint(view))
+        # SCOPED TO THE GRAPHICS WIDGETS, not to the panel that contains them. Since the
+        # redesign the adapter lives inside the System panel beside the processor, and that
+        # panel renders the REAL host by design — it reads `device_profile()`, which has no
+        # stub. Searching the whole panel for a forbidden vendor string would find the
+        # suite's own machine in the processor line and report the UI as hardcoded when it is
+        # doing exactly its job.
+        text = " | ".join(_visible_text(w) for w in (view.gpu_name, view._gpu_empty))
+
+        for token in machine["expect"]:
+            check(f"[{name}] shows '{token}'", token in text,
+                  "the card must name the adapter this machine actually has")
+        for token in machine["forbid"]:
+            check(f"[{name}] never shows '{token}'", token not in text,
+                  "a value from another machine appeared on screen")
+
+        if machine["graphics"] and not machine["graphics"].get("telemetry"):
+            # The card must not draw an unmeasured utilization as 0%, and must not claim
+            # there is no GPU on a machine that has one.
+            check(f"[{name}] does not claim there is no GPU",
+                  "No GPU detected" not in text)
+            check(f"[{name}] says telemetry is unavailable",
+                  "telemetry unavailable" in text.lower(), text[:160])
+        if not machine["graphics"] and not machine["gpu"]:
+            check(f"[{name}] reports the absence honestly", "No GPU detected" in text)
+
+        view.on_hide()
+        view.deleteLater()
+
+    # ── The rendered System sheet carries no hardware literal ──
+    # Every value must be traceable to the profile dict; a model name or a capacity written
+    # into the view is exactly what makes a screen right on one machine and wrong on another.
+    import kayra.ui.views.system as system_view_module
+    view_source = io.open(system_view_module.__file__, encoding="utf-8").read()
+    code_only = chr(10).join(line for line in view_source.splitlines()
+                             if not line.lstrip().startswith("#"))
+    for literal in ("RTX", "GeForce", "Radeon", "Iris Xe", "Core i5", "Core i7",
+                    "Ryzen", "1920x1080", "16 GB", "8 GB"):
+        check(f"the System view contains no '{literal}' literal", literal not in code_only,
+              "hardware names belong in the profile, not in a view")
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                      6. SETTINGS SAFETY                                │
@@ -1257,21 +1669,31 @@ def section_interaction(app):
           "success" in tones and "danger" in tones, str(tones))
 
     # ── LISTENING ─────────────────────────────────────────────────────
+    # Driven through the DOCK, which is where the control lives now. Home is checked as a
+    # readout beside it, so the two surfaces are asserted to agree rather than assumed to.
     bridge = StubBridge()
-    home = HomeView(bridge)
-    home.on_show()
+    window = docked_window(bridge)
+    home = window.views["home"]
     app.processEvents()
     check("listening starts on", bridge.listening_enabled())
-    check("the control offers to PAUSE while listening",
-          "Pause listening" in home.listen_button.text(), home.listen_button.text())
+    check("the dock offers to PAUSE while listening",
+          "Pause listening" in window.dock.mic_button.toolTip(),
+          window.dock.mic_button.toolTip())
+    check("and its glyph is an open microphone", window.dock.mic_button._kind == "mic")
 
-    home.listen_button.click()
+    dock_press(window.dock.mic_button)
     app.processEvents()
-    check("clicking pauses listening", bridge.listening is False)
+    check("pressing it pauses listening", bridge.listening is False)
     check("pausing does not interrupt speech", bridge.interrupted == 0)
     check("pausing does not shut Kayra down", bridge.shutdown_called is False)
-    check("the control now offers to START", "Start listening" in home.listen_button.text(),
-          home.listen_button.text())
+    check("the dock now offers to START",
+          "Start listening" in window.dock.mic_button.toolTip(),
+          window.dock.mic_button.toolTip())
+    check("and the glyph changes SHAPE, not just tint",
+          window.dock.mic_button._kind == "mic_off")
+    check("Home's readout agrees with the dock",
+          "paused" in home.mic_line.value_label.toolTip().lower(),
+          home.mic_line.value_label.toolTip())
     # The CAPTION is the voice state machine's, and it says PAUSED only because the
     # microphone was deliberately closed. In the running application that transition is
     # emitted by `app`; here it is emitted directly, which is the point — the view renders
@@ -1283,9 +1705,9 @@ def section_interaction(app):
     check("and says Kayra is still running",
           "still running" in home.state_caption.text().lower(), home.state_caption.text())
 
-    home.listen_button.click()
+    dock_press(window.dock.mic_button)
     app.processEvents()
-    check("clicking again resumes listening", bridge.listening is True)
+    check("pressing again resumes listening", bridge.listening is True)
     bridge.voiceStateChanged.emit("LISTENING", "Listening", "Microphone open.", 31)
     check("resuming restores the normal prompt",
           "paused" not in home.prompt.text().lower(), home.prompt.text())
@@ -1538,37 +1960,48 @@ def section_lifecycle_controls(app):
     from kayra.ui.views.settings import SettingsView
     from kayra.output import tts_device
 
-    # ── Home: the shutdown button ──
+    # ── The dock: the shutdown control ──
+    # It moved off Home with every other control. Home is a readout now, and the one place a
+    # press happens is the floating dock — which is also what makes it impossible for this
+    # screen to offer a shutdown that disagrees with the dock's.
     bridge = StubBridge()
-    home = HomeView(bridge)
-    check("Home has a shutdown control", hasattr(home, "shutdown_button"))
-    check("it says what it shuts down", "Kayra" in home.shutdown_button.text())
-    check("it is styled as destructive",
-          home.shutdown_button.property("variant") == "danger")
-    check("it says it is not a machine shutdown",
-          "microphone" in (home.shutdown_button.toolTip() or "").lower())
+    window = docked_window(bridge)
+    home = window.views["home"]
+    dock = window.dock
+    check("the dock has a shutdown control", hasattr(dock, "power_button"))
+    check("it is the only control in the danger tone",
+          dock.power_button._tone == "danger"
+          and all(b._tone != "danger" for b in (dock.mic_button, dock.camera_button,
+                                                dock.gesture_button, dock.talk_button,
+                                                dock.chat_button, dock.menu_button)))
+    check("it says what it shuts down",
+          "Kayra" in (dock.power_button.toolTip() or ""), dock.power_button.toolTip())
+    check("Home carries no shutdown control of its own",
+          not hasattr(home, "shutdown_button"))
 
     # THE THREE CONTROLS MUST STAY DISTINCT. Pausing, interrupting and quitting are the three
     # things this application has most consistently confused with one another.
-    check("the shutdown button is NOT the listening button",
-          home.shutdown_button is not home.listen_button)
-    check("pressing the listening button does not shut down",
-          (home._toggle_listening(), bridge.shutdown_called is False)[1])
-    check("pressing the listening button only changes the microphone",
+    check("the shutdown control is NOT the listening control",
+          dock.power_button is not dock.mic_button)
+    check("pressing the listening control does not shut down",
+          (dock_press(dock.mic_button), bridge.shutdown_called is False)[1])
+    check("pressing the listening control only changes the microphone",
           bridge.listening is False)
     bridge.set_listening(True)
 
-    # Confirmed shutdown reaches the central path exactly once, and locks the control.
+    # Confirmed shutdown reaches the central path exactly once, and locks every control.
     from PySide6.QtWidgets import QMessageBox
     real_exec = QMessageBox.exec
     QMessageBox.exec = lambda self: QMessageBox.Yes
     try:
-        home._request_shutdown()
+        dock_press(dock.power_button)
         check("a confirmed shutdown reaches the central path", bridge.shutdown_called is True)
-        check("the button is disabled afterwards", home.shutdown_button.isEnabled() is False)
+        check("the control is disabled afterwards", dock.power_button.isEnabled() is False)
         check("the other controls are locked too",
-              home.talk_button.isEnabled() is False
-              and home.listen_button.isEnabled() is False)
+              dock.talk_button.isEnabled() is False
+              and dock.mic_button.isEnabled() is False)
+        check("and Home stops asking the camera for frames",
+              home._shutting_down is True)
         # The view no longer writes this caption itself: `request_shutdown` moves the voice
         # state to STOPPING, which is an ABSORBING state, and the machine paints it. Driving
         # the signal here is what the real backend does a moment after `shutdown()` returns.
@@ -1581,13 +2014,13 @@ def section_lifecycle_controls(app):
 
     # Cancelling must change nothing at all.
     bridge2 = StubBridge()
-    home2 = HomeView(bridge2)
+    window2 = docked_window(bridge2)
     QMessageBox.exec = lambda self: QMessageBox.Cancel
     try:
-        home2._request_shutdown()
+        dock_press(window2.dock.power_button)
         check("cancelling does NOT shut down", bridge2.shutdown_called is False)
-        check("cancelling leaves the button usable",
-              home2.shutdown_button.isEnabled() is True)
+        check("cancelling leaves the control usable",
+              window2.dock.power_button.isEnabled() is True)
     finally:
         QMessageBox.exec = real_exec
 
@@ -1608,54 +2041,78 @@ def section_lifecycle_controls(app):
 
     check("Home still paints with the new control", paint(home3))
 
-    # ── Home: the Graphics card ──
+    # ── Home: the graphics block, now inside the System panel ──
+    # IT MOVED, AND THAT WAS THE POINT. A graphics adapter is a property of the MACHINE, and
+    # giving it its own card made it look like a subsystem of the assistant. What speech is
+    # running on went the other way, into Intelligence, because that is a fact about what is
+    # answering rather than about what the machine contains.
     from kayra.ui.views.home import HomeView as _HV
     gb = StubBridge()
     gpu_home = _HV(gb)
     gpu_home.on_show()
 
-    check("Home has a Graphics card", hasattr(gpu_home, "gpu_card"))
-    check("the GPU name is shown", "4060" in gpu_home.gpu_name.toolTip(),
+    check("Home reports graphics inside the System panel",
+          gpu_home.gpu_name.parent() is gpu_home.system_panel
+          or gpu_home.gpu_name.parentWidget() is gpu_home.system_panel)
+    check("the GPU name is shown", gb.gpu["name"] in gpu_home.gpu_name.toolTip(),
           gpu_home.gpu_name.toolTip())
     check("utilization is a live value, not hardcoded", gpu_home.gpu_meter._value == 18.0)
     check("VRAM is shown as used / total",
           "4.2" in gpu_home.vram_meter._caption and "8.0" in gpu_home.vram_meter._caption,
           gpu_home.vram_meter._caption)
     check("VRAM percentage comes from the metrics", gpu_home.vram_meter._value == 52.5)
-    check("temperature is shown", "58" in gpu_home.gpu_detail.toolTip()
-          or "58" in gpu_home._gpu_detail_text, gpu_home._gpu_detail_text)
-    check("the TTS provider is shown beside the GPU",
-          "CUDAExecutionProvider" in gpu_home._gpu_detail_text, gpu_home._gpu_detail_text)
-    check("the header pill reports the SPEECH device, not the hardware",
-          "GPU" in gpu_home.gpu_pill.text(), gpu_home.gpu_pill.text())
+    check("temperature is shown", "58" in gpu_home.gpu_name.toolTip(),
+          gpu_home.gpu_name.toolTip())
+    check("the speech provider is reported in Intelligence, not beside the GPU",
+          "CUDAExecutionProvider" in gpu_home.route_speech.value_label.toolTip(),
+          gpu_home.route_speech.value_label.toolTip())
     check("the empty state is hidden while there is a GPU",
           gpu_home._gpu_empty.isHidden() is True)
 
-    # THE CARD MUST STAY TRUTHFUL WHEN SPEECH IS ON THE CPU WHILE A GPU EXISTS.
+    # THE PAGE MUST STAY TRUTHFUL WHEN SPEECH IS ON THE CPU WHILE A GPU EXISTS.
     # This is the exact state the whole change was about, and hiding the physical GPU here
     # would be as misleading as claiming acceleration that is not happening.
     gb.provider = "CPUExecutionProvider"
-    gpu_home._refresh_gpu()
+    gpu_home._refresh_graphics()
+    gpu_home._refresh_intelligence()
     check("a CPU speech device does NOT hide the physical GPU",
           gpu_home.gpu_name.isHidden() is False
-          and "4060" in gpu_home.gpu_name.toolTip())
-    check("the pill says CPU when speech is on the CPU",
-          "CPU" in gpu_home.gpu_pill.text(), gpu_home.gpu_pill.text())
+          and gb.gpu["name"] in gpu_home.gpu_name.toolTip())
     check("the provider shown is the real one",
-          "CPUExecutionProvider" in gpu_home._gpu_detail_text)
+          "CPUExecutionProvider" in gpu_home.route_speech.value_label.toolTip(),
+          gpu_home.route_speech.value_label.toolTip())
     check("GPU statistics are still live", gpu_home.gpu_meter._value == 18.0)
 
-    # ── No GPU at all: graceful, and the CPU/RAM card is untouched ──
+    # ── TELEMETRY GONE BUT HARDWARE STILL PRESENT ──
+    # This is the AMD/Intel case and it must NOT reach the empty state. Losing NVIDIA
+    # telemetry does not remove the graphics card from the machine, and the page that used to
+    # say "No GPU detected" here was telling every non-NVIDIA owner they had no GPU.
     gb.gpu = {}
     gb.telemetry_pending = False
-    gpu_home._refresh_gpu()
+    gpu_home._refresh_graphics()
+    check("no telemetry does NOT mean no GPU", gpu_home._gpu_empty.isHidden() is True)
+    check("the adapter is still named from the static profile",
+          gb.graphics["name"] in gpu_home.gpu_name.toolTip(), gpu_home.gpu_name.toolTip())
+    check("an unmeasured utilization is captioned, not drawn as 0%",
+          "not reported" in (gpu_home.gpu_meter._caption or ""),
+          gpu_home.gpu_meter._caption)
+    check("installed VRAM is shown when live usage is unknown",
+          "installed" in (gpu_home.vram_meter._caption or ""),
+          gpu_home.vram_meter._caption)
+
+    # ── No GPU at all: graceful, and the CPU/RAM readout is untouched ──
+    gb.graphics = {}
+    gpu_home._refresh_graphics()
     check("with no GPU the empty state is shown", gpu_home._gpu_empty.isHidden() is False)
     check("with no GPU the meters are hidden", gpu_home.gpu_meter.isHidden() is True)
+    check("the processor meter is NOT hidden with the graphics block",
+          gpu_home.cpu_meter.isHidden() is False,
+          "the machine still has a CPU whatever its graphics situation")
     check("no GPU does not crash the screen", paint(gpu_home))
 
     # ── Telemetry still arriving is NOT the same as absent ──
     gb.telemetry_pending = True
-    gpu_home._refresh_gpu()
+    gpu_home._refresh_graphics()
     check("a pending read says so rather than announcing no GPU",
           "Reading" in gpu_home._gpu_empty._heading.text(),
           gpu_home._gpu_empty._heading.text())
@@ -1664,20 +2121,72 @@ def section_lifecycle_controls(app):
     gpu_home._refresh_panels()
     check("the processor meter still works", gpu_home.cpu_meter._value >= 0.0)
     check("the memory meter still works", gpu_home.ram_meter._value >= 0.0)
+
+    # ── The System card's machine identity line ──
+    # The profile is collected FIRST and the panel refreshed afterwards, because the read is
+    # deliberately non-blocking: Home skips the line until the profile is warm rather than
+    # stalling the GUI thread on a ~150ms collection. Refreshing before collecting would be
+    # testing the cold path and calling it a missing feature.
+    from kayra.core.system_profile import device_profile as _profile
+    from kayra.core.system_profile import os_summary as _os_summary
+    real = _profile()
+    gpu_home._refresh_panels()
+    # READ FROM THE WIDGET, not from a shadow copy on the view. `_ElidedCaption` owns the
+    # full text now — the string the label would show if it had unlimited width — which is
+    # also what removed the timing bug that let a 570px line sit unelided in a 374px label.
+    identity = gpu_home.machine_line.full_text()
+    product, _version = _os_summary()
+    check("Home names the operating system", product in identity, identity)
+    check("Home names the processor", (real["cpu_name"] or "") in identity, identity)
+    if real.get("os_build"):
+        check("Home shows the real OS build", str(real["os_build"]) in identity, identity)
+        check("Home never shows platform.release() as the build",
+              f"Build {real['os_release']}" not in identity, identity)
     check("the memory meter still has its caption", bool(gpu_home.ram_meter._caption))
     check("the footprint line still reports Kayra's own usage",
-          "Kayra is using" in getattr(gpu_home, "_footprint_text", ""))
+          "Kayra is using" in gpu_home.footprint.full_text(),
+          gpu_home.footprint.full_text())
 
-    # ── Three cards, one row, no clipping ──
-    gpu_home.resize(1100, 860)
+    # THE ELISION IS THE WIDGET'S OWN JOB, and this is the regression that made it so: the
+    # machine line was written by a background collection a second into the session, elided
+    # against a width the layout had not yet assigned, and never re-elided — 570px of text
+    # running straight out of a 374px panel. A widget that elides in its own `resizeEvent`
+    # cannot reach that state.
+    from PySide6.QtGui import QFontMetrics
+    gpu_home.resize(900, 800)
     gpu_home.layout().activate()
-    right_edge = max(c.x() + c.width()
-                     for c in (gpu_home.activity_card, gpu_home.system_card, gpu_home.gpu_card))
-    check("the bottom strip fits inside the window", right_edge <= 1100,
-          f"(rightmost card edge {right_edge}px)")
-    check("all three cards share one height",
-          len({gpu_home.activity_card.height(), gpu_home.system_card.height(),
-               gpu_home.gpu_card.height()}) == 1)
+    app.processEvents()
+    gpu_home._refresh_panels()
+    app.processEvents()
+    for name, label in (("machine", gpu_home.machine_line),
+                        ("graphics", gpu_home.gpu_name),
+                        ("footprint", gpu_home.footprint)):
+        advance = QFontMetrics(label.font()).horizontalAdvance(label.text())
+        check(f"the {name} line fits the width it was given",
+              advance <= max(40, label.width()),
+              f"{advance}px of text in a {label.width()}px label")
+        check(f"...and the {name} line keeps its whole string in a tooltip",
+              label.toolTip() == label.full_text())
+
+    # ── Four panels, three columns, no clipping and no page scroll ──
+    # The bottom strip is gone; the page is columns now. The property that matters is the
+    # same one it always was: nothing may force the layout wider than the window, which is
+    # what an un-elided non-wrapping label does every time it is allowed to.
+    panels = (gpu_home.intelligence_panel, gpu_home.interaction_panel,
+              gpu_home.system_panel, gpu_home.activity_panel)
+    for width in (1040, 1100, 1920):
+        gpu_home.resize(width, 860)
+        gpu_home.layout().activate()
+        app.processEvents()
+        right_edge = max(p.mapTo(gpu_home, p.rect().topRight()).x() for p in panels)
+        check(f"the panels fit inside a {width}px window", right_edge <= width,
+              f"(rightmost panel edge {right_edge}px)")
+    check("Home never needs a vertical scrollbar",
+          gpu_home.scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff)
+    check("the two columns flank the orb",
+          gpu_home.intelligence_panel.x() < gpu_home.orb.mapTo(gpu_home, QPoint(0, 0)).x()
+          < gpu_home.system_panel.x(),
+          "the orb must stay the middle column at every width")
 
     # ── Settings: the device selector ──
     view = SettingsView(StubBridge())
@@ -1788,33 +2297,37 @@ def section_presence(app):
     check("Settings paints with the presence card", paint(view))
 
     # ── Home ──
+    # PRESENCE IS ONE LINE NOW, not a card of its own. It is a subsystem whose whole job is
+    # to stay quiet, and four rows in the bottom strip gave it more prominence than a service
+    # the user is meant not to notice earns. What survives is what matters: whether it is on,
+    # when it could next speak, and how much of the day's budget it has spent.
     home = HomeView(bridge)
     home._refresh_presence()
-    check("Home shows the presence card while the layer is running",
-          home.presence_card.isVisible() or not home.presence_card.isHidden())
-    check("the pill reports it as active", "Active" in home.presence_pill.text())
-    check("the last observation is named",
-          "work session" in home.presence_last.toolTip().lower(),
-          home.presence_last.toolTip())
-    check("the next eligible time is shown",
-          "minutes" in home.presence_next.toolTip(), home.presence_next.toolTip())
-    check("the day's budget is shown",
-          "1 of 8" in home.presence_budget.toolTip(), home.presence_budget.toolTip())
+    presence = home.presence_line.value_label.toolTip()
+    check("Home reports presence while the layer is running",
+          presence.startswith("On"), presence)
+    check("the next eligible time is shown", "next" in presence, presence)
+    check("the day's budget is shown", "1/8" in presence, presence)
 
-    # Switched off: the empty state is SHOWN, not created — the card keeps its children.
+    # Switched off: the line says so rather than showing stale numbers.
     bridge.presence = False
     home._refresh_presence()
-    check("an off layer shows an empty state rather than stale numbers",
-          not home.presence_last.isVisible() and not home._presence_empty.isHidden())
-    check("and the pill says so", "Off" in home.presence_pill.text())
+    presence = home.presence_line.value_label.toolTip()
+    check("an off layer says so rather than showing stale numbers",
+          presence.startswith("Off") and "next" not in presence, presence)
+    check("and it says what that means",
+          "only when asked" in presence.lower(), presence)
 
-    # Not running at all: the card hides itself rather than describing a service that does
-    # not exist — the same rule the Graphics card follows on a machine with no GPU.
+    # Not running at all is a THIRD state, distinct from "off": a service that does not exist
+    # has not been switched off by anybody, and saying so is the same rule the graphics block
+    # follows on a machine with no adapter.
     bridge.presence_running = False
     home._refresh_presence()
-    check("a card for a service that is not running is hidden", home.presence_card.isHidden())
+    presence = home.presence_line.value_label.toolTip()
+    check("a service that is not running says exactly that",
+          "not running" in presence.lower(), presence)
 
-    check("Home paints with the presence card", paint(home))
+    check("Home paints with the presence line", paint(home))
 
 
 def section_speech_backend(app):
@@ -2054,19 +2567,26 @@ def section_boot_ordering(app):
     check("the pre-boot snapshot says the microphone state is not known",
           snapshot.get("listening_known") is False, str(snapshot.get("listening_known")))
 
-    # ── 2. Home during the boot window ──
+    # ── 2. The dock during the boot window ──
+    # SAME CONTRACT, NEW SURFACE. The control moved to the floating dock in the redesign, and
+    # the boot-window defect follows the control rather than the screen: the dock is built by
+    # `KayraWindow.__init__` seconds before the session boots, exactly as Home's button was.
     bridge = StubBridge()
     bridge.known = False                 # the backend has not booted yet
-    home = HomeView(bridge)
-    home.on_show()
+    window = docked_window(bridge)
+    dock = window.dock
+    home = window.views["home"]
     app.processEvents()
 
     check("during boot the control is not offered as actionable",
-          home.listen_button.isEnabled() is False)
+          dock.mic_button.isEnabled() is False)
     check("and it does not claim listening is off",
-          "Pause listening" in home.listen_button.text(), home.listen_button.text())
+          dock.mic_button._kind == "mic", dock.mic_button._kind)
     check("the tooltip says why it cannot be used",
-          "starting" in home.listen_button.toolTip().lower(), home.listen_button.toolTip())
+          "starting" in dock.mic_button.toolTip().lower(), dock.mic_button.toolTip())
+    check("Home's readout does not claim it either",
+          "starting" in home.mic_line.value_label.toolTip().lower(),
+          home.mic_line.value_label.toolTip())
 
     # ── 3. bootFinished corrects it, and NO listening_changed is fired ──
     #
@@ -2082,65 +2602,67 @@ def section_boot_ordering(app):
     bridge.bootFinished.emit(True, "voice input ready, speech output ready")
     app.processEvents()
 
-    check("boot completing enables the control", home.listen_button.isEnabled() is True)
-    check("THE REPORTED BUG: the button says Pause, not Start, while listening",
-          "Pause listening" in home.listen_button.text(), home.listen_button.text())
+    check("boot completing enables the control", dock.mic_button.isEnabled() is True)
+    check("THE REPORTED BUG: the control offers Pause, not Start, while listening",
+          "Pause listening" in dock.mic_button.toolTip(), dock.mic_button.toolTip())
     check("and it got there with NO listeningChanged event at all",
           emitted == [], str(emitted))
 
     # ── 4. The state it was reported in: listening, never toggled ──
     bridge2 = StubBridge()
     bridge2.known = False
-    home2 = HomeView(bridge2)
-    home2.on_show()
+    window2 = docked_window(bridge2)
+    home2 = window2.views["home"]
     bridge2.known = True
     bridge2.bootFinished.emit(True, "ready")
     bridge2.voiceStateChanged.emit("LISTENING", "Listening", "Microphone open.", 5)
     app.processEvents()
     check("caption and control agree after boot, with no toggle",
           home2.prompt.text() == "Listening"
-          and "Pause listening" in home2.listen_button.text(),
-          f"{home2.prompt.text()!r} / {home2.listen_button.text()!r}")
+          and "Pause listening" in window2.dock.mic_button.toolTip(),
+          f"{home2.prompt.text()!r} / {window2.dock.mic_button.toolTip()!r}")
 
     # ── 5. And the toggle path still works, in both directions ──
-    home2.listen_button.click()
+    dock_press(window2.dock.mic_button)
     app.processEvents()
-    check("clicking still pauses", bridge2.listening is False)
-    check("and the label follows", "Start listening" in home2.listen_button.text(),
-          home2.listen_button.text())
-    home2.listen_button.click()
+    check("pressing still pauses", bridge2.listening is False)
+    check("and the tooltip follows",
+          "Start listening" in window2.dock.mic_button.toolTip(),
+          window2.dock.mic_button.toolTip())
+    dock_press(window2.dock.mic_button)
     app.processEvents()
-    check("clicking again resumes", bridge2.listening is True)
-    check("and the label follows back", "Pause listening" in home2.listen_button.text(),
-          home2.listen_button.text())
+    check("pressing again resumes", bridge2.listening is True)
+    check("and the tooltip follows back",
+          "Pause listening" in window2.dock.mic_button.toolTip(),
+          window2.dock.mic_button.toolTip())
 
     # ── 6. A genuinely paused microphone at boot must still read as paused ──
     bridge3 = StubBridge()
     bridge3.known = False
-    home3 = HomeView(bridge3)
-    home3.on_show()
+    window3 = docked_window(bridge3)
     bridge3.known = True
     bridge3.listening = False
     bridge3.bootFinished.emit(True, "ready")
     app.processEvents()
     check("a microphone that really is paused at boot reads as paused",
-          "Start listening" in home3.listen_button.text(), home3.listen_button.text())
+          "Start listening" in window3.dock.mic_button.toolTip(),
+          window3.dock.mic_button.toolTip())
 
     # ── 7. Shutdown must not be re-enabled by a late re-sync ──
     from PySide6.QtWidgets import QMessageBox
     bridge4 = StubBridge()
-    home4 = HomeView(bridge4)
+    window4 = docked_window(bridge4)
     real_exec = QMessageBox.exec
     QMessageBox.exec = lambda self: QMessageBox.Yes
     try:
-        home4._request_shutdown()
+        dock_press(window4.dock.power_button)
     finally:
         QMessageBox.exec = real_exec
     bridge4.bootFinished.emit(True, "ready")
-    home4.on_show()
+    window4.views["home"].on_show()
     app.processEvents()
     check("a late re-sync cannot re-enable controls during shutdown",
-          home4.listen_button.isEnabled() is False)
+          window4.dock.mic_button.isEnabled() is False)
 
     # ── 8. The composer's microphone has the same contract ──
     bridge5 = StubBridge()
@@ -2188,6 +2710,487 @@ def section_no_side_effects(before):
     check("the suite did not modify the developer's .env", after == before)
 
 
+def section_gesture(app):
+    """
+    Hand gesture control on Home and in Settings.
+
+    THE ONE RULE BEING TESTED, in several forms: **the controls reflect what the backend did,
+    never what the user asked for.** A camera that fails to open must leave the switch off. It
+    is the same requested-vs-active discipline the speech backend card follows, and the same
+    failure it exists to prevent — a screen showing "on" over a device that is not running.
+    """
+    print_system("\n[17] Hand gesture control")
+
+    from kayra.ui.views.home import HomeView
+    from kayra.ui.views.settings import SettingsView
+    from kayra.ui.components.camera_preview import CameraPreview
+
+    # ── Home, cold ──
+    # The preview and the STATUS stayed on Home; the two CONTROLS moved to the dock with
+    # everything else. Both are driven here from one window, so the readout and the control
+    # are asserted to agree rather than assumed to.
+    bridge = StubBridge()
+    window = docked_window(bridge)
+    home = window.views["home"]
+    dock = window.dock
+    app.processEvents()
+    home.on_show()
+    app.processEvents()
+
+    check("Home has a camera preview",
+          isinstance(getattr(home, "camera_preview", None), CameraPreview))
+    check("the dock has a camera control", hasattr(dock, "camera_button"))
+    check("the dock has a gesture control", hasattr(dock, "gesture_button"))
+    check("Home carries neither control itself",
+          not hasattr(home, "camera_button") and not hasattr(home, "gesture_button"))
+    check("with nothing running, neither control is checked",
+          not dock.camera_button.is_checked() and not dock.gesture_button.is_checked())
+    check("the status pill says Off", "Off" in home.gesture_pill.text(),
+          home.gesture_pill.text())
+    check("the preview is not asking for frames", bridge.frames_served == 0)
+
+    # ── Turning the camera on, from the dock ──
+    dock_press(dock.camera_button)
+    app.processEvents()
+    check("pressing the camera control calls the backend", bridge.camera_calls == [True],
+          str(bridge.camera_calls))
+    check("...and does NOT turn gesture control on", not bridge.gesture_calls,
+          str(bridge.gesture_calls))
+    check("...and the control reflects it", dock.camera_button.is_checked())
+    check("...as a different SHAPE, not a different tint",
+          dock.camera_button._kind == "camera", dock.camera_button._kind)
+    check("...and the pill says the camera is on", "Camera on" in home.gesture_pill.text(),
+          home.gesture_pill.text())
+
+    # THE PREVIEW PULLS. It asks the bridge on its own timer; nothing pushes frames at it.
+    # Counted as a DELTA rather than against a total: the preview's own timer is live on a
+    # shown window, so the absolute count depends on how many event-loop turns have passed —
+    # which is a property of the test harness, not of the widget.
+    before_frames = bridge.frames_served
+    home.camera_preview._pull()
+    check("the preview pulls a frame when the camera is on",
+          bridge.frames_served == before_frames + 1,
+          f"{bridge.frames_served} after {before_frames}")
+    check("...and painted it", home.camera_preview._pixmap is not None)
+
+    # ── Gesture control on ──
+    dock_press(dock.gesture_button)
+    app.processEvents()
+    check("pressing the gesture control calls the backend", bridge.gesture_calls == [True],
+          str(bridge.gesture_calls))
+    check("...and the pill says Active", "Active" in home.gesture_pill.text(),
+          home.gesture_pill.text())
+
+    bridge.gesture["hand"] = True
+    bridge.gesture["gesture"] = "Cursor"
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+    # THE HAND AND THE GESTURE ARE THEIR OWN LINE, separate from the pill and from the
+    # running/paused caption. That separation is the point: "no hand in frame" must never be
+    # able to render as "paused".
+    check("the current gesture is shown on its own line",
+          "Cursor" in home.gesture_line.value_label.toolTip(),
+          home.gesture_line.value_label.toolTip())
+    check("...and the pill still says Active", "Active" in home.gesture_pill.text(),
+          home.gesture_pill.text())
+
+    bridge.gesture["hand"] = False
+    bridge.gesture["gesture"] = "No hand"
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+    check("no hand is shown as no hand",
+          "No hand" in home.gesture_line.value_label.toolTip(),
+          home.gesture_line.value_label.toolTip())
+    check("...and NOT as paused", "Paused" not in home.gesture_pill.text(),
+          home.gesture_pill.text())
+    check("...the pill still reads Active with no hand in frame",
+          "Active" in home.gesture_pill.text(), home.gesture_pill.text())
+
+    # A DELIBERATE PAUSE, which must look different from an empty frame.
+    bridge.gesture["paused"] = True
+    bridge.gesture["state"] = "PAUSED"
+    bridge.gesture["hand"] = True
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+    check("a deliberate pause reads as Paused", "Paused" in home.gesture_pill.text(),
+          home.gesture_pill.text())
+    check("...and says how to undo it",
+          "resume" in home.gesture_line.value_label.toolTip().lower(),
+          home.gesture_line.value_label.toolTip())
+    bridge.gesture["paused"] = False
+    bridge.gesture["state"] = "ACTIVE"
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+
+    # ── A FAILING CAMERA MUST NOT LEAVE THE CONTROL ON ──
+    # This is the rule the whole control layer is shaped around: the button is not the source
+    # of truth and is never allowed to become one. A press that failed must leave the control
+    # showing OFF, not showing the state the user asked for.
+    failing = StubBridge()
+    failing.camera_result = (False, "camera 0 could not be opened")
+    failing.gesture_result = (False, "camera 0 could not be opened")
+    broken_window = docked_window(failing)
+    broken = broken_window.views["home"]
+    app.processEvents()
+    dock_press(broken_window.dock.gesture_button)
+    app.processEvents()
+    check("a gesture control that failed to start shows as OFF",
+          not broken_window.dock.gesture_button.is_checked())
+    check("...and the pill is not Active", "Active" not in broken.gesture_pill.text(),
+          broken.gesture_pill.text())
+    check("...and the reason is on screen",
+          "could not be opened" in broken.camera_preview._message,
+          broken.camera_preview._message)
+    check("...and the preview is not live", not broken.camera_preview._live)
+
+    # ── The preview stops asking when the camera stops ──
+    served = bridge.frames_served
+    bridge.gesture["camera"] = "OFF"
+    bridge.gesture["gesture_enabled"] = False
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+    check("the preview goes dark when the camera stops", not home.camera_preview._live)
+    check("...and drops the last frame rather than showing a stale one",
+          home.camera_preview._pixmap is None)
+    home.camera_preview._pull()
+    check("...and asks for nothing", bridge.frames_served == served,
+          f"{bridge.frames_served} vs {served}")
+
+    # ── The preview's timer follows visibility, like every other polling surface ──
+    bridge.gesture["camera"] = "ACTIVE"
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+    check("a visible live preview runs its timer", home.camera_preview._timer.isActive())
+    window.hide()
+    app.processEvents()
+    check("a hidden preview stops its timer", not home.camera_preview._timer.isActive())
+
+    # ── Shutdown disables the controls, and the preview goes dark ──
+    from PySide6.QtWidgets import QMessageBox as _QMB
+    quitting = StubBridge()
+    quitting.gesture["camera"] = "ACTIVE"
+    ending_window = docked_window(quitting)
+    ending = ending_window.views["home"]
+    app.processEvents()
+    real_exec = _QMB.exec
+    _QMB.exec = lambda self: _QMB.Yes
+    try:
+        dock_press(ending_window.dock.power_button)
+    finally:
+        _QMB.exec = real_exec
+    check("a shutting-down window disables the camera control",
+          not ending_window.dock.camera_button.isEnabled())
+    check("...and the gesture control",
+          not ending_window.dock.gesture_button.isEnabled())
+    check("...and the preview is dark", not ending.camera_preview._live)
+    # A late status arriving during teardown must not re-enable anything.
+    quitting.gestureStateChanged.emit(dict(quitting.gesture))
+    app.processEvents()
+    check("a late gesture status cannot re-enable a control during shutdown",
+          not ending_window.dock.camera_button.isEnabled()
+          and not ending_window.dock.gesture_button.isEnabled())
+    check("...and cannot restart the preview either", not ending.camera_preview._live)
+
+    # ── Settings ──
+    settings_bridge = StubBridge()
+    settings = SettingsView(settings_bridge)
+    settings.show()
+    app.processEvents()
+    settings.on_show()
+    app.processEvents()
+
+    check("Settings has a camera switch", hasattr(settings, "camera_toggle"))
+    check("Settings has a gesture switch", hasattr(settings, "gesture_toggle"))
+    for key in ("GESTURE_SENSITIVITY", "GESTURE_CURSOR_SMOOTHING",
+                "GESTURE_CLICK_SENSITIVITY", "GESTURE_ENABLED", "GESTURE_DIAGNOSTICS"):
+        check(f"Settings exposes {key}", key in settings._controls, str(key))
+
+    settings.gesture_toggle.setChecked(True)
+    app.processEvents()
+    check("the Settings switch calls the backend", settings_bridge.gesture_calls == [True],
+          str(settings_bridge.gesture_calls))
+    check("...and the pill reflects the running state",
+          "Active" in settings.gesture_pill.text(), settings.gesture_pill.text())
+    check("...and the camera switch followed, because the controller started it",
+          settings.camera_toggle.isChecked())
+
+    failing_settings = StubBridge()
+    failing_settings.gesture_result = (False, "no camera")
+    other = SettingsView(failing_settings)
+    other.show()
+    app.processEvents()
+    other.gesture_toggle.setChecked(True)
+    app.processEvents()
+    check("a failed switch leaves the Settings control off",
+          not other.gesture_toggle.isChecked())
+    check("...and says why", "no camera" in other.gesture_detail.text(),
+          other.gesture_detail.text())
+
+    # NO UI MODULE ANNOUNCES A SETTING CHANGE. The settings recorder is the one owner of that
+    # event and `app.set_gesture_control` already goes through it transactionally, so a view
+    # that logged it too would be the second of two lines for one change.
+    # Checked by parsing the IMPORTS rather than grepping the text: these modules DISCUSS the
+    # settings recorder in their comments, and they should — the reasoning belongs where the
+    # decision is.
+    #
+    # Settings is deliberately NOT in this list. Its Save button legitimately announces a batch
+    # of persisted values through the recorder, which is the sanctioned one-owner pattern; what
+    # must not happen is the GESTURE handlers announcing a change the backend already
+    # announced transactionally, and that is asserted separately below.
+    import ast as _ast
+    import inspect as _inspect
+    for module_name, path in (("home", "kayra/ui/views/home.py"),
+                              ("camera_preview", "kayra/ui/components/camera_preview.py")):
+        full = os.path.join(project_root, "src", *path.split("/"))
+        tree = _ast.parse(open(full, encoding="utf-8").read(), filename=full)
+        imported = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom) and node.module:
+                imported.add(node.module)
+            elif isinstance(node, _ast.Import):
+                imported.update(alias.name for alias in node.names)
+        check(f"{module_name} does not import the settings recorder",
+              "kayra.core.settings_log" not in imported, str(sorted(imported)))
+        check(f"{module_name} does not import the logger",
+              "kayra.core.logbus" not in imported, str(sorted(imported)))
+
+    for name in ("_on_camera_toggle", "_on_gesture_toggle"):
+        handler = _inspect.getsource(getattr(SettingsView, name))
+        check(f"SettingsView.{name} does not announce the change itself",
+              "settings_log" not in handler and "get_settings_recorder" not in handler,
+              "app.set_gesture_control already records it transactionally")
+
+    for widget in (home, broken, ending, settings, other):
+        widget.hide()
+        widget.deleteLater()
+    app.processEvents()
+
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │              17. THE REDESIGNED SHELL: DOCK, DRAWER, CHROME            │
+# └────────────────────────────────────────────────────────────────────────┘
+# Deliberately small. This is a UI redesign, so the checks pin the STRUCTURAL claims the
+# redesign makes — which surface appears where, that the dock reads real state, that Home
+# fills its viewport — and nothing else. Whether it looks good is a judgement that needs eyes
+# on a rendered screen, and these checks were written after taking those screenshots.
+
+def section_shell(app):
+    print_system("\n[17] The redesigned shell")
+    from kayra.ui import theme
+    from kayra.ui.theme import Size, Motion
+    from kayra.ui.components.dock import FloatingDock
+    from kayra.ui.components.backdrop import AmbientBackdrop
+    from kayra.ui.components.chrome import AppWindowChrome, native_chrome_supported
+    from kayra.ui.components.navigation import DESTINATIONS
+
+    bridge = StubBridge()
+    window = docked_window(bridge)
+    app.processEvents()
+
+    # ── EXACTLY ONE navigation surface per screen ──
+    for key in ("home", "chat"):
+        window.navigate_to(key)
+        app.processEvents()
+        check(f"{key} shows the dock", not window.dock.isHidden())
+        check(f"{key} gives up the permanent rail", window.sidebar.isHidden())
+    for key in ("automation", "memory", "activity", "system", "settings"):
+        window.navigate_to(key)
+        app.processEvents()
+        check(f"{key} keeps the permanent rail", not window.sidebar.isHidden())
+        check(f"{key} has no floating dock", window.dock.isHidden(),
+              "a pill over a settings form covers the last row of it")
+
+    # ── The drawer opens, closes, navigates, and belongs to the dock's screens ──
+    window.navigate_to("home")
+    app.processEvents()
+    check("the drawer starts closed", not window.drawer.is_open())
+    window.dock.menuToggled.emit()
+    app.processEvents()
+    check("Menu opens the drawer", window.drawer.is_open())
+    check("and the Menu control shows as active", window.dock.menu_button.is_checked())
+    check("the drawer carries every destination",
+          set(window.drawer._items) == {key for key, _label, _glyph in DESTINATIONS})
+    window.dock.menuToggled.emit()
+    app.processEvents()
+    check("Menu closes it again", not window.drawer.is_open())
+
+    window.dock.menuToggled.emit()
+    app.processEvents()
+    window.drawer.navigate.emit("system")
+    app.processEvents()
+    check("choosing a destination navigates", window.stack.currentWidget()
+          is window.views["system"])
+    check("and closes the drawer behind it", not window.drawer.is_open(),
+          "the drawer exists to LEAVE these screens; two gestures for one intention is wrong")
+    check("a screen with a rail never leaves the drawer open", not window.drawer.is_open())
+    # And the keyboard is not a way around that rule: Ctrl+B reaches every screen.
+    window._toggle_drawer()
+    check("the drawer cannot be opened on a screen that already has a rail",
+          not window.drawer.is_open(),
+          "two navigation surfaces on one page is the state _apply_shell exists to prevent")
+
+    # ── The dock reflects BACKEND state, and remembers nothing ──
+    window.navigate_to("home")
+    app.processEvents()
+    bridge.set_listening(False)
+    app.processEvents()
+    check("the dock follows a listening change it did not cause",
+          window.dock.mic_button._kind == "mic_off", window.dock.mic_button._kind)
+    bridge.set_listening(True)
+    app.processEvents()
+    check("...and follows it back", window.dock.mic_button._kind == "mic")
+
+    bridge.gesture["camera"] = "ACTIVE"
+    bridge.gesture["gesture_enabled"] = True
+    bridge.gestureStateChanged.emit(dict(bridge.gesture))
+    app.processEvents()
+    check("the dock follows a camera change it did not cause",
+          window.dock.camera_button.is_checked())
+    check("...and a gesture change", window.dock.gesture_button.is_checked())
+
+    # ── Every control is reachable by keyboard, and says what it does ──
+    controls = (window.dock.menu_button, window.dock.talk_button, window.dock.chat_button,
+                window.dock.mic_button, window.dock.camera_button,
+                window.dock.gesture_button, window.dock.power_button)
+    check("every dock control takes focus",
+          all(c.focusPolicy() == Qt.StrongFocus for c in controls))
+    check("every dock control has a tooltip",
+          all((c.toolTip() or "").strip() for c in controls),
+          str([c._kind for c in controls if not (c.toolTip() or "").strip()]))
+    check("the dock is a true pill",
+          window.dock.height() == 2 * Size.dock_radius,
+          f"{window.dock.height()}px tall, radius {Size.dock_radius}px")
+
+    # ── ONE state for microphone and listening. Not two controls, not two flags. ──
+    kinds = [c._kind for c in controls]
+    check("there is exactly ONE microphone control in the dock",
+          len([k for k in kinds if k in ("mic", "mic_off")]) == 1, str(kinds))
+    import inspect
+    dock_source = inspect.getsource(FloatingDock)
+    check("and no separate start/stop-listening control beside it",
+          "listeningToggled" in dock_source
+          and "muteToggled" not in dock_source and "startListening" not in dock_source)
+
+    # ── Home fills its viewport, at every size, without scrolling ──
+    home = window.views["home"]
+    for width, height in ((1040, 680), (1440, 900), (1920, 1080)):
+        window.resize(width, height)
+        app.processEvents()
+        panels = (home.intelligence_panel, home.interaction_panel,
+                  home.system_panel, home.activity_panel)
+        covered = sum(p.width() * p.height() for p in panels)
+        check(f"[{width}x{height}] the panels use the width",
+              max(p.mapTo(home, p.rect().topRight()).x() for p in panels) <= width)
+        check(f"[{width}x{height}] and a real share of the page",
+              covered > 0.20 * width * height,
+              f"{100.0 * covered / (width * height):.0f}% of the viewport")
+        check(f"[{width}x{height}] the orb scales with the room it has",
+              home.ORB_MIN <= home.orb.diameter() <= home.ORB_MAX,
+              f"{home.orb.diameter()}px")
+    check("Home never scrolls",
+          home.scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff)
+
+    # ── The dock never covers the content it floats over ──
+    window.resize(1440, 900)
+    window.navigate_to("home")
+    app.processEvents()
+    dock_top = window.dock.mapTo(home, QPoint(0, 0)).y()
+    lowest = max(p.mapTo(home, p.rect().bottomLeft()).y()
+                 for p in (home.interaction_panel, home.activity_panel))
+    check("the dock clears the lowest panel on Home", lowest <= dock_top,
+          f"panel bottom {lowest}px, dock top {dock_top}px")
+
+    window.navigate_to("chat")
+    app.processEvents()
+    chat = window.views["chat"]
+    composer_bottom = chat.composer.mapTo(chat, chat.composer.rect().bottomLeft()).y()
+    dock_top_chat = window.dock.mapTo(chat, QPoint(0, 0)).y()
+    check("the dock clears the composer on Chat", composer_bottom <= dock_top_chat,
+          f"composer bottom {composer_bottom}px, dock top {dock_top_chat}px")
+    check("the conversation column is bounded and centred",
+          chat.transcript_scroll.width() <= Size.chat_max
+          and chat.composer.width() == chat.transcript_scroll.width(),
+          f"{chat.transcript_scroll.width()}px / {chat.composer.width()}px")
+
+    # ── The ambient backdrop: behind everything, cheap, and stoppable ──
+    check("the window has one backdrop", isinstance(window.backdrop, AmbientBackdrop))
+    check("it never intercepts a click",
+          window.backdrop.testAttribute(Qt.WA_TransparentForMouseEvents))
+    check("it covers the whole window",
+          window.backdrop.width() == window.centralWidget().width()
+          and window.backdrop.height() == window.centralWidget().height())
+    check("the content area is transparent, or the backdrop would never be seen",
+          "transparent" in theme.build().split("#ContentArea")[1].split("}")[0])
+    window.backdrop.set_animated(False)
+    check("reduced motion stops the animation", not window.backdrop._timer.isActive())
+    check("...and it still paints a complete frame", paint(window.backdrop, 400, 300))
+    window.backdrop.set_animated(True)
+
+    # ── Nothing new polls ──
+    # The redesign added two overlays and a backdrop. The backdrop's timer is the only one,
+    # it is slower than the orb's, and it stops when hidden.
+    check("the dock owns no timer at all",
+          not window.dock.findChildren(QTimer),
+          "a dock that polled would run for the whole session; its hover lift is an "
+          "animation that exists only while the pointer is arriving or leaving")
+    # The drawer's ONLY timer is the shared `OrbBadge`'s, which the rail already carries and
+    # which stops itself for every resting state. A closed drawer must not be running it.
+    drawer_timers = window.drawer.findChildren(QTimer)
+    check("the drawer adds no timer of its own",
+          all(t.parent().__class__.__name__ == "OrbBadge" for t in drawer_timers),
+          str([t.parent().__class__.__name__ for t in drawer_timers]))
+    check("and none of them runs while it is closed",
+          not window.drawer.is_open() and not any(t.isActive() for t in drawer_timers))
+    check("and it is slower than the orb", Motion.backdrop_fps < Motion.orb_fps_idle,
+          f"{Motion.backdrop_fps} fps vs {Motion.orb_fps_idle} fps")
+    window.hide()
+    app.processEvents()
+    check("a hidden backdrop stops entirely", not window.backdrop._timer.isActive())
+
+    # ── Window chrome: custom where supported, native everywhere else ──
+    chrome = AppWindowChrome("Kayra")
+    check("the chrome offers the three window controls",
+          all(hasattr(chrome, name) for name in
+              ("minimize_button", "maximize_button", "close_button")))
+    check("the caption buttons follow the platform's proportions, not the app's grid",
+          chrome.close_button.width() > chrome.close_button.height(),
+          f"{chrome.close_button.width()}x{chrome.close_button.height()}")
+    check("the buttons are NOT part of the draggable caption",
+          not chrome.is_caption_at(chrome.close_button.geometry().center()))
+    chrome.set_maximized(True)
+    check("the middle button offers restore once maximised",
+          chrome.maximize_button._kind == "restore")
+    chrome.set_maximized(False)
+    check("...and maximise once restored", chrome.maximize_button._kind == "maximize")
+    check("custom chrome declines on a platform that cannot hit-test",
+          native_chrome_supported() is False,
+          "the offscreen platform has no window manager; the native frame must be kept")
+    check("so this window kept its native frame", window.native_chrome is False)
+
+    # ── The drag is the PLATFORM'S, not a reimplementation ──
+    chrome_source = io.open(
+        os.path.join(project_root, "src", "kayra", "ui", "components", "chrome.py"),
+        encoding="utf-8").read()
+    import ast
+    tree = ast.parse(chrome_source)
+    movers = [n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "mouseMoveEvent"]
+    check("the chrome never moves the window itself", not movers,
+          "a manual drag loses Aero Snap, Win+Arrow, shake and the snap-layouts flyout")
+    check("it answers WM_NCHITTEST instead", "WM_NCHITTEST" in chrome_source)
+
+    # ── Shutdown still goes through the one confirmed path ──
+    from kayra.ui.controls import KayraControls
+    controls_source = inspect.getsource(KayraControls)
+    check("the action layer delegates teardown rather than performing it",
+          "shutdown(hard=True)" in controls_source
+          and "taskkill" not in controls_source and "terminate" not in controls_source)
+    check("and it asks first", "QMessageBox" in controls_source)
+    check("the dialog says it is not a machine shutdown",
+          "does not shut down your computer" in controls_source)
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     print_banner("KAYRA UI", "Shell, views, state reflection and boundary discipline")
@@ -2205,6 +3208,7 @@ def main():
     section_views(app)
     section_state(app)
     section_system(app)
+    section_hardware_portability(app)
     section_settings(app)
     section_window(app)
     section_boundary(app)
@@ -2215,6 +3219,8 @@ def main():
     section_speech_backend(app)
     section_memory_management(app)
     section_boot_ordering(app)
+    section_gesture(app)
+    section_shell(app)
     section_no_side_effects(env_before)
 
     print_system("\n" + "=" * 60)

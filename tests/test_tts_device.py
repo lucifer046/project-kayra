@@ -417,8 +417,18 @@ def section_live_session():
         skip("engine integration", f"TTS engine unavailable: {exc}")
         return
 
-    engine = TextToSpeechEngine(warm_up=False)
+    # THE MODE IS PINNED, NOT INHERITED FROM `.env`.
+    #
+    # `TextToSpeechEngine()` with no argument reads `TTS_DEVICE_MODE` from the configuration,
+    # so these checks used to describe the developer's own setting: on a machine configured
+    # for CPU, "the default engine runs on CUDA" failed and "switching replaced the session"
+    # failed because the switch to CPU was a no-op from CPU. Both were correct behaviour
+    # reported as defects — a tier-1 suite reading the host, which is the thing this suite is
+    # otherwise strict about. AUTO is what the GPU assertions below actually mean.
+    engine = TextToSpeechEngine(warm_up=False, device_mode="AUTO")
     try:
+        check("an explicitly requested mode is honoured over the configuration",
+              engine.device_mode == "AUTO", engine.device_mode)
         report = engine.device_report()
         check("the engine exposes a device report", bool(report))
         check("the engine's report matches its own session",
@@ -430,15 +440,22 @@ def section_live_session():
         check("Kokoro adopted the manager's session, it did not construct one",
               engine.onnx.sess.get_providers() == engine.onnx.sess.get_providers())
         if cuda_ok:
-            check("with CUDA usable, the default engine runs on CUDA",
+            check("with CUDA usable, an AUTO engine runs on CUDA",
                   engine.onnx.sess.get_providers()[0] == td.CUDA_PROVIDER,
+                  engine.onnx.sess.get_providers()[0])
+        else:
+            check("without usable CUDA, an AUTO engine runs on the CPU",
+                  engine.onnx.sess.get_providers()[0] == td.CPU_PROVIDER,
                   engine.onnx.sess.get_providers()[0])
 
         # A runtime switch: one session at a time, and speech must still work afterwards.
         before = engine.onnx
         status = engine.set_device_mode("CPU")
         check("switching returns the resulting status", status is not None)
-        check("switching replaced the session", engine.onnx is not before)
+        # A REAL change of mode rebuilds; asking for the mode already in force does not, and
+        # that distinction is checked explicitly at the end of this block rather than being
+        # assumed one way here.
+        check("a real mode change replaces the session", engine.onnx is not before)
         check("the mode was applied", engine.device_mode == "CPU")
         check("the switched session really is on the CPU",
               engine.onnx.sess.get_providers()[0] == td.CPU_PROVIDER)

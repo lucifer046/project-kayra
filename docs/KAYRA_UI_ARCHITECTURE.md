@@ -8,7 +8,7 @@
 > [`KAYRA_SYSTEM_ARCHITECTURE.md`](KAYRA_SYSTEM_ARCHITECTURE.md). This layer sits **on top** of
 > it and changes almost nothing in it — see [§10](#10-backend-changes).
 >
-> **Last verified against the tree:** 2026-09-07.
+> **Last verified against the tree:** 2026-09-10.
 
 ---
 
@@ -310,7 +310,8 @@ This is the only continuously animated element in the application:
 ## 6. Screen architecture
 
 ```
-Home        the assistant itself: state, prompt, voice controls, recent activity, health
+Home        a three-column instrument panel: Intelligence and Interaction down the left,
+            the orb in the middle, System and Activity down the right
 Chat        one transcript for typed and spoken turns, with automation traces
 Automation  the six-stage pipeline for the current task, plus verified history
 Memory      what Kayra kept, why, and how to delete it
@@ -319,7 +320,30 @@ System      device, three-axis capability analysis, live resources, system guide
 Settings    configuration, written to .env with comments preserved
 ```
 
-`Ctrl+1..7` navigate, `Ctrl+K` jumps to Chat, `Ctrl+.` interrupts.
+`Ctrl+1..7` navigate, `Ctrl+K` jumps to Chat, `Ctrl+.` interrupts, `Ctrl+M` is the
+microphone, `Ctrl+B` opens the navigation drawer.
+
+### TWO SHELLS, AND WHICH SCREEN GETS WHICH (2026-09-10)
+
+```
+Home, Chat                                   every other screen
+──────────────────────────                   ──────────────────────────
+no permanent rail                            permanent left rail
+floating dock, bottom centre                 no dock
+navigation drawer on demand (Menu / Ctrl+B)  navigation always visible
+full window width for content                content beside the rail
+```
+
+`KayraWindow.DOCK_SCREENS` is the whole rule and `_apply_shell()` is the whole
+implementation: it shows exactly one navigation surface, hides the other, and closes the
+drawer if a rail screen is entered with it open. **Two navigation surfaces on one page is the
+state that must never exist**, which is why one function owns both.
+
+Home and Chat give up the rail because they are the two screens where Kayra is the SUBJECT
+rather than a settings surface, and a permanent 224px column of destinations is 224px not
+spent on the thing the user came to look at. Every other screen keeps it: those are dense
+utility screens where a visible list of destinations earns its width, and where a pill
+floating over a form would cover the last row of it.
 
 ### The view contract
 
@@ -335,6 +359,256 @@ onto the **same** bridge. There is one backend session per process. Closing the 
 hides it to tray and does **not** stop the assistant — a voice assistant that stops listening
 because its window was closed is not an assistant. Quitting is explicit, from the tray, and the
 tray says so the first time.
+
+---
+
+## 6c. Home's composition (redesigned 2026-09-10)
+
+**WHAT WAS WRONG.** Home stacked a centred hero over a strip of five 206px cards pinned to the
+bottom. On a 1440x900 window that left roughly a third of the viewport as bare background down
+both sides of the orb, while every fact the page had to show was compressed into five small
+boxes along the bottom edge. It read as a screen that had failed to finish loading.
+
+```
+┌───────────────┬───────────────────────┬───────────────┐
+│ INTELLIGENCE  │                       │    SYSTEM     │
+│               │         ORB           │               │
+├───────────────┤       Listening       ├───────────────┤
+│ INTERACTION   │     Microphone open   │   ACTIVITY    │
+└───────────────┴───────────────────────┴───────────────┘
+                  [ the floating dock ]
+```
+
+**Four panels, grouped by SUBJECT rather than by which subsystem produced them.** That
+regrouping is the substance of the change, not the column count:
+
+| Panel | Carries | Why here |
+|---|---|---|
+| **Intelligence** | live model tier, decision route, chat route, speech-out provider, speech-in backend, memory count | everything about WHAT IS ANSWERING |
+| **System** | OS/CPU/RAM identity, processor and memory meters, the graphics adapter and its meters, Kayra's own footprint | everything about THE MACHINE |
+| **Interaction** | camera preview, microphone, camera, gestures, presence | everything about THE INPUT DEVICES |
+| **Activity** | recent turns, action count | what has been said |
+
+Two things moved deliberately. The **graphics adapter** left its own card and joined System
+beside the processor — it is a property of the machine, and giving it a card of its own made
+it look like a subsystem of the assistant. **Which provider speech is running on** went the
+other way, into Intelligence, because it is a fact about what is answering rather than about
+what the machine contains. Presence shrank from four rows to one, which is the prominence a
+subsystem whose whole job is to stay quiet actually earns.
+
+**Nothing is a fixed pixel position.** Columns are stretch ratios (3 : 4 : 3), the orb is sized
+from the centre column's own share of the width (`_resize_orb`, clamped 168–320px), and every
+caption is elided to the width it is GIVEN. The same composition holds at the 1040px minimum
+and at 2560px; the test suite renders it at three sizes and asserts nothing overflows.
+
+**Home carries no controls.** It is pure status, and every press lives in the dock. That is
+what makes it structurally impossible for a control on this page to disagree with the same
+control two inches below it.
+
+---
+
+## 6d. The floating dock (2026-09-10)
+
+One pill, bottom centre, on Home and Chat only.
+
+```
+[ Menu ] | [ Talk to Kayra ] [ Chat ] | [ Mic ] [ Camera ] [ Gesture ] | [ Power ]
+   nav        the two things you        the three input devices,         the one
+               came here to do          grouped as one category      irreversible action
+```
+
+The order is an argument. Navigation is leftmost because it leads AWAY. The destructive
+control is rightmost, alone past a divider, in the only danger tone on the bar — "Pause
+listening" and "Shut down Kayra" are precisely the pair that must never be hit by mistake.
+
+**ONE CONTROL FOR ONE STATE.** "Microphone on/off" and "start/stop listening" are the same
+fact, so there is one control and it is the microphone. Two would be two places to read a
+single state and inevitably two places for it to be read differently — the class of bug
+`core.voice_state` exists to end. The tooltip says which ACTION a press performs; the icon
+says which STATE the microphone is in, and it says it as a SHAPE (a struck-through
+microphone), because whether Kayra can hear you must not depend on noticing a shade.
+
+**The dock holds no state.** Every button is painted from what the bridge reports and every
+press is handed straight back; `_sync_dock_state()` re-reads the whole picture. It also
+inherits the boot-window rule: while `listening_known()` is False the control is DISABLED
+rather than guessed at, and `bootFinished` re-reads — the same defect Home's button had, at a
+new surface, pinned by the same checks.
+
+**The actions live in `ui/controls.py`**, not in the dock and not in a view. The dock, the
+keyboard shortcuts and the tray all call `KayraControls`, so one press cannot have three
+implementations. `confirm_shutdown()` asks, then delegates to `bridge.shutdown(hard=True)` —
+which is `app.request_shutdown`, the one authoritative teardown. There is no second ordering
+anywhere in the UI and there must never be.
+
+**DockButton is self-painted.** A stylesheet can give a QPushButton a hover colour but cannot
+animate one, and Qt's generic `QPushButton` geometry beats `setFixedSize` (the `min-height`
+trap `Toggle` already had to work around). Painting the plate here makes the hover lift, the
+press compression and the focus ring one cheap pass with no stylesheet fight — and the lift
+animation runs ONLY while the pointer is arriving or leaving, so an idle dock has no timers at
+all. The suite asserts that.
+
+---
+
+## 6e. The navigation drawer (2026-09-10)
+
+Home and Chat reach the rest of the application through a glass panel that slides in from the
+left, over the page.
+
+**An overlay, not a collapsing column.** A drawer that pushed the page aside would relayout
+everything underneath it — on Home the orb slides, the backdrop's bloom moves, and every
+elided caption re-elides, twice per open. An overlay changes nothing below it, which is also
+why opening it is cheap enough to animate at all.
+
+**The scrim is part of the control.** It separates the panel from the content so the glass
+edge is legible, it says the page is temporarily not the subject, and it is the click target
+that closes the drawer. A drawer that can only be closed by finding the same small button
+again is a drawer people leave open. Escape closes it too.
+
+Choosing a destination closes it: the drawer exists to LEAVE these two screens, so keeping it
+open over the page just asked for would be two gestures for one intention.
+
+Both navigation surfaces read the SAME `DESTINATIONS` tuple in `components/navigation.py`.
+Two copies would be two places to add a screen, and the second one would be forgotten.
+
+---
+
+## 6b. Hand gesture control on screen (2026-09-09)
+
+Home carries a **Hand gesture** card in the bottom strip, and Settings a matching card. Between
+them they express three facts and no telemetry.
+
+### The camera preview PULLS. Nothing pushes frames at it.
+
+`ui/components/camera_preview.py` owns a QTimer at the preview rate and asks the bridge for the
+newest frame. The obvious alternative — a `frameReady` signal carrying an image from the gesture
+thread — is a queued Qt signal per frame, and **a queued signal is a queue**: if the GUI thread
+is busy laying out a chat message when three frames arrive, all three are delivered afterwards
+and every one is painted. That is a backlog by construction, and it is exactly the failure the
+rest of this document's performance strategy exists to avoid.
+
+A pull model cannot have a backlog. The gesture runtime keeps one preview buffer and overwrites
+it; a frame the widget does not ask for is never seen. Stale frames are dropped by not existing.
+
+The buffer arrives as ready-to-paint RGB888 because the **gesture thread** did the colour
+conversion and the resize — a GUI thread that had to convert in order to paint is a GUI thread
+that stutters when the camera is busy. `tests/test_ui.py` asserts by AST that no UI module
+imports `cv2` or `mediapipe`.
+
+The timer runs only while the widget is visible, like every other polling surface here, and
+`set_live(False)` clears the last pixmap: a preview still showing the last frame after the
+camera was released tells the user the camera is on, which is the one thing a camera indicator
+must not get wrong.
+
+### Two controls, because they are two facts
+
+A camera switch and a gesture switch, on Home and in Settings. Both are **live and reflected**:
+they call the controller and then re-read what it actually did, so a camera that fails to open
+leaves the switch OFF and puts the camera's own message on screen. That is the same
+requested-versus-active discipline the speech backend card follows, and it prevents the same
+lie — a screen reporting "on" over a device that is not running.
+
+The camera control uses a **different glyph** when off, not a different shade. Whether a camera
+is watching must be readable as a shape; the same rule `mic_off` follows, and more important
+here, because a camera makes no sound.
+
+### The card that fell off the right edge
+
+A `setFixedSize` preview clipped the whole Hand gesture card out of the bottom strip. A widget
+with a hard minimum width forces its card to that width, the row's minima add up, and the last
+card is pushed past the window edge. This is the SAME defect the System card's footprint
+caption caused once already, arriving from a different direction — and, as the earlier note
+warns, **the layout test suite passed throughout**. It was found by rendering the page and
+looking at it.
+
+Two fixes, and the second is the general one:
+
+* the preview is fixed-HEIGHT and expanding-width, so it letterboxes into whatever the card can
+  spare rather than dictating it;
+* `Card` titles now **elide** to the width they are given and keep their full text in a tooltip,
+  instead of reporting that full text width as a minimum. A card titled "Hand gesture" could not
+  previously be narrower than 180px of title plus padding. That change alone cut the bottom
+  strip's minimum width from **1330px to 961px** — below the 1040px `min_window_width` it had
+  been quietly exceeding since the Graphics card was added.
+
+## Home shows THIS machine, whatever machine it is
+
+Two cards on Home describe the hardware, and neither may contain a device name. Both read
+`core.system_profile`, whose facts come from `core.hardware` — see §21c of the system
+architecture for how those are measured.
+
+### The System card's identity line
+
+One elided line: the OS product with its real build, the processor's branded name, and the
+installed memory. It sits ABOVE the meters because it is what the meters are measuring.
+
+* **The read is NON-BLOCKING.** This card refreshes on a 1.5s timer on the GUI thread, and the
+  first profile collection costs ~122ms (audio device enumeration). `profile_if_ready()`
+  returns None until a one-shot warmer has finished, and the line is simply not painted until
+  then. There is nothing true to put in it yet, and 122ms on the paint path is a visible hitch.
+* **Every value is measured or absent.** A machine whose OS build cannot be read shows the
+  product without a build; one whose processor cannot be named shows the memory alone. A
+  plausible default would be worse than showing less — a user checking what Kayra thinks their
+  machine is has no way to tell an assumption from a reading.
+* It previously showed no machine identity at all, and the System SCREEN showed
+  `(build 10)` — `platform.release()`, which is 10 on every Windows 11 machine.
+
+### The Graphics card is vendor-neutral
+
+It reads THREE sources, answering three different questions, and none substitutes for another:
+
+| Source | Question | Availability |
+|---|---|---|
+| `graphics_profile()` | what hardware IS this | every vendor, registry-read, cached |
+| `gpu_metrics()` | what is it DOING right now | NVIDIA only (`nvidia-smi`) |
+| `tts_provider()` | what is SPEECH running on | the live engine |
+
+The card previously had only the second, so **a machine with an AMD or Intel GPU was shown the
+"No GPU detected" empty state** — while its owner was looking at their graphics card. It now
+names the adapter from the profile, overlays live telemetry when there is any, and says
+"<vendor> telemetry unavailable" when there is not. The empty state is reached only when there
+is genuinely no adapter at all.
+
+* **A MISSING MEASUREMENT IS NEVER DRAWN AS A ZERO.** An unreported utilization is captioned
+  "not reported" rather than shown as a 0% bar, because a 0% bar reads as an idle GPU rather
+  than as one whose vendor does not tell us. Unmeasured VRAM shows the installed capacity, or
+  "shared with system memory" for an integrated part.
+* **The header pill still reports the SPEECH device, not the hardware.** "There is a GPU" and
+  "speech is running on it" are different facts, and showing the second when only the first is
+  true is the lie this whole subsystem exists to prevent.
+
+### Proved by rendering machines that do not exist
+
+`test_ui.py::section_hardware_portability` renders Home against five synthetic machines — an
+RTX 3050, an RTX 4060, an Intel Iris Xe, a discrete Radeon, and no GPU at all — and fails if a
+value belonging to a DIFFERENT machine appears on screen. Two details make it work:
+
+* **The search is scoped to the Graphics card.** The System card beside it renders the REAL
+  host by design (it has no stub), so searching the whole page for a forbidden vendor string
+  finds the suite's own machine in the processor line and reports the UI as hardcoded when it
+  is doing exactly its job.
+* **Labels are filtered by `isVisibleTo(root)`, not `isHidden()`.** `isHidden()` is a widget's
+  OWN flag — a label inside a hidden parent reports False. Home's empty states are permanent
+  children that are shown and hidden rather than created and destroyed (see the empty-state
+  note above), so an unfiltered search reports "No GPU detected" as visible on every machine.
+
+A UI that reads the profile passes every other check in that file on any machine, because it
+renders whatever it is given. What it cannot do, if it is hardcoded, is render something ELSE.
+
+### It is independent of the voice orb, and that is enforced
+
+Gesture status arrives on its own `gestureStateChanged` signal carrying the whole resolved
+status, for the same reason `voiceStateChanged` carries the whole voice picture: a card that
+took its camera state from one signal and its gesture state from another would eventually
+render a combination that never existed. Nothing on Home derives one from the other, the orb
+never sees any of it, and no gesture code path can move the voice state machine — asserted by
+AST in `tests/test_gesture_control.py`.
+
+### The views announce nothing
+
+`app.set_gesture_control` and `app.set_camera` already go through `core.settings_log`
+transactionally — requested, run, committed only on success. A view that logged the change too
+would be the second of two lines for one event, and the two would eventually disagree about
+whether it took. No UI module imports the logger; the suite asserts it.
 
 ---
 
@@ -400,19 +674,65 @@ That is a deliberate choice with three concrete payoffs: nothing to ship or vers
 rendering at every DPI scale factor without per-density copies, and icons that can carry the
 assistant's state colour (the tray icon changes hue with what Kayra is doing).
 
-A background image is supported by the design but **deliberately not used**, and the question
-was re-opened during the refinement pass rather than inherited:
+A background **image** is still supported by the design and still **deliberately not used**:
 
-* the layered graphite surfaces already carry the depth an image would provide;
 * any image behind text on a near-black ground costs contrast, and the type here is already
   sitting at the low end of what a dark UI can afford;
-* Home has exactly one focal point, and it is the assistant. A texture in the space around the
-  orb competes with the only element on the page that is supposed to hold the eye;
-* the interface's whole thesis is instrumentation rather than decoration. An atmospheric image
-  would be the single decorative element in it, and would read as borrowed.
+* Home has exactly one focal point, and it is the assistant. A photographic texture in the
+  space around the orb competes with the only element on the page that is supposed to hold
+  the eye;
+* an atmospheric stock image would be the single borrowed element in an interface whose whole
+  thesis is that it was drawn for this product.
 
 `ui/assets/` remains the drop-in location should one ever be wanted; nothing depends on an
 external URL, and no code path assumes the directory has contents.
+
+### 8a. The ambient backdrop (added 2026-09-10)
+
+What the redesign added instead is a **drawn** ambient layer — `components/backdrop.py` — which
+keeps every objection above intact because it is generated from the theme's own tokens and
+stays within a few points of the base ground. Four layers:
+
+1. a vertical wash, top slightly lighter than bottom — the only thing giving the window a
+   sense of up and down;
+2. a coarse diagonal hairline lattice, rasterised ONCE per resize into a pixmap. A square grid
+   reads as a spreadsheet; a diagonal one reads as depth;
+3. a warm radial bloom, positioned by the view — Home puts it behind the orb, which is what
+   makes the orb look LIT rather than pasted on. Chat pulls it up and dims it, because there
+   the transcript is the subject;
+4. eighteen slow drifting motes.
+
+**Cost, which is why it is shaped this way.** It paints behind every screen, so it is bounded
+harder than the orb is: **8 fps** and a 90-second cycle (the movement is felt, not watched),
+the lattice never repainted, the timer stopped completely when hidden, `WA_OpaquePaintEvent`
+so Qt does not clear before painting, and a fixed-length mote list so nothing here can grow.
+It is slower than the orb's idle rate, and the suite asserts that.
+
+**`#ContentArea` had to become transparent for any of it to be visible.** It was
+`background-color: base` — an opaque sheet over the whole content area, under which the
+backdrop painted perfectly and reached not one pixel of the screen. Anything needing a ground
+of its own (a card, a panel, an input well) declares one; the page itself must not.
+
+**Reduced motion is respected.** `prefers_reduced_motion()` reads the platform preference
+(`SPI_GETCLIENTAREAANIMATION`, with a `KAYRA_REDUCED_MOTION` override the suite uses), and
+`set_animated(False)` stops the drift while still painting a complete picture — nothing is
+lost except the movement.
+
+### 8b. Glass, and why it is a second surface type
+
+`GlassPanel` is translucent and floats OVER the backdrop; `Card` is opaque and sits IN a page.
+They are different objects and both are needed. Home uses glass so the bloom behind the orb
+bleeds through the panels around it instead of stopping dead at their edges — that continuity
+is most of what separates "one lit surface" from "five rectangles on a dark page". The five
+utility screens keep opaque cards, where content is dense and a solid ground is what makes a
+table readable, and where a moving backdrop behind a settings form would be a distraction
+rather than depth.
+
+Qt has no `backdrop-filter`, so there is no real frosted blur available in a stylesheet. What
+sells glass here is the transparency itself plus a hairline top edge (`glass_rim`) that reads
+as a lit rim. Alphas are deliberately high (0.72–0.92): anything more transparent stops being
+a surface, and the dock's whole value is that its controls stay instantly readable over any
+content.
 
 ---
 

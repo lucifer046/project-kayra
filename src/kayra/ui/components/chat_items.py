@@ -30,14 +30,21 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QColor
 from PySide6.QtWidgets import QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
 
-from kayra.ui.theme import Color, Font, Space, Radius
-from kayra.ui.components.primitives import Caption, _label
+from kayra.ui.theme import Color, Space, Size
+from kayra.ui.components.primitives import _label
 
 
 # The readable measure for a conversation. Wider than this and the eye loses the line
 # return; the assistant's replies used to run the full width of a 1440px window, which is
 # roughly 160 characters a line — unreadable for anything longer than a sentence.
 MAX_BUBBLE_WIDTH = 560
+
+# The share of the transcript column one bubble may occupy. A CONSTANT maximum alone is not
+# enough: on a narrow window 560px IS the whole column, so both speakers' turns become full
+# width and the left/right asymmetry that distinguishes them disappears — which is the only
+# signal this transcript has, since there are no avatars. The bubble takes whichever is
+# smaller, the constant or this share.
+BUBBLE_WIDTH_SHARE = 0.74
 
 
 def _timestamp(when=None):
@@ -63,7 +70,7 @@ class MessageBubble(QFrame):
         super().__init__(parent)
         self.role = role
         self.setObjectName(self.OBJECT_NAMES.get(role, "BubbleAssistant"))
-        self.setMaximumWidth(MAX_BUBBLE_WIDTH)
+        self.setMaximumWidth(MessageRow.bubble_max_width())
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
         layout = QVBoxLayout(self)
@@ -111,7 +118,9 @@ class MessageBubble(QFrame):
             meta_metrics = QFontMetrics(self.meta_label.font())
             ideal = max(ideal, meta_metrics.horizontalAdvance(self.meta_label.text()))
         padding = 2 * Space.base
-        self.setMinimumWidth(int(min(MAX_BUBBLE_WIDTH, max(110, ideal + padding))))
+        ceiling = MessageRow.bubble_max_width()
+        self.setMaximumWidth(ceiling)
+        self.setMinimumWidth(int(min(ceiling, max(110, ideal + padding))))
 
     def append_text(self, fragment):
         """
@@ -136,12 +145,28 @@ class MessageRow(QWidget):
     up with its edge instead of drifting in the margin.
     """
 
+    # The width the transcript column currently has. A CLASS attribute rather than an
+    # argument threaded through every construction site: bubbles are created from six places
+    # (a user turn, a reply, a system note, an error, the boot notice, a restored transcript)
+    # and passing a width to all of them would mean six places to forget it. `ChatView` sets
+    # it once per resize, before any bubble is built.
+    _available_width = Size.chat_max
+
+    @classmethod
+    def set_available_width(cls, width):
+        cls._available_width = max(240, int(width))
+
+    @classmethod
+    def bubble_max_width(cls):
+        """The narrower of the constant measure and this window's share of the column."""
+        return int(min(MAX_BUBBLE_WIDTH, cls._available_width * BUBBLE_WIDTH_SHARE))
+
     def __init__(self, role, text, meta=None, show_time=True, parent=None):
         super().__init__(parent)
         self.role = role
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, Space.xxs, 0, Space.xxs)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         self.bubble = MessageBubble(role, text, meta,
@@ -156,6 +181,21 @@ class MessageRow(QWidget):
 
     def append_text(self, fragment):
         self.bubble.append_text(fragment)
+
+    def set_streaming(self, streaming):
+        """
+        Marks a reply that is still arriving.
+
+        A dynamic property plus one repolish, so the stylesheet paints an accent edge on the
+        bubble and NOTHING here runs per frame. An animated caret would need a timer per
+        bubble, and a transcript of forty replies would then carry forty timers.
+
+        `repolish` is not optional: Qt does not re-evaluate property selectors when the
+        property changes, and forgetting it is the most common way Qt theming looks broken.
+        """
+        from kayra.ui.theme import repolish
+        self.bubble.setProperty("streaming", bool(streaming))
+        repolish(self.bubble)
 
 
 class ThinkingRow(QWidget):

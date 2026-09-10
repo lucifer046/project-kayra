@@ -253,8 +253,25 @@ class VoiceStateMachine:
         VoiceState.PROCESSING, VoiceState.ASSISTANT_SPEAKING, VoiceState.USER_SPEAKING,
     })
 
+    # ── HOW LONG A VOICE MUST PERSIST TO INTERRUPT PLAYBACK ──
+    # OBSERVED: while Kayra was speaking the visual flipped ASSISTANT_SPEAKING <-> USER_SPEAKING
+    # repeatedly. The page already raises the VAD threshold during playback (`vadEchoMargin`,
+    # 7x rather than 3.2x), but residual echo still crosses it in bursts, and ANY crossing was
+    # enough to repaint the state.
+    #
+    # A person taking the floor speaks for a few hundred milliseconds; an echo spike does not.
+    # So over playback — and ONLY over playback — the detector must have been saying "voice"
+    # continuously for this long before the visual accepts it.
+    #
+    # THIS DOES NOT SLOW BARGE-IN. A real "stop" reaches the assistant through the page's
+    # interim interrupt flag, which sets the turn machine to INTERRUPTING; that is branch 3
+    # above and it is immediate. This dwell governs only the case where the VAD alone is
+    # guessing, which is exactly where a guess was wrong.
+    BARGE_IN_VAD_DWELL_MS = 320.0
+
     def __init__(self, clock_ms=None):
         self._now_ms = clock_ms or _now_ms
+        self._voice_since_ms = (clock_ms or _now_ms)()
         self._lock = threading.RLock()
         self._state = VoiceState.OFFLINE
         self._revision = 0
@@ -339,14 +356,33 @@ class VoiceStateMachine:
         with self._lock:
             for key, value in facts.items():
                 if key in self._facts:
+                    if key == "voice_active":
+                        self._note_voice(bool(value))
                     self._facts[key] = value
             return self._resolve()
+
+    def _note_voice(self, active):
+        """
+        Records when the VAD's verdict last CHANGED, so its age can be read.
+
+        Only the transition is stamped, not every sample: `_voice_since_ms` therefore answers
+        "how long has the detector been saying this?", which is the question the barge-in
+        dwell below needs and the one a per-sample timestamp cannot answer.
+        """
+        if bool(self._facts.get("voice_active")) != bool(active):
+            self._voice_since_ms = self._now_ms()
+
+    def _voice_age_ms(self):
+        return self._now_ms() - getattr(self, "_voice_since_ms", 0.0)
 
     def _resolve(self):
         if self._facts.get("shutting_down"):
             self._shutting_down_seen = True
 
-        resolved, reason = self._compute(self._facts)
+        # The age of the VAD's current verdict travels IN, so `_compute` stays pure, static
+        # and total — every combination of facts still yields exactly one state, which is what
+        # lets the suite sweep all of them.
+        resolved, reason = self._compute(self._facts, self._voice_age_ms())
         current = self._state
 
         # Once shutdown has been observed, the machine is absorbing: a late VAD sample from a
@@ -388,7 +424,7 @@ class VoiceStateMachine:
     # ── The resolution itself ─────────────────────────────────────────
 
     @staticmethod
-    def _compute(facts):
+    def _compute(facts, voice_age_ms=0.0):
         """
         THE PRECEDENCE. Pure, static and total — every combination of facts yields a state.
 
@@ -434,10 +470,17 @@ class VoiceStateMachine:
         if assistant == "INTERRUPTING":
             return VoiceState.USER_SPEAKING, "barge-in"
         if assistant == "SPEAKING":
-            # A voice arriving over playback IS the barge-in, one poll before the turn machine
-            # hears about it. Showing the user they have the floor at the instant they take it
-            # is the difference between a responsive assistant and one that argues.
-            if voice_active:
+            # A SUSTAINED voice arriving over playback is the barge-in, one poll before the
+            # turn machine hears about it. Showing the user they have the floor at the instant
+            # they take it is the difference between a responsive assistant and one that
+            # argues — but the instant has to be real.
+            #
+            # A single VAD crossing is not evidence of a person while Kayra's own voice is in
+            # the room. Requiring the detector to have held its verdict for
+            # `BARGE_IN_VAD_DWELL_MS` is what stops residual echo repainting the state several
+            # times a sentence. A genuine "stop" does not wait for this: it arrives as
+            # INTERRUPTING through the page's interim flag, handled above.
+            if voice_active and voice_age_ms >= VoiceStateMachine.BARGE_IN_VAD_DWELL_MS:
                 return VoiceState.USER_SPEAKING, "barge-in (vad)"
             return VoiceState.ASSISTANT_SPEAKING, "speaking"
         if assistant in ("PROCESSING", "AUTOMATING"):

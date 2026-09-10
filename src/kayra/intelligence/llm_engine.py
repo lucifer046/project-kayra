@@ -20,12 +20,145 @@ from openai import OpenAI
 
 # Robust relative path imports across standalone and package execution
 from kayra.core.config import env_values
+from kayra.core import logbus
 from kayra.core.logbus import Subsystem, info, warning, error, debug, field
 from kayra.intelligence.provider_router import (
     ROUTE_CHAT, ROUTE_DECISION, COHERE, GROQ, GEMINI, LOCAL,
     AllProvidersFailed, FailureKind, get_provider_router,
+    # The router's own failure taxonomy, reused rather than re-invented: whether a failure is
+    # worth retrying is answered from ONE vocabulary, and the local path gets the same reading
+    # of an exception that the cloud path does.
+    classify_failure,
 )
 from kayra.utils import print_system
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                        THE DMM RETRY BOUND                             │
+# └────────────────────────────────────────────────────────────────────────┘
+# How many times an EMPTY token response is retried before the request is treated as
+# conversation. Five.
+#
+# This governs ONE failure class — the provider answered and the answer contained no usable
+# token — and nothing else. Transport failures, rate limits, timeouts and auth errors are the
+# provider router's business and never reach it; a rate-limited key therefore still costs
+# exactly one call per provider per request, which is the property the router exists to
+# guarantee and which five retries here must not be allowed to undo.
+#
+# Five rather than three because the local-model path is where empty completions actually
+# happen: a small local model that samples only stop-tokens, or one still warming its KV
+# cache, produces them regularly, and each attempt is an in-process round-trip on the user's
+# own machine rather than a metered call. Three attempts was degrading classifiable requests
+# to conversation often enough for the user to notice.
+#
+# There is no backoff and there must not be one. The retry is not waiting for anything to
+# recover — the model is up, it just produced nothing — so a sleep would add latency to a
+# turn the user is waiting on and buy nothing.
+MAX_DMM_EMPTY_RETRIES = 5
+
+# ── WHAT IS WORTH RETRYING ───────────────────────────────────────────────
+# An empty completion is a transient sampling outcome and is worth asking again. A malformed
+# request, a bad credential or a model that is not there are not: the next four attempts will
+# fail identically, and the only thing five of them buys is fifty seconds of a user waiting
+# for the same answer.
+#
+# These names are the provider router's (`FailureKind`), reused rather than re-invented, so
+# "is this worth retrying?" is answered from one vocabulary. The router owns TRANSPORT
+# retries; this owns retries over the model's OUTPUT, and the two must not become two
+# authorities for the same thing.
+RETRYABLE_DMM_FAILURES = frozenset({"EMPTY_RESPONSE", "TRANSIENT", "SERVER_ERROR", "UNKNOWN"})
+TERMINAL_DMM_FAILURES = frozenset({"INVALID_REQUEST", "AUTH_FAILURE", "MODEL_UNAVAILABLE"})
+
+# ── BACKOFF ──────────────────────────────────────────────────────────────
+# The first retry is IMMEDIATE. The model is up and merely produced nothing, so there is
+# nothing to wait for on the first re-ask, and a delay there is pure added latency on the
+# common case — which is a retry that succeeds.
+#
+# Later attempts get a small, bounded, LINEAR pause. Not exponential: this is not congestion
+# control and the local server is not overloaded; it is a token sampler that produced a stop
+# token, and a growing wait would only make the worst case worse. Measured against LM Studio
+# here an empty completion already costs ~2.0s of inference, so the pause is a rounding error
+# next to the attempt itself and exists only to give a model that is still warming a moment.
+DMM_RETRY_DELAY_MS = 120
+DMM_MAX_RETRY_DELAY_MS = 600
+
+# ── HEALTH COOLDOWN ──────────────────────────────────────────────────────
+# A model that answered nothing for three consecutive REQUESTS is not having a bad sample, it
+# is not working. Running five retries per utterance against it costs the user ten seconds a
+# turn and cannot succeed. After the third, it is stood down briefly and every request goes
+# straight to the fallback the architecture already has.
+#
+# This is a per-model latch, not a circuit breaker with half-open probing: the next request
+# after the cooldown expires IS the probe, and one success clears it. Anything more elaborate
+# would be a second retry authority.
+def _turn_superseded(turn):
+    """
+    Has the turn that started this work been replaced by a newer one?
+
+    THE RULE IS "NEWER TURN EXISTS", not "turn ended". A retry chain that is still running
+    when the user says something else is working on a question they have moved on from, and
+    every further attempt costs the current turn's latency and prints into its log. Turn 0
+    means "not correlated" — boot-time and diagnostic calls — and is never superseded.
+    """
+    if not turn:
+        return False
+    # `latest_turn()`, NOT `current_turn()`. Between turns the open turn is 0, so a check
+    # against it would report a finished turn as still current in exactly the window where a
+    # stale retry is most likely to still be running.
+    return logbus.latest_turn() > turn
+
+
+DMM_UNHEALTHY_AFTER = 3
+DMM_HEALTH_COOLDOWN_SECONDS = 20.0
+
+# A WALL-CLOCK CEILING ON TOP OF THE COUNT, because a count alone is not a bound on the user's
+# wait. Measured against the local model on this host: an empty completion costs ~2.0s, so five
+# retries is ~10s of a person sitting in front of a silent assistant for a request that ends in
+# "treat this as conversation" anyway.
+#
+# The budget does NOT replace the count — with a backend at 2s/attempt all five still run,
+# which is the case the count was raised for. It stops a SLOWER backend from turning five
+# retries into half a minute. Whichever limit is reached first wins, and the log says which.
+#
+# There is still no sleep anywhere in the retry path. This is a deadline, not a backoff: the
+# model is up and merely produced nothing, so waiting between attempts would add latency and
+# buy nothing.
+def _retry_budget_seconds():
+    """The budget, from `.env`, clamped to 2-120s. A budget of zero would disable the retry."""
+    try:
+        from kayra.core.config import env_float
+        return env_float("KAYRA_DMM_RETRY_BUDGET_SECONDS", 15.0, 2.0, 120.0)
+    except Exception:
+        return 15.0
+
+
+DMM_RETRY_BUDGET_SECONDS = 15.0
+
+# ── A PER-ATTEMPT CEILING, WHICH IS A DIFFERENT BOUND FROM THE BUDGET ────
+# The budget above bounds the WHOLE retry chain. It does not bound ONE attempt, and that gap
+# is what made the worst case unpredictable: a local server that accepts a request and then
+# takes twelve seconds to answer nothing spends almost the entire chain on a single call, so
+# the five retries the count promises never happen and the user waits the full budget for one
+# useless answer.
+#
+# Each attempt therefore gets its own deadline. Three seconds is comfortably above the ~2.0s
+# an empty completion costs against LM Studio on this host, so a healthy backend never meets
+# it; what it stops is one hung call eating the chain. It is CLAMPED BY THE REMAINING BUDGET
+# at every call site, so the per-attempt bound can never extend the request past the deadline
+# — the two limits compose, and whichever is tighter wins.
+#
+# This is a REQUEST TIMEOUT handed to the client, not a sleep and not a second retry
+# authority: the SDK is constructed with `max_retries=0`, so a timeout raises once and the
+# retry decision stays here, where the count and the budget already live.
+DMM_ATTEMPT_TIMEOUT_SECONDS = 3.0
+
+
+def _attempt_timeout_seconds(budget_left=None):
+    """The deadline for ONE attempt: the per-attempt ceiling, capped by what is left."""
+    timeout = DMM_ATTEMPT_TIMEOUT_SECONDS
+    if budget_left is not None:
+        timeout = min(timeout, max(0.05, float(budget_left)))
+    return timeout
 
 
 class CentralizedLLMEngine:
@@ -745,7 +878,43 @@ class CentralizedLLMEngine:
     # ┌────────────────────────────────────────────────────────────────────────┐
     # │                    1. DECISION MAKING MODEL (DMM)                      │
     # └────────────────────────────────────────────────────────────────────────┘
-    def classify_intent(self, prompt: str, retries: int = 0):
+    # ── LOCAL MODEL HEALTH ────────────────────────────────────────────────
+    # Process-wide, because there is one engine per process and one local server behind it.
+    # Plain attributes rather than a class: the state is two numbers and a timestamp, and a
+    # structure would imply more machinery than exists.
+
+    def _local_unhealthy(self):
+        """True while the local model is standing down after repeated empty completions."""
+        until = getattr(self, "_local_cooldown_until", 0.0)
+        if until and time.monotonic() < until:
+            return True
+        if until:
+            # Expired. The next request IS the probe; clear the latch so it is actually made.
+            self._local_cooldown_until = 0.0
+            self._local_empty_streak = 0
+        return False
+
+    def _note_local_result(self, produced_tokens):
+        """
+        Records whether a REQUEST (not an attempt) produced anything usable.
+
+        Counted per request rather than per retry on purpose: five empty attempts inside one
+        request are one piece of evidence about the model, not five.
+        """
+        if produced_tokens:
+            self._local_empty_streak = 0
+            self._local_cooldown_until = 0.0
+            return
+        streak = getattr(self, "_local_empty_streak", 0) + 1
+        self._local_empty_streak = streak
+        if streak >= DMM_UNHEALTHY_AFTER:
+            self._local_cooldown_until = time.monotonic() + DMM_HEALTH_COOLDOWN_SECONDS
+            warning(Subsystem.DMM,
+                    f"Local model produced nothing on {streak} consecutive requests; "
+                    f"standing it down for {DMM_HEALTH_COOLDOWN_SECONDS:.0f}s")
+
+    def classify_intent(self, prompt: str, retries: int = 0, deadline: float = 0.0,
+                        turn: int = 0):
         """
         Classifies user prompt inputs into structured system task tokens.
         Priority: Cohere (cloud DMM) -> Local.
@@ -753,10 +922,37 @@ class CentralizedLLMEngine:
         Parameters:
             prompt (str): Raw user query string.
             retries (int): Internal counter managing query planning retry recursion.
+            deadline (float): Internal. `time.monotonic()` after which no further empty-response
+                retry is started, whatever the counter says. Set on the first call.
 
         Returns:
             list: List of parsed task labels matching standard intents.
         """
+        if not deadline:
+            deadline = time.monotonic() + _retry_budget_seconds()
+            # THE TURN THAT OWNS THIS REQUEST. Recorded once, on the first call, and carried
+            # through every retry — see `_turn_superseded`. It is NOT printed by these lines:
+            # `logbus` already stamps every correlated line with the open turn, and putting it
+            # in the message too produced "[DMM] Turn #1 · Turn #1 retry 1/5".
+            turn = turn or logbus.current_turn()
+
+        # ── STALE WORK STOPS ──
+        # OBSERVED: "[DMM] Retry 4/5", then a new utterance committed, then "Retry 5/5" — a
+        # retry chain outliving the turn that started it, printing into another turn's log and
+        # eventually returning a classification for a question the user had moved on from.
+        if _turn_superseded(turn):
+            debug(Subsystem.DMM,
+                  f"cancelled: superseded by turn #{logbus.latest_turn()}")
+            return []
+
+        if not self.is_online and self._local_unhealthy():
+            # The model has answered nothing for several requests running. Five more attempts
+            # cannot change that, and the user is waiting.
+            warning(Subsystem.DMM,
+                    "Local model is standing down after repeated empty responses; "
+                    "treating this as conversation.")
+            return ["general " + prompt]
+
         try:
             if self.is_online:
                 try:
@@ -774,7 +970,30 @@ class CentralizedLLMEngine:
                             "No decision provider answered. Treating this as conversation.")
                     return ["general " + prompt]
             else:
-                response_text = self._dmm_local(prompt)
+                try:
+                    # ONE attempt, with its OWN deadline. `deadline` bounds the chain; this
+                    # bounds the call, so a backend that hangs hands the turn back in ~3s and
+                    # the remaining retries still get to happen.
+                    response_text = self._dmm_local(
+                        prompt,
+                        timeout=_attempt_timeout_seconds(deadline - time.monotonic()))
+                except Exception as exc:
+                    # NOT EVERY FAILURE IS WORTH FIVE ATTEMPTS. A malformed request, a bad
+                    # credential or a model that is not loaded will fail identically four more
+                    # times; the only thing repeating it buys is the user's time. The router's
+                    # own vocabulary is reused so "is this worth retrying?" is answered once.
+                    kind, _retry_after = classify_failure(exc)
+                    if kind in TERMINAL_DMM_FAILURES:
+                        warning(Subsystem.DMM,
+                                f"local model: {kind} — not retryable. "
+                                "Treating this as conversation.")
+                        self._note_local_result(False)
+                        return ["general " + prompt]
+                    # Retryable, and the router does not own the local path (local-first is a
+                    # chain of one), so the retry happens here under the same bounds as an
+                    # empty completion.
+                    debug(Subsystem.DMM, f"local model: {kind}")
+                    response_text = ""
 
             # Clean and split response text into discrete tasks
             response_text = response_text.replace("\n", "")
@@ -819,19 +1038,64 @@ class CentralizedLLMEngine:
                 seen_tasks.add(dedup_key)
                 parsed_task.append(task)
 
-            # Intercept empty or failed token responses to attempt recursive retries
+            # Intercept empty or failed token responses to attempt bounded retries.
             if len(parsed_task) == 0:
-                if retries < 3:
+                budget_left = deadline - time.monotonic()
+                if _turn_superseded(turn):
+                    debug(Subsystem.DMM,
+                          f"retry abandoned: superseded by turn "
+                          f"#{logbus.latest_turn()}")
+                    self._note_local_result(False)
+                    return []
+                if retries < MAX_DMM_EMPTY_RETRIES and budget_left > 0:
                     # A retry over the model's OUTPUT, not over a transport failure — the
                     # router owns the latter and this must never become a second retry
-                    # authority for it. Bounded at 3, and it re-enters the router, so a
-                    # provider that has meanwhile been stood down is skipped rather than
-                    # hammered.
+                    # authority for it. It re-enters the router, so a provider that has
+                    # meanwhile been stood down is skipped rather than hammered.
+                    #
+                    # RAISED FROM 3 TO 5 for the local-model path. A local server is the
+                    # opposite case from a cloud one: an empty completion there is a cheap,
+                    # local, genuinely transient event (a sampler that produced only
+                    # stop-tokens, a model still warming), and each attempt costs one
+                    # in-process round-trip rather than a metered API call. Three attempts
+                    # was leaving classifiable requests degraded to conversation.
+                    #
+                    # THIS IS NOT FIVE RETRIES AFTER EVERY FAILURE. It is reached only when
+                    # the provider ANSWERED and the answer parsed to zero usable tokens. A
+                    # transport failure never arrives here — the router has already
+                    # classified it, stood the provider down and moved on — so a rate-limited
+                    # cloud key still costs exactly one call per provider per request.
+                    # ONE progress line per retry, at INFO, and NOT at WARNING.
+                    # Five visually dominant warnings for a condition the assistant recovers
+                    # from on its own is noise that trains a reader to skim; the WARNING is
+                    # kept for the exhaustion, which is the part that has a consequence.
+                    info(Subsystem.DMM,
+                         f"empty response — retry {retries + 1}/"
+                         f"{MAX_DMM_EMPTY_RETRIES}")
+                    # Bounded, linear, and ZERO on the first retry — the common case is a
+                    # retry that succeeds, and delaying it is pure added latency.
+                    delay_ms = min(DMM_RETRY_DELAY_MS * retries, DMM_MAX_RETRY_DELAY_MS)
+                    if delay_ms:
+                        time.sleep(min(delay_ms, max(0.0, budget_left * 1000.0)) / 1000.0)
+                    return self.classify_intent(prompt=prompt, retries=retries + 1,
+                                                deadline=deadline, turn=turn)
+                # Exhausted. Say so ONCE, at WARNING, with no traceback: an empty completion is
+                # an expected outcome of a small model, not a defect to dump a stack for. The
+                # line names WHICH limit was reached, because "the model kept answering
+                # nothing" and "the model is too slow to ask five times" are different
+                # problems with different fixes.
+                if retries >= MAX_DMM_EMPTY_RETRIES:
                     warning(Subsystem.DMM,
-                            f"Empty token response. Retrying ({retries + 1}/3).")
-                    return self.classify_intent(prompt=prompt, retries=retries + 1)
+                            f"exhausted {MAX_DMM_EMPTY_RETRIES} retries — "
+                            "treating this as conversation")
                 else:
-                    return ["general " + prompt]
+                    warning(Subsystem.DMM,
+                            f"spent its {_retry_budget_seconds():.0f}s retry budget "
+                            f"after {retries + 1} attempt(s) — treating this as "
+                            "conversation")
+                self._note_local_result(False)
+                return ["general " + prompt]
+            self._note_local_result(True)
             return parsed_task
 
         except Exception as e:
@@ -921,12 +1185,23 @@ class CentralizedLLMEngine:
         )
         return completion.choices[0].message.content or ""
 
-    def _dmm_local(self, prompt):
+    def _dmm_local(self, prompt, timeout=None):
         """
         The offline DMM. Not routed: local-first is absolute, so when a local server is up
         there is exactly one provider, and a chain of one is a chain with no decisions in it.
+
+        `timeout` is this ONE attempt's deadline, supplied by the retry loop and already
+        capped by what remains of the retry budget. `with_options` returns a shallow copy of
+        the client rather than mutating the shared one, so a short-deadline DMM call cannot
+        change the timeout of the chat stream running beside it.
         """
-        response = self.local_client.chat.completions.create(
+        client = self.local_client
+        if timeout:
+            try:
+                client = client.with_options(timeout=timeout)
+            except Exception:
+                client = self.local_client
+        response = client.chat.completions.create(
             model=self.local_decision_model,
             messages=self._dmm_messages(prompt),
             temperature=0.1,

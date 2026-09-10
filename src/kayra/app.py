@@ -69,10 +69,17 @@ from kayra.core.config import (load_environment, env_values,
                                assistant_name as configured_assistant_name)
 from kayra.core.runtime_state import AssistantState, get_runtime_state
 from kayra.core.conversation_context import get_conversation_context
-from kayra.core.voice_control import ControlKind, classify_control
+from kayra.core.voice_control import (
+    ControlKind, ControlCommand, classify_control,
+    # The confirmation layer. Lifecycle commands are REQUESTS until the user answers;
+    # see `_dispatch_control` for why there is no second execution path.
+    DANGEROUS_KINDS, ControlConfirmations,
+    confirmation_question, confirmation_ack,
+)
 from kayra.core.voice_state import get_voice_state
 from kayra.core import logbus
 from kayra.core.logbus import Subsystem
+from kayra.core import settings_log
 from kayra.utils import (
     print_banner, print_system, print_info, print_error, print_success, print_warning,
     console, StageTimer, now_ms,
@@ -122,6 +129,100 @@ create_default_agent = None
 
 _BOOTSTRAPPED = False
 _barge_in_metrics = {}
+
+# ── THE TWO SPOKEN LIFECYCLE ANNOUNCEMENTS ───────────────────────────────
+# Fixed sentences, composed here and NEVER generated. Neither is routed through the DMM or
+# the chat model, for the same reason the local control vocabulary is not: they have to be
+# identical every time (a boot line the user cannot predict is not an announcement), they
+# have to work with the network down, and the shutdown one runs while the process is already
+# tearing down — there is nothing left to wait on a cloud round-trip with.
+#
+# `_boot_announced` is what makes the boot line play EXACTLY ONCE per process. Both front
+# ends reach it (the console `Main_Loop`, and `ui.session` after its own boot), and without
+# the latch a UI that also runs a turn loop would announce twice.
+_boot_announced = threading.Event()
+
+SHUTDOWN_ANNOUNCEMENT = (
+    "Kayra shutdown initiated. Powering down in 3... 2... 1... Goodbye.")
+
+
+def boot_announcement():
+    """
+    The one spoken startup line, naming where intelligence is ACTUALLY coming from.
+
+    Read from the live engine (`is_online`), never from `.env`: the same rule the startup
+    report follows. A machine with cloud keys configured and LM Studio running is a LOCAL
+    machine, and saying "cloud" there would describe a configuration rather than the process
+    that is about to answer the user.
+    """
+    tier = "Cloud" if getattr(engine, "is_online", False) else "Local"
+    return (f"{assistant_name} is now online. "
+            f"{tier} intelligence services are active and I'm ready.")
+
+
+def speak_boot_announcement():
+    """
+    Plays the startup announcement once, after every subsystem is up and before listening.
+
+    Called at the top of `Main_Loop` and at the end of the UI's boot, whichever front end is
+    running. Non-blocking: the sentence plays while the microphone opens, so the announcement
+    costs the user nothing and a "stop" over it is a barge-in like any other.
+    """
+    if _boot_announced.is_set():
+        return ""
+    _boot_announced.set()
+    line = boot_announcement()
+    logbus.info(Subsystem.BOOT, line, correlate=False)
+    if TTS_ENABLED and tts_engine is not None:
+        try:
+            tts_engine.begin_turn()
+            tts_engine.speak(line)
+        except Exception:
+            pass
+    return line
+
+
+# ── THE TURN'S VISIBLE LIFECYCLE ─────────────────────────────────────────
+# ONE line per CHANGE of stage, and never one per callback. The old console prints fired once
+# per loop iteration regardless of whether anything had happened, so an utterance consumed by
+# a control command or rejected as echo printed "Listening..." again with nothing between the
+# two — and a reader could not tell a new turn from a discarded one.
+#
+# The key includes the OPEN TURN, so the same stage in two different turns is two lines while
+# the same stage repeated inside one turn is one. That is also what stops background work
+# printing itself as the current turn: `logbus.current_turn()` is 0 between turns, so a line
+# emitted then is neither correlated nor mistaken for the turn that just finished.
+_flow_lock = threading.Lock()
+_flow_last = None
+
+
+def _announce_reply(reply):
+    """
+    Logs the assistant's answer once, as the turn's own line.
+
+    TRUNCATED, deliberately. A deep-research summary is thousands of characters and a
+    terminal that has to be scrolled to find the next lifecycle line is exactly the flow this
+    replaced. The full text still reaches the console through the service that produced it.
+    """
+    text = " ".join((reply or "").split())
+    if not text:
+        return False
+    if len(text) > 160:
+        text = text[:157] + "..."
+    return _voice_flow(assistant_name, f'"{text}"')
+
+
+def _voice_flow(stage, detail=""):
+    """Logs one lifecycle stage for the current turn, only when it actually changes."""
+    key = (logbus.current_turn(), stage, detail)
+    with _flow_lock:
+        global _flow_last
+        if key == _flow_last:
+            return False
+        _flow_last = key
+    logbus.info(Subsystem.VOICE, f"{stage}: {detail}" if detail else stage)
+    return True
+
 
 # Shutdown is idempotent and single-entry. Ctrl+C during teardown, a tray Quit that races the
 # spoken "exit", and the UI button pressed twice all arrive here; the first caller runs the
@@ -568,8 +669,52 @@ def bootstrap():
             print_warning(f"Proactive agent failed to start (non-fatal): {e}")
             proactive_agent = None
 
+    # Gesture control comes up LAST among the services and only when `.env` asks for it, so
+    # a camera never stands between the user and a working microphone. See `_boot_gesture`.
+    try:
+        _boot_gesture()
+    except Exception as e:
+        print_warning(f"Hand gesture control failed to start (non-fatal): {e}")
+
     _report_startup()
     _install_signal_handlers()
+
+
+def _boot_gesture():
+    """
+    Brings gesture control up when `.env` asks for it. Called at the END of bootstrap.
+
+    LAST, AND ON THE CALLER'S THREAD, on purpose. It is off by default, so the common boot
+    pays nothing; when it IS on, starting it after speech and the microphone means a camera
+    that takes 400ms to open cannot delay the two subsystems the user actually notices. It is
+    also the only boot step allowed to fail quietly — a webcam that is unplugged must cost a
+    warning and a disabled feature, never a boot.
+    """
+    from kayra.input.gesture.config import camera_enabled_default, gesture_enabled_default
+
+    if gesture_enabled_default():
+        ok, detail = (gesture_controller() or _NullGesture()).set_gesture(True, reason="boot")
+        if not ok:
+            print_warning(f"Hand gesture control did not start: {detail}")
+    elif camera_enabled_default():
+        ok, detail = (gesture_controller() or _NullGesture()).set_camera(True)
+        if not ok:
+            print_warning(f"The camera did not start: {detail}")
+
+
+class _NullGesture:
+    """Stands in when the gesture package cannot be imported, so `_boot_gesture` stays linear."""
+
+    gesture_enabled = False
+
+    def set_gesture(self, enabled, reason=""):
+        return False, "gesture package unavailable"
+
+    def set_camera(self, enabled):
+        return False, "gesture package unavailable"
+
+    def camera_enabled(self):
+        return False
 
 
 def _report_startup():
@@ -591,6 +736,35 @@ def _report_startup():
     from kayra.intelligence.provider_router import ROUTE_CHAT, ROUTE_DECISION
 
     logbus.section(Subsystem.BOOT, "Kayra is ready")
+
+    # ── The machine ──
+    # FIRST, because everything below it is conditioned on this. A speech device, a provider
+    # and a GPU line all read differently depending on what hardware is underneath them, and a
+    # report that made the reader infer the machine from the subsystems would be asking them to
+    # do the work this block exists to save.
+    #
+    # Read from `core.hardware` (registry, ~0.4 ms) — not from `platform`, whose Windows
+    # answers are compatibility values, and not from the profile, whose audio enumeration costs
+    # 122 ms that boot should not pay to print two lines.
+    try:
+        from kayra.core import hardware
+        os_facts = hardware.os_info()
+        cpu_facts = hardware.cpu_info()
+        field(Subsystem.SYSTEM, "OS",
+              f"{os_facts.display_name}"
+              + (f"  ·  {os_facts.version_text}" if os_facts.version_text else ""))
+        field(Subsystem.SYSTEM, "CPU",
+              f"{cpu_facts.model}  ·  {cpu_facts.topology_text}")
+        adapter = hardware.primary_gpu()
+        if adapter is not None:
+            field(Subsystem.GPU, "Adapter",
+                  f"{adapter.name}  ·  {adapter.memory_text}")
+        else:
+            # Stated, not omitted. "No GPU" is a fact about this machine that explains the
+            # speech-device line below it; leaving it out makes CPU synthesis look unexplained.
+            field(Subsystem.GPU, "Adapter", "none detected")
+    except Exception:
+        logbus.warning(Subsystem.SYSTEM, "Machine details unavailable")
 
     # ── Models ──
     try:
@@ -658,6 +832,20 @@ def _report_startup():
     except Exception:
         pass
 
+    # ── Hand gesture control ──
+    # Reported from the LIVE controller and only when one exists, so the line is absent on the
+    # overwhelmingly common boot where nobody turned it on — rather than a permanent "Gesture:
+    # OFF" row that a reader has to learn to ignore. Never CONSTRUCTS a controller: a startup
+    # report that opened a camera to say the camera was closed would be its own kind of joke.
+    try:
+        status = gesture_status()
+        if status:
+            field(Subsystem.GESTURE, "Control",
+                  "active" if status.get("gesture_enabled") else "off")
+            field(Subsystem.CAMERA, "Camera", status.get("camera", "OFF"))
+    except Exception:
+        pass
+
     # ── Presence ──
     try:
         presence = presence_engine()
@@ -686,20 +874,186 @@ def _report_startup():
 # for why the matching is exact.
 
 
-def _dispatch_control(kind, text="", source="voice"):
+# ONE pending lifecycle confirmation for the whole process, for the same reason `RuntimeState`
+# is a singleton: the question is asked from the control watcher and answered on the turn loop,
+# and two managers would mean one thread arming a request the other cannot see.
+CONFIRMATIONS = ControlConfirmations()
+
+
+def confirmations():
+    """The process-wide lifecycle confirmation manager. Read by the UI through the bridge."""
+    return CONFIRMATIONS
+
+
+def _ask_confirmation(command, source="voice"):
+    """
+    Raises the confirmation for a dangerous control and SPEAKS the question.
+
+    Returns True, because the command WAS handled — it was handled by asking. The caller must
+    not fall through to executing it, and nothing downstream may treat "not executed" as "not
+    understood".
+    """
+    request = CONFIRMATIONS.request(command, turn=logbus.current_turn())
+    logbus.info(Subsystem.VOICE, f"control: {command.kind} "
+                                 f"({'explicit' if command.explicit else 'bare'})",
+                correlate=True)
+    logbus.info(Subsystem.VOICE, "confirmation required", correlate=True)
+    _confirm(confirmation_question(command.kind, command.explicit, _address_form()))
+    return bool(request)
+
+
+def _address_form():
+    """
+    How the user likes to be addressed, if they set one. "" when they did not.
+
+    Read from the same configuration the presence layer uses, so the confirmation sounds like
+    the rest of the assistant rather than like a dialog box.
+    """
+    try:
+        from kayra.core.config import env
+        return (env("USER_TITLE", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def resolve_lifecycle_confirmation(text, source="voice", echo=False,
+                                   alternatives=None, confidence=None):
+    """
+    Applies an utterance to the pending lifecycle confirmation, if there is one.
+
+    Returns True when the utterance was CONSUMED as an answer (executed, cancelled, or
+    re-asked) and must not be processed further. False when there was no pending request, or
+    when the utterance was not an answer and is the caller's to handle normally.
+
+    THIS RUNS BEFORE THE ECHO GATE, AND IT HAS TO.
+    Kayra asks the question out loud, so the user's "Yes." lands within a second or two of her
+    own voice — often overlapping it. The echo gate exists to stop her answering herself, and
+    if the confirmation were resolved after it, the one reply that matters most would be the
+    one most reliably discarded. A broad post-speech mute window would have exactly the same
+    effect, which is why there is not one.
+
+    `echo=True` says the capture-timestamp gate believes this audio was Kayra's own. It does
+    not discard the utterance — it RAISES THE BAR. Only a clean, whole-utterance YES or NO is
+    honoured from echo-flagged audio; an ambiguous reading is ignored rather than re-asked.
+    Without that, Kayra's own question is the problem: "Just to confirm — should I shut down
+    the Kayra engine?" opens with a word in the affirmative vocabulary, reads as UNCLEAR, and
+    would make her re-ask herself in a loop. She cannot produce a bare "yes", so the clean
+    forms are safe.
+    """
+    outcome, request = CONFIRMATIONS.answer(text, echo=echo, alternatives=alternatives,
+                                            confidence=confidence)
+    if request is None:
+        return False
+
+    # THE RAW TRANSCRIPT IS ALWAYS SHOWN. A confirmation that executed off a reading the user
+    # would not recognise as their own words is the one case where hiding the transcript costs
+    # the most, so the line names what was heard, what it was read as, and why.
+    evidence = getattr(CONFIRMATIONS, "last_evidence", "")
+    if outcome in ("execute", "cancel", "reask"):
+        logbus.info(Subsystem.VOICE,
+                    f'Confirmation response: raw="{text}"'
+                    + (f"  ({evidence})" if evidence else ""),
+                    correlate=True)
+
+    if outcome == "execute":
+        logbus.info(Subsystem.VOICE, "Confirmation: YES", correlate=True)
+        # CLEARED BEFORE EXECUTING — the manager already did, and that ordering is deliberate:
+        # a shutdown that took two seconds to tear down with the request still armed could be
+        # re-triggered by an echo of its own farewell.
+        # NO ACKNOWLEDGEMENT FOR A SHUTDOWN. `request_shutdown` speaks the countdown, and
+        # it begins by cancelling everything queued — so an acknowledgement queued here is
+        # discarded a fraction of a second later, which the user hears as a clipped syllable
+        # in front of the announcement. Every other confirmed control still acknowledges.
+        if request.kind != ControlKind.SHUTDOWN:
+            _confirm(confirmation_ack(request.kind, True))
+        _execute_confirmed(request, source)
+        return True
+
+    if outcome == "cancel":
+        logbus.info(Subsystem.VOICE, "Confirmation: NO", correlate=True)
+        logbus.info(Subsystem.VOICE,
+                    f"{request.kind} cancelled (asked on turn #{request.turn or '?'})",
+                    correlate=True)
+        _confirm(confirmation_ack(request.kind, False))
+        return True
+
+    if outcome == "reask":
+        # Answer-shaped but not an answer. Ask once more and no further — a third question is
+        # a loop, and a user who has been asked twice without answering plainly did not want
+        # this.
+        logbus.info(Subsystem.VOICE,
+                    "Confirmation: UNCLEAR — awaiting a clear yes or no", correlate=True)
+        _confirm(confirmation_question(request.kind, True, _address_form()))
+        return True
+
+    if outcome == "restated":
+        # The same request again, not an answer. A noisy recognizer producing "exit" three
+        # times must not ask three times; the question is already on the table.
+        logbus.info(Subsystem.VOICE,
+                    f'Confirmation still pending for {request.kind}; heard "{text}" again',
+                    correlate=True)
+        _confirm("Please say yes or no.")
+        return True
+
+    if outcome == "none-echo":
+        # Kayra heard her own question. Nobody answered, so the request is still open and the
+        # audio is consumed here rather than being handed on as a user utterance.
+        logbus.debug(Subsystem.VOICE,
+                     "Confirmation ignored self-echo; still waiting for an answer")
+        return True
+
+    # Not an answer at all. The request has been cleared by the manager; the utterance belongs
+    # to the caller.
+    logbus.debug(Subsystem.VOICE,
+                 f"Confirmation for {request.kind} dropped: unrelated utterance")
+    return False
+
+
+def _execute_confirmed(request, source="voice"):
+    """Runs a control the user has just confirmed. The ONLY path to a dangerous action."""
+    if request.kind == ControlKind.SHUTDOWN:
+        logbus.info(Subsystem.SHUTDOWN, "Executing confirmed Kayra shutdown", correlate=False)
+        # THE COUNTDOWN IS SPOKEN, AND IT IS SPOKEN HERE. `farewell=True` makes
+        # `request_shutdown` play `SHUTDOWN_ANNOUNCEMENT` blocking, before a single resource
+        # is disposed, and only then tear down. The acknowledgement queued a moment ago is
+        # discarded by the `stop()` that precedes it, so the user hears one sentence.
+        #
+        # THIS ENDS KAYRA AND NOTHING ELSE. A Windows shutdown is a different action with a
+        # different confirmation, owned by the automation policy
+        # (`policy.resolve_power_target` -> `system.shutdown`), and nothing on this path can
+        # reach it.
+        request_shutdown(reason=f"{source}: confirmed {request.phrase}", farewell=True)
+        return True
+    if request.kind == ControlKind.SLEEP:
+        set_sleeping(True)
+        return True
+    return False
+
+
+def _dispatch_control(kind, text="", source="voice", command=None):
     """
     Executes one local control command. Returns True if it was handled.
 
     Every caller -- the watcher below, `Listen()`, the UI -- routes through this one function,
     so a spoken "stop listening" and a clicked pause button cannot drift into two behaviours.
+
+    DANGEROUS KINDS DO NOT EXECUTE HERE. `SHUTDOWN` and `SLEEP` raise a confirmation and
+    return; the only path that runs them is `_execute_confirmed`, reached from
+    `resolve_lifecycle_confirmation` after the user has said yes. A caller that wants the old immediate
+    behaviour — the UI's Shut down button, a signal handler, the tray's Quit — calls
+    `request_shutdown`/`set_sleeping` directly, which is correct: a button press is already an
+    unambiguous confirmed intent, and a transcript is not.
     """
     if kind == ControlKind.INTERRUPT:
         return _interrupt_speech(text)
 
-    if kind == ControlKind.SHUTDOWN:
-        print_system(f"[CONTROL] '{(text or '').strip()}' -- shutting {assistant_name} down.")
-        request_shutdown(reason=f"{source}: {(text or '').strip()}", farewell=True)
-        return True
+    if kind in DANGEROUS_KINDS:
+        # Reconstruct enough of the command for the wording when the caller did not pass one
+        # (the watcher deals in dicts). `explicit` defaults to the safer reading — the more
+        # cautious question — when we cannot tell.
+        if command is None:
+            command = ControlCommand(kind, (text or "").strip().lower(), text)
+        return _ask_confirmation(command, source)
 
     if kind == ControlKind.PAUSE_LISTENING:
         # Silence first, then close the microphone. A user who says "stop listening" over a
@@ -713,12 +1067,32 @@ def _dispatch_control(kind, text="", source="voice"):
         _confirm(set_listening(True))
         return True
 
-    if kind == ControlKind.SLEEP:
-        _confirm(set_sleeping(True))
-        return True
+    # SLEEP is handled by the DANGEROUS_KINDS branch above and deliberately has no branch
+    # here. A second execution path for a confirmation-gated action is exactly the shape of
+    # the bug this milestone exists to remove.
 
     if kind == ControlKind.WAKE:
         _confirm(set_sleeping(False))
+        return True
+
+    # Hand gesture control and the camera. Handled here rather than in the DMM for the same
+    # reason the rest of this table is: the user reaching for "turn off hand gesture control"
+    # is usually reaching for it because the pointer is doing something they did not ask for,
+    # and a cloud round-trip is the last thing that request should wait on.
+    if kind == ControlKind.GESTURE_ON:
+        _confirm(set_gesture_control(True))
+        return True
+
+    if kind == ControlKind.GESTURE_OFF:
+        _confirm(set_gesture_control(False))
+        return True
+
+    if kind == ControlKind.CAMERA_ON:
+        _confirm(set_camera(True))
+        return True
+
+    if kind == ControlKind.CAMERA_OFF:
+        _confirm(set_camera(False))
         return True
 
     return False
@@ -818,8 +1192,12 @@ def _local_control_watcher():
             else:                     # pragma: no cover - an engine older than this change
                 hit, control = stt_engine.poll_interrupt(), None
 
-            # Lifecycle commands are acted on whatever Kayra is doing. They are the two
-            # categories -- silence yourself, end yourself -- that never need protecting from.
+            # THE PAGE NO LONGER PUBLISHES LIFECYCLE COMMANDS, so this branch is now
+            # unreachable in practice — `window.kayraControl` is initialised to null and
+            # nothing assigns it. It is kept, rather than deleted, because it is the seam an
+            # older cached page would arrive through, and because `_dispatch_control` gates
+            # the dangerous kinds: even if something did publish one, the worst it can do is
+            # ASK. Deleting the branch would trade a harmless dead path for a crash.
             if control:
                 _dispatch_control(str(control.get("kind") or ""),
                                   str(control.get("text") or ""))
@@ -919,6 +1297,135 @@ def set_listening(enabled, announce=True):
         reply = "Okay, listening is paused. Use the window to start it again."
         print_system("[LISTENING] Microphone paused — Kayra is still running.")
     return reply if announce else ""
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                    HAND GESTURE CONTROL AND THE CAMERA                 │
+# └────────────────────────────────────────────────────────────────────────┘
+# THE ONE ENTRY POINT for each, exactly as `set_listening` is for the microphone. The Home
+# toggles, the Settings screen, the spoken commands and the standalone runner all arrive here,
+# so a clicked toggle and a spoken command cannot drift into two behaviours.
+#
+# NEITHER OF THESE TOUCHES VOICE STATE. They do not pause listening, do not enter standby, do
+# not move the assistant state machine and do not feed the voice state machine a single fact.
+# `tests/test_gesture_control.py` asserts that by AST, because "I turned the camera on and it
+# said Listening paused" is exactly the class of bug the voice state machine was built to end
+# and it must not be reintroduced from a new direction.
+
+
+def gesture_controller(create=True):
+    """
+    The gesture runtime, or None.
+
+    `create=False` asks WITHOUT constructing one — the startup report and the status readers
+    use it, because asking "is gesture control running?" must never be the thing that builds a
+    camera owner. Same rule as `automation.targets.kayra_owned_pids`.
+    """
+    try:
+        if create:
+            from kayra.input.gesture import get_gesture_controller
+            return get_gesture_controller()
+        from kayra.input.gesture import gesture_controller_if_running
+        return gesture_controller_if_running()
+    except Exception as exc:
+        if create:
+            print_warning(f"Hand gesture control is unavailable: {exc}")
+        return None
+
+
+def set_gesture_control(enabled, announce=True, source="voice"):
+    """
+    Turns hand gesture control on or off. Returns the sentence to say, or "".
+
+    Enabling starts the camera first when it is not already on — the controller owns that
+    ordering, and it is the reason there is no `camera OFF, gesture ON` state to handle here.
+    A failure returns the CAMERA'S message rather than a generic one: "gesture control is
+    unavailable" tells the user nothing they can act on, and "I could not open the camera"
+    does.
+    """
+    enabled = bool(enabled)
+    controller = gesture_controller()
+    if controller is None:
+        return ("I can't reach the camera stack, so hand gesture control is unavailable."
+                if announce else "")
+
+    was = controller.gesture_enabled
+    committed, detail = settings_log.apply(
+        "GESTURE_ENABLED", enabled,
+        runtime=lambda: controller.set_gesture(enabled, reason=source),
+        old_value=was, subsystem=Subsystem.GESTURE)
+
+    if not committed:
+        return (f"I couldn't start hand gesture control. {detail}" if announce else "")
+    if was == enabled:
+        return ""
+    if enabled:
+        return ("Hand gesture control is on. Point with your index finger." if announce else "")
+    return "Hand gesture control is off." if announce else ""
+
+
+def set_camera(enabled, announce=True, source="voice"):
+    """
+    Turns the camera on or off. Returns the sentence to say, or "".
+
+    A SEPARATE AXIS from gesture control, and it stays separate. Turning the camera on shows
+    the preview and starts nothing that can move the pointer; turning it off stops gesture
+    control first (the controller does that, in that order) because a gesture runtime with no
+    frames is a runtime that reports ACTIVE while doing nothing.
+    """
+    enabled = bool(enabled)
+    controller = gesture_controller()
+    if controller is None:
+        return "I can't reach the camera." if announce else ""
+
+    was = controller.camera_enabled()
+    committed, detail = settings_log.apply(
+        "CAMERA", enabled,
+        runtime=lambda: controller.set_camera(enabled),
+        old_value=was, subsystem=Subsystem.CAMERA)
+
+    if not committed:
+        return (f"I couldn't turn the camera on. {detail}" if announce else "")
+    if was == enabled:
+        return ""
+    return ("The camera is on." if enabled else "The camera is off.") if announce else ""
+
+
+def gesture_status():
+    """
+    What gesture control is doing, or `{}` when it has never been started.
+
+    Never constructs a controller — a status read must not be able to open a camera.
+    """
+    controller = gesture_controller(create=False)
+    if controller is None:
+        return {}
+    try:
+        return controller.status()
+    except Exception:
+        return {}
+
+
+def gesture_telemetry():
+    """Diagnostics for the advanced view and `--doctor`. `{}` when nothing is running."""
+    controller = gesture_controller(create=False)
+    if controller is None:
+        return {}
+    try:
+        return controller.telemetry()
+    except Exception:
+        return {}
+
+
+def gesture_preview():
+    """The newest camera preview frame as (rgb_bytes, width, height), or None."""
+    controller = gesture_controller(create=False)
+    if controller is None:
+        return None
+    try:
+        return controller.preview()
+    except Exception:
+        return None
 
 
 def set_stt_backend(backend, source="settings"):
@@ -1155,6 +1662,54 @@ def Listen():
 
             spoken_over_tts = _is_self_echo(result)
 
+            # ── COMMITTED. This is the one place a turn becomes words anything may act on.
+            # `capture()` only returns once `core.endpointing` has committed the utterance, so
+            # everything below here is reasoning about a COMPLETE user thought. Nothing above
+            # this line — not an interim result, not a final recognition segment, not the VAD —
+            # may reach a control, the DMM or the conversation context.
+            # THE TURN IS OPENED HERE, AT THE COMMIT, and not in the loop below.
+            #
+            # This is the only point at which a complete user thought exists, and it is also
+            # where the utterance may be CONSUMED — by a confirmation answer or a lifecycle
+            # command — without ever reaching the loop. Numbering it in the loop meant those
+            # consumed utterances had no turn at all, while the loop printed a second
+            # "committed" line for the ones that did reach it: two lines for one event, one of
+            # them uncorrelated.
+            logbus.end_turn()
+            logbus.begin_turn()
+            # THE ONE transcript line per turn, at INFO. Interim results, N-best readings
+            # and the endpoint's own reasoning stay at DEBUG: a reader following the turn
+            # needs the words that were committed, not the recognizer's drafts.
+            logbus.info(Subsystem.VOICE, f'Transcribed: "{user_input}"')
+            if isinstance(result, dict) and result.get("endpoint_reason"):
+                logbus.debug(Subsystem.VOICE,
+                             f"endpoint: {result.get('endpoint_reason')}")
+
+            # ── PENDING LIFECYCLE CONFIRMATION ──
+            # FIRST, and before the classifier, for exactly the reason the automation
+            # confirmation is answered before the DMM: a bare "yes" sent to a classifier comes
+            # back as conversation and the question would never resolve. An utterance that is
+            # not an answer falls through and is handled normally.
+            # `spoken_over_tts` is computed above, from the capture timestamps. Handing it
+            # here is what lets the resolver raise its bar for echo-flagged audio instead of
+            # either trusting it blindly or discarding the user's answer with it.
+            # THE RECOGNIZER'S OWN ALTERNATIVES TRAVEL WITH THE ANSWER.
+            # A confirmation reply is one short word, and short words are where the recognizer
+            # is least certain — "yes" was observed committing as "S". Handing the N-best list
+            # here lets the resolver prefer a reading the recognizer ITSELF proposed instead of
+            # inventing one. See `voice_control.resolve_short_answer`.
+            confirmation_alternatives = []
+            confirmation_confidence = None
+            if isinstance(result, dict):
+                confirmation_alternatives = result.get("alternatives") or []
+                if confirmation_alternatives:
+                    confirmation_confidence = confirmation_alternatives[0].get("confidence")
+            if resolve_lifecycle_confirmation(user_input, echo=spoken_over_tts,
+                                              alternatives=confirmation_alternatives,
+                                              confidence=confirmation_confidence):
+                logbus.end_turn()
+                return ""
+
             # ── LOCAL CONTROL INTERPRETER ──
             # Runs BEFORE the echo gate and before the DMM. Before the DMM because none of
             # these commands should cost a cloud round-trip and several of them have to work
@@ -1162,10 +1717,12 @@ def Listen():
             # a running answer are exactly the cases that matter most, and the echo gate would
             # discard them.
             #
-            # The watcher normally beats this path by ~800ms (it reads INTERIM results). This
-            # is the backstop for the case where only the finalized transcript matched -- a
-            # short utterance the recognizer never emitted an interim result for, or a moment
-            # when the driver lock was busy.
+            # THIS IS NO LONGER A BACKSTOP — IT IS THE ONLY PATH. The recognition page used to
+            # classify lifecycle commands from INTERIM results and publish them for the
+            # watcher to dispatch, which is how a transient fragment shut the assistant down
+            # mid-sentence. That classifier is gone. Barge-in still runs off interim text,
+            # because silencing playback is not an action on the world; everything else waits
+            # for the commit above.
             control = classify_control(user_input)
             if control is not None:
                 if control.kind == ControlKind.INTERRUPT:
@@ -1173,14 +1730,19 @@ def Listen():
                         print_system(f"[BARGE-IN] '{user_input}' — cancelling speech "
                                      f"(finalized path).")
                         _interrupt_speech(user_input, announce=False)
+                    logbus.end_turn()
                     return ""
-                _dispatch_control(control.kind, user_input)
+                # Dangerous kinds ASK here; they do not execute. `_dispatch_control` owns that
+                # decision so the UI and the watcher inherit it without repeating it.
+                _dispatch_control(control.kind, user_input, command=control)
+                logbus.end_turn()
                 return ""
 
             # ── Standby ──
-            # Asleep, nothing but a control command is acted on -- and every control command
-            # was already handled above. Discarding here rather than in the caller is what
-            # makes standby genuinely cheap: no emotion analysis, no DMM call, no network.
+            # Asleep, nothing but a control command is acted on -- and every control command,
+            # including an answer to a pending confirmation, was already handled above.
+            # Discarding here rather than in the caller is what makes standby genuinely cheap:
+            # no emotion analysis, no DMM call, no network.
             if sleeping():
                 print_info(f"[STANDBY] Ignoring '{user_input}' — say \"wake up\" first.")
                 continue
@@ -1218,6 +1780,34 @@ def on_before_exit(hook):
 def shutdown_requested():
     """True once shutdown has begun. Read by anything that must stop producing work."""
     return _shutdown_started.is_set()
+
+
+def _cancel_active_work():
+    """
+    Stops work that is still in flight, before any resource it depends on is disposed.
+
+    CALLED FIRST IN THE SHUTDOWN SEQUENCE, and the ordering is the point. A DMM retry chain,
+    a chat stream or a proactive generation that is still running when the audio device and
+    the browser session are disposed will either raise into a log nobody is reading any more,
+    or — worse — print progress lines after the farewell, so the terminal shows the assistant
+    working after it said goodbye.
+
+    Everything here is COOPERATIVE. Nothing is killed: the shutdown flag is already set, the
+    log turn is closed so no stale line can claim to be current, and the loops that check
+    those two stop by themselves at their next boundary.
+    """
+    # Closing the log turn is what makes `_turn_superseded` true for every retry chain that
+    # started inside a turn, so they abandon at their next check rather than running to five.
+    try:
+        logbus.end_turn()
+    except Exception:
+        pass
+    # The TTS epoch is bumped so a stream still producing sentences cannot queue another.
+    if TTS_ENABLED and tts_engine is not None:
+        try:
+            tts_engine.stop()
+        except Exception:
+            pass
 
 
 def request_shutdown(reason="", farewell=False, exit_code=0):
@@ -1273,6 +1863,11 @@ def request_shutdown(reason="", farewell=False, exit_code=0):
     # 1-2. Announce, and stop accepting work.
     RUNTIME.shutdown_event.set()
     RUNTIME.set_state(AssistantState.SHUTTING_DOWN)
+    # IN-FLIGHT WORK IS CANCELLED BEFORE ANYTHING IT DEPENDS ON IS DISPOSED. A DMM retry chain
+    # still running when the browser session is reaped either raises into a log nobody reads,
+    # or prints progress after the farewell — the terminal showing the assistant working
+    # after it said goodbye. Cooperative: nothing is killed, the loops notice and stop.
+    _cancel_active_work()
     # STOPPING is an ABSORBING state in the voice machine: once it is entered, no fact — not a
     # late VAD sample from a watcher thread that has not noticed yet, not a backend
     # notification from a session being reaped — can put the assistant visual back to
@@ -1297,7 +1892,10 @@ def request_shutdown(reason="", farewell=False, exit_code=0):
                 # allowed through. Safe here because the epoch has already moved: a response
                 # stream cancelled a moment ago tests `is_cancelled(token)` and stays cancelled.
                 tts_engine.begin_background_utterance()
-                tts_engine.speak("Shutting down. Goodbye.", True)
+                # A FIXED sentence, never generated. The DMM is not consulted, the chat model
+                # is not consulted, and neither could be: this runs after `_cancel_active_work`
+                # with the process already tearing down.
+                tts_engine.speak(SHUTDOWN_ANNOUNCEMENT, True)
         except BaseException:
             pass
 
@@ -1306,6 +1904,18 @@ def request_shutdown(reason="", farewell=False, exit_code=0):
     if proactive_agent is not None:
         try:
             proactive_agent.stop(timeout=2.0)
+        except BaseException:
+            pass
+
+    # 3b. Hand gesture control: the camera is released and the pointer controller is
+    #     disabled BEFORE anything else is torn down. Ordering matters in one direction only,
+    #     and it is this one: a gesture runtime left running past this point could still move
+    #     the user's mouse while the rest of the process is disappearing, and a camera left
+    #     open is a device no other application can claim until the process dies.
+    controller = gesture_controller(create=False)
+    if controller is not None:
+        try:
+            controller.shutdown()
         except BaseException:
             pass
 
@@ -1433,6 +2043,24 @@ def _presence_greeting(text):
         return None
 
 
+def _say(reply):
+    """
+    Announces the assistant's reply for the turn, then speaks it.
+
+    ONE writer for the two closing lines of a turn's lifecycle, so no branch of
+    `Execute_Task` can print the reply in its own shape. `_voice_flow` de-duplicates, so a
+    task that produces several sentences still reports "Speaking" once.
+    """
+    reply = (reply or "").strip()
+    if not reply:
+        return ""
+    _announce_reply(reply)
+    if TTS_ENABLED and tts_engine is not None and not tts_engine.interrupted:
+        _voice_flow("Speaking")
+        tts_engine.speak(reply)
+    return reply
+
+
 async def Execute_Task(intent_array, original_query, mood=None):
     """
     Takes the parsed intent array from the DMM and routes it to the correct modules, then
@@ -1477,9 +2105,7 @@ async def Execute_Task(intent_array, original_query, mood=None):
                 proactive_agent.set_enabled(wants_on)
                 reply = ("Proactive suggestions are back on."
                          if wants_on else "Alright, I'll keep quiet unless you ask.")
-            print_system(reply)
-            if TTS_ENABLED:
-                tts_engine.speak(reply)
+            _say(reply)
 
         # 2b. Listening control. A THIRD kind of "stop", and the one most easily confused
         #     with the other two: "stop" alone is a barge-in handled by the audio layer and
@@ -1509,23 +2135,30 @@ async def Execute_Task(intent_array, original_query, mood=None):
         elif greeting_reply is not None:
             reply = greeting_reply
             CONTEXT.note_assistant_turn(reply)
-            print_system(reply)
-            if TTS_ENABLED:
-                tts_engine.speak(reply)
+            _say(reply)
 
         # 3. General conversation (knowledge, math, logic)
         elif task_lower.startswith("general "):
             set_state(STATE_SPEAKING)
-            await asyncio.to_thread(Chatbot, original_query,
-                                    tts_engine if TTS_ENABLED else None, mood)
+            # The chatbot speaks sentence by sentence as the model streams, so the reply is
+            # already on its way out when this returns. Announcing it here rather than
+            # re-speaking it is what keeps ONE sentence queue (see the barge-in section).
+            _voice_flow("Speaking")
+            answer = await asyncio.to_thread(Chatbot, original_query,
+                                             tts_engine if TTS_ENABLED else None, mood)
+            if isinstance(answer, str):
+                _announce_reply(answer)
 
         # 4. Real-time web search (live RAG)
         elif task_lower.startswith("realtime "):
             set_state(STATE_SPEAKING)
             # The TTS engine is handed in so sentences are spoken as they stream out of the
             # model, instead of buffering the whole answer and speaking it afterwards.
-            await asyncio.to_thread(RealTimeSearchEngine, original_query, mood,
-                                    tts_engine if TTS_ENABLED else None)
+            _voice_flow("Speaking")
+            answer = await asyncio.to_thread(RealTimeSearchEngine, original_query, mood,
+                                             tts_engine if TTS_ENABLED else None)
+            if isinstance(answer, str):
+                _announce_reply(answer)
 
         # 5. Autonomous deep research
         elif task_lower.startswith("deep research "):
@@ -1573,8 +2206,8 @@ async def Execute_Task(intent_array, original_query, mood=None):
             # vocabulary plausible on the very next utterance.
             CONTEXT.set_pending_confirmation(
                 (pending_confirmation() or "") if pending_confirmation else "")
-        if spoken and isinstance(spoken, str) and TTS_ENABLED and not tts_engine.interrupted:
-            tts_engine.speak(spoken)
+        if spoken and isinstance(spoken, str):
+            _say(spoken)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1595,27 +2228,26 @@ async def Main_Loop():
     if BOOT is not None:
         BOOT.report("BOOT")
 
-    # ONE short spoken line. The model-routing diagnostics stay on the console where they
+    # ONE short spoken line, AFTER every subsystem is up and verified and BEFORE the
+    # first `Listen()`. The model-routing diagnostics stay on the console where they
     # belong; narrating them cost several seconds of speech before the first user turn.
-    if TTS_ENABLED:
-        tts_engine.begin_turn()
-        # Same one-sentence budget as before, now aware of the hour. A contextual opening
-        # line costs nothing at boot — it is a dictionary lookup and a `random.choice` — and
-        # it is the first thing that makes the assistant feel present rather than started.
-        opening = None
-        presence = presence_engine()
-        if presence is not None:
-            try:
-                opening = presence.boot_line()
-            except Exception:
-                opening = None
-        tts_engine.speak(opening or f"{assistant_name} online.")
+    #
+    # It is the FIXED announcement rather than the presence layer's contextual greeting.
+    # A startup line is the one place predictability beats variety: it is the user's only
+    # evidence that boot finished, and "did local or cloud win?" is the one thing about a
+    # boot they cannot see from the outside. `presence.boot_line()` is unchanged and still
+    # answers a spoken greeting.
+    speak_boot_announcement()
 
     while True:
         try:
             try:
                 if AUDIO_ENABLED:
-                    console.print("\n[bold cyan]Listening...[/bold cyan]")
+                    # ONE line per genuine return to listening. It used to print on
+                    # every iteration, so an utterance consumed by a control command or
+                    # dropped as echo produced a second "Listening" with nothing
+                    # between the two.
+                    _voice_flow("Listening")
             except ValueError:
                 os._exit(1)          # terminal died
 
@@ -1624,8 +2256,9 @@ async def Main_Loop():
             if not user_input or not user_input.strip():
                 continue
 
-            if AUDIO_ENABLED:
-                print_info(f"Transcribed Input: '{user_input}'")
+            # The transcript is announced ONCE, by the turn-committed line below, which
+            # carries the turn number. A second uncorrelated copy here was the first of the
+            # duplicated lines that made an overlapping log hard to follow.
 
             # A fresh turn: clears any latched interrupt from the previous response and starts
             # the command -> first-audible-word stopwatch.
@@ -1661,6 +2294,9 @@ async def Main_Loop():
             # know that the agent exists.
             RUNTIME.note_user_utterance()
             RUNTIME.begin_turn()
+            # The turn was opened at the COMMIT, inside `Listen()`, which is the only place a
+            # complete utterance exists. It is not reopened here — doing so would renumber a
+            # turn that has already logged under its own number.
             RUNTIME.emit("user_utterance", text=user_input)
             # The conversation context is updated on the SAME path as the runtime state, so
             # the repair stage reading it on the next utterance can never be a turn behind.
@@ -1688,18 +2324,17 @@ async def Main_Loop():
 
             # 2. Feed text into the Decision-Making Model
             try:
-                console.print("[dim yellow]Analyzing semantic intent...[/dim yellow]")
+                _voice_flow("Processing")
             except ValueError:
                 os._exit(1)
 
             dmm_commands = await asyncio.to_thread(engine.classify_intent, user_input)
             dmm_seconds = time.perf_counter() - turn_t0
 
-            try:
-                console.print(f"[bold magenta]System Trace ->[/bold magenta] {dmm_commands} "
-                              f"[dim](DMM {dmm_seconds:.2f}s)[/dim]")
-            except ValueError:
-                os._exit(1)
+            # The token list is a DIAGNOSTIC, not part of the lifecycle the user reads. At
+            # INFO it sat between "Processing" and the reply and made the flow hard to
+            # follow; `KAYRA_LOG_LEVEL=DEBUG` brings it back.
+            logbus.debug(Subsystem.DMM, f"tokens={dmm_commands} ({dmm_seconds:.2f}s)")
 
             RUNTIME.emit("intent_classified", text=user_input, tokens=list(dmm_commands))
             CONTEXT.note_intent(list(dmm_commands))
@@ -1709,6 +2344,11 @@ async def Main_Loop():
                 await Execute_Task(dmm_commands, user_input, detected_mood)
             finally:
                 RUNTIME.end_turn()
+                # The log turn ends with the runtime turn. Leaving it open makes every
+                # subsequent line — a proactive suggestion, a boot message, a stale retry —
+                # claim to belong to a turn that finished, which is exactly the unreadable
+                # interleaving this correlation exists to remove.
+                logbus.end_turn()
 
             if TTS_ENABLED:
                 first_audio = tts_engine.last_latency.get("first_audio_s")
@@ -1730,6 +2370,7 @@ async def Main_Loop():
             # Close the turn explicitly: a turn left latched open by a crash would read as
             # "user is mid-command" forever and mute the proactive agent for the session.
             RUNTIME.end_turn()
+            logbus.end_turn()
             set_state(STATE_LISTENING)
 
 
