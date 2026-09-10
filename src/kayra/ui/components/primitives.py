@@ -848,9 +848,11 @@ def _icon_glyph(kind, color, size=16, dpr=None):
     s = float(size)
 
     if kind == "mic":
-        painter.drawRoundedRect(s * 0.36, s * 0.14, s * 0.28, s * 0.44, s * 0.14, s * 0.14)
-        painter.drawArc(int(s * 0.24), int(s * 0.36), int(s * 0.52), int(s * 0.42),
-                        180 * 16, 180 * 16)
+        painter.drawRoundedRect(QRectF(s * 0.36, s * 0.14, s * 0.28, s * 0.44),
+                                s * 0.14, s * 0.14)
+        # QRectF, not the int overload: truncation put the cradle arc's centre a half pixel
+        # left of the capsule it hangs under. See the `power` note for the same fix.
+        painter.drawArc(QRectF(s * 0.24, s * 0.36, s * 0.52, s * 0.42), 180 * 16, 180 * 16)
         painter.drawLine(QPointF(s * 0.5, s * 0.72), QPointF(s * 0.5, s * 0.88))
     elif kind == "send":
         painter.drawPolyline([QPointF(s * 0.18, s * 0.5), QPointF(s * 0.82, s * 0.5)])
@@ -867,9 +869,9 @@ def _icon_glyph(kind, color, size=16, dpr=None):
     elif kind == "mic_off":
         # The microphone with a slash. A DIFFERENT SHAPE, not just a dimmer colour: "can Kayra
         # hear me" must not depend on noticing a shade.
-        painter.drawRoundedRect(s * 0.36, s * 0.14, s * 0.28, s * 0.44, s * 0.14, s * 0.14)
-        painter.drawArc(int(s * 0.24), int(s * 0.36), int(s * 0.52), int(s * 0.42),
-                        180 * 16, 180 * 16)
+        painter.drawRoundedRect(QRectF(s * 0.36, s * 0.14, s * 0.28, s * 0.44),
+                                s * 0.14, s * 0.14)
+        painter.drawArc(QRectF(s * 0.24, s * 0.36, s * 0.52, s * 0.42), 180 * 16, 180 * 16)
         painter.drawLine(QPointF(s * 0.5, s * 0.72), QPointF(s * 0.5, s * 0.88))
         painter.drawLine(QPointF(s * 0.16, s * 0.84), QPointF(s * 0.84, s * 0.16))
     elif kind == "camera":
@@ -891,8 +893,7 @@ def _icon_glyph(kind, color, size=16, dpr=None):
         for i, x in enumerate((0.34, 0.48, 0.62)):
             painter.drawLine(QPointF(s * x, s * (0.20 + i * 0.02)), QPointF(s * x, s * 0.62))
         painter.drawLine(QPointF(s * 0.74, s * 0.34), QPointF(s * 0.74, s * 0.62))
-        painter.drawArc(int(s * 0.26), int(s * 0.46), int(s * 0.52), int(s * 0.46),
-                        180 * 16, 180 * 16)
+        painter.drawArc(QRectF(s * 0.26, s * 0.46, s * 0.52, s * 0.46), 180 * 16, 180 * 16)
         painter.drawLine(QPointF(s * 0.26, s * 0.58), QPointF(s * 0.16, s * 0.46))
     elif kind == "pause":
         # Two filled bars. A PAUSE, not the stop square used for barge-in — the two actions
@@ -916,19 +917,33 @@ def _icon_glyph(kind, color, size=16, dpr=None):
         # The IEC power mark: a broken ring with a vertical bar. Universally read as "off",
         # which is exactly what this control does — and it must never be mistaken for the
         # pause bars beside it.
-        painter.drawArc(int(s * 0.22), int(s * 0.22), int(s * 0.56), int(s * 0.56),
-                        -60 * 16, 300 * 16)
-        painter.drawLine(QPointF(s * 0.5, s * 0.14), QPointF(s * 0.5, s * 0.46))
+        #
+        # THE ARC RECT IS A QRectF, AND THAT IS THE WHOLE OF THE ALIGNMENT FIX. The integer
+        # overload TRUNCATES: at the dock's 18px glyph, `int(s * 0.22)` is 3 and
+        # `int(s * 0.56)` is 10, so the ring's centre landed at x=8 while the bar was drawn
+        # at s * 0.5 = 9. One pixel of disagreement between the two halves of one symbol,
+        # and the bar visibly sat right of the gap it is supposed to rise out of.
+        #
+        # THE RING IS ALSO PUSHED DOWN, deliberately. The bar extends ABOVE the ring, so a
+        # geometrically centred ring puts the mark's ink low-heavy and the glyph reads as
+        # sitting below the icons beside it. Centring the mark's full extent — bar top to
+        # ring bottom — is what makes it look centred:
+        #     bar_top (0.17) + ring_bottom (cy + r) == 1.0, with cy = 0.56, r = 0.27.
+        cx = s * 0.5
+        cy = s * 0.56
+        r = s * 0.27
+        # The gap is symmetric about vertical (span centred on 90 degrees), so the bar rises
+        # out of the exact middle of the break rather than grazing one end of it.
+        painter.drawArc(QRectF(cx - r, cy - r, r * 2.0, r * 2.0), -60 * 16, 300 * 16)
+        painter.drawLine(QPointF(cx, s * 0.17), QPointF(cx, s * 0.52))
     elif kind == "talk":
         # A speech burst: three rising strokes inside a soft arc. Distinct from `chat`, which
         # is a bubble and means "go to the transcript"; this one means "say something now".
         for index, (x, height) in enumerate(((0.36, 0.16), (0.50, 0.26), (0.64, 0.20))):
             painter.drawLine(QPointF(s * x, s * (0.5 - height)),
                              QPointF(s * x, s * (0.5 + height)))
-        painter.drawArc(int(s * 0.14), int(s * 0.14), int(s * 0.72), int(s * 0.72),
-                        120 * 16, 120 * 16)
-        painter.drawArc(int(s * 0.14), int(s * 0.14), int(s * 0.72), int(s * 0.72),
-                        -60 * 16, 120 * 16)
+        painter.drawArc(QRectF(s * 0.14, s * 0.14, s * 0.72, s * 0.72), 120 * 16, 120 * 16)
+        painter.drawArc(QRectF(s * 0.14, s * 0.14, s * 0.72, s * 0.72), -60 * 16, 120 * 16)
     elif kind == "chat":
         painter.drawRoundedRect(QRectF(s * 0.14, s * 0.18, s * 0.72, s * 0.50),
                                 s * 0.12, s * 0.12)

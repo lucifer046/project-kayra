@@ -264,35 +264,30 @@ class DockButton(QWidget):
         # PRIMARY CONTROL (Mic / Listening)
         if self._tone == "primary":
             if not self._checked:
-                # Paused: sleek dark glass plate with soft highlight on hover
-                alpha = int(10 + 16 * self._hover + (24 if self._pressed else 0))
-                return QColor(255, 255, 255, alpha)
-            # Listening: warm amber filled capsule
-            base = QColor(Color.accent_press if self._pressed else Color.accent)
-            if self._hover > 0 and not self._pressed:
-                base = _mix(base, QColor(Color.accent_hover), self._hover)
-            return base
+                # Paused: sleek dark glass plate. The plate does NOT respond to hover —
+                # only the glyph and the rim do.
+                return QColor(255, 255, 255, 10 + (24 if self._pressed else 0))
+            # Listening: warm amber filled capsule. Unchanged by hover; a filled state that
+            # also brightens under the pointer is two signals for one fact.
+            return QColor(Color.accent_press if self._pressed else Color.accent)
 
         # DANGER CONTROL (Shutdown)
         if self._tone == "danger":
             tint = QColor(Color.danger)
-            if self._hover > 0 or self._pressed:
-                tint.setAlphaF(0.12 + 0.10 * self._hover + (0.08 if self._pressed else 0.0))
-            else:
-                tint.setAlphaF(0.04)
+            tint.setAlphaF(0.12 if self._pressed else 0.04)
             return tint
 
         # ACTIVE NAVIGATION / DEVICES (Home, Chat, Camera ON, Gesture ON)
         if self._checked:
             # Luminous warm amber glass plate — sleek and clear, not muddy
             tint = QColor(Color.accent)
-            tint.setAlphaF(0.14 + 0.08 * self._hover + (0.08 if self._pressed else 0.0))
+            tint.setAlphaF(0.22 if self._pressed else 0.14)
             return tint
 
-        # IDLE NEUTRAL CONTROLS
-        if self._hover > 0.01 or self._pressed:
-            alpha = int(22 * self._hover + (16 if self._pressed else 0))
-            return QColor(255, 255, 255, alpha)
+        # IDLE NEUTRAL CONTROLS. Hover contributes NOTHING here: a hovered control is lit,
+        # not filled. Press still paints, because a press is a different thing from a hover.
+        if self._pressed:
+            return QColor(255, 255, 255, 16)
         return QColor(0, 0, 0, 0)
 
     def _glyph_color(self):
@@ -301,14 +296,21 @@ class DockButton(QWidget):
         if self._tone == "primary":
             # Dark ink on the filled amber plate; clear warm text on the paused glass plate.
             # Paused uses full primary text (not secondary) — it is a status label, not decoration.
-            return Color.text_on_accent if self._checked else Color.text
+            if self._checked:
+                return Color.text_on_accent
+            return _lit(QColor(Color.text), self._hover, 0.40)
         if self._tone == "danger":
-            return Color.danger
+            # Gently, and no further: the shutdown control is identified by being RED, so a
+            # hover that washes it toward white takes the meaning out of the mark.
+            return _lit(QColor(Color.danger), self._hover, 0.30)
         if self._checked:
-            return Color.accent
-        # Hovered controls brighten toward primary text; idle stays secondary.
-        # Threshold at 0.3 (not 0.5) so the brightening feels early and responsive.
-        return Color.text if self._hover > 0.30 else Color.text_secondary
+            return _lit(QColor(Color.accent), self._hover, 0.40)
+        # THE HOVER IS THE GLYPH. Idle sits at secondary text and rises CONTINUOUSLY to
+        # primary text and a little beyond, so the control reads as illuminated from within
+        # rather than as a highlighted rectangle. No threshold: a step in brightness at 0.3
+        # of the animation is a flicker, not a transition.
+        return _lit(_mix(QColor(Color.text_secondary), QColor(Color.text), self._hover),
+                    self._hover, 0.30)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -336,25 +338,31 @@ class DockButton(QWidget):
             painter.setBrush(color)
             painter.drawRoundedRect(plate, radius, radius)
 
-        # CRISP HAIRLINE BORDERS (Half-pixel inset for ultra-sharp rendering)
+        # CRISP HAIRLINE BORDERS (Half-pixel inset for ultra-sharp rendering).
+        #
+        # THE RIM IS THE OTHER HALF OF THE HOVER, and it is drawn a half pixel INSIDE the
+        # plate, so it can never be clipped however the dock's own rounding falls. A button
+        # that has a stroke gets a brighter stroke; one that does not gets a faint glass rim
+        # that fades in with the pointer.
         edge = None
         if self._tone == "primary":
             if not self._checked and self._enabled_look:
                 edge = QColor(Color.border_strong)
                 if self._hover > 0:
-                    edge = _mix(edge, QColor(Color.text_secondary), self._hover * 0.4)
+                    edge = _mix(edge, QColor(Color.text_secondary), self._hover * 0.55)
         elif self._tone == "danger":
-            if self._hover > 0 or self._pressed:
-                edge = QColor(Color.danger_edge)
-                if self._hover > 0:
-                    edge = _mix(edge, QColor(Color.danger), self._hover * 0.4)
+            # Idle keeps NO rim, exactly as before — the shutdown control is meant to be
+            # unremarkable until it is looked for. The rim is purely the hover's doing.
+            if self._hover > 0.01 or self._pressed:
+                edge = _mix(QColor(Color.danger_edge), QColor(Color.danger),
+                            min(1.0, self._hover * 0.55 + (0.25 if self._pressed else 0.0)))
         elif self._checked and self._enabled_look:
             edge = QColor(Color.accent_subtle)
             if self._hover > 0:
-                edge = _mix(edge, QColor(Color.accent), self._hover * 0.5)
-        elif self._hover > 0.05 and self._enabled_look:
+                edge = _mix(edge, QColor(Color.accent), self._hover * 0.65)
+        elif self._hover > 0.01 and self._enabled_look:
             # Subtle glass rim for hovered neutral buttons
-            edge = QColor(255, 255, 255, int(30 * self._hover))
+            edge = QColor(255, 255, 255, int(40 * self._hover))
 
         if edge is not None:
             pen = QPen(edge)
@@ -365,21 +373,11 @@ class DockButton(QWidget):
             border_radius = max(0.0, radius - 0.5)
             painter.drawRoundedRect(border_plate, border_radius, border_radius)
 
-        # THE GLOW. Drawn AFTER the plate so it reads as a bright rim on top of the surface,
-        # not as a shadow lurking behind an opaque panel. Alpha is stronger for the filled
-        # listening state (amber glow) and lighter for danger, matching their visual weight.
-        if self._hover > 0.01 and self._enabled_look:
-            is_danger = self._tone == "danger"
-            is_listening = self._tone == "primary" and self._checked
-            glow_alpha = 0.18 if is_listening else (0.11 if is_danger else 0.13)
-            glow = QColor(Color.danger if is_danger else Color.accent)
-            glow.setAlphaF(glow_alpha * self._hover)
-            pen = QPen(glow)
-            pen.setWidthF(2.5)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(plate.adjusted(-1.25, -1.25, 1.25, 1.25),
-                                    radius + 1.25, radius + 1.25)
+        # THERE IS NO OUTER GLOW, AND THERE MUST NOT BE ONE. A ring painted OUTSIDE the
+        # plate (`plate.adjusted(-1.25, ...)`) is drawn beyond this widget's own rectangle,
+        # so Qt clips it — and the clip lands unevenly against the dock's rounded end-caps,
+        # which is what produced the cut-off rounded shadow around the end buttons. The
+        # hover now lives entirely inside the bounds: the glyph brightens and the rim lifts.
 
         # FOCUS RING (accent, visible for keyboard navigation)
         if self.hasFocus():
@@ -420,6 +418,23 @@ class DockButton(QWidget):
         painter.end()
 
 
+def _lit(color, amount, strength):
+    """
+    Raises a colour toward white by `amount * strength`, keeping its alpha.
+
+    THE HOVER IS AN ILLUMINATION, NOT A HIGHLIGHT. A lit control brightens the mark the eye
+    is already on; a highlighted one paints a rectangle around it. This is what the dock's
+    buttons do under the pointer instead of filling a plate or casting an outer glow, and it
+    is by construction unclippable — nothing is drawn outside the glyph that was already
+    being drawn.
+    """
+    amount = max(0.0, min(1.0, float(amount)))
+    if amount <= 0.0:
+        return color
+    return _mix(QColor(color), QColor(255, 255, 255, QColor(color).alpha()),
+                amount * strength)
+
+
 def _mix(a, b, t):
     """Linear blend between two QColors. Used for the accent button's hover."""
     t = max(0.0, min(1.0, t))
@@ -440,9 +455,11 @@ class DockDivider(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        line_x = self.width() / 2.0
+        # A 1px stroke centred on a WHOLE coordinate straddles two device pixels and renders
+        # as a soft 2px smear. Landing it on a half coordinate is what makes it a hairline.
+        line_x = int(self.width() / 2.0) + 0.5
         line_h = 18.0
-        y1 = (self.height() - line_h) / 2.0
+        y1 = round((self.height() - line_h) / 2.0)
         y2 = y1 + line_h
         pen = QPen(QColor(255, 255, 255, 38))  # soft glass alpha ~0.15 — visible but non-assertive
         pen.setWidthF(1.0)

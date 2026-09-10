@@ -56,10 +56,11 @@ NOTHING HERE POLLS THE ASSISTANT. State arrives on `voiceStateChanged`; the pane
 only while the screen is visible, on a slow timer, from data the backend already keeps.
 """
 
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QRectF, QPointF
+from PySide6.QtGui import QPainter, QColor, QLinearGradient
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
 
-from kayra.ui.theme import Space, Size, Motion
+from kayra.ui.theme import Space, Size, Motion, Color, Font
 from kayra.ui.components.orb import AssistantOrb
 from kayra.ui.components.primitives import (
     GlassPanel, Caption, StatusPill, Meter, EmptyState, ListRow, RowRule, _label,
@@ -87,6 +88,46 @@ PROMPTS = {
     "OFFLINE": "Not connected",
     "SHUTTING_DOWN": "Shutting down",
 }
+
+
+class _AccentRule(QWidget):
+    """
+    A short hairline under the Home wordmark, in the accent, fading out at both ends.
+
+    THE ACCENT LANGUAGE WITHOUT THE ACCENT VOLUME. Setting the wordmark itself in amber
+    would put a second warm focal point directly above the orb, which is the one element on
+    this page that is meant to hold the eye. A 64px rule says "this is Kayra's colour" in
+    about a hundred pixels of ink and then gets out of the way — and because it is centred
+    and horizontal, it also reads as an arrow pointing down the column.
+
+    STATIC. No timer, no animation: the orb and the backdrop are the only things on this
+    page that move, and a third animated element would be a third thing competing.
+    """
+
+    WIDTH = 64
+    HEIGHT = 3
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        mid = QColor(Color.accent)
+        edge = QColor(Color.accent)
+        mid.setAlphaF(0.72)
+        edge.setAlphaF(0.0)
+        gradient = QLinearGradient(QPointF(0.0, 0.0), QPointF(float(self.width()), 0.0))
+        gradient.setColorAt(0.0, edge)
+        gradient.setColorAt(0.5, mid)
+        gradient.setColorAt(1.0, edge)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(gradient)
+        y = (self.height() - 1.0) / 2.0
+        painter.drawRoundedRect(QRectF(0.0, y, float(self.width()), 1.0), 0.5, 0.5)
+        painter.end()
 
 
 class _ActivityLine(ListRow):
@@ -334,7 +375,21 @@ class HomeView(View):
         """
         hero = QVBoxLayout()
         hero.setSpacing(Space.md)
-        hero.addStretch(1)
+
+        # ── THE IDENTITY BLOCK ──
+        # The centre column used to open with a stretch, so the top third of the most
+        # important column on the page was empty while the composition's whole weight sat in
+        # the middle. This fills it WITHOUT repeating the sidebar's branding at volume: a
+        # small mark, a hairline in the accent, and one line of what Kayra is — then the eye
+        # is handed down to the orb, which remains the page's only focal point.
+        #
+        # The stretch RATIOS are what place it: 3 above, 3 between it and the orb, 4 below.
+        # No pixel positions, so the block holds its place at any window height exactly as
+        # the rest of this page does — and the slightly smaller share underneath is what
+        # keeps the composition off the dock without a hardcoded offset.
+        hero.addStretch(3)
+        hero.addWidget(self._build_wordmark(), 0, Qt.AlignHCenter)
+        hero.addStretch(3)
 
         self.orb = AssistantOrb(Size.orb_home, interactive=True)
         self.orb.setToolTip("Click to type to Kayra")
@@ -349,9 +404,41 @@ class HomeView(View):
         self.state_caption.setAlignment(Qt.AlignCenter)
         hero.addWidget(self.state_caption)
 
-        hero.addStretch(1)
+        hero.addStretch(4)
         self.orb.clicked.connect(self._focus_chat)
         return hero
+
+    def _build_wordmark(self):
+        """
+        KAYRA, an accent hairline, and one restrained line of what it is.
+
+        NOT A SECOND LOGO. The sidebar already carries the name at reading weight, so a
+        large mark here would be duplication rather than composition. This one is 22px
+        against the status line's 30px, sits well above it, and is the quietest thing on
+        the column apart from the caption — its job is to give the empty upper area a
+        reason to exist and to point downward.
+        """
+        block = QWidget()
+        block.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        column = QVBoxLayout(block)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(Space.xs)
+
+        mark = _label("KAYRA", "HomeWordmark")
+        mark.setAlignment(Qt.AlignCenter)
+        # The tracking is applied to the LAST letter too, so a centred wordmark reads as
+        # sitting one tracking-step right of centre. Reclaiming that width is the difference
+        # between "centred" and "looks centred".
+        mark.setContentsMargins(int(Font.tracking_wordmark), 0, 0, 0)
+        column.addWidget(mark)
+
+        column.addWidget(_AccentRule(), 0, Qt.AlignHCenter)
+
+        tagline = _label("Your intelligent desktop companion", "HomeTagline")
+        tagline.setAlignment(Qt.AlignCenter)
+        column.addWidget(tagline)
+
+        return block
 
     # ── Left column, top ──
 

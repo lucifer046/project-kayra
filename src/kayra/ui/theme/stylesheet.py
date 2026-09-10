@@ -137,6 +137,27 @@ QToolTip {{
     font-weight: {f.medium};
 }}
 
+/* ── The Home wordmark ──
+   The identity line that occupies the empty upper half of Home's centre column. It is
+   SMALLER and QUIETER than #HeroLine on purpose: the sidebar already says who this is, so
+   this one earns its place by composing the column and leading the eye down to the orb,
+   not by announcing the product a second time. */
+#HomeWordmark {{
+    font-family: {f.ui_display};
+    font-size: {f.wordmark}px;
+    font-weight: {f.semibold};
+    letter-spacing: {f.tracking_wordmark}px;
+    color: {c.text};
+}}
+
+#HomeTagline {{
+    font-family: {f.ui};
+    font-size: {f.caption}px;
+    font-weight: {f.regular};
+    letter-spacing: {f.tracking_tagline}px;
+    color: {c.text_tertiary};
+}}
+
 #HeroLine {{
     font-family: {f.ui_display};
     font-size: {f.display}px;

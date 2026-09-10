@@ -218,6 +218,19 @@ class Font:
     # Uppercase text at 10-11px is unreadable without it.
     tracking_label = 1.2
 
+    # The Home wordmark. Far wider than a label's tracking, because "KAYRA" there is a MARK
+    # rather than a word being read — the letters are meant to be taken in as a shape, and
+    # the openness is what keeps a 22px wordmark from competing with the 30px status line
+    # below it. The tagline gets a gentler figure so it reads as a sentence, not a second
+    # wordmark.
+    tracking_wordmark = 7.0
+    tracking_tagline = 0.6
+
+    # The Home wordmark's size. Deliberately BETWEEN `title` (a page heading) and `display`
+    # (the one hero status line): it must lead the eye without ever out-weighing the state
+    # the user actually came to read.
+    wordmark = 22
+
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                        SPACING / GEOMETRY                              │
@@ -316,8 +329,16 @@ class Motion:
     drawer = 360              # panel slide + scrim fade (300–450ms target)
     drawer_items = 360        # synchronized with panel slide
     drawer_stagger = 0        # unified drawer motion without delayed pop-in
-    nav_transition = 360      # a page arriving: smooth dual-surface crossfade (250–400ms target)
-    nav_travel = 0            # px. 0 for a seamless, calm crossfade without lateral twitching
+    # A page arriving. 300ms sits in the middle of the 250-400ms band: long enough to read
+    # as a transition rather than a cut, short enough that a user clicking through the rail
+    # is never waiting on it. ONE animation runs for this whole duration — the incoming page
+    # fading in over the outgoing one — so both directions take exactly the same time by
+    # construction rather than by two curves being kept in agreement.
+    nav_transition = 300
+    # px of lateral travel. ZERO, AND IT MUST STAY ZERO. A page inside a QStackedWidget has
+    # its geometry owned by the layout, so animating its position means the animation and
+    # the layout write the same property, and any relayout mid-flight snaps the page back.
+    nav_travel = 0
     indicator = 280           # the active-item rail moving between destinations
     dock_hover = 180          # dock interaction hover transition
     press = 100

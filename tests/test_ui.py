@@ -3089,11 +3089,22 @@ def section_shell(app):
 
     check("tooltip popup cards are gone",
           all(not (c.toolTip() or "").strip() for c in controls))
+    # The transition must leave NOTHING behind: no composite layer on the page that is now
+    # on screen (a QGraphicsOpacityEffect left in place routes every later repaint of Home's
+    # orb and camera preview through an offscreen buffer), and no page still shown
+    # underneath it. The snapshot overlay this used to check for is gone with the snapshot.
+    window.navigate_to("chat")
+    app.processEvents()
     window._end_page_animation()
-    check("drawer and page transitions complete correctly",
+    check("page transitions complete without leaving a composite layer behind",
           window.stack.currentWidget().graphicsEffect() is None
-          and getattr(window, "_transition_overlay", None) is not None
-          and window._transition_overlay.isHidden())
+          and getattr(window, "_page_animation", None) is None)
+    check("and the page that faded out underneath is hidden again",
+          getattr(window, "_page_outgoing", None) is None
+          and window.views["home"].isHidden())
+    window.navigate_to("home")
+    app.processEvents()
+    window._end_page_animation()
 
     # ── Home fills its viewport, at every size, without scrolling ──
     home = window.views["home"]

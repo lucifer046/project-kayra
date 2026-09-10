@@ -248,17 +248,17 @@ class Sidebar(QWidget):
         layout.setContentsMargins(Space.md, Space.base, Space.md, Space.md)
         layout.setSpacing(0)
 
-        # ── Brand ──
-        brand_row = QHBoxLayout()
-        brand_row.setContentsMargins(Space.sm, 0, Space.sm, 0)
-        brand_row.setSpacing(Space.sm)
-        self.badge = OrbBadge(9)
-        brand = _label("KAYRA", "BrandMark")
-        brand_row.addWidget(self.badge)
-        brand_row.addWidget(brand)
-        brand_row.addStretch(1)
-        layout.addLayout(brand_row)
-        layout.addSpacing(Space.lg)
+        # ── NO BRAND MARK HERE ──
+        # The name used to head this rail, and it was the THIRD "KAYRA" on the screen: the
+        # title bar carries it, Home's identity block carries it, and this one repeated it a
+        # few pixels from both. A wordmark earns its place by telling the reader whose
+        # software this is; the third instance tells them nothing and costs the rail its
+        # quietest, most useful space. The destinations start at the top instead.
+        #
+        # `self.badge` SURVIVES, because it was never branding — it is the live assistant
+        # state dot, driven by `set_state`/`set_voice_state` below, and it now sits in the
+        # status footer next to the state it has always been reporting. Deleting it would
+        # have meant deleting a status readout while removing a logo.
 
         # ── Destinations ──
         self.group = QButtonGroup(self)
@@ -283,9 +283,18 @@ class Sidebar(QWidget):
         footer = QVBoxLayout()
         footer.setContentsMargins(Space.sm, Space.md, Space.sm, 0)
         footer.setSpacing(Space.xxs)
+        self.badge = OrbBadge(9)
         self.state_label = _label("Starting", "StatusName")
+        # The dot and the word it stands for, on one line. They were two readings of one
+        # fact at opposite ends of the rail before.
+        state_row = QHBoxLayout()
+        state_row.setContentsMargins(0, 0, 0, 0)
+        state_row.setSpacing(Space.xs)
+        state_row.addWidget(self.badge)
+        state_row.addWidget(self.state_label)
+        state_row.addStretch(1)
+        footer.addLayout(state_row)
         self.detail_label = Caption("Bringing subsystems up")
-        footer.addWidget(self.state_label)
         footer.addWidget(self.detail_label)
 
         # The microphone gets its own line. Folding it into the assistant state would mean
