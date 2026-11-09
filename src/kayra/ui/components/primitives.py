@@ -19,8 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from kayra.ui.theme import (
-    Color, Font, Space, Radius, Size, meter_color, repolish, glyph_dpr,
-    VERDICT_COLORS, VERDICT_LABELS,
+    Color, Font, Space, meter_color, repolish, glyph_dpr, VERDICT_LABELS,
 )
 
 

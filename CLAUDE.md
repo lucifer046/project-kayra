@@ -1,12 +1,19 @@
 # Kayra — Project Context for AI Agents
 
-> Personal, Jarvis-inspired desktop assistant for Windows. Voice or text in, LLM-routed intent
+> **Pending work:** [`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) —
+> the planned full browser-control round. Implement it only when the user asks.
+>
+> **Start with [`AGENTS.md`](AGENTS.md)** — the concise rules, layout and workflow for every agent.
+> This file is the long-form reference: the gotchas, each with the bug that taught it.
+>
+> Kayra, a personal desktop assistant for Windows and Linux (Omarchy/Hyprland first;
+> desktop automation remains Windows-only). Voice or text in, LLM-routed intent
 > classification, and hands-on system automation out. This file orients any AI agent working in
 > this repo (Claude Code, or another tool via `AGENTS.md`) — architecture, conventions, and
 > gotchas that aren't obvious from reading a single file in isolation. Read this before making
 > cross-module changes; update it when you change something it describes.
 >
-> User-facing install/feature docs live in `README.md` and `blueprint.md` — this file is for
+> User-facing install/feature docs live in `README.md` and `docs/development/` — this file is for
 > agents making changes, not for end users. The full architecture (how each subsystem works,
 > why it is shaped that way, what alternatives were rejected and why) lives in
 > **`docs/KAYRA_SYSTEM_ARCHITECTURE.md`** — read that when you need depth; read this for the
@@ -175,11 +182,108 @@ keeps the duplicate honest.
   non-NVIDIA one. A machine that GAINS an NVIDIA GPU is upgraded on the next run; one that
   loses it is reconciled down.
 
+## Cross-platform: Windows and Linux (added 2026-11-09)
+
+Kayra now runs on Linux, with **Omarchy (Arch + Hyprland)** as the first-class target. Full
+strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`.
+
+- **`kayra.platforms` is the OS boundary** — `detect.py` (family, distro, Omarchy, session,
+  Hyprland), `windows.py`, `linux.py`, `fallback.py` (identical function names),
+  `hyprland.py` (IPC socket client, never `hyprctl`). A stdlib-only leaf BELOW `core`:
+  `core.hardware` may import it, it imports nothing else from `kayra`
+  (`tests/test_platforms.py` and `test_hardware_profile.py` assert this). New OS questions go
+  there, never into a new `if sys.platform` branch in a shared module.
+- **Windows code moved verbatim, behaviour unchanged.** `pointer._Win32Injector` and
+  `store.explorer_command` remain as aliases into `platforms.windows`. `hardware.py` gates its
+  registry paths on `winreg` being importable rather than on `sys.platform`, so the test suite
+  can serve synthetic Windows machines on Linux with a stub `winreg`.
+- **Automation runs on both OSes (ported 2026-11-09).** `automation.load_backend()` picks
+  `automation.windows` (Win32) or `automation.linux` (Hyprland IPC + wtype, wpctl,
+  brightnessctl, grim, wl-clipboard, nmcli, bluetoothctl, playerctl/MPRIS-over-gdbus). The
+  normalizer, power-target gate, planner, timers, file handlers and the `AutomationRuntime`
+  executor live in `automation.common` and are shared; `windows.py` re-exports them under
+  their old names (its own executor is unchanged). Linux apps resolve from XDG desktop entries
+  (`automation.linux_apps`) by EXACT identity only. Full guide and roadmap:
+  `docs/platforms/LINUX_AUTOMATION.md`. Tests: `tests/test_linux_automation.py` (fake
+  compositor + recording runner); the two Win32 suites are still `n/a:win32` on Linux.
+- **Round 2 (2026-11-10) — see the changelog in `docs/platforms/LINUX_AUTOMATION.md`.**
+  The shell policy now DENIES stopping/disabling/masking ANY service, `kill`/`pkill`,
+  critical-package and forced removals, recursive chmod/chown of system paths or `~`,
+  `rm -rf ~`, and kernel/boot/firewall/mount/user-management tools; inline code (`-c/-e/-m`)
+  and network kill-switches are CONFIRM. Clicking by visible text is OCR (`grim` +
+  `tesseract`) on the focused monitor, never inside Kayra's own window, CONFIRM-gated for
+  risky words; real clicks need `/dev/uinput`. "system undo …" pops Kayra's own bounded undo
+  stack (10 actions, 5 min) — a bare "undo" stays Ctrl+Z. "an empty workspace" is always the
+  LOWEST-numbered one with no window. Battery state comes from sysfs
+  (`platforms.battery_status()`).
+- **Round 3 — assistant features (2026-11-10).** New modules under `automation/`: `ai` (bounded model
+  calls: `summarize` with a deterministic fallback, `see` = vision, local LM Studio first),
+  `diagnostics`, `browser_bridge` + `extension/kayra-bridge` (Chrome MV3 extension over
+  ws://127.0.0.1:17893, accepted ONLY from Origin chrome-extension://gdllbbphfpgfcgmpjjklkkkpebimeeel),
+  `web_macros` (tabs/pages/Gmail/Calendar/WhatsApp/Meet), `screen_ai`, `workflows` (scenes,
+  planner, triggers, the ONE `kayra-watch` thread, briefing, recall, call detection),
+  `linux_system`, `status_file` (+ `extension/omarchy-kayra-widget`). Rules that matter:
+  * Models only REWORD or SEE; they never decide whether something runs. Planned steps are
+    validated by `normalize_command` + `classify_action` and run through `run_steps`, which
+    parks the rest of a plan behind a confirmation.
+  * Every new `system …` phrase sits BEFORE the power needles in `_SYSTEM_VERBS` ("sleep timer",
+    "restart the docker container" must never reach the power gate). Asserted in test_assistant_automation.
+  * Background speech goes through `common.announce` → `app.speak_unprompted`, which holds
+    non-urgent lines during a turn, a call (another app recording the mic) or standby.
+  * `linux.start_services()` is the only thing that starts the bridge, watcher, notification
+    log (Kayra's one kept child process, reaped by handle) and status file — called from
+    `app.bootstrap`, never at import. Teardown is in `RUNTIME.shutdown()`.
+  * DMM tokens are split on commas: no new command may need a comma inside it (the preamble
+    says so; use "saying" / ":").
+  * With Chrome in front and the extension connected, `mouse.click_text` / scroll go INTO the
+    page (`linux._browser_in_front`), never to OCR. Gmail rows are opened by the extension's
+    `gmail.open`, not by a click on a name. A new extension command needs a manifest version
+    bump AND `web_macros.REQUIRED_VERSION`; an older extension answers "unknown command",
+    which `_call` turns into the spoken "reload the extension" instruction.
+  * Tests: `tests/test_assistant_automation.py` (unit, 326), `tests/test_browser_extension.py` (integration,
+    real headless Chrome). Guide: `docs/platforms/LINUX_AUTOMATION.md`, `docs/platforms/CHROME_BRIDGE.md`.
+- **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
+  STRING, not a refused connection, so "got a reply" is not success. Always go through
+  `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and
+  counts only a literal `ok`. The old `movecursor` call had silently stopped moving the
+  gesture pointer on 0.56.
+- **Speech input on Linux = Google Chrome.** Two traps, both fixed: (1) Arch's `chromedriver`
+  on PATH belongs to Chromium and Selenium Manager prefers a PATH driver even when its major
+  version mismatches, so Chrome failed to start and Kayra fell back to Chromium —
+  `SpeechToTextEngine._matching_driver` resolves the driver with `--skip-driver-in-path` on
+  Linux; (2) Omarchy's DEFAULT browser is Chromium, which starts a recognition session without
+  error and never transcribes — on Linux an `unknown`-backend default no longer outranks an
+  installed Google Chrome (otherwise the probe passes and Chromium is cached as "verified").
+- **MediaPipe ≥ 0.10.30 removed `mp.solutions`**, and those are the only wheels for Python
+  3.13+. `detector.py` uses `solutions` when present and a Tasks `HandLandmarker` adapter
+  (`_TasksHands`, same `process()` contract) otherwise, reading `models/hand_landmarker.task`
+  (setup downloads it). **Every mediapipe 1.x SIGKILLs** during HandLandmarker construction on
+  the reference host, independent of Kayra — hence `mediapipe<1.0`.
+- **Signals in the UI.** `bootstrap()` runs on the session worker thread in the desktop UI, so
+  its `signal.signal` calls silently failed and SIGTERM killed Python without reaping the
+  speech browser. `ui/application.py::_install_signal_bridge` (POSIX only) uses
+  `signal.set_wakeup_fd` + `QSocketNotifier` — no timer — to run `bridge.shutdown(hard=True)`.
+- **Linux hardware identity** comes from os-release, `/proc/cpuinfo`, sysfs PCI (class 0x03),
+  `/proc/driver/nvidia`, `pci.ids` and amdgpu `mem_info_vram_total`; NVIDIA VRAM is unknown in
+  sysfs (0, rendered "unknown"). An AMD APU's graphics are named from the CPU brand string.
+- **Gesture pointer on Linux**: Hyprland `dispatch movecursor` (logical coordinates, focused
+  monitor origin) + uinput (python-evdev) for buttons/wheel. `/dev/uinput` is root-only by
+  default; without access the pointer moves and clicks are reported unavailable once.
+- **PySide6 6.12.0 crashes CPython 3.10/3.11** (`Fatal Python error: none_dealloc` while the
+  orb paints) — a shiboken refcount bug that 3.12+'s immortal `None` masks. `requirements.txt`
+  caps it `<6.12` for `python_version < "3.12"`; 6.11.3 and 6.10.3 pass `test_ui.py` there.
+- **`--no-voice` only skips the UI listener thread** — `bootstrap()` still starts STT (mic) and
+  TTS (speaks the boot line). Do not use it as a "silent" test mode.
+- **Python 3.10–3.14** resolve on Windows and Linux; the unit tier was run on Linux for each.
+  3.15 is unreleased. See `docs/architecture/DEPENDENCIES.md`.
+
 ## Package layout and import rules
 
 ```
 src/kayra/
 ├── app.py            orchestrator
+├── platforms/        OS abstraction: detect, windows, linux, hyprland, fallback
+│                     ← stdlib only; imports NOTHING from kayra (below core)
 ├── core/             paths, config, runtime_state, voice_state, conversation_context,
 │                    voice_control, endpointing, hardware, system_profile, logbus,
 │                    settings_log
@@ -197,7 +301,8 @@ src/kayra/
                      controls (the action layer every control surface calls)
 ```
 
-- **`core` is a leaf.** Anything may import it; it imports nothing back. That is what makes
+- **`core` is a leaf** (above `platforms`, the only thing it may import from `kayra`).
+  Anything may import it; it imports nothing back. That is what makes
   `runtime_state` safe for the proactive thread and `paths` safe for everything else.
 - **`automation` must never import `input`.** Importing `speech_to_text` boots a headless
   Chrome as a side effect, and the user asking to close a window must not start a browser. The
@@ -722,7 +827,7 @@ for the longer device phrases.
   pairs into its first member.
 - **The DMM was NOT changed for any of this.** The `exit` / `stop listening` / `proactive`
   tokens still exist and still work as the fallback for phrasings only the classifier catches
-  ("that's all", "bye jarvis"); the local layer just gets there first. Adding tokens or touching
+  ("that's all", "bye kayra"); the local layer just gets there first. Adding tokens or touching
   `dmm_chat_history` for lifecycle commands would have been the expensive way to buy nothing.
 
 ### Why "stop", "wait" and "hold" were unreliable — three defects, none in the vocabulary

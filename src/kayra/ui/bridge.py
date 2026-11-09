@@ -30,7 +30,7 @@ application are for values that genuinely have no event source: system metrics a
 log, both on multi-second intervals.
 """
 
-from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtCore import QObject, Signal
 
 from kayra.ui.session import KayraSession, SessionEvents
 

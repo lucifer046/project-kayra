@@ -28,13 +28,13 @@ is the one control with no restart note.
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox, QSizePolicy, QMessageBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
 )
 
-from kayra.ui.theme import Color, Space, Size, repolish
+from kayra.ui.theme import Space, Size, repolish
 from kayra.ui.components.primitives import (
     Card, Caption, Secondary, StatusPill, AccentButton, GhostButton, Toggle,
-    SectionLabel, Divider, RowRule, _label,
+    RowRule, _label,
 )
 from kayra.ui.views.base import View
 

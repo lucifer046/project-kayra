@@ -9,7 +9,6 @@ augments the LLM system prompt with live retrieved document contexts, and
 orchestrates conversational streaming with support for dual-tier memory management.
 """
 
-import os
 
 # Fallback block to safely import DDGS from ddgs or duckduckgo_search packages
 try:

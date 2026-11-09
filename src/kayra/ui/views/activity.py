@@ -22,10 +22,10 @@ import time
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy
 
-from kayra.ui.theme import Color, Space, repolish
+from kayra.ui.theme import Space
 from kayra.ui.components.primitives import (
     Card, Caption, Secondary, StatusPill, CardAction, EmptyState, SegmentedControl,
-    ListRow, _label,
+    ListRow,
 )
 from kayra.ui.views.base import View
 

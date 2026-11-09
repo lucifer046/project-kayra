@@ -15,7 +15,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
 from kayra.output.text_to_speech import TextToSpeechEngine
-from kayra.utils import print_banner, print_info, print_error, print_system, print_success, console
+from kayra.utils import print_banner, print_error, print_system, print_success, console
 
 def main():
     print_banner("KAYRA TTS PLAYGROUND", "Interactive Offline Voice Synthesis Sandbox")

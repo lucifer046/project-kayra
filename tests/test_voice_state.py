@@ -47,7 +47,7 @@ import inspect
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from kayra.utils import print_banner, print_info, print_success, print_error, print_system
+from kayra.utils import print_banner, print_success, print_error, print_system
 from kayra.core import voice_state as vs
 from kayra.core.voice_state import (
     VoiceState, VoiceStateMachine, STATES, STATE_TEXT, STATE_DETAIL,

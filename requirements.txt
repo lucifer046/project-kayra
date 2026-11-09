@@ -1,8 +1,19 @@
 # ==============================================================================
 #                        KAYRA ENGINE PYTHON DEPENDENCIES
 # ==============================================================================
-# Version floors are pinned where a breaking major-version change is known to
-# exist upstream. Everything else is left open to track security/bug fixes.
+# The ONE dependency manifest. `python setup.py` installs it into `.venv`; there is no
+# pyproject/Poetry/Pipenv layer on purpose (see docs/development/DEPENDENCIES.md).
+#
+# Supported interpreters: CPython 3.10 - 3.14 (3.15 is not released; see DEPENDENCIES.md).
+# Supported platforms:    Windows 10/11 (x64) and Linux x86_64 (Arch/Omarchy first).
+#
+# Platform-specific packages carry PEP 508 environment markers, so the same file installs
+# cleanly everywhere and never asks Linux to build a Windows-only wheel:
+#   sys_platform == "win32"  -> Windows only (desktop automation, Win32 window control)
+#   sys_platform == "linux"  -> Linux only   (uinput pointer injection for gestures)
+#
+# Version floors are pinned where a breaking change is known upstream; ceilings only where
+# a newer release was MEASURED to break Kayra (each one says why).
 # ==============================================================================
 
 # Core Engine Dependencies
@@ -12,17 +23,18 @@ python-dotenv>=1.0
 rich>=13.7
 requests>=2.31
 psutil>=5.9          # Process cleanup on shutdown (shutdown in src/kayra/app.py, tests/test_DMM.py)
-pygetwindow>=0.0.9   # Active-window context signal (src/kayra/services/proactive_agent.py)
-pywin32>=306         # Win32 window enumeration / focus / WM_CLOSE (src/kayra/automation/targets.py).
+pygetwindow>=0.0.9; sys_platform == "win32"   # Active-window signal on Windows (kayra.platforms.windows).
+                     # Linux reads the active window from Hyprland IPC instead.
+pywin32>=306; sys_platform == "win32"   # Win32 window enumeration / focus / WM_CLOSE (src/kayra/automation/targets.py).
                      # Required for target resolution; without it the resolver reports
                      # UNAVAILABLE rather than guessing, and window control is disabled.
-pyperclip>=1.8       # In-process clipboard read/write (replaces a shell 'clip' spawn per call)
+pyperclip>=1.8       # Clipboard read/write for automation (cross-platform package)
 send2trash>=1.8      # OPTIONAL. When present, file deletion goes to the Recycle Bin instead of
                      # being permanent. Absent, DeletePath still works and deletes outright.
 
 # LLM & AI Clients
 openai>=1.30         # Also used as the OpenAI-compatible client for Groq/Gemini/local endpoints
-cohere>=6.0,<8        # chat_stream(message=, preamble=, chat_history=) verified compatible through 7.1.1
+cohere>=6.0,<8       # chat_stream(message=, preamble=, chat_history=) verified through 7.3.1
 
 # Audio & Voice (Kokoro TTS)
 kokoro-onnx>=0.4
@@ -52,26 +64,43 @@ soundfile>=0.12
 # Run `python setup.py` rather than installing ONNX Runtime by hand.
 
 # Search & RAG
-ddgs>=9.0                  # Current package name for the DuckDuckGo search client
-duckduckgo-search>=6.0     # Legacy name kept as an import fallback (see src/kayra/services/real_time_search.py / deep_research.py)
+ddgs>=9.0            # DuckDuckGo search client. (The legacy `duckduckgo-search` name is still an
+                     # import fallback in the code but is no longer installed — it was redundant.)
 
 # Web Scraping
 beautifulsoup4>=4.12
 
-# Windows System Control & Keystroke Automation
-AppOpener>=1.7
-pyautogui>=0.9
-pynput>=1.7
-pywhatkit>=5.4
-keyboard>=0.13
+# Desktop automation (src/kayra/automation) — these are the WINDOWS hands' libraries. On Linux
+# they either do not install (AppOpener, pywin32) or fail at import without an X server/root
+# (pyautogui, pynput, keyboard), so they are not installed there. The Linux hands
+# (`automation/linux.py`) need no Python package at all: they drive Hyprland's IPC socket and
+# the Wayland tools Omarchy ships (wtype, wpctl, brightnessctl, grim, wl-clipboard, nmcli).
+# See docs/platforms/LINUX_AUTOMATION.md.
+AppOpener>=1.7; sys_platform == "win32"
+pyautogui>=0.9; sys_platform == "win32"
+pynput>=1.7; sys_platform == "win32"
+pywhatkit>=5.4; sys_platform == "win32"
+keyboard>=0.13; sys_platform == "win32"
 
-# Air Cursor Engine (optional hand-gesture mouse control, src/kayra/input/gesture.py)
+# Hand gesture control (src/kayra/input/gesture). Optional at runtime: imported lazily.
 opencv-python>=4.9
-mediapipe>=0.10
+# mediapipe: 0.10.14-0.10.21 ship `mp.solutions.hands` (cp39-cp312 wheels only); 0.10.30+
+# removed it and are the only releases installable on Python 3.13+, so the detector uses the
+# Tasks API there (setup.py downloads `models/hand_landmarker.task`). EVERY 1.x release
+# (1.0.0-1.2.2) was measured to SIGKILL during HandLandmarker construction on the reference
+# host, independent of Kayra — hence the ceiling. Re-test before raising it.
+mediapipe>=0.10.14,<1.0
+evdev>=1.7; sys_platform == "linux"   # uinput clicks/scroll for gestures (kayra.platforms.linux)
 
 # ── Desktop UI ────────────────────────────────────────────────────────────────
 # PySide6-ESSENTIALS, not the full PySide6 distribution. Essentials omits QtWebEngine and the
 # other add-on modules, which keeps the install ~200MB instead of ~1GB and — more importantly —
 # guarantees no browser runtime is shipped to render the interface. The UI is native Qt widgets.
 # Measured cost: +262ms to reach a painted window, +20MB RSS.
-PySide6-Essentials>=6.6   # Native desktop UI (src/kayra/ui). Kayra runs headless without it.
+# Native desktop UI (src/kayra/ui). Kayra runs headless without it.
+# PySide6 6.12.0 aborts the interpreter on CPython 3.10/3.11 ("Fatal Python error: none_dealloc"
+# — a shiboken refcount bug that 3.12+'s immortal None hides). Measured with tests/test_ui.py:
+# 6.12.0 crashes on 3.10 and 3.11, 6.11.3 and 6.10.3 pass all checks on 3.11, 6.12.0 passes on
+# 3.12-3.14. Hence a ceiling for the older interpreters only.
+PySide6-Essentials>=6.6,<6.12; python_version < "3.12"
+PySide6-Essentials>=6.6; python_version >= "3.12"

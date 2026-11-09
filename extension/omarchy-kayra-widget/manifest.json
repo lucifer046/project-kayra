@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "kayra.status",
+  "name": "Kayra",
+  "version": "1.0.0",
+  "author": "Kayra",
+  "description": "Shows what the Kayra assistant is doing; click to bring it up or start it",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Panel.qml"},
+  "barWidget": {
+    "displayName": "Kayra",
+    "description": "Kayra assistant status",
+    "category": "System",
+    "allowMultiple": false
+  }
+}

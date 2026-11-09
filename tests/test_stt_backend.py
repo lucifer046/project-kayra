@@ -36,7 +36,6 @@ import os
 import re
 import sys
 import ast
-import time
 import types
 import inspect
 
@@ -45,7 +44,6 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 
 from kayra.utils import print_banner, print_info, print_success, print_error, print_system
 from kayra.core import logbus
-from kayra.core.logbus import Subsystem
 from kayra.input import stt_backend as sb
 from kayra.input.stt_backend import (
     STTBackendManager, STTBackendState, BackendStatus, AUTO, normalize, label_for,

@@ -57,7 +57,7 @@ explicitly rather than left to chance:
 
 import math
 
-from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, Signal
+from PySide6.QtCore import Qt, QTimer, QPointF, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QRadialGradient, QBrush
 from PySide6.QtWidgets import QWidget
 

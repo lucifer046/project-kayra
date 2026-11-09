@@ -475,7 +475,7 @@ def _app_index():
     AppOpener's cached Start-Menu index, as a plain dict. Read at most once per TTL.
 
     Entries whose value is falsy are dropped: that value is what AppOpener interpolates into
-    `explorer shell:appsFolder\<id>`, and an empty id makes explorer open a FILE EXPLORER
+    `explorer shell:appsFolder\\<id>`, and an empty id makes explorer open a FILE EXPLORER
     WINDOW rather than failing. An unlaunchable entry is not an installed application.
     """
     now = time.time()

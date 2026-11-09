@@ -5,7 +5,7 @@
 """
 The single place gesture control touches the user's machine.
 
-WHY user32 DIRECTLY AND NOT `automation.windows`
+WHY THE PLATFORM INJECTOR AND NOT `automation.windows`
 ------------------------------------------------
 Two reasons, and the first is structural.
 
@@ -42,11 +42,12 @@ button-up events are posted back to back here; Windows synthesises the press dur
 message timestamps and no application requires a real delay between them.
 """
 
-import ctypes
 import sys
 import threading
 
-from kayra.core.logbus import Subsystem, debug
+from kayra import platforms
+from kayra.platforms import windows as _platform_windows
+from kayra.core.logbus import Subsystem, debug, warning
 
 _WINDOWS = sys.platform.startswith("win")
 
@@ -71,7 +72,7 @@ class PointerController:
         # `injector` is substitutable so the whole action path can be exercised in a test
         # without moving the developer's actual mouse pointer — which is the difference
         # between a suite that can be run and one that cannot.
-        self._injector = injector or (_Win32Injector() if _WINDOWS else _NullInjector())
+        self._injector = injector or _default_injector()
         self._lock = threading.Lock()
         self.enabled = False
 
@@ -188,42 +189,31 @@ class PointerController:
         }
 
 
-class _Win32Injector:
-    """Raw user32. Cheapest available path: `SetCursorPos` is 0.012ms on this machine."""
+# The Win32 injector lives in the platform layer now, beside its Linux counterpart. The old
+# private name is kept because the test suite and diagnostics reach it by that name.
+_Win32Injector = _platform_windows.Win32Injector
 
-    def __init__(self):
-        self._u32 = ctypes.windll.user32
-        self._held = set()
 
-    def screen_size(self):
-        return int(self._u32.GetSystemMetrics(0)), int(self._u32.GetSystemMetrics(1))
-
-    def move(self, x, y):
-        self._u32.SetCursorPos(x, y)
-
-    def click(self, down, up):
-        # Down and up posted back to back, with no sleep. See the module docstring.
-        self._held.add(down)
-        self._u32.mouse_event(down, 0, 0, 0, 0)
-        self._u32.mouse_event(up, 0, 0, 0, 0)
-        self._held.discard(down)
-
-    def wheel(self, delta):
-        self._u32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-
-    def release_buttons(self):
-        """Lifts anything still logically held. See `PointerController.disable`."""
-        for down in list(self._held):
-            up = MOUSEEVENTF_LEFTUP if down == MOUSEEVENTF_LEFTDOWN else MOUSEEVENTF_RIGHTUP
-            try:
-                self._u32.mouse_event(up, 0, 0, 0, 0)
-            except Exception:
-                pass
-        self._held.clear()
+def _default_injector():
+    """
+    The platform's injector, or the null one. Logged ONCE, at construction, because a pointer
+    that moves but cannot click (Linux without /dev/uinput access) must say so up front rather
+    than through a debug line per failed frame.
+    """
+    injector, detail = platforms.pointer_injector()
+    if injector is None:
+        if not _WINDOWS:
+            warning(Subsystem.GESTURE, f"Pointer control unavailable: {detail}")
+        return _NullInjector()
+    if "unavailable" in detail:
+        warning(Subsystem.GESTURE, f"Pointer: {detail}")
+    else:
+        debug(Subsystem.GESTURE, f"Pointer backend: {detail}")
+    return injector
 
 
 class _NullInjector:
-    """Non-Windows, and the default in the test suite. Records nothing, does nothing."""
+    """No usable pointer backend. Records nothing, does nothing."""
 
     def screen_size(self):
         return 1920, 1080

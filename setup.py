@@ -37,6 +37,7 @@ DESIGN RULES
 import os
 import re
 import sys
+import glob
 import json
 import shutil
 import socket
@@ -50,7 +51,9 @@ import subprocess
 # blocked — refusing to run on a version nobody has tried is not the same as knowing it fails.
 MIN_PYTHON = (3, 10)
 RECOMMENDED_PYTHON = (3, 11)
-MAX_VERIFIED_PYTHON = (3, 12)
+# Highest version the dependency set has been installed and the unit tier run on. 3.13 and
+# 3.14 were verified on Linux (2026-11). See docs/development/DEPENDENCIES.md for the matrix.
+MAX_VERIFIED_PYTHON = (3, 14)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 VENV_DIR = os.path.join(PROJECT_ROOT, ".venv")
@@ -195,7 +198,11 @@ def check_python():
         fail(f"Kayra requires Python {version_text(MIN_PYTHON)} or newer.")
         info("")
         info("Install a supported Python and run setup again with it, for example:")
-        info(r"    C:\Python311\python.exe setup.py")
+        if IS_WINDOWS:
+            info(r"    C:\Python311\python.exe setup.py")
+        else:
+            info("    python3.11 setup.py      (Arch/Omarchy: sudo pacman -S python, "
+                 "or `uv python install 3.12`)")
         info("")
         info("Downloads: https://www.python.org/downloads/")
         return False
@@ -339,18 +346,25 @@ def install_dependencies(python_exe):
 
 IMPORT_GROUPS = [
     ("Core",       ["dotenv", "rich", "requests", "psutil"]),
-    ("LLM",        ["openai", "cohere", "google.generativeai"]),
+    ("LLM",        ["openai", "cohere"]),
     ("Speech-out", ["kokoro_onnx", "sounddevice", "numpy"]),
     ("Speech-in",  ["selenium", "mtranslate"]),
-    ("Automation", ["pyautogui", "keyboard", "pyperclip", "AppOpener", "pywhatkit", "bs4"]),
-    ("Search",     ["ddgs"]),
+    ("Search",     ["ddgs", "bs4"]),
+    ("Gestures",   ["cv2", "mediapipe"]),
 ]
 
+# Desktop automation's PYTHON libraries are Windows-only. On Linux the automation layer
+# (`kayra.automation.linux`) drives the compositor and Wayland command-line tools instead, so
+# readiness there is a PATH check (`_linux_automation_missing`), not an import group.
 if IS_WINDOWS:
+    IMPORT_GROUPS.append(("Automation", ["pyautogui", "keyboard", "pyperclip", "AppOpener",
+                                         "pywhatkit"]))
     IMPORT_GROUPS.append(("Windows", ["win32gui", "win32process", "pygetwindow"]))
+elif sys.platform.startswith("linux"):
+    IMPORT_GROUPS.append(("Linux", ["evdev"]))
 
 # Missing these degrades a feature; missing anything else stops the assistant.
-OPTIONAL_IMPORTS = {"google.generativeai", "ddgs", "send2trash", "mediapipe", "cv2"}
+OPTIONAL_IMPORTS = {"ddgs", "send2trash", "mediapipe", "cv2", "evdev"}
 
 
 def validate_imports(python_exe):
@@ -574,15 +588,75 @@ _SOFTWARE_ADAPTER_MARKERS = ("basic display adapter", "remote display", "remotef
                              "virtual display", "citrix indirect display")
 
 
+_SYS_PCI = "/sys/bus/pci/devices"
+
+
+def _read_sysfs(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _sysfs_adapters():
+    """
+    [(vendor, name, vram_bytes)] from Linux sysfs -- the kernel's registry-equivalent.
+
+    Display-class (0x03xxxx) PCI devices only. NVIDIA names come from the driver's own
+    `/proc/driver/nvidia/gpus/*/information`; VRAM is amdgpu's `mem_info_vram_total` where it
+    exists and 0 (unknown) otherwise. Mirrors `kayra.core.hardware._linux_gpu_adapters` --
+    the agreement is asserted by `tests/test_setup_runtime.py`.
+    """
+    if not os.path.isdir(_SYS_PCI):
+        return []
+    nvidia_models = {}
+    for info_file in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+        model = location = ""
+        for line in _read_sysfs(info_file).splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "Model":
+                model = value.strip()
+            elif key.strip() == "Bus Location":
+                location = value.strip().lower()
+        if model and location:
+            nvidia_models[location] = model
+
+    found = []
+    for device_dir in sorted(glob.glob(os.path.join(_SYS_PCI, "*"))):
+        if not _read_sysfs(os.path.join(device_dir, "class")).lower().startswith("0x03"):
+            continue
+        try:
+            vendor_id = int(_read_sysfs(os.path.join(device_dir, "vendor")), 16)
+        except ValueError:
+            continue
+        if vendor_id in (0x1414, 0x15AD, 0x1AF4, 0x1013):
+            continue                    # virtual display adapters are not graphics hardware
+        vendor = _PCI_VENDORS.get(vendor_id, "")
+        location = os.path.basename(device_dir).lower()
+        name = nvidia_models.get(location) or f"{vendor or 'Unknown'} graphics"
+        try:
+            vram = int(_read_sysfs(os.path.join(device_dir, "mem_info_vram_total")) or 0)
+        except ValueError:
+            vram = 0
+        found.append((vendor, name, max(0, vram)))
+    # NVIDIA publishes no VRAM in sysfs, so "most VRAM first" would rank an APU's 512 MB
+    # carve-out above an 8 GB card. NVIDIA parts are always discrete; rank them first.
+    found.sort(key=lambda item: (item[0] == "NVIDIA", item[2]), reverse=True)
+    return found
+
+
 def _registry_adapters():
     """
-    [(vendor, name, vram_bytes)] for every graphics adapter, from the registry. [] off Windows.
+    [(vendor, name, vram_bytes)] for every graphics adapter: the registry on Windows, sysfs on
+    Linux, [] anywhere else. (The name is historical; it is the ADAPTER LIST door either way,
+    and the test suite substitutes it to serve synthetic machines.)
 
     Costs well under a millisecond and spawns nothing, so it is safe to call on a machine with
     no GPU tooling of any kind -- which is exactly the machine whose answer matters most here.
     """
     if winreg is None:
-        return []
+        return _sysfs_adapters()
     found = []
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _GPU_CLASS_KEY) as root:
@@ -708,9 +782,9 @@ def detect_graphics():
             result["nvidia_name"] = smi_name
             if smi_vram:
                 result["nvidia_vram_mib"] = smi_vram
-    elif not adapters and winreg is None:
-        # Off Windows there is no registry to read. Fall back to the tool, so a Linux
-        # developer with a real card is not told they have none.
+    elif not adapters and winreg is None and not os.path.isdir(_SYS_PCI):
+        # Neither a registry nor sysfs to read (an unusual container or OS). Fall back to the
+        # tool, so a developer with a real card is not told they have none.
         smi_name, smi_vram = _nvidia_smi_gpu()
         if smi_name:
             result.update(nvidia=True, nvidia_name=smi_name, nvidia_vram_mib=smi_vram,
@@ -1049,7 +1123,7 @@ def configure_speech_runtime(python_exe, offer_gpu=True):
             info(f"    Installing the CUDA {cuda_build} runtime for ONNX Runtime: "
                  f"{', '.join(missing)}")
             info("    (these are large wheels - roughly 1.4 GB - and are what supply "
-                 "cublasLt64_12.dll and cuDNN 9)")
+                 "cuBLAS, cuFFT, the CUDA runtime and cuDNN 9)")
             if _pip(python_exe, "install", *pins).returncode != 0:
                 fail("The CUDA runtime packages could not be installed.")
                 state["cuda_reason"] = "pip could not install the NVIDIA runtime wheels"
@@ -1344,6 +1418,68 @@ def check_models():
     return "missing"
 
 
+# Hand-landmark model for MediaPipe's Tasks API. MediaPipe 0.10.30+ (the only releases for
+# Python 3.13+) dropped `mp.solutions` and no longer bundles the model, so the detector needs it
+# as a file. Google's official model storage; ~7.8 MB. Must stay in sync with
+# `kayra.input.gesture.detector.HAND_MODEL_URL`.
+HAND_MODEL_FILE = "hand_landmarker.task"
+HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                  "hand_landmarker/float16/latest/hand_landmarker.task")
+
+
+def ensure_hand_model(python_exe):
+    """
+    Downloads the hand-landmark model when the installed MediaPipe needs it. Returns a status:
+    "bundled" (legacy solutions API, nothing needed), "present", "downloaded", "skipped",
+    "failed" or "no-mediapipe". Gesture control is optional, so none of these blocks setup.
+    """
+    step("Checking the hand-gesture model")
+    probe = subprocess.run(
+        [python_exe, "-c", "import mediapipe as mp; print(int(hasattr(mp, 'solutions')))"],
+        capture_output=True, text=True)
+    if probe.returncode != 0:
+        warn("MediaPipe is not importable; hand gesture control will be unavailable.")
+        return "no-mediapipe"
+    if probe.stdout.strip() == "1":
+        ok("MediaPipe ships the legacy hands graph; no model file is needed.")
+        return "bundled"
+
+    target = os.path.join(MODELS_DIR, HAND_MODEL_FILE)
+    if os.path.isfile(target) and os.path.getsize(target) > 1_000_000:
+        ok(f"{HAND_MODEL_FILE} present.")
+        return "present"
+
+    info(f"This MediaPipe needs {HAND_MODEL_FILE} (~8 MB) from Google's model storage.")
+    if not ask_yes_no("Download it now for hand gesture control?", default=True):
+        warn("Skipped. Gesture control will report the missing model until it is downloaded.")
+        info(f"    {HAND_MODEL_URL}  ->  models/{HAND_MODEL_FILE}")
+        return "skipped"
+
+    import urllib.request
+    import zipfile
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    partial = target + ".part"
+    try:
+        with urllib.request.urlopen(HAND_MODEL_URL, timeout=60) as response, \
+                open(partial, "wb") as handle:
+            shutil.copyfileobj(response, handle)
+        # A .task bundle is a zip of two .tflite models. Verify before it can be loaded, so a
+        # captive-portal HTML page is never installed as a model.
+        if not zipfile.is_zipfile(partial):
+            raise ValueError("the download is not a model bundle")
+        os.replace(partial, target)
+    except Exception as exc:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        fail(f"Could not download {HAND_MODEL_FILE}: {type(exc).__name__}: {exc}")
+        info(f"    Download manually: {HAND_MODEL_URL}  ->  models/{HAND_MODEL_FILE}")
+        return "failed"
+    ok(f"Downloaded {HAND_MODEL_FILE}.")
+    return "downloaded"
+
+
 def _print_model_help():
     info("    Download from: https://github.com/thewh1teagle/kokoro-onnx/releases")
     info("    Place kokoro-v1.0.int8.onnx and voices-v1.0.bin into models/")
@@ -1353,6 +1489,111 @@ def _print_model_help():
 # │                     8. PLATFORM VALIDATION                             │
 # └────────────────────────────────────────────────────────────────────────┘
 
+def _os_release():
+    data = {}
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as handle:
+            for line in handle:
+                key, sep, value = line.strip().partition("=")
+                if sep:
+                    data[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return data
+
+
+# Linux system libraries the Python wheels do NOT bundle, by ctypes name, with the Arch
+# package that provides each. Debian/Fedora names are given in docs/platforms/LINUX.md.
+_LINUX_LIBRARIES = (
+    ("portaudio", "portaudio", "audio output (sounddevice)", True),
+    ("xcb-cursor", "xcb-util-cursor", "the Qt window under X11/XWayland", False),
+)
+
+
+def _check_linux_system(results):
+    """Distribution, session, the native libraries pip cannot install, and uinput access."""
+    import ctypes.util
+
+    release = _os_release()
+    distro_id = release.get("ID", "").lower()
+    like = release.get("ID_LIKE", "").lower().split()
+    is_arch = distro_id in ("arch", "omarchy") or "arch" in like
+    name = release.get("PRETTY_NAME") or release.get("NAME") or "Linux"
+    omarchy = distro_id == "omarchy" or os.path.isdir(os.path.expanduser(
+        "~/.local/share/omarchy")) or os.path.isdir("/usr/share/omarchy")
+    ok(f"{name}{' (Omarchy, Arch-based)' if omarchy and distro_id != 'omarchy' else ''}"
+       f" -- kernel {platform.release()}")
+
+    session = os.environ.get("XDG_SESSION_TYPE", "") or (
+        "wayland" if os.environ.get("WAYLAND_DISPLAY") else
+        "x11" if os.environ.get("DISPLAY") else "none")
+    hyprland = bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
+    ok(f"Session: {session}{' / Hyprland' if hyprland else ''}")
+    if not hyprland:
+        info("    The active-window signal and Hyprland pointer control are Hyprland-only; "
+             "elsewhere Kayra runs without them.")
+
+    missing = []
+    for lib, package, purpose, required in _LINUX_LIBRARIES:
+        if lib == "xcb-cursor" and session == "wayland":
+            continue                         # Qt uses its Wayland plugin here
+        if ctypes.util.find_library(lib):
+            ok(f"lib{lib}: present ({purpose})")
+        else:
+            (fail if required else warn)(f"lib{lib} not found -- needed for {purpose}")
+            missing.append(package)
+    if missing:
+        if is_arch:
+            info(f"    Install with:  sudo pacman -S --needed {' '.join(missing)}")
+        else:
+            info("    Install the equivalent packages with your distribution's package "
+                 "manager (see docs/platforms/LINUX.md).")
+    results["linux_libraries"] = not any(
+        required for lib, pkg, _p, required in _LINUX_LIBRARIES if pkg in missing)
+
+    # Gesture clicks go through /dev/uinput. Informational: everything else works without it.
+    if os.path.exists("/dev/uinput") and os.access("/dev/uinput", os.W_OK):
+        ok("/dev/uinput is writable (gesture clicks and scrolling available)")
+    else:
+        warn("/dev/uinput is not writable: hand-gesture control can move the pointer "
+             "(on Hyprland) but cannot click or scroll.")
+        info("    See docs/platforms/LINUX.md, 'Gesture control and voice clicks: uinput access'.")
+
+    missing = _linux_automation_missing()
+    if not missing:
+        ok("Desktop automation tools present (wtype, uwsm-app, xdg-open, wpctl)")
+    else:
+        warn("Desktop automation is missing: " + ", ".join(missing))
+        info("    On Arch/Omarchy: sudo pacman -S wtype wireplumber uwsm xdg-utils "
+             "(Omarchy ships all of them).")
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        info("    Window management (focus, close, workspaces) needs a Hyprland session; "
+             "apps, media and system control work without one.")
+
+
+# The tools `kayra.automation.linux` cannot work without, as (label, any-of). Duplicated from
+# `kayra.platforms.linux.AUTOMATION_CORE` on purpose: setup runs before `kayra` is importable.
+_LINUX_AUTOMATION_CORE = (
+    ("wtype", ("wtype", "ydotool")),
+    ("uwsm-app", ("uwsm-app", "gtk-launch")),
+    ("xdg-open", ("xdg-open",)),
+    ("wpctl", ("wpctl", "pamixer")),
+)
+
+
+def _linux_automation_missing():
+    return [label for label, commands in _LINUX_AUTOMATION_CORE
+            if not any(shutil.which(c) for c in commands)]
+
+
+def _linux_automation_summary():
+    missing = _linux_automation_missing()
+    if missing:
+        return "missing " + ", ".join(missing)
+    return ("ready (Hyprland)" if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+            else "ready (no window management outside Hyprland)")
+
+
 def check_platform(python_exe):
     """Windows version, audio output, and the browser the STT layer drives."""
     step("Checking the platform")
@@ -1360,10 +1601,12 @@ def check_platform(python_exe):
 
     if IS_WINDOWS:
         ok(f"Windows {platform.release()} (build {platform.version()})")
+    elif sys.platform.startswith("linux"):
+        _check_linux_system(results)
     else:
-        warn(f"{platform.system()} detected. Kayra's automation layer is Windows-only; "
-             "conversation and speech will work, computer control will not.")
-    results["os"] = IS_WINDOWS
+        warn(f"{platform.system()} detected. This OS has no platform backend yet; "
+             "conversation and speech may work, desktop integration will not.")
+    results["os"] = IS_WINDOWS or sys.platform.startswith("linux")
 
     # Audio OUTPUT is checkable without recording anything. Microphone access deliberately is
     # not probed: doing so would open the device and pop a permission prompt during setup, and
@@ -1398,15 +1641,19 @@ def check_platform(python_exe):
     if usable:
         ok(f"Speech-input browser: {', '.join(usable)}")
         for label in unusable:
-            info(f"    {label} is installed but ships no speech backend, so it cannot "
-                 f"transcribe; Kayra will not use it for voice input.")
+            info(f"    {label} is installed but has no working speech backend, so it "
+                 f"cannot transcribe; Kayra will not prefer it for voice input.")
         results["chrome"] = True
     else:
         warn("No browser that can run speech recognition was found.")
         if unusable:
             info(f"    Found {', '.join(unusable)}, but that browser ships without a speech "
                  f"backend and cannot transcribe.")
-        info("    Voice input needs Microsoft Edge (preinstalled on Windows 11) or Chrome.")
+        if IS_WINDOWS:
+            info("    Voice input needs Microsoft Edge (preinstalled on Windows 11) or Chrome.")
+        else:
+            info("    Voice input needs Google Chrome. On Arch/Omarchy: "
+                 "yay -S google-chrome")
         info("    Kayra still runs without one - it falls back to keyboard input.")
         results["chrome"] = False
 
@@ -1444,6 +1691,20 @@ _SPEECH_BROWSERS = (
 )
 
 
+# Linux: (label, capability, executables on PATH). Mirrors `kayra.input.browsers`.
+# Google Chrome (AUR `google-chrome` on Arch/Omarchy) is VERIFIED to transcribe on Linux.
+# Distribution Chromium builds are not entitled to Google's speech service: on the reference
+# Omarchy host Arch's Chromium started a recognition session without error but produced no
+# transcripts. Setup therefore does not count it as a usable speech browser; the runtime
+# still probes it (see kayra.input.browsers), so a build that works is not locked out.
+_LINUX_SPEECH_BROWSERS = (
+    ("Google Chrome", "usable", ("google-chrome-stable", "google-chrome")),
+    ("Microsoft Edge", "unknown", ("microsoft-edge-stable", "microsoft-edge")),
+    ("Brave", "no-backend", ("brave", "brave-browser")),
+    ("Chromium", "no-backend", ("chromium", "chromium-browser")),
+)
+
+
 def _find_speech_browsers():
     """
     (usable_names, unusable_names) for browsers that could run speech recognition.
@@ -1452,6 +1713,11 @@ def _find_speech_browsers():
     without one is reported separately so the summary can explain rather than just warn.
     """
     usable, unusable = [], []
+    if not IS_WINDOWS:
+        for label, capability, commands in _LINUX_SPEECH_BROWSERS:
+            if any(shutil.which(command) for command in commands):
+                (usable if capability != "no-backend" else unusable).append(label)
+        return usable, unusable
     for label, capability, paths in _SPEECH_BROWSERS:
         found = False
         for raw in paths:
@@ -1461,8 +1727,6 @@ def _find_speech_browsers():
             if os.path.isfile(expanded):
                 found = True
                 break
-        if not found and not IS_WINDOWS:
-            found = bool(shutil.which(label.split()[-1].lower()))
         if found:
             (usable if capability != "no-backend" else unusable).append(label)
     return usable, unusable
@@ -1484,7 +1748,7 @@ def _speech_browser_text():
     if usable:
         text = ", ".join(usable)
         if unusable:
-            text += f" ({', '.join(unusable)} has no speech backend)"
+            text += f" ({', '.join(unusable)}: no working speech backend)"
         return text
     if unusable:
         return f"only {', '.join(unusable)}, which cannot transcribe - install Edge or Chrome"
@@ -1603,7 +1867,12 @@ def summary(state):
     print(_paint(_G["rule"] * 64, "1;36"))
 
     def row(label, value, good=True):
-        mark = _paint(_G["yes"], "1;32") if good else _paint(_G["no"], "1;31")
+        # good=None is NEUTRAL: expected on this platform, neither a pass nor a problem to fix
+        # (desktop automation on Linux). A red cross there sent people looking for a fix.
+        if good is None:
+            mark = _paint("-", "1;37")
+        else:
+            mark = _paint(_G["yes"], "1;32") if good else _paint(_G["no"], "1;31")
         print(f"  {mark} {label:<28} {value}")
 
     row("Python", state["python"], True)
@@ -1616,12 +1885,15 @@ def summary(state):
     row("Speech device", state["tts_device"], state["tts_device_ok"])
     row("Audio output", state["audio"], state["audio_ok"])
     row("Speech-input browser", state["chrome"], state["chrome_ok"])
+    if "gesture_model" in state:
+        row("Gesture model", state["gesture_model"], state["gesture_model_ok"])
     row("Automation", state["automation"], state["automation_ok"])
 
     print(_paint(_G["rule"] * 64, "1;36"))
     if state["ready"]:
         print(_paint("\n  Setup complete. Start Kayra with:\n", "1;32"))
-        print(_paint("      python run.py\n", "1;37"))
+        print(_paint("      python run.py\n" if IS_WINDOWS else "      python3 run.py\n",
+                     "1;37"))
     else:
         print(_paint(f"\n  Setup finished with problems. Fix the items marked {_G['no']} above, "
                      "then run setup again.\n", "1;33"))
@@ -1652,6 +1924,7 @@ def main():
                                                                         "cohere": False,
                                                                         "chat": False})
     model_state = check_models()
+    hand_model = ensure_hand_model(python_exe) if deps_ok else "no-mediapipe"
     speech_runtime = (configure_speech_runtime(python_exe) if deps_ok
                       else {"gpu_name": None, "vram_mib": None, "ort": {}, "cuda_ok": False,
                             "cuda_reason": "dependencies were not installed",
@@ -1697,8 +1970,17 @@ def main():
         "audio_ok": bool(platform_state.get("audio")),
         "chrome": _speech_browser_text(),
         "chrome_ok": bool(_find_speech_browsers()[0]),
-        "automation": "ready" if (imports_ok and IS_WINDOWS) else "unavailable on this OS",
-        "automation_ok": bool(imports_ok and IS_WINDOWS),
+        "gesture_model": {"bundled": "built into MediaPipe", "present": "present",
+                          "downloaded": "downloaded", "skipped": "not downloaded",
+                          "failed": "download FAILED",
+                          "no-mediapipe": "MediaPipe unavailable"}[hand_model],
+        "gesture_model_ok": hand_model in ("bundled", "present", "downloaded"),
+        "automation": ("ready" if imports_ok else "imports FAILED") if IS_WINDOWS
+                      else (_linux_automation_summary() if sys.platform.startswith("linux")
+                            else "no backend for this OS (expected)"),
+        "automation_ok": bool(imports_ok) if IS_WINDOWS
+                         else (not _linux_automation_missing()
+                               if sys.platform.startswith("linux") else None),
         "ready": ready,
     })
     return 0 if ready else 1

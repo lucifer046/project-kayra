@@ -37,7 +37,7 @@ import logging
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(project_root, "src"))
 
-from kayra.utils import print_banner, print_info, print_success, print_error, print_system
+from kayra.utils import print_banner, print_success, print_error, print_system
 from kayra.core import logbus
 from kayra.core.logbus import Subsystem, SUBSYSTEMS, LEVELS, format_line, redact
 from kayra.core import settings_log

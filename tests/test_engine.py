@@ -24,10 +24,8 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 from kayra.intelligence.llm_engine import CentralizedLLMEngine
 from kayra.utils import (
     print_info,
-    print_warning,
     print_error,
     print_critical,
-    print_system,
     print_success,
     print_banner,
     print_section,

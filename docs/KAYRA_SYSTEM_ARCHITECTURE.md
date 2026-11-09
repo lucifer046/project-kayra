@@ -3009,7 +3009,7 @@ project-kayra/
 ├── main.py                     ← backward-compatibility shim → kayra.app.main()
 ├── requirements.txt
 ├── .env / .env.example         ← .env is gitignored
-├── README.md · blueprint.md · CLAUDE.md · AGENTS.md
+├── README.md · CLAUDE.md · AGENTS.md   (docs/architecture, docs/platforms, docs/development)
 │
 ├── src/
 │   └── kayra/

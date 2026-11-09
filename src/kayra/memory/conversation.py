@@ -24,7 +24,7 @@ back to the backup when the primary is unreadable.
 import json
 import shutil
 
-from kayra.core.paths import conversation_paths, data_path, data_dir
+from kayra.core.paths import conversation_paths
 from kayra.utils.console import print_warning, print_error
 
 

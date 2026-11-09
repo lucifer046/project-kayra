@@ -74,6 +74,7 @@ import os
 import re
 import sys
 import platform
+import glob
 import functools
 
 try:
@@ -85,6 +86,9 @@ try:
     import winreg                       # Windows only; absent everywhere else by design
 except Exception:                       # pragma: no cover - non-Windows
     winreg = None
+
+# The platform layer is a stdlib-only leaf BELOW core, so importing it keeps `core` a leaf.
+from kayra import platforms
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -397,8 +401,11 @@ def os_info():
     architecture = platform.machine() or ""
     kernel = platform.version() or ""
 
-    if not sys.platform.startswith("win") or winreg is None:
-        # macOS / Linux / anything else. `platform.system()` and `.release()` are accurate off
+    if winreg is None and platforms.current().is_linux:
+        return _linux_os_info(architecture)
+
+    if winreg is None:
+        # macOS / anything else. `platform.system()` and `.release()` are accurate off
         # Windows — the staleness problem is specific to Windows' compatibility shims.
         return OSInfo(name=platform.system() or "Unknown",
                       edition="", display_version=platform.release() or "",
@@ -488,7 +495,7 @@ def cpu_info():
     cores, threads, max_mhz = _cpu_counts()
     architecture = platform.machine() or ""
 
-    if sys.platform.startswith("win") and winreg is not None:
+    if winreg is not None:
         values = _reg_values(winreg.HKEY_LOCAL_MACHINE, _CPU_KEY,
                              ("ProcessorNameString", "VendorIdentifier"))
         model = str(values.get("ProcessorNameString") or "").strip()
@@ -574,6 +581,179 @@ def _is_software_adapter(name):
     return any(marker in lowered for marker in _SOFTWARE_ADAPTERS)
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                         LINUX (sysfs / os-release)                     │
+# └────────────────────────────────────────────────────────────────────────┘
+# The Linux equivalents of the registry reads above. Files only — no `lspci`, no `glxinfo`,
+# no `nvidia-smi` — for the same reason the Windows path avoids PowerShell: this runs on the
+# System screen's first paint, and a subprocess there is a visible hitch.
+
+_SYS_PCI = "/sys/bus/pci/devices"
+_PCI_IDS_FILES = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/usr/share/pci.ids")
+
+
+def _read_text(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return default
+
+
+def _linux_os_info(architecture):
+    """os-release names the distribution; the kernel release is the build identity."""
+    info = platforms.current()
+    kernel = platform.release() or ""
+    name = info.distro_name or "Linux"
+    return OSInfo(name=name, edition="", display_version=info.distro_version,
+                  build=None, revision=None, architecture=architecture,
+                  kernel_version=kernel, is_server=False, source="os-release")
+
+
+def _pci_names(wanted):
+    """
+    {(vendor_id, device_id): device name} from the pci.ids database, for the ids asked for.
+
+    One linear scan (~12 ms for the 1.4 MB file on the reference host), done at most once per
+    process because `gpu_adapters()` is cached. Returns {} when no database is installed.
+    """
+    if not wanted:
+        return {}
+    for path in _PCI_IDS_FILES:
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        found, vendor = {}, None
+        with handle:
+            for line in handle:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                if not line.startswith("\t"):
+                    try:
+                        vendor = int(line[:4], 16)
+                    except ValueError:
+                        vendor = None
+                    continue
+                if line.startswith("\t\t") or vendor is None:
+                    continue
+                try:
+                    device = int(line[1:5], 16)
+                except ValueError:
+                    continue
+                if (vendor, device) in wanted:
+                    found[(vendor, device)] = line[5:].strip()
+                    if len(found) == len(wanted):
+                        break
+        return found
+    return {}
+
+
+def _marketing_name(vendor, codename):
+    """`AD107M [GeForce RTX 4060 Max-Q / Mobile]` -> `NVIDIA GeForce RTX 4060 Max-Q / Mobile`."""
+    match = re.search(r"\[([^\]]+)\]", codename or "")
+    name = (match.group(1) if match else (codename or "")).strip()
+    if vendor and name and not name.lower().startswith(vendor.lower()):
+        name = f"{vendor} {name}"
+    return name
+
+
+def _nvidia_proc_models():
+    """{pci bus location: model name} from the NVIDIA driver's own /proc entries."""
+    models = {}
+    for info_file in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+        model = location = ""
+        for line in _read_text(info_file).splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "Model":
+                model = value.strip()
+            elif key.strip() == "Bus Location":
+                location = value.strip().lower()
+        if model and location:
+            models[location] = model
+    return models
+
+
+def _linux_integrated_hint(location, vendor, vram):
+    """
+    (integrated, name) from evidence pci.ids does not carry, or (None, "") when unsettled.
+
+    * Intel's integrated GPU is always function 00:02.0 — a fixed PCI convention.
+    * An AMD APU's brand string NAMES its graphics ("Ryzen 9 8945HS w/ Radeon 780M
+      Graphics"). When the CPU says so and the AMD adapter's dedicated pool is a carve-out
+      (≤ 2 GiB), that adapter is the APU's graphics — and that string is also its real name,
+      where pci.ids only knows the silicon codename ("HawkPoint1").
+    """
+    if vendor == VENDOR_INTEL and location.endswith(":00:02.0"):
+        return True, ""
+    if vendor == VENDOR_AMD and vram and vram <= 2 * 1024 ** 3:
+        model = cpu_info().model
+        match = re.search(r"(radeon[\w\s-]*?graphics)", model, re.IGNORECASE)
+        if match and "amd" in model.lower():
+            return True, f"AMD {match.group(1).strip()}"
+    return None, ""
+
+
+def _linux_gpu_adapters():
+    """Every display-class PCI device, from sysfs. Same ordering contract as Windows."""
+    entries = []
+    for device_dir in sorted(glob.glob(os.path.join(_SYS_PCI, "*"))):
+        pci_class = _read_text(os.path.join(device_dir, "class"))
+        if not pci_class.lower().startswith("0x03"):          # display controller
+            continue
+        try:
+            vendor_id = int(_read_text(os.path.join(device_dir, "vendor")), 16)
+            device_id = int(_read_text(os.path.join(device_dir, "device")), 16)
+        except ValueError:
+            continue
+        driver = os.path.basename(os.path.realpath(os.path.join(device_dir, "driver"))) \
+            if os.path.exists(os.path.join(device_dir, "driver")) else ""
+        entries.append((os.path.basename(device_dir).lower(), vendor_id, device_id, driver,
+                        device_dir))
+    if not entries:
+        return ()
+
+    nvidia_models = _nvidia_proc_models()
+    unnamed = {(v, d) for loc, v, d, _, _ in entries if loc not in nvidia_models}
+    pci_names = _pci_names(unnamed)
+
+    adapters = []
+    for location, vendor_id, device_id, driver, device_dir in entries:
+        vendor = PCI_VENDORS.get(vendor_id, f"PCI {vendor_id:04x}")
+        name = nvidia_models.get(location) or _marketing_name(
+            vendor, pci_names.get((vendor_id, device_id), "")) or f"{vendor} graphics"
+
+        # amdgpu publishes the dedicated pool; the NVIDIA driver does not (nvidia-smi does,
+        # and `gpu_metrics` overlays it). Unknown stays 0 — never a guess.
+        vram = _as_int(_read_text(os.path.join(device_dir, "mem_info_vram_total"))) or 0
+
+        if driver == "nvidia":
+            driver_version = _read_text("/sys/module/nvidia/version")
+        elif driver:
+            driver_version = f"{driver} (kernel {platform.release()})"
+        else:
+            driver_version = ""
+
+        integrated = _classify_integrated(name, vram, vendor)
+        if integrated is None:
+            integrated, better_name = _linux_integrated_hint(location, vendor, vram)
+            name = better_name or name
+
+        software = vendor_id in (0x1414, 0x15AD, 0x1AF4, 0x1013) or _is_software_adapter(name)
+        adapters.append(GPUAdapter(
+            vendor=vendor, name=name, vram_total=vram, driver_version=driver_version,
+            integrated=integrated,
+            pci_vendor_id=vendor_id, pci_device_id=device_id,
+            software=software, source="sysfs"))
+
+    def rank(adapter):
+        return (0 if adapter.software else 1, 0 if adapter.integrated else 1,
+                adapter.vram_total)
+
+    adapters.sort(key=rank, reverse=True)
+    return tuple(adapters)
+
+
 @functools.lru_cache(maxsize=1)
 def gpu_adapters():
     """
@@ -584,12 +764,13 @@ def gpu_adapters():
     VRAM ahead of smaller. On this host that yields the RTX 4060 first and the Radeon 780M
     second, which is the order a user would name them.
 
-    Off Windows this returns an empty tuple rather than a fabricated entry. There is no
-    portable registry-equivalent, and inventing one adapter from an OpenGL string would be a
-    guess presented as a measurement.
+    On Linux the same facts come from sysfs (`/sys/bus/pci/devices`, display class 0x03),
+    which is the kernel's own registry-equivalent — see `_linux_gpu_adapters`. Anywhere else
+    this returns an empty tuple rather than a fabricated entry: inventing one adapter from an
+    OpenGL string would be a guess presented as a measurement.
     """
-    if not sys.platform.startswith("win") or winreg is None:
-        return ()
+    if winreg is None:
+        return _linux_gpu_adapters() if platforms.current().is_linux else ()
 
     adapters = []
     try:
@@ -716,74 +897,13 @@ def displays():
     them. When nothing can be measured the answer is `(0, 0, 0, 1.0)` and the caller renders
     "unknown".
 
-    `user32` is used directly rather than Qt because this is a `core` module and `core` is a
-    leaf — it may not import the UI, and the System screen is not the only caller.
+    Qt is not used because this is a `core` module and `core` is a leaf — it may not import the
+    UI. `kayra.platforms` sits BELOW core (stdlib only), so delegating to it keeps the rule.
     """
-    if not sys.platform.startswith("win"):
-        return 0, 0, 0, 1.0
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        count = int(user32.GetSystemMetrics(80))          # SM_CMONITORS
-
-        # `GetSystemMetrics(SM_CXSCREEN)` returns the DPI-*virtualised* size unless the process
-        # declared per-monitor awareness — measured here as 1440x900 on a 2880x1800 panel at
-        # 200%. That is not the display's resolution, it is what a scaled window thinks the
-        # desktop is, so reporting it would be exactly the fabricated-value failure this module
-        # exists to avoid. `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` reports the adapter's
-        # ACTUAL current mode and is unaffected by the calling process's awareness.
-        class _DEVMODE(ctypes.Structure):
-            _fields_ = [("dmDeviceName", wintypes.WCHAR * 32),
-                        ("dmSpecVersion", wintypes.WORD),
-                        ("dmDriverVersion", wintypes.WORD),
-                        ("dmSize", wintypes.WORD),
-                        ("dmDriverExtra", wintypes.WORD),
-                        ("dmFields", wintypes.DWORD),
-                        ("dmPositionX", ctypes.c_long),
-                        ("dmPositionY", ctypes.c_long),
-                        ("dmDisplayOrientation", wintypes.DWORD),
-                        ("dmDisplayFixedOutput", wintypes.DWORD),
-                        ("dmColor", ctypes.c_short),
-                        ("dmDuplex", ctypes.c_short),
-                        ("dmYResolution", ctypes.c_short),
-                        ("dmTTOption", ctypes.c_short),
-                        ("dmCollate", ctypes.c_short),
-                        ("dmFormName", wintypes.WCHAR * 32),
-                        ("dmLogPixels", wintypes.WORD),
-                        ("dmBitsPerPel", wintypes.DWORD),
-                        ("dmPelsWidth", wintypes.DWORD),
-                        ("dmPelsHeight", wintypes.DWORD),
-                        ("dmDisplayFlags", wintypes.DWORD),
-                        ("dmDisplayFrequency", wintypes.DWORD),
-                        ("dmICMMethod", wintypes.DWORD),
-                        ("dmICMIntent", wintypes.DWORD),
-                        ("dmMediaType", wintypes.DWORD),
-                        ("dmDitherType", wintypes.DWORD),
-                        ("dmReserved1", wintypes.DWORD),
-                        ("dmReserved2", wintypes.DWORD),
-                        ("dmPanningWidth", wintypes.DWORD),
-                        ("dmPanningHeight", wintypes.DWORD)]
-
-        mode = _DEVMODE()
-        mode.dmSize = ctypes.sizeof(_DEVMODE)
-        width = height = 0
-        if user32.EnumDisplaySettingsW(None, -1, ctypes.byref(mode)):   # ENUM_CURRENT_SETTINGS
-            width, height = int(mode.dmPelsWidth), int(mode.dmPelsHeight)
-        if not width or not height:
-            width = int(user32.GetSystemMetrics(0))
-            height = int(user32.GetSystemMetrics(1))
-
-        # The scale is then the ratio between the real mode and the virtualised metric, which
-        # is correct whether or not this process is DPI-aware — unlike `GetDpiForSystem`, which
-        # answers 96 for an unaware process on a 200% display.
-        scale = 1.0
-        virtual_width = int(user32.GetSystemMetrics(0))
-        if virtual_width and width:
-            scale = round(width / float(virtual_width), 2) or 1.0
-        return max(0, count), max(0, width), max(0, height), scale
-    except Exception:
-        return 0, 0, 0, 1.0
+    # The measurement itself is OS-specific and lives in the platform layer: Windows asks
+    # `EnumDisplaySettingsW` (immune to DPI virtualisation), Hyprland reports each monitor's
+    # current mode and scale over IPC, other Linux sessions fall back to /sys/class/drm.
+    return platforms.displays()
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

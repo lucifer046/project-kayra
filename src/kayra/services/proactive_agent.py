@@ -51,12 +51,10 @@ import random
 import datetime
 import threading
 
-# PyGetWindow handles Windows active-window introspection. Absent elsewhere; the agent then
-# runs with the context signal disabled rather than failing.
-try:
-    import pygetwindow as gw
-except Exception:
-    gw = None
+# The active-window signal comes from the platform layer: pygetwindow on Windows, Hyprland's
+# IPC socket on Omarchy/Hyprland. Where neither exists the agent runs with the context signal
+# disabled rather than failing.
+from kayra import platforms
 
 from kayra.utils import (print_info, print_warning, print_system, print_success,
                     speech_safe_text)
@@ -543,10 +541,10 @@ class ProactiveAgent:
                 print_warning(f"Proactive presence unavailable (non-fatal): {exc}")
                 self.presence = None
 
-        self.context_available = gw is not None
+        self.context_available, context_detail = platforms.active_window_support()
         if not self.context_available:
-            print_warning("pygetwindow unavailable — proactive context signal disabled "
-                          "(time and habit signals still work).")
+            print_warning(f"Active-window signal unavailable ({context_detail}) — proactive "
+                          "context signal disabled (time and habit signals still work).")
 
     # ──────────────────────────────────────────────────────────────────────
     #                              LIFECYCLE
@@ -726,10 +724,10 @@ class ProactiveAgent:
         if not self.context_available:
             return None
         try:
-            window = gw.getActiveWindow()
-            if window is None or not getattr(window, "title", None):
+            window = platforms.active_window()
+            if window is None or not window[0]:
                 return None
-            name = normalize_app_name(window.title)
+            name = normalize_app_name(window[0])
             if name.lower() in _IGNORED_APP_TITLES:
                 return None
             return name

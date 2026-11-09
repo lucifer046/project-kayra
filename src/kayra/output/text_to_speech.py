@@ -24,7 +24,6 @@ through the microphone.
 """
 
 import os
-import re
 import sys
 import time
 import queue
@@ -38,7 +37,7 @@ from kayra.output import tts_device
 from kayra.core.config import env_values
 from kayra.core.paths import model_path as model_file
 from kayra.core import logbus
-from kayra.utils import print_info, print_warning, print_error, print_system, print_success, console, now_ms, speech_safe_text
+from kayra.utils import print_info, print_warning, print_error, console, now_ms, speech_safe_text
 
 
 # Sample rate the Kokoro v1.0 checkpoints synthesize at.

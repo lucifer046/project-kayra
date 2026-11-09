@@ -360,6 +360,11 @@ class CentralizedLLMEngine:
             "cancel timer", "list timers",
             "click", "double click", "right click", "scroll up", "scroll down",
             "terminal", "run command",
+            # ── Round 3 (2026-11-10). Each is parsed by automation.common. ──
+            "browser", "meet", "email", "calendar", "message", "diagnose", "screen",
+            "scene", "plan", "trigger", "files", "git",
+            "click on", "click the", "click at", "double click on", "right click on",
+            "move mouse to",
         ]
         
         # Preamble instructions to restrict DMM responses to structured task labels.
@@ -453,6 +458,22 @@ class CentralizedLLMEngine:
                sleep. Keep the user's wording: 'mute the sound' -> 'system mute';
                'increase volume by 20%' -> 'system increase volume by 20%';
                'set brightness to 50' -> 'system brightness 50%'; 'lock my pc' -> 'system lock'.
+               Desktop-session controls are 'system' too, again in the user's words:
+               'go to workspace 3' -> 'system workspace 3'; 'move this window to workspace 2'
+               -> 'system move window to workspace 2'; 'turn on bluetooth' -> 'system
+               bluetooth on'; 'enable do not disturb' -> 'system do not disturb on';
+               'what song is this' -> 'system now playing'; 'make this window float' ->
+               'system toggle floating'; 'turn on night light' -> 'system night light on';
+               'open an empty workspace' -> 'system workspace empty'; 'is my laptop
+               charging' -> 'system battery status'; 'how hot is my cpu' -> 'system
+               temperature'; 'which wifi am I on' -> 'system wifi network'; 'switch to
+               performance mode' -> 'system power profile performance'; 'undo what you just
+               did' -> 'system undo last action' (a bare 'undo' stays the Ctrl+Z hotkey).
+            -> 'click on (visible text)' — click a button or link by the words on it:
+               "click the save button" -> 'click on save'; 'double click on (text)',
+               'right click on (text)', 'click at (x) (y)', 'move mouse to (text or place)'.
+               Settings screens are opened with 'open': "open control panel" -> 'open
+               control panel'; "open wifi settings" -> 'open wifi settings'.
             -> 'wifi on' / 'wifi off' — enable/disable Wi-Fi.
             -> System information about THIS machine (emit exactly): 'battery', 'ram', 'cpu',
                'disk', 'uptime', 'ip address'. These are about the user's own computer — a
@@ -493,6 +514,78 @@ class CentralizedLLMEngine:
             -> 'terminal (command)' — ONLY when the user explicitly asks to run a shell or
                terminal command: "run git status in the terminal" -> 'terminal git status'.
                A question about a command is conversation, not execution.
+
+            =========================================================
+            D3. INSIDE CHROME, DIAGNOSTICS, SCREEN, MODES, PLANS
+            =========================================================
+            NEVER put a comma INSIDE one of these commands — commas separate commands. Use
+            ' saying ' or ':' instead.
+            -> 'browser (what to do in the open web page or tabs)' — keep the user's words:
+               'list my tabs' -> 'browser list tabs'; 'go to my gmail tab' -> 'browser switch
+               to gmail tab'; 'close the youtube tab' -> 'browser close youtube tab'; 'click
+               the sign in button' -> 'browser click on sign in'; 'type hello in the search
+               box' -> 'browser type hello into search'; 'summarize this page' -> 'browser
+               summarize this page'; 'read this article' -> 'browser read this page'; 'open
+               the article I read yesterday about transformers' -> 'browser open the article
+               i read yesterday about transformers'; 'connect to chrome' -> 'browser set up'.
+               A click INSIDE the browser page is 'browser click on X'; a click anywhere else
+               on the screen is 'click on X'.
+            -> 'meet (action)' — Google Meet: 'join my meeting abc-defg-hij' -> 'meet join
+               abc-defg-hij'; 'mute me' -> 'meet mic off'; 'turn on my camera' -> 'meet camera
+               on'; 'share my entire screen' -> 'meet share entire screen'; 'stop sharing' ->
+               'meet stop sharing'; 'leave the call' -> 'meet leave'.
+            -> Gmail: 'email check' (how many unread); 'email open latest' ("open my latest
+               email", "open the newest mail"); 'email open first' / 'email open second' ("open
+               the first/second email"); 'email open from (name)'; 'email open unread';
+               'email read latest' ("read my latest email" = open it AND read it); 'email read
+               this' ("read this email"); 'email read inbox' ("read my emails"); 'email open
+               sent' / 'email open all mail' / 'email open starred' / 'email open drafts'
+               ("go to my sent mails"); 'email reply', 'email forward', 'email archive',
+               'email delete', 'email back'; 'email draft to (address) about (subject) saying
+               (text)', 'email send'. Opening an email is NEVER 'open (something)' — it is
+               'email open ...'.
+            -> ANY "click on X" / "scroll down" while the user is in the browser is fine as
+               plain 'click on X' / 'scroll down': Kayra sends it into the page itself.
+            -> 'calendar today', 'calendar tomorrow', 'calendar add (title) (day) at (time)'.
+            -> 'message (contact): (text)' — WhatsApp: "tell rahul I'm running late" ->
+               'message rahul: i'm running late'.
+            -> 'diagnose (what)' — "diagnose my computer", "why is my laptop slow", "why is the
+               fan so loud", "what's draining my battery", "why is the internet slow", "is my
+               computer secure", "what crashed" -> 'diagnose computer' / 'diagnose slow' /
+               'diagnose heat' / 'diagnose battery' / 'diagnose network' / 'diagnose security'
+               / 'diagnose crashes'. 'fix it' right after a diagnosis -> 'diagnose fix'.
+            -> 'screen (question)' — about what is VISIBLE: "what's on my screen", "explain
+               this error", "read this to me", "copy the text on screen", "record my screen",
+               "stop recording" -> 'screen describe' / 'screen explain this error' / 'screen
+               read' / 'screen copy text' / 'screen record' / 'screen stop recording'.
+            -> 'scene (name)' — modes: "work mode", "start movie mode", "save this layout as
+               study", "what modes do I have" -> 'scene work' / 'scene movie' / 'scene save
+               study' / 'scene list'.
+            -> 'plan (goal)' — a goal needing several different steps that no single command
+               covers: "get me ready for my presentation" -> 'plan get me ready for my
+               presentation'.
+            -> 'trigger (when ...) (what to do)' — automations: "when the download finishes
+               shut down the computer" -> 'trigger when the download finishes shut down the
+               computer'; "every day at 9 start work mode"; "list my automations" -> 'trigger
+               list'; "cancel the download automation" -> 'trigger cancel download'.
+            -> 'files (request)' — "organize my downloads", "find the pdf I downloaded
+               yesterday", "what's taking up space", "what did I work on today", "summarize
+               resume.pdf", "convert report.docx to pdf", "back up my documents" -> 'files
+               organize downloads' / 'files find the pdf i downloaded yesterday' / 'files space'
+               / 'files recent today' / 'files summarize resume.pdf' / ...
+            -> 'git status', 'git branch', 'git commit (message)'.
+            -> More 'system' wording kept verbatim: 'system switch to headphones', 'system
+               mute my mic', 'system connect my earbuds', 'system earbuds battery', 'system
+               connect to wifi (name)', 'system check for updates', 'system update my system',
+               'system install (app)', 'system uninstall (app)', 'system what's using my cpu',
+               'system close the app using the most memory', 'system set refresh rate to 60',
+               'system theme catppuccin', 'system next wallpaper', 'system read my
+               notifications', 'system morning briefing' ("brief me", "good morning, what's
+               my day"), 'system what did you just do', 'system what's open', 'system where is
+               chrome', 'system chrome on the left and vs code on the right', 'system move all
+               browsers to workspace 2', 'system remember my setup', 'system restore my last
+               session', 'system set a sleep timer for 30 minutes', 'system run my tests',
+               'system docker status'.
 
             =========================================================
             E. MULTI-INTENT, EXIT AND FALLBACK
@@ -542,7 +635,7 @@ class CentralizedLLMEngine:
             {"role": "User", "message": "run a deep research query on solid state hydrogen storage vectors"},
             {"role": "Chatbot", "message": "deep research solid state hydrogen storage vectors"},
             # -- Exit (placed early so it is NOT the freshest pattern) --
-            {"role": "User", "message": "bye jarvis."},
+            {"role": "User", "message": "bye kayra."},
             {"role": "Chatbot", "message": "exit"},
             {"role": "User", "message": "Exit."},
             {"role": "Chatbot", "message": "exit"},
