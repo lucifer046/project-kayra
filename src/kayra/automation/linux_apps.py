@@ -368,3 +368,67 @@ def resolve(name):
 
 def installed(target) -> bool:
     return bool(target and (target.entry or target.tui or target.canonical == "terminal"))
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                     WEB APPS (Omarchy and friends)                     │
+# └────────────────────────────────────────────────────────────────────────┘
+# An Omarchy web app is a desktop entry whose Exec is `omarchy-launch-webapp <url>`; it runs as
+# a Chrome `--app` window whose class is `chrome-<host><path>__-<profile>` (for example
+# `chrome-web.whatsapp.com__-Default`). Kayra treats such a window as a BROWSER surface (the
+# Kayra Bridge extension runs inside it) and prefers the web app when the user names its site.
+
+_WEBAPP_LAUNCHERS = ("omarchy-launch-webapp", "omarchy-webapp-handler")
+_APP_WINDOW_PREFIXES = ("chrome-", "brave-", "msedge-", "chromium-", "vivaldi-")
+# Hosts that serve several unrelated products: the first path segment must match too, so the
+# Google Maps web app is never what "open google" launches.
+_SHARED_HOSTS = frozenset({"google.com", "docs.google.com", "music.youtube.com"})
+
+
+def _host_path(url):
+    raw = str(url or "").strip().strip('"').lower()
+    raw = re.sub(r"^[a-z]+://", "", raw)
+    host, _, path = raw.partition("/")
+    host = host[4:] if host.startswith("www.") else host
+    return host, path.split("?")[0].strip("/").split("/")[0]
+
+
+def webapp_url(entry):
+    """The URL a web-app desktop entry opens, or None for an ordinary application."""
+    exec_line = getattr(entry, "exec", "") or ""
+    if not any(launcher in exec_line for launcher in _WEBAPP_LAUNCHERS):
+        return None
+    m = re.search(r"https?://[^\s\"']+", exec_line)
+    return m.group(0) if m else None
+
+
+def webapp_for_url(url, entries=None):
+    """The installed web app that serves `url`, or None. Exact host (and path when shared)."""
+    host, segment = _host_path(url)
+    if not host:
+        return None
+    for entry in (entries if entries is not None else INDEX.entries()):
+        target = webapp_url(entry)
+        if not target:
+            continue
+        app_host, app_segment = _host_path(target)
+        if app_host != host:
+            continue
+        if host in _SHARED_HOSTS and app_segment != segment:
+            continue
+        return entry
+    return None
+
+
+def is_app_window_class(cls):
+    """True for a Chromium `--app` window class such as `chrome-web.whatsapp.com__-Default`."""
+    low = str(cls or "").lower()
+    return low.startswith(_APP_WINDOW_PREFIXES) and "__" in low
+
+
+def site_of_window_class(cls):
+    """'chrome-web.whatsapp.com__-Default' -> 'web.whatsapp.com'. None for anything else."""
+    if not is_app_window_class(cls):
+        return None
+    body = str(cls).split("-", 1)[1].split("__", 1)[0]
+    return body.split("_", 1)[0] or None

@@ -132,8 +132,28 @@ async function run(cmd, args) {
       return {closed: tabs.length, titles: tabs.map((t) => t.title).slice(0, 5)};
     }
     case "tabs.open": {
-      const tab = await chrome.tabs.create({url: args.url, active: args.active !== false});
-      if (args.active !== false) await chrome.windows.update(tab.windowId, {focused: true});
+      // where: "tab" (default) | "window" | "incognito" | "next" (right of the active tab).
+      const where = args.where || "tab";
+      let tab = null;
+      if (where === "window" || where === "incognito") {
+        const win = await chrome.windows.create({url: args.url, focused: true, incognito: where === "incognito"});
+        tab = win.tabs && win.tabs[0];
+        if (!tab) return {id: null, windowId: win.id, url: args.url, incognito: where === "incognito"};
+      } else {
+        const opts = {url: args.url, active: args.active !== false};
+        if (where === "next") {
+          const cur = await activeTab();
+          Object.assign(opts, {index: cur.index + 1, windowId: cur.windowId, openerTabId: cur.id});
+        } else {
+          // Never into a web-app (--app) window: a tab belongs in a normal browser window.
+          try {
+            const normal = await chrome.windows.getLastFocused({windowTypes: ["normal"]});
+            if (normal && normal.id !== undefined) opts.windowId = normal.id;
+          } catch (e) { /* no normal window: Chrome makes one */ }
+        }
+        tab = await chrome.tabs.create(opts);
+        if (args.active !== false) await chrome.windows.update(tab.windowId, {focused: true});
+      }
       if (args.wait) await waitForLoad(tab.id, args.timeoutMs);
       return tabInfo(await chrome.tabs.get(tab.id));
     }
@@ -159,6 +179,24 @@ async function run(cmd, args) {
     case "page.text": return inPage(await targetTab(args), pageText, [args.max || 15000]);
     case "page.click": return inPage(await targetTab(args), pageClick, [args.text, args.nth || 1]);
     case "gmail.open": return inPage(await targetTab(args), gmailOpen, [args.which || "first", args.nth || 1, args.query || ""]);
+    case "page.waitFor": {
+      // Readiness instead of fixed sleeps: every condition given must hold.
+      const tab = await targetTab(args);
+      const deadline = Date.now() + (args.timeoutMs || 8000);
+      while (Date.now() < deadline) {
+        const t = await chrome.tabs.get(tab.id);
+        let ok = true;
+        if (args.urlIncludes && !(t.url || "").includes(args.urlIncludes)) ok = false;
+        if (ok && args.titleIncludes && !(t.title || "").includes(args.titleIncludes)) ok = false;
+        if (ok && (args.text || args.selector)) {
+          try { ok = !!(await inPage(t, pageHas, [args.text || "", args.selector || ""])); }
+          catch (e) { ok = false; }      // the page is still navigating
+        }
+        if (ok) return {ok: true, title: t.title, url: t.url};
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return {ok: false, timedOut: true};
+    }
     case "runtime.reload": setTimeout(() => chrome.runtime.reload(), 200); return {reloading: true};
     case "page.type": return inPage(await targetTab(args), pageType, [args.field || "", args.text || "", !!args.submit, !!args.clear]);
     case "page.scroll": return inPage(await targetTab(args), pageScroll, [args.direction || "down", args.until || ""]);
@@ -180,6 +218,12 @@ async function run(cmd, args) {
 }
 
 // ── page functions (serialised into the page; must be self-contained) ───
+
+function pageHas(text, selector) {
+  if (selector && !document.querySelector(selector)) return false;
+  if (text && !(document.body && (document.body.innerText || "").toLowerCase().includes(String(text).toLowerCase()))) return false;
+  return true;
+}
 
 function pageText(max) {
   const main = document.querySelector("main,[role=main]") || document.body;

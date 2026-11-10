@@ -127,6 +127,10 @@ def main():
         names = [c["name"] for c in call("pageControls", 20)]
         check("controls are listed by name", "Share screen" in names and "Save" in names, names)
         check("page text has the title", call("pageText", 500)["title"])
+        check("page.waitFor's probe: text present", call("pageHas", "pricing section", ""))
+        check("page.waitFor's probe: text absent", not call("pageHas", "no such words here", ""))
+        check("page.waitFor's probe: selector", call("pageHas", "", "input[placeholder]")
+              and not call("pageHas", "", "#nope"))
 
         d.get("data:text/html;base64," + base64.b64encode(GMAIL.encode()).decode())
         check.section("[4] Gmail, as it really is")

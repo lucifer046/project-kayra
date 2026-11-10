@@ -853,6 +853,56 @@ def _strip(text, *words):
     return out.strip(" .?!")
 
 
+# Where a page should open (round 5, A3). Matched at the END of the target only, so a site
+# whose name contains one of these words is never cut. Order matters: longest first.
+_WHERE_PHRASES = (
+    (r"(?:in|on|into) (?:this|that|the|my) (?:same |current |existing |open )?tab", "current"),
+    (r"(?:in|on) (?:the )?(?:same|current) (?:tab|page)", "current"),
+    (r"(?:right )?here|in place|instead", "current"),
+    (r"(?:in|on) (?:a |another |one more )?(?:new|separate|different|fresh) tab", "tab"),
+    (r"(?:in|on) (?:a |another )?(?:new|separate|different|fresh) (?:browser )?window", "window"),
+    (r"(?:in|on) (?:an? )?(?:incognito|private|secret)(?: mode| window| tab)?|incognito|privately",
+     "incognito"),
+    (r"(?:next to|beside|after) (?:this|the current|my current) tab", "next"),
+    (r"(?:in|on|using|with) (?:the |my )?(?:browser|chrome|google chrome|web)", "browser"),
+)
+
+
+def _split_where(target):
+    """'google sheets in that tab' -> ('google sheets', 'current'). ('x', None) when unsaid."""
+    text = str(target or "").strip()
+    for pattern, where in _WHERE_PHRASES:
+        m = re.search(rf"\s*,?\s*\b(?:{pattern})\s*[.?!]*$", text, re.I)
+        if m and m.start() > 0:
+            return text[:m.start()].strip(" ,"), where
+    return text, None
+
+
+def merge_tab_steps(actions):
+    """
+    "open new tab and open Google Sheets in that tab" arrives as TWO tokens, `new tab` and
+    `open google sheets in that tab`. Run literally they race: Ctrl+T, then a navigation that
+    lands in whichever tab won. One utterance, one flow (A4): the `new tab` is dropped and the
+    open that follows it is told to use a new tab. An `app.open` after `new tab` is a web open
+    — the user said tab.
+    """
+    out = []
+    for action in actions:
+        previous = out[-1] if out else None
+        if previous is not None and previous.domain == "browser" and previous.action == "new_tab" \
+                and ((action.domain == "browser" and action.action in
+                      ("open_url", "search_web", "search_youtube"))
+                     or (action.domain == "app" and action.action == "open")):
+            if action.parameters.get("where") not in ("window", "incognito"):
+                action.parameters["where"] = "tab"
+            if action.domain == "app":
+                action.parameters["web"] = True
+            out[-1] = action
+            continue
+        out.append(action)
+    return out
+
+
 def _web_action(kind, payload, raw):
     """'browser …', 'meet …', 'email …', 'calendar …', 'message …' -> a structured action."""
     text = (payload or "").strip()
@@ -918,6 +968,13 @@ def _web_action(kind, payload, raw):
         m = re.match(r"(?:open )?(?:my )?bookmark(?:ed)? (.+)$", low)
         if m:
             return Action("browser", "bookmark_open", target=_strip(m.group(1), "for", "called"), raw=raw)
+        m = re.match(r"(?:open|go to|visit|load|navigate to)\s+(.+)$", text, re.I)
+        if m and not re.match(r"(?:the )?(?:page|article|site|tab)? ?(?:i|that i) (?:read|visited|saw|opened)",
+                              m.group(1), re.I):
+            return _build_action("app", "open", m.group(1), raw, None)
+        if low in ("update", "update extension", "update the extension", "reload extension",
+                   "reload the extension", "update yourself", "reload the bridge"):
+            return Action("browser", "bridge_update", target="bridge", raw=raw)
         if low in ("set up", "setup", "connect", "set up the bridge", "install"):
             return Action("browser", "bridge_setup", target="bridge", raw=raw)
         if low in ("status", "bridge status", "are you connected"):
@@ -1220,18 +1277,27 @@ def _build_action(domain, action, payload, raw, context):
         return _web_action("email", "open " + target, raw)
 
     if domain == "app" and action == "open":
+        target, where = _split_where(target)
+        if where:
+            parameters["where"] = where
+        if re.search(r"\b(?:i|that i|i was) (?:read|visited|saw|opened|reading|watching|watched)\b",
+                     target or "", re.I):
+            # "open the article I read yesterday" is a HISTORY lookup, not an app or a site.
+            return _web_action("browser", target, raw)
         # TYPE THE TARGET HERE, not three layers down. "open X" is an application launch only
         # when X is an application; when X is an address or a web service it is a browser
         # navigation, and the two must not share an execution path. Two dictionary lookups,
         # measured in microseconds — there is no reason to defer this decision.
         if targets.is_explicit_url(target):
             return Action("browser", "open_url", target=target,
-                          parameters={"url": targets.normalize_url(target)}, raw=raw)
-        if not targets.canonical_app(target):
+                          parameters={"url": targets.normalize_url(target), **parameters},
+                          raw=raw)
+        if not targets.canonical_app(target) or where:
             url = targets.website_url(target)
             if url:
                 return Action("browser", "open_url", target=target,
-                              parameters={"url": url, "site": targets.canonical_website(target)},
+                              parameters={"url": url, "site": targets.canonical_website(target),
+                                          **parameters},
                               confidence=confidence, raw=raw)
 
     if domain == "app" and action == "close_all":
@@ -1248,6 +1314,11 @@ def _build_action(domain, action, payload, raw, context):
         # the safest reading and what a person actually means standing at their desk.
         if confidence < 1.0 and (payload or "").lower().strip(" .?!") in targets.CURRENT_TARGET_WORDS:
             return Action("window", "close", target="current", raw=raw)
+
+    if domain == "browser" and action in ("search_web", "search_youtube"):
+        target, where = _split_where(target)
+        if where:
+            parameters["where"] = where
 
     if domain == "file" and action == "open_file":
         # "open file explorer" is an APPLICATION, not a file called "explorer". The prefix
@@ -1422,7 +1493,7 @@ class AutomationRuntime:
         spoken = []
         outcomes = {"ok": 0, "failed": 0, "tokens": []}
         try:
-            for group in plan_actions(actions):
+            for group in plan_actions(merge_tab_steps(actions)):
                 if len(group) == 1:
                     results = [await asyncio.to_thread(self.execute_action, group[0])]
                 else:

@@ -170,9 +170,14 @@ class Rig:
         # deliberately window-less launch from spinning for the real 8 seconds.
         linux.LAUNCH_TIMEOUT_S, linux.CLOSE_TIMEOUT_S = 0.05, 0.05
         linux.CONFIRMATIONS.cancel()
+        from kayra.automation import web_macros
+        # "open <unknown>" may look the name up on the web; never from a unit test.
+        self._top, web_macros.TOP_RESULTS = web_macros.TOP_RESULTS, (lambda q: [])
         return self
 
     def __exit__(self, *exc):
+        from kayra.automation import web_macros
+        web_macros.TOP_RESULTS = self._top
         (linux.HYPR, linux.RUNNER, linux.SLEEP, linux.LAUNCH_TIMEOUT_S,
          linux.CLOSE_TIMEOUT_S) = self._saved
         linux.CONFIRMATIONS.cancel()
@@ -362,10 +367,15 @@ def section_applications():
             check("the focus targeted that window's address",
                   any('address:0xc1' in d for d in hypr.dispatched))
 
-            result = rig.do("open spotify")
+            result = rig.do("open obsidian")
             check("a missing app is NOT_FOUND, said out loud",
                   result.status == Status.NOT_FOUND and "installed" in result.message,
                   result.message)
+            runner.spawned.clear()
+            result = rig.do("open spotify")
+            check("a missing app with a web version opens it and says so (as on Windows)",
+                  result.ok and "isn't installed" in result.message and
+                  any("open.spotify.com" in " ".join(a) for a in runner.spawned), result.message)
             result = rig.do("open github")
             check("'open github' opens the website (never Git GUI)",
                   any(a[:1] == ["xdg-open"] and "github.com" in a[1] for a in runner.spawned),

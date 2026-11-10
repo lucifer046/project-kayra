@@ -292,7 +292,7 @@ Allowed without asking: read-only queries — `systemctl status`, `df`, `free`, 
 
 ## Tests
 
-`tests/test_assistant_automation.py` — 291 checks, ~1 s: every new phrasing, every new confirmation (and that
+`tests/test_assistant_automation.py` — 326 checks, ~1 s: every new phrasing, every new confirmation (and that
 nothing runs before the yes), the Chrome bridge over real sockets, every web flow against a
 fake extension, diagnostics with fake probes and models, screen AI, scenes/plans/triggers
 (including the one-minute shutdown grace), every system control at the argv level, files in a
@@ -326,6 +326,37 @@ And the ones that depend on something outside Kayra:
 | Windows | The new families are Linux-only for now; on Windows they answer "I don't know how to do that yet." |
 
 ## Changelog
+
+### 2026-11-10 — round 5, part 1: open anything, anywhere, the way you say it
+
+Plan: `docs/roadmap/BROWSER_CONTROL_PLAN.md` (items A1–A6, G3, H0.1).
+
+**What was wrong:** "open new tab and open Google Sheet in that tab" answered *"I couldn't find
+an app called google sheet"*: 23 known sites, exact aliases only, no web fallback, no "this
+tab", and the two tokens raced.
+
+**What changed**
+- `automation/sites.py` (new): ~190 sites with aliases, title fragments, a category and a
+  search template. `targets.WEBSITE_REGISTRY` is a view over it. Lookups now accept grammar
+  (singular/plural, "the … website/app", "my …") but never misspellings; folder names
+  (documents, photos) are never sites.
+- `automation/common.py`: `_split_where` ("in this tab", "in a new window", "in incognito",
+  "next to this tab", "in the browser"); `merge_tab_steps` turns `new tab` + `open X` into one
+  open; `browser open …`, `browser update`; "open the article I read …" goes to history.
+- `automation/linux.py`: "open X" → installed app → Omarchy web app → known site → top web
+  result (DuckDuckGo text API, 6 s cap) → web search, said honestly; a known app that is not
+  installed opens its web version (as on Windows); web-app windows (`chrome-…__-Default`) are
+  browser surfaces, so clicks there go into the page; incognito/new window without the
+  extension starts Chrome with `--incognito` / `--new-window`.
+- `automation/linux_apps.py`: `webapp_for_url`, `webapp_url`, `is_app_window_class`,
+  `site_of_window_class`.
+- `automation/web_macros.py`: `open_in`, `open_site`, `web_worthy`, `bridge_update`,
+  `_outdated` / self-update, `_wait_for`.
+- Extension 1.2.0: `tabs.open {where: tab|window|incognito|next}` (never into an `--app`
+  window), `page.waitFor {text|selector|urlIncludes|titleIncludes, timeoutMs}`.
+- `intelligence/llm_engine.py`: preamble lines for sites with a location (history untouched).
+- Tests: `tests/test_browser_control.py` (new, 107), `test_browser_extension.py` +3,
+  `test_linux_automation.py` "open spotify" now expects the web player.
 
 ### 2026-11-10 — round 4: browser control that actually works in Gmail
 

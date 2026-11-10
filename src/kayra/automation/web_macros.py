@@ -40,9 +40,11 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 1, 0)
+REQUIRED_VERSION = (1, 2, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
+RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
+                 "to reconnect, then ask me again.")
 
 
 def _version():
@@ -58,8 +60,48 @@ def _call(cmd, timeout=10.0, **args):
         return BRIDGE.call(cmd, timeout=timeout, **args)
     except browser_bridge.BridgeError as e:
         if "unknown command" in str(e):
-            raise browser_bridge.BridgeError(UPDATE_HINT)
+            raise browser_bridge.BridgeError(_self_update() or UPDATE_HINT)
         raise
+
+
+def _self_update():
+    """
+    Since 1.1.0 the extension accepts `runtime.reload`, which makes Chrome re-read the
+    unpacked extension from this repository. So an out-of-date extension updates ITSELF and
+    the user never opens chrome://extensions. Returns the sentence to say, or None when the
+    extension is too old to reload itself (1.0.x).
+    """
+    if _version() < (1, 1, 0):
+        return None
+    try:
+        BRIDGE.call("runtime.reload", timeout=3.0)
+    except Exception:
+        return None
+    return RELOADED_HINT
+
+
+def _outdated(minimum=REQUIRED_VERSION):
+    """An ActionResult when the connected extension is older than `minimum`, else None."""
+    if _version() >= tuple(minimum):
+        return None
+    return ActionResult.failure(_self_update() or UPDATE_HINT)
+
+
+def _wait_for(timeout_ms=8000, **condition):
+    """
+    Waits until the active tab shows `text`, matches `selector`, has `urlIncludes` in its URL
+    or `titleIncludes` in its title (G3). Returns True when it did. Older extensions without
+    `page.waitFor` get the old fixed pause instead, so nothing breaks while one updates.
+    """
+    if _version() < (1, 2, 0):
+        SLEEP(min(timeout_ms, 1500) / 1000.0)
+        return True
+    try:
+        result = _call("page.waitFor", timeout=timeout_ms / 1000.0 + 2.0, timeoutMs=timeout_ms,
+                       **condition) or {}
+    except browser_bridge.BridgeError:
+        return False
+    return bool(result.get("ok"))
 
 
 def _need_bridge():
@@ -97,6 +139,19 @@ def bridge_setup():
         "I've opened Chrome's extensions page and the extension folder, and copied its path. "
         "Turn on Developer mode at the top right, click Load unpacked, and choose that "
         "folder. I'll connect on my own within half a minute.", folder=folder)
+
+
+def bridge_update():
+    if not BRIDGE.connected():
+        return ActionResult.not_found(SETUP_HINT)
+    if _version() < (1, 1, 0):
+        return ActionResult.failure(UPDATE_HINT)
+    try:
+        BRIDGE.call("runtime.reload", timeout=3.0)
+    except Exception:
+        return ActionResult.failure(UPDATE_HINT)
+    return ActionResult.success("Updating the Kayra Bridge extension. It reconnects on its own "
+                                "in a few seconds.")
 
 
 def bridge_status():
@@ -297,6 +352,152 @@ def bookmark_open(query):
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
+# │                    OPENING ANYTHING (round 5, A1–A6)                   │
+# └────────────────────────────────────────────────────────────────────────┘
+
+_WHERE_SAID = {"current": "in this tab", "tab": "in a new tab", "window": "in a new window",
+               "incognito": "in an incognito window", "next": "next to this tab"}
+
+
+def display_name(site):
+    """'sheets' -> 'Google Sheets', 'youtube' -> 'YouTube'. What Kayra SAYS it opened."""
+    from kayra.automation import sites
+    return sites.display_name(site)
+
+
+def _host(url):
+    host = re.sub(r"^[a-z]+://", "", str(url or "").lower()).split("/")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def open_in(url, where=None, name=None):
+    """
+    Opens `url` where the user said (A3): None/'tab' a new tab, 'current' this tab, 'window',
+    'incognito', 'next' (beside this tab). Through the extension when it is connected — the
+    user's own Chrome, and the tab is then known for "search it" / "close it" — otherwise by
+    `xdg-open` or a browser argv, saying honestly what could not be honoured.
+    """
+    if not url:
+        return ActionResult.failure("Open what?")
+    label = name if name else _host(url)
+    said = _WHERE_SAID.get(where, "")
+    if not BRIDGE.connected():
+        return _open_without_bridge(url, where, label)
+    if where in ("window", "incognito", "next"):
+        stale = _outdated((1, 2, 0))
+        if stale:
+            return stale
+    try:
+        if where == "current":
+            tab = _call("tabs.navigate", url=url, wait=False) or {}
+        else:
+            tab = _call("tabs.open", url=url, where=where or "tab", wait=False) or {}
+    except browser_bridge.BridgeError as e:
+        if where == "incognito":
+            return _open_without_bridge(url, where, label)
+        return ActionResult.failure(f"I couldn't open {label}: {e}")
+    _focus_chrome()
+    spoken = f"Opened {label} {said}." if where in _WHERE_SAID and where != "tab" else \
+        f"Opening {label}."
+    return ActionResult.success(spoken, url=url, tab=tab.get("id"))
+
+
+def _open_without_bridge(url, where, label):
+    L = _L()
+    if where in ("window", "incognito"):
+        binary = L._browser_binary()
+        if binary:
+            result = L.open_browser_window(binary, where, url)
+            if result.ok:
+                result.message = f"Opened {label} {_WHERE_SAID[where]}."
+            return result
+    result = L.open_url(url)
+    if not result.ok:
+        return result
+    if where in ("current", "next"):
+        result.message = (f"Opened {label} in a new tab. To use this tab I need the Kayra Bridge "
+                          "extension; say \"browser set up\".")
+    else:
+        result.message = f"Opening {label}."
+    return result
+
+
+# Words that say the thing is NOT a website: "open the PR group chat", "open my resume file".
+_NOT_WEB = re.compile(r"\b(chat|chats|group|conversation|folder|file|files|email|mail|message|"
+                      r"messages|tab|tabs|window|workspace|terminal|setting|settings|"
+                      r"document|sheet|spreadsheet|pdf)\s*$", re.I)
+
+
+def web_worthy(name):
+    """May an unknown 'open X' fall back to the web? Short names only, never paths or chats."""
+    text = " ".join(str(name or "").split())
+    return bool(text) and len(text.split()) <= 5 and "/" not in text and "~" not in text \
+        and not _NOT_WEB.search(text) and not re.match(r"(this|that|it)$", text, re.I)
+
+
+def _ddgs_top(query, limit=5):
+    """Top web results from DuckDuckGo's text API (the same library real-time search uses)."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return []
+    import threading
+    box = []
+
+    def work():
+        try:
+            with DDGS() as client:
+                box.extend(client.text(query, max_results=limit) or [])
+        except Exception:
+            pass
+    worker = threading.Thread(target=work, name="kayra-web-lookup", daemon=True)
+    worker.start()
+    worker.join(6.0)                       # a lookup never holds the turn longer than this
+    return [{"url": r.get("href") or r.get("url"), "title": r.get("title", "")}
+            for r in list(box) if (r.get("href") or r.get("url"))]
+
+
+TOP_RESULTS = _ddgs_top                    # the test suite replaces this; no network in tests
+
+
+def best_result(name, results):
+    """The result whose HOST carries the spoken name ('swiggy' -> swiggy.com), else the first."""
+    squashed = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    for result in results:
+        if squashed and squashed in re.sub(r"[^a-z0-9]", "", _host(result.get("url"))):
+            return result
+    return results[0] if results else None
+
+
+def open_site(name, where=None):
+    """
+    "open X" for something that is not an installed app (A1): a known website, else the top
+    web result for X, else a web search. Never "I couldn't find an app called X" for a site.
+    """
+    from kayra.automation import targets
+    url = targets.website_url(name)
+    if url:
+        return open_in(url, where, display_name(targets.canonical_website(name)))
+    if targets.is_explicit_url(name):
+        return open_in(targets.normalize_url(name), where, _host(name))
+    hit = best_result(name, TOP_RESULTS(name) or [])
+    if hit:
+        result = open_in(hit["url"], where, _host(hit["url"]))
+        if result.ok:
+            result.message = (f"I don't have an app called {name}, so I opened "
+                              f"{_host(hit['url'])}, the top web result.")
+        return result
+    result = open_in(f"https://www.google.com/search?q={quote_plus(name)}", where, "")
+    if result.ok:
+        result.message = (f"I couldn't find an app or a site called {name}, so I searched the "
+                          "web for it.")
+    return result
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
 # │                               GMAIL                                    │
 # └────────────────────────────────────────────────────────────────────────┘
 
@@ -315,7 +516,7 @@ def email_check():
     if not BRIDGE.connected():
         return _L().open_url(GMAIL)
     tab = _ensure_tab("mail.google.com", GMAIL)
-    SLEEP(1.5)
+    _wait_for(titleIncludes="Inbox", timeout_ms=6000)
     title = (_call("tabs.active") or tab or {}).get("title", "")
     match = re.search(r"\((\d[\d,]*)\)", title)
     if match:

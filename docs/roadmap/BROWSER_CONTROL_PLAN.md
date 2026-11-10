@@ -1,7 +1,8 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: PLANNED, NOT STARTED.** Written 2026-11-10 at the user's request so a later session
-> can implement it when told "implement the browser control plan" (or a phase of it).
+> **Status: IN PROGRESS — Part 1 of 7 done (2026-11-10).** See §10 for the parts and what is
+> next. Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
 > `docs/platforms/LINUX_AUTOMATION.md` + `docs/platforms/CHROME_BRIDGE.md` as you go.
@@ -430,19 +431,48 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 | H3 — Other messaging/social apps | H3 |
 | H4 — Cross-app layer | H4 |
 
-- [ ] A1 [ ] A2 [ ] A3 [ ] A4 [ ] A5 [ ] A6
+- [x] A1 [x] A2 [x] A3 [x] A4 [x] A5 [x] A6  *(A6: GitHub "my repos" has no user-free URL — not added)*
 - [ ] B1 [ ] B2 [ ] B3 [ ] B4 [ ] B5 [ ] B6 [ ] B7 [ ] B8
 - [ ] C1 [ ] C2 [ ] C3 [ ] C4 [ ] C5 [ ] C6 [ ] C7 [ ] C8 [ ] C9 [ ] C10 [ ] C11
 - [ ] D1 [ ] D2 [ ] D3 [ ] D4 [ ] D5
 - [ ] E1 [ ] E2 [ ] E3 [ ] E4 [ ] E5 [ ] E6 [ ] E7 [ ] E8
 - [ ] F1 [ ] F2 [ ] F3 [ ] F4 [ ] F5 [ ] F6
-- [ ] G1 [ ] G2 [ ] G3 [ ] G4 [ ] G5 [ ] G6
-- [ ] H0.1 [ ] H0.2 [ ] H0.3 [ ] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
+- [ ] G1 [ ] G2 [x] G3 [ ] G4 [ ] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
+- [x] H0.1 [ ] H0.2 [ ] H0.3 [ ] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
 
 ## 9. Known state at the time of writing
 
-- Extension in the repo is **1.1.0**; the user's Chrome was still running **1.0.0** (needs one
-  reload on chrome://extensions — after that, use `runtime.reload` for updates).
-- Unit tier: 4398 checks green; extension integration suite: 24 checks green.
+- Rounds 1–4 were committed in `1261170` (feature/linux-desktop-automation).
+- Extension in the repo is **1.2.0** (Part 1). From 1.1.0 on it updates itself: when Kayra
+  needs a newer command it sends `runtime.reload` and says so; only a 1.0.x extension still
+  needs the manual reload on chrome://extensions.
+- Unit tier after Part 1: 4506 checks green (new suite `tests/test_browser_control.py`, 107);
+  extension integration suite: 27 checks green.
 - Screen (non-browser) clicking needs `/dev/uinput` and is deliberately deferred by the user.
-- Nothing from rounds 1–4 has been committed yet.
+
+## 10. Implementation parts (one per session)
+
+The user asked for this to be built in parts so a quota limit never leaves half a feature.
+Each part ends green on `tests/run_all.py` + `tests/test_browser_extension.py`, with the
+checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRIDGE.md.
+
+| Part | Items | Status |
+|---|---|---|
+| 1 | Tuning pass; A1–A6, G3 (`page.waitFor`), H0.1, `browser update` + self-updating extension | **done 2026-11-10** |
+| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | next |
+| 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | |
+| 4 | E1–E8 Google Workspace (needs D3 answered) | |
+| 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | |
+| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
+| 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Tuning applied in Part 1** (found while reading rounds 1–4):
+- `REQUIRED_VERSION` was declared but never checked, so an old extension silently ignored new
+  arguments. It is now checked before any feature that needs it, and an out-of-date 1.1.0+
+  extension is reloaded automatically instead of the user being sent to chrome://extensions.
+- `open_url` answered "Done." for a navigation (against §2's honest-outcome rule): it now says
+  what it opened.
+- A curated app that is not installed (Spotify) said "not installed" on Linux but opened the
+  web player on Windows; Linux now does what Windows (and CLAUDE.md) describe.
+- "open the article I read yesterday" reached the app launcher; it is a history lookup now.
+- This section's stale "nothing committed yet" and the extension version.

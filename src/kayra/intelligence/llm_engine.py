@@ -431,6 +431,12 @@ class CentralizedLLMEngine:
             -> 'close window'           — close the CURRENT/THIS window (no app named).
             -> 'close tab'              — close the CURRENT/THIS browser tab.
             -> 'new tab'                — open a new browser tab (NOT 'open').
+            -> Websites by name are 'open (site)' with the user's own words, including WHERE:
+               "open google sheet" -> 'open google sheet'; "open notion in this tab" ->
+               'open notion in this tab'; "open youtube in incognito" -> 'open youtube in
+               incognito'; "open new tab and open google sheets in that tab" -> 'new tab,
+               open google sheets in that tab'; "I need to check Google Sheets" -> 'open
+               google sheets'; "update the chrome extension" -> 'browser update'.
             The distinction is what the user named: an application -> 'close (app)';
             "this window" -> 'close window'; "this tab" -> 'close tab'.
 

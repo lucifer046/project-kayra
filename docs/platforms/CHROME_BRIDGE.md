@@ -30,6 +30,11 @@ anywhere else; one is never needed for an unpacked extension.
 
 | Say | What happens |
 |---|---|
+| "open google sheet", "open notion", "open swiggy" | the site (an installed app or Omarchy web app wins; an unknown name opens the top web result) |
+| "open google sheets in this tab / in a new window / in incognito / next to this tab" | exactly there |
+| "open new tab and open Google Sheets in that tab" | one new tab with Sheets — no race |
+| "open my sheets / my docs / watch later / my orders" | your own lists |
+| "browser update" | reloads the extension from this folder |
 | "list my tabs" | titles of every open tab |
 | "go to my Gmail tab", "switch to the YouTube tab" | activates it and brings Chrome forward |
 | "close the YouTube tab" | closes it; two YouTube tabs → asks which (or "close all YouTube tabs") |
@@ -87,10 +92,12 @@ the right one.
 
 ## Updating the extension
 
-When Kayra gains a new extension feature it says *"Your Kayra Bridge extension is out of
-date…"*. Open `chrome://extensions` and press the **reload arrow** on Kayra Bridge. From 1.1.0
-on, the extension also accepts a `runtime.reload` command, so future updates can be applied
-without opening that page.
+From 1.1.0 on the extension updates itself: when Kayra needs a command your Chrome does not
+have yet, it sends `runtime.reload` (Chrome re-reads this folder) and says *"I've just updated
+the Kayra Bridge extension…"* — ask again a few seconds later. You can also say **"browser
+update"**. Only a 1.0.x extension needs the manual **reload arrow** on `chrome://extensions`.
+
+Current version: **1.2.0** (adds `tabs.open` with `where`, and `page.waitFor`).
 
 ## How "share my entire screen" works
 
@@ -155,5 +162,7 @@ a WebSocket that exchanges a ping every 20 seconds keeps its service worker runn
   placeholder, refuse password and card fields, type into a chat box, scroll to text and
   list the controls. A Gmail-shaped page (priority-inbox order, a collapsed "More", "Show
   more messages", rows that are not buttons) proves "click on more", "all mails", "sent",
-  "load more", and opening the first / latest / second / from-Ana / second-unread email. 24
-  checks.
+  "load more", and opening the first / latest / second / from-Ana / second-unread email, and
+  the `page.waitFor` probe. 27 checks.
+- `tests/test_browser_control.py` (unit): the site registry, every "where", the new-tab merge,
+  app/web-app/site/web-result order, the no-extension fallbacks, self-update. 107 checks.

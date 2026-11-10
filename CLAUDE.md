@@ -242,6 +242,14 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
     which `_call` turns into the spoken "reload the extension" instruction.
   * Tests: `tests/test_assistant_automation.py` (unit, 326), `tests/test_browser_extension.py` (integration,
     real headless Chrome). Guide: `docs/platforms/LINUX_AUTOMATION.md`, `docs/platforms/CHROME_BRIDGE.md`.
+- **Round 5 — browser control, in parts (2026-11-10).** Plan and part table:
+  `docs/roadmap/BROWSER_CONTROL_PLAN.md` §10. Part 1 done: `automation/sites.py` is the site
+  table (`targets.WEBSITE_REGISTRY` is a view; folder names are never sites; "spotify" and
+  "whatsapp" stay app names); "open X" = app → Omarchy web app → site → top web result →
+  search; `common._split_where` + `merge_tab_steps`; web-app windows are browser surfaces.
+  `web_macros.TOP_RESULTS` does network I/O — every test rig must stub it (the Linux `Rig`
+  does). A new extension feature must check `_outdated(min)`; 1.1.0+ extensions reload
+  themselves. Tests: `tests/test_browser_control.py`.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

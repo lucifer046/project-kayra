@@ -461,7 +461,11 @@ def restart_app(name):
 
 
 def _is_browser_window(window):
-    return bool(window.classes & linux_apps.BROWSER_CLASSES)
+    # A Chromium `--app` window (an Omarchy web app: WhatsApp, YouTube, X…) is a browser
+    # surface too: the Kayra Bridge extension runs inside it, so clicks, typing and scrolling
+    # must go into its page rather than to the screen clicker (round 5, H0.1).
+    return bool(window.classes & linux_apps.BROWSER_CLASSES) or any(
+        linux_apps.is_app_window_class(c) for c in window.classes)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1498,6 +1502,48 @@ def click_on_text(phrase, verb="click_text"):
                                  "right_click_text": "Right-clicked."}.get(verb, "Clicked."))
 
 
+def _open_site_app(name, url):
+    """An installed native app named `name`, else the web app serving `url`; None if neither."""
+    try:
+        app = linux_apps.resolve(name)
+        if app is not None and linux_apps.installed(app) and \
+                not (app.classes & linux_apps.BROWSER_CLASSES):
+            return open_application(name)
+        entry = linux_apps.webapp_for_url(url)
+        if entry is not None:
+            return open_application(entry.name)
+    except Exception:
+        return None
+    return None
+
+
+_CHROMIUM_BINARIES = ("google-chrome-stable", "google-chrome", "chromium", "brave",
+                      "microsoft-edge-stable", "vivaldi-stable")
+
+
+def _browser_binary(name=None):
+    """The browser binary for 'chrome' / 'chromium' / …, or the first installed one for None."""
+    wanted = str(name or "").lower().replace("google ", "")
+    if name is not None:
+        app = linux_apps.resolve(name)
+        if app is None or not (app.classes & linux_apps.BROWSER_CLASSES):
+            return None
+    for binary in _CHROMIUM_BINARIES:
+        if (not wanted or wanted.split()[0] in binary) and _have(binary):
+            return binary
+    return next((b for b in _CHROMIUM_BINARIES if _have(b)), None)
+
+
+def open_browser_window(binary, where, url=None):
+    """A new (or incognito) browser window, by argv. Used without the extension."""
+    flag = "--incognito" if where == "incognito" else "--new-window"
+    argv = [binary, flag] + ([url] if url else [])
+    if RUNNER.spawn(argv):
+        return ActionResult.success("Opened an incognito window." if where == "incognito"
+                                    else "Opened a new window.", url=url)
+    return ActionResult.failure("The browser didn't start.")
+
+
 def open_url(url):
     if not url:
         return ActionResult.failure("Open what?")
@@ -1505,10 +1551,10 @@ def open_url(url):
     if not target.startswith(("http://", "https://")):
         target = "https://" + target.lstrip("/")
     if _have("xdg-open") and RUNNER.spawn(["xdg-open", target]):
-        return ActionResult.success("Done.", url=target)
+        return ActionResult.success("Opening that page.", url=target)
     try:
         webbrowser.open(target, new=2)
-        return ActionResult.success("Done.", url=target)
+        return ActionResult.success("Opening that page.", url=target)
     except Exception as e:
         return ActionResult.failure("I couldn't open that link.", error=str(e))
 
@@ -1792,6 +1838,14 @@ def _dispatch(action):
         if verb == "open":
             if not target:
                 return ActionResult.failure("Open what?")
+            where = params.get("where")
+            if where in ("window", "incognito") and _browser_binary(target):
+                return open_browser_window(_browser_binary(target), where)
+            if params.get("web") or where:
+                # The user said where in the BROWSER it should go ("in a new tab", "in this
+                # tab"), so this is a page, whatever else the name could mean.
+                from kayra.automation import web_macros
+                return web_macros.open_site(target, None if where == "browser" else where)
             result = open_application(target)
             if result.status == Status.NOT_FOUND:
                 # The Windows order, kept: a named user folder or a literal path is the LAST
@@ -1799,9 +1853,23 @@ def _dispatch(action):
                 path = targets.resolve_path(target)
                 if path.ok:
                     return open_path(target)
-                web = targets.website_url(target)
-                if web:
-                    return open_url(web)
+                # No app and no folder: a website we know, else the top web result (A1).
+                # "I couldn't find an app called notion" is never the answer for a site.
+                from kayra.automation import web_macros
+                if linux_apps.canonical(target):
+                    # A KNOWN app that is not installed: its web version if it has one
+                    # ("spotify web"), never a web search for the app's name.
+                    key = linux_apps.canonical(target)
+                    web = targets.website_url(f"{target} web") or targets.website_url(f"{key} web")
+                    if web:
+                        opened = web_macros.open_in(web, None, f"the {target} web player")
+                        if opened.ok:
+                            opened.message = (f"{target.title()} isn't installed, so I opened "
+                                              "its web version.")
+                        return opened
+                    return result
+                if targets.website_url(target) or web_macros.web_worthy(target):
+                    return web_macros.open_site(target, None)
             return result
         if verb == "close":
             return close_target(target)
@@ -1821,22 +1889,30 @@ def _dispatch(action):
         return _dispatch_extended(domain, verb, target, params, action)
 
     if domain == "browser":
+        from kayra.automation import web_macros
+        where = params.get("where")
         if verb == "open_url":
-            result = open_url(params.get("url") or target)
-            if result.ok:
-                site = params.get("site") or targets.canonical_website(target)
-                result.message = f"Opening {site.title()}." if site else "Opening that link."
-            return result
+            url = params.get("url") or target
+            site = params.get("site") or targets.canonical_website(target)
+            if site and where is None:
+                # A5 / A1: an installed application, or the Omarchy web app for this site,
+                # wins over a browser tab. "open youtube in the browser" skips this.
+                launched = _open_site_app(target, url)
+                if launched is not None:
+                    return launched
+            return web_macros.open_in(url, None if where == "browser" else where,
+                                      web_macros.display_name(site) if site else None)
         if verb == "search_web":
-            result = open_url(f"https://www.google.com/search?q={quote_plus(target or '')}")
+            result = web_macros.open_in(
+                f"https://www.google.com/search?q={quote_plus(target or '')}", where, "")
             if result.ok:
-                result.message = "Searching."
+                result.message = f"Searching the web for {target}." if target else "Searching."
             return result
         if verb == "search_youtube":
-            result = open_url(f"https://www.youtube.com/results?search_query="
-                              f"{quote_plus(target or '')}")
+            result = web_macros.open_in(f"https://www.youtube.com/results?search_query="
+                                        f"{quote_plus(target or '')}", where, "")
             if result.ok:
-                result.message = "Searching YouTube."
+                result.message = f"Searching YouTube for {target}." if target else "Searching YouTube."
             return result
         return browser_nav(verb)
 
@@ -1991,7 +2067,8 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "page_find": lambda: W.page_find(target), "page_controls": lambda: W.page_controls(),
                  "history_open": lambda: W.history_open(target, params.get("days", 7)),
                  "bookmark_open": lambda: W.bookmark_open(target),
-                 "bridge_setup": lambda: W.bridge_setup(), "bridge_status": lambda: W.bridge_status()}
+                 "bridge_setup": lambda: W.bridge_setup(), "bridge_status": lambda: W.bridge_status(),
+                 "bridge_update": lambda: W.bridge_update()}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
