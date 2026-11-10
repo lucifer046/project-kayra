@@ -482,16 +482,12 @@ def section_web():
         result = rig.do("meet mic off")
         check("'meet mic off' clicks Meet's own 'Turn off microphone'",
               ("page.click", {"text": "Turn off microphone", "nth": 1}) in meet.calls, result.message)
-        rig.do("meet share entire screen")
+        result = rig.do("meet share entire screen")
         linux.resolve_confirmation("yes")
-        check("sharing first tells the page hook to prefer the entire screen",
-              ("page.setMain", {"key": "__kayraShareSurface", "value": "monitor"}) in meet.calls)
-        check("then clicks Meet's share button",
-              ("page.click", {"text": "Share screen", "nth": 1}) in meet.calls)
-        check("and confirms Chrome's picker and the portal picker with Enter",
-              rig.runner.calls.count(["wtype", "-k", "Return"]) == 2, rig.runner.calls)
-        check("the share picker window was focused first",
-              any("0xp" in d for d in rig.hypr.dispatched))
+        # This fake is ALREADY presenting ("Stop presenting" is on screen), so nothing is
+        # clicked twice. The full share flow is test_browser_control.py section [12].
+        check("sharing while already presenting says so instead of opening a second picker",
+              ("page.click", {"text": "Share screen", "nth": 1}) not in meet.calls)
 
     whatsapp = FakeBridge(tabs=[{"id": 5, "title": "WhatsApp", "url": "https://web.whatsapp.com/"}])
     with WebRig(whatsapp) as rig:

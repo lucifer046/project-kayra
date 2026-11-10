@@ -327,6 +327,30 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-10 — round 5, part 2M: meetings and screen sharing
+
+- **Four misroutes fixed** (the audit log of a live attempt): `common.share_request()` reads
+  every way of asking to share into ONE `meet.share` (surface monitor/window/browser, a name,
+  audio, "instead"); a bare token ("share screen", "click on share screen", "present now") is
+  caught before the click and screen prefixes. `merge_share_steps` folds `focus X` + `meet
+  share window` into one share of X, and keeps one share per utterance.
+  `llm_engine._guard_meeting_code` drops a meeting code the user never said (the preamble's
+  `abc-defg-hij`) and re-reads "meet join/start" as a share when the user said share.
+- **Share what was named** (`web_macros.meet_share`, `automation/share_picker.py`,
+  `extension/kayra-share-picker/kayra-share-picker`): a window by its Hyprland address, a
+  monitor by position (left to right) or the focused one, a tab via Chrome's tab list (your
+  pick), system audio (extension 1.4.0). Switching while sharing stops the old share first.
+- **Readiness, not clocks**: the four fixed `SLEEP`s in `meet_share` are gone; the pickers are
+  answered when they appear and the result is read from Meet's own "Stop presenting".
+- **Confirmation names what goes out**; "yes, don't ask again" trusts `meet.share` (and ONLY
+  it) until `meet leave`, three hours at most.
+- **Do Not Disturb while presenting** (mako), undone only if Kayra turned it on.
+- **Test hygiene**: `KAYRA_AUDIT_LOG` (a path, or `off`) redirects the audit log; `run_all.py`
+  points it at a temp file and `_harness.py` turns it off for suites run alone. The unit tier
+  no longer appends to `logs/automation.log`.
+- Tests: `tests/test_browser_control.py` sections [12]-[14].
+- Not verified in a live call (M0.7).
+
 ### 2026-11-10 — tuning pass: less waiting, fewer model calls, no idle churn
 
 Measured on the reference laptop (gemma-4-e4b in LM Studio, RTX 4060 Laptop).

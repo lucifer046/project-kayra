@@ -39,7 +39,7 @@ both: Win32 on Windows, Hyprland IPC + Wayland tools on Linux (`docs/platforms/L
 ## Tech stack
 
 Python 3.10–3.14 · PySide6-Essentials (Qt 6 widgets) · Selenium + Chrome/Edge (speech input) ·
-kokoro-onnx + ONNX Runtime (CPU or CUDA) · sounddevice/PortAudio · Cohere / Groq / Gemini /
+kokoro-onnx + ONNX Runtime (CPU or CUDA) · sounddevice/PortAudio · Claude (anthropic) / Groq / Gemini /
 local OpenAI-compatible servers (LM Studio, Ollama) · ddgs + BeautifulSoup · OpenCV + MediaPipe ·
 psutil · rich. One dependency manifest: `requirements.txt` (PEP 508 platform markers).
 

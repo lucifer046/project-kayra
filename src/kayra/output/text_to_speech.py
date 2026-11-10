@@ -60,6 +60,20 @@ VOICE_FILES = ("voices-v1.0.bin", "voices.bin")
 _QUANTIZED_BYTES = range(80_000_000, 110_000_000)     # the int8 graph is ~92 MB; fp16 ~177 MB
 
 
+_VOICE_NAMES = {}
+
+
+def voice_names(path):
+    """The voice ids inside a Kokoro voices file (an .npz), sorted. Cached per path."""
+    if path not in _VOICE_NAMES:
+        try:
+            with np.load(path) as bundle:
+                _VOICE_NAMES[path] = tuple(sorted(bundle.files))
+        except Exception:
+            _VOICE_NAMES[path] = ()
+    return _VOICE_NAMES[path]
+
+
 def is_quantized_voice_model(path):
     """True for the slow int8 graph, by name or — for the historical `kokoro.onnx` — by size."""
     name = os.path.basename(str(path)).lower()
@@ -315,6 +329,12 @@ class DynamicVoiceEngine:
             self.voice = "am_adam"  # High-quality North American Male style vector
         else:
             self.voice = "af_bella"  # Ultra-realistic North American Female style vector
+        # ASSISTANT_VOICE (Settings → Voice) wins when it names a voice this voices file
+        # actually holds. The setting existed on the Settings screen for a long time and was
+        # never read here, so choosing a voice did nothing at all.
+        chosen = str(env_vars.get("ASSISTANT_VOICE", "") or "").strip()
+        if chosen and chosen in voice_names(voices_path):
+            self.voice = chosen
 
         # First Kokoro inference pays the ONNX graph-optimization + weight-warm cost
         # (~0.6-1.5s on CPU). Doing it here, silently, on a background thread means the

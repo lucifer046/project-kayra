@@ -304,6 +304,12 @@ QPushButton#NavItem {{
     min-height: {z.nav_item}px;
 }}
 
+/* The rail at narrow widths: icons only, centred in a 60px column. */
+QPushButton#NavItem[compact="true"] {{
+    padding: 0px;
+    text-align: center;
+}}
+
 QPushButton#NavItem:hover {{
     background-color: {c.surface_hover};
     color: {c.text};
@@ -341,6 +347,73 @@ QPushButton#NavItem:focus {{
     background-color: {c.surface};
     border: 1px solid {c.border_subtle};
     border-radius: {r.md}px;
+}}
+
+/* A fact: label ABOVE value, on a quiet inset tile. Used for live status readouts in
+   Settings and the device sheet in System, where "Label: value" lines read as raw output. */
+#FactTile {{
+    background-color: {c.surface};
+    border: 1px solid {c.border_subtle};
+    border-radius: {r.md}px;
+}}
+
+#FactLabel {{
+    font-size: {f.caption}px;
+    font-weight: {f.medium};
+    color: {c.text_tertiary};
+}}
+
+#FactValue {{
+    font-size: {f.body}px;
+    color: {c.text};
+}}
+
+#FactDetail {{
+    font-size: {f.caption}px;
+    color: {c.text_secondary};
+}}
+
+/* One provider inside the Cloud models card: its own quiet panel, so three providers read as
+   three things rather than one long form. */
+#ProviderPanel {{
+    background-color: {c.surface};
+    border: 1px solid {c.border_subtle};
+    border-radius: {r.lg}px;
+}}
+
+#ProviderName {{
+    font-size: {f.body}px;
+    font-weight: {f.semibold};
+    color: {c.text};
+}}
+
+#ProviderRole {{
+    font-size: {f.caption}px;
+    color: {c.text_tertiary};
+}}
+
+/* The in-window confirmation (components/confirm.py). */
+#ConfirmPanel {{
+    background-color: {c.overlay};
+    border: 1px solid {c.border_strong};
+    border-radius: {r.lg}px;
+}}
+
+#ConfirmTitle {{
+    font-size: {f.title}px;
+    font-weight: {f.semibold};
+    color: {c.text};
+}}
+
+#ConfirmBody {{
+    font-size: {f.body}px;
+    color: {c.text_secondary};
+}}
+
+/* The Save bar, pinned under every Settings section. */
+#ActionBar {{
+    background-color: {c.surface};
+    border-top: 1px solid {c.border_subtle};
 }}
 
 #Well {{

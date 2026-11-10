@@ -19,6 +19,7 @@ calendar events, sharing the screen, and clicking buttons whose label sounds des
 extension refuses password and payment fields on its own side as well.
 """
 
+import os
 import re
 import time
 import datetime
@@ -26,7 +27,10 @@ from urllib.parse import quote, quote_plus
 
 from kayra.automation import ai
 from kayra.automation import browser_bridge
-from kayra.automation.policy import ActionResult
+# Kayra's lane into the Hyprland screen-share portal. Replaced by a fake in the test suite:
+# the real one reads ~/.config/hypr/xdph.conf and writes under $XDG_RUNTIME_DIR.
+from kayra.automation import share_picker as SHARE_HELPER
+from kayra.automation.policy import ActionResult, Status
 
 BRIDGE = browser_bridge            # the test suite replaces this with a fake extension
 SLEEP = time.sleep
@@ -40,7 +44,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 2, 1)
+REQUIRED_VERSION = (1, 4, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -221,10 +225,246 @@ def tabs_list():
                                 f"{head}{more}.", tabs=tabs)
 
 
+# ── Tabs by POSITION (B1) and in bulk (B2) ──────────────────────────────
+# Targets written by `common.tab_position`: "#3" (third), "#-1" (last), "#-2" (second last),
+# "+1" (the tab on the right), "-1" (the tab on the left). Positions count within the window
+# Kayra is acting in — the focused Chrome window — the way the tab strip reads.
+
+def is_position(target):
+    return bool(re.fullmatch(r"#-?\d+|[+-]\d+", str(target or "").strip()))
+
+
+def _strip_tabs():
+    """(tabs of the focused window in strip order, the active one) — or (None, None)."""
+    active = _call("tabs.active") or {}
+    tabs = [t for t in (_call("tabs.list") or []) if t.get("windowId") == active.get("windowId")]
+    return (tabs, active) if tabs else (None, None)
+
+
+def _tab_at(target):
+    tabs, active = _strip_tabs()
+    if not tabs:
+        return None, "I don't see any tabs."
+    spec = str(target).strip()
+    if spec.startswith("#"):
+        nth = int(spec[1:])
+        index = nth - 1 if nth > 0 else len(tabs) + nth
+        if not 0 <= index < len(tabs):
+            return None, f"You only have {len(tabs)} tab{'s' if len(tabs) != 1 else ''} open."
+        return tabs[index], None
+    here = next((i for i, t in enumerate(tabs) if t.get("id") == active.get("id")), 0)
+    index = here + int(spec)
+    if not 0 <= index < len(tabs):
+        return None, "There is no tab on that side."
+    return tabs[index], None
+
+
+def _close_ids(ids):
+    stale = _outdated((1, 2, 2))
+    if stale:
+        return stale
+    result = _call("tabs.close", tabIds=list(ids)) or {}
+    closed = result.get("closed", 0)
+    return ActionResult.success(f"Closed {closed} tab{'s' if closed != 1 else ''}.")
+
+
+def _url_key(url):
+    url = str(url or "").split("#", 1)[0]
+    return url[:-1] if url.endswith("/") else url
+
+
+def tabs_close_duplicates():
+    """Closes every tab whose page is already open in another tab, keeping the active one."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tabs = _call("tabs.list") or []
+    seen, doomed = {}, []
+    for tab in sorted(tabs, key=lambda t: not t.get("active")):     # active ones are kept
+        key = _url_key(tab.get("url"))
+        if not key or tab.get("pinned"):
+            continue
+        if key in seen:
+            doomed.append(tab["id"])
+        else:
+            seen[key] = tab["id"]
+    if not doomed:
+        return ActionResult.success("No duplicate tabs — every tab is a different page.")
+    return _close_ids(doomed)
+
+
+def tabs_close_side(side):
+    """Closes the unpinned tabs to the right (or left) of the active one in its window."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tabs, active = _strip_tabs()
+    if not tabs:
+        return ActionResult.not_found("I don't see any tabs.")
+    here = next((i for i, t in enumerate(tabs) if t.get("id") == active.get("id")), 0)
+    chosen = tabs[here + 1:] if side == "right" else tabs[:here]
+    ids = [t["id"] for t in chosen if not t.get("pinned")]
+    if not ids:
+        return ActionResult.success(f"There are no tabs to the {side}.")
+    return _close_ids(ids)
+
+
+# ── Part 2b: mute the rest, recently closed, sleep, find, zoom, hard reload, copy ──
+
+def _bridge_at(minimum):
+    """The ActionResult to return instead of acting, or None when the bridge can do it."""
+    return _need_bridge() or _outdated(minimum)
+
+
+def tabs_mute_others(on=True):
+    """B3: "mute everything except this" — every tab but the active one."""
+    stop = _bridge_at((1, 3, 0))
+    if stop:
+        return stop
+    changed = (_call("tabs.muteOthers", on=bool(on)) or {}).get("changed", 0)
+    if not changed:
+        return ActionResult.success("Nothing else was " + ("playing." if on else "muted."))
+    return ActionResult.success(f"{'Muted' if on else 'Unmuted'} {changed} other "
+                                f"tab{'s' if changed != 1 else ''}.")
+
+
+def tabs_recently_closed():
+    """B6: "what did I just close?" — the last few closed tabs and windows, newest first."""
+    stop = _bridge_at((1, 3, 0))
+    if stop:
+        return stop
+    items = _call("tabs.recentlyClosed", max=5) or []
+    if not items:
+        return ActionResult.success("You haven't closed anything recently.")
+    names = [_short(i.get("title") or i.get("url", "")) for i in items]
+    return ActionResult.success("You recently closed " + ", ".join(names[:3])
+                                + (f", and {len(names) - 3} more." if len(names) > 3 else ".")
+                                + " Say reopen and the name to bring one back.", closed=items)
+
+
+def tab_reopen(name=""):
+    """B6: reopen the last closed tab, or the closed tab whose title or address matches."""
+    stop = _bridge_at((1, 3, 0))
+    if stop:
+        return stop
+    key = _site_key(name) if name and name not in ("last", "tab", "last closed") else ""
+    session = None
+    if key:
+        for item in _call("tabs.recentlyClosed", max=25) or []:
+            if key in f"{item.get('title', '')} {item.get('url', '')}".lower():
+                session = item.get("sessionId")
+                break
+        if not session:
+            return ActionResult.not_found(f"I don't see a recently closed {name} tab.")
+    result = _call("tabs.restore", **({"sessionId": session} if session else {})) or {}
+    if not result.get("restored"):
+        return ActionResult.not_found("There's nothing to reopen.")
+    _focus_chrome()
+    return ActionResult.success(f"Reopened {_short(result.get('title') or 'it')}.")
+
+
+def tabs_discard():
+    """B7: put background tabs to sleep. They reload when clicked; nothing playing is touched."""
+    stop = _bridge_at((1, 3, 0))
+    if stop:
+        return stop
+    count = (_call("tabs.discard") or {}).get("discarded", 0)
+    if not count:
+        return ActionResult.success("Every background tab is already asleep.")
+    return ActionResult.success(f"Put {count} background tab{'s' if count != 1 else ''} to "
+                                "sleep. They reload when you open them.")
+
+
+_STOP_WORDS = frozenset("the a an i was am is about on of for and to in my me where with that "
+                        "reading read tab page looking at".split())
+
+
+def tab_find(topic, max_tabs=30, max_chars=20000):
+    """
+    B8: "find the tab where I was reading about X" — titles and addresses first, then the
+    text of each tab (bounded: 30 tabs, 20 KB each), and switches to the best match.
+    """
+    missing = _need_bridge()
+    if missing:
+        return missing
+    words = [w for w in re.findall(r"[a-z0-9]+", str(topic).lower()) if w not in _STOP_WORDS]
+    if not words:
+        return ActionResult.failure("What was the tab about?")
+    best, best_score = None, 0.0
+    for tab in (_call("tabs.list") or [])[:max_tabs]:
+        head = f"{tab.get('title', '')} {tab.get('url', '')}".lower()
+        score = 3.0 * sum(w in head for w in words)
+        if score < 3.0 * len(words):
+            try:
+                text = str((_call("page.text", tabId=tab["id"], max=max_chars) or {}).get("text", ""))
+            except Exception:
+                text = ""                     # a sleeping or restricted tab: title only
+            low = text.lower()
+            score += sum(min(low.count(w), 5) for w in words) / 5.0
+        if score > best_score:
+            best, best_score = tab, score
+    if best is None:
+        return ActionResult.not_found(f"No open tab mentions {topic}.")
+    _call("tabs.activate", tabId=best["id"])
+    _focus_chrome()
+    return ActionResult.success(f"Here's {_short(best.get('title') or 'that tab')}.")
+
+
+def page_reload(hard=False):
+    """C1: reload; "hard reload" bypasses the cache."""
+    stop = _bridge_at((1, 3, 0) if hard else (1, 0, 0))
+    if stop:
+        return stop
+    _call("tabs.reload", hard=bool(hard))
+    return ActionResult.success("Reloaded without the cache." if hard else "Reloaded.")
+
+
+def page_zoom(percent):
+    """C2: "zoom to 150 percent" (Ctrl+plus / minus / 0 already cover in, out and reset)."""
+    stop = _bridge_at((1, 3, 0))
+    if stop:
+        return stop
+    try:
+        factor = max(25, min(500, int(float(percent)))) / 100.0
+    except (TypeError, ValueError):
+        return ActionResult.failure("What zoom level?")
+    result = _call("tabs.zoom", factor=factor) or {}
+    return ActionResult.success(f"Zoom is {round(float(result.get('factor', factor)) * 100)} percent.")
+
+
+def page_copy(what="link"):
+    """C7: the active tab's address or title onto the clipboard."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tab = _call("tabs.active") or {}
+    value = tab.get("title") if what == "title" else tab.get("url")
+    if not value:
+        return ActionResult.not_found("I can't read this tab.")
+    if not COPY(str(value)):
+        return ActionResult.failure("I couldn't use the clipboard.")
+    return ActionResult.success("Copied the page title." if what == "title" else "Copied the link.")
+
+
+def _copy_default(text):
+    from kayra.automation import linux
+    return linux.clipboard_set(text)
+
+
+COPY = _copy_default        # replaced by the test rigs
+
+
 def tab_switch(name):
     missing = _need_bridge()
     if missing:
         return missing
+    if is_position(name):
+        tab, problem = _tab_at(name)
+        if tab is None:
+            return ActionResult.not_found(problem)
+        _call("tabs.activate", tabId=tab["id"])
+        _focus_chrome()
+        return ActionResult.success(f"Here's {_short(tab.get('title') or 'that tab')}.")
     try:
         tab = _call("tabs.activate", match=_site_key(name))
     except browser_bridge.BridgeError:
@@ -237,6 +477,11 @@ def tab_close(name, all_tabs=False):
     missing = _need_bridge()
     if missing:
         return missing
+    if is_position(name):
+        tab, problem = _tab_at(name)
+        if tab is None:
+            return ActionResult.not_found(problem)
+        return _close_ids([tab["id"]])
     result = _call("tabs.close", match=_site_key(name), all=all_tabs) or {}
     if result.get("ambiguous"):
         titles = [_short(t.get("title", "")) for t in result["ambiguous"]]
@@ -923,6 +1168,9 @@ def meet_toggle(control, on):
     else:
         labels = _MEET_LABELS[(control, on)]
     clicked = _click_first(labels)
+    if clicked == "Leave call":
+        _share_dnd(False)                      # leaving ends any share Kayra silenced for
+        _SHARE_STATE["what"] = ""
     if not clicked:
         already = {True: "on", False: "off"}.get(on)
         return ActionResult.success(f"Your {control} is already {already}.") if already else \
@@ -933,11 +1181,134 @@ def meet_toggle(control, on):
                                  "Leave call": "You've left the call."}.get(clicked, "Done."))
 
 
-def meet_share(surface="monitor"):
+_PRESENTING = re.compile(r"stop presenting|you are presenting|stop sharing", re.I)
+_SHARE_INDICATOR = re.compile(r"\bis sharing\b|sharing (?:your|a|this)|stop sharing", re.I)
+_SHARE_STATE = {"dnd": False, "what": ""}
+SHARE_WAIT_S = 12.0
+
+
+def _presenting():
+    controls = [c.get("name", "") for c in (_call("page.controls", limit=80) or [])]
+    return any(_PRESENTING.search(c) for c in controls)
+
+
+def _share_window(name):
+    """The window the user named: (window, None) or (None, sentence)."""
+    L = _L()
+    if not L.hyprland_ready():
+        return None, "Sharing a named window needs the Hyprland session."
+    app = L.linux_apps.resolve(name)
+    if app is not None:
+        matches = L._windows_for(app, strict=False)
+    else:
+        needle = (name or "").lower().strip()
+        matches = [w for w in L.list_windows() if needle and needle in w.title.lower()]
+    if not matches:
+        return None, f"I don't see {name} open, so I can't share it."
+    window = L._pick_single(matches, prefer_recent=True)
+    return (window, None) if window is not None else (None, f"Which {name} window?")
+
+
+def _share_monitor(name):
+    """'#2' / '<' / '>' / '' -> a Hyprland monitor dict (focused one for ''), or None."""
+    L = _L()
+    try:
+        monitors = list(L.HYPR.monitors())
+    except Exception:
+        monitors = []
+    if not monitors:
+        return None
+    ordered = sorted(monitors, key=lambda m: (m.get("x", 0), m.get("y", 0)))
+    if not name:
+        return next((m for m in monitors if m.get("focused")), ordered[0])
+    if name == "<":
+        return ordered[0]
+    if name == ">":
+        return ordered[-1]
+    if name.startswith("#") and name[1:].isdigit():
+        index = int(name[1:]) - 1
+        return ordered[index] if 0 <= index < len(ordered) else None
+    return next((m for m in monitors if str(m.get("name", "")).lower() == name.lower()), None)
+
+
+def _share_dnd(on):
     """
-    Starts screen sharing. Meet's button opens Chrome's picker; the extension's page hook
-    preselects the requested surface ("Entire screen" for "monitor"). Kayra then confirms the
-    picker with Enter, and on Wayland accepts the desktop portal's monitor picker the same way.
+    Do Not Disturb for the length of a share (M2.1): notifications never pop up on a shared
+    screen. Only undone by Kayra when Kayra turned it on. MEET_SHARE_DND=off disables it.
+    """
+    if str(os.environ.get("MEET_SHARE_DND", "on")).strip().lower() in ("0", "off", "false", "no"):
+        return False
+    L = _L()
+    if not L._have("makoctl"):
+        return False
+    if on:
+        _, modes = L._run("makoctl", "mode")
+        if "do-not-disturb" in (modes or ""):
+            return False                          # the user already had it on: leave it alone
+        _SHARE_STATE["dnd"] = L._ok("makoctl", "mode", "-a", "do-not-disturb")
+        return _SHARE_STATE["dnd"]
+    if _SHARE_STATE["dnd"]:
+        _SHARE_STATE["dnd"] = False
+        return L._ok("makoctl", "mode", "-r", "do-not-disturb")
+    return False
+
+
+def _drive_pickers(before, auto_portal, press_chrome):
+    """
+    Answers the pickers that open after Meet's share button, by READINESS (M0.4): each poll
+    looks at what is actually on screen — Meet already presenting, a new portal picker
+    window, a new Chrome picker window — and acts on that, instead of pressing Enter after a
+    fixed pause. Returns "sharing", "portal" (the portal picker is up and the user must
+    choose) or None (nothing happened in time).
+    """
+    L = _L()
+    state = {"portal": False, "chrome": 0, "polls": 0}
+
+    def attempt():
+        if _presenting():
+            return "sharing"
+        state["polls"] += 1
+        try:
+            windows = L.list_windows(include_kayra=True)
+        except Exception:
+            windows = []
+        new = [w for w in windows if w.address not in before]
+        portal = [w for w in new if any("share-picker" in c for c in w.classes)]
+        if portal:
+            if not auto_portal:
+                return "portal"
+            if not state["portal"]:
+                L.focus_window(portal[0])
+                L.send_keys("enter")             # the portal picker: its first monitor
+                state["portal"] = True
+            return None
+        if not press_chrome or state["chrome"] >= 2:
+            return None
+        chrome = [w for w in new if L._is_browser_window(w) and not _SHARE_INDICATOR.search(w.title)]
+        if chrome and (state["chrome"] == 0 or state["polls"] % 4 == 0):
+            # Chrome's picker: "Share" on the preselected source. A second press covers
+            # Chrome on Wayland, where Share is enabled only once the portal has answered.
+            L.focus_window(chrome[0])
+            L.send_keys("enter")
+            state["chrome"] += 1
+        elif not chrome and state["chrome"] == 0 and state["polls"] == 6:
+            L.send_keys("enter")                 # no separate picker window (X11): it has focus
+            state["chrome"] += 1
+        return None
+
+    return _until(attempt, SHARE_WAIT_S)
+
+
+def meet_share(surface="monitor", name="", audio=False, instead=False):
+    """
+    Shares into the Meet call exactly what was named (§12 M1): the entire screen (the one in
+    front, or "my second screen"), a named window ("the LM Studio window"), or a Chrome tab.
+
+    Meet's button opens Chrome's picker; the extension's page hook preselects the surface
+    (and system audio when asked). On Hyprland with Kayra's share picker installed, the
+    portal is answered with the named window or monitor itself — no picker window appears.
+    Without it, a whole screen is still chosen for the user, but a NAMED window or tab is
+    left for the user to pick: pressing Enter there would share whatever is listed first.
     """
     missing = _need_bridge()
     if missing:
@@ -946,27 +1317,107 @@ def meet_share(surface="monitor"):
         _call("tabs.activate", match="meet.google.com")
     except browser_bridge.BridgeError:
         return ActionResult.not_found("You're not in a Google Meet call.")
+    L = _L()
+    what, request = "your entire screen", None
+    if surface == "window" and name:
+        window, problem = _share_window(name)
+        if window is None:
+            return ActionResult.not_found(problem) if "open" in problem or "needs" in problem \
+                else ActionResult(Status.AMBIGUOUS, problem)
+        what, request = f"the {name.strip()} window", ("window", window)
+    elif surface == "window":
+        what = "a window"
+    elif surface == "browser":
+        what = f"the {name} tab" if name else "a Chrome tab"
+    else:
+        monitor = _share_monitor(name)
+        if name and monitor is None:
+            return ActionResult.not_found("I don't see that screen.")
+        if name and monitor is not None:
+            what = f"your {_SCREEN_NAMES.get(name, 'screen')} ({monitor.get('name')})"
+        request = ("monitor", monitor) if monitor is not None else None
+
+    if _presenting():
+        # The same thing again is a no-op; anything else (M1.4, "share LM Studio instead")
+        # stops the current share and starts the new one.
+        if not instead and not audio and what == (_SHARE_STATE.get("what") or "your entire screen"):
+            return ActionResult.success(f"You're already sharing {what}.")
+        _click_first(_MEET_LABELS["stop_share"])
+        _until(lambda: not _presenting(), 3.0)
+
+    helper = SHARE_HELPER.installed()
+    if helper and request is not None:
+        if request[0] == "window":
+            SHARE_HELPER.request_window(request[1])
+        else:
+            SHARE_HELPER.request_monitor(request[1].get("name"))
+    # Without the helper the portal picker would share its FIRST entry on Enter: right for
+    # "my screen" on a one-monitor desk, wrong for anything that was named.
+    auto_portal = not helper and surface == "monitor" and not name
+    press_chrome = surface != "browser"            # a tab is the user's pick in Chrome's list
+
     _focus_chrome()
     _call("page.setMain", key="__kayraShareSurface", value=surface)
+    if audio and _version() >= (1, 4, 0):
+        _call("page.setMain", key="__kayraShareAudio", value=True)
+    try:
+        before = {w.address for w in L.list_windows(include_kayra=True)}
+    except Exception:
+        before = set()
     if not _click_first(_MEET_LABELS["share"]):
+        SHARE_HELPER.clear()
         return ActionResult.not_found("I can't find Meet's share button.")
-    L = _L()
-    SLEEP(1.5)
-    L.send_keys("enter")                       # Chrome's picker: "Share" on the preselected screen
-    SLEEP(1.5)
-    picker = [w for w in L.list_windows(include_kayra=True)
-              if "share-picker" in w.cls or "share-picker" in w.initial_class]
-    if picker:
-        L.focus_window(picker[0])
-        L.send_keys("enter")                   # the Hyprland portal picker: the first monitor
-        SLEEP(1.0)
-    SLEEP(1.0)
-    controls = [c.get("name", "") for c in (_call("page.controls", limit=80) or [])]
-    if any(re.search(r"stop presenting|you are presenting|stop sharing", c, re.I) for c in controls):
-        return ActionResult.success("You're sharing your entire screen." if surface == "monitor"
-                                    else "You're sharing.")
-    return ActionResult.success("I've opened the share picker with your entire screen "
-                                "selected. If it's still open, press Share.")
+    outcome = _drive_pickers(before, auto_portal, press_chrome)
+    SHARE_HELPER.clear()                            # answered or not, never a second time
+    if outcome == "sharing":
+        _SHARE_STATE["what"] = what
+        quiet = _share_dnd(True)
+        return ActionResult.success(f"You're sharing {what}"
+                                    + (" with sound" if audio else "")
+                                    + (", and I've silenced notifications until you stop."
+                                       if quiet else "."))
+    if surface == "browser":
+        return ActionResult.success(f"Chrome's share picker is open on tabs. Pick {what} and "
+                                    "press Share.")
+    if request is not None and request[0] == "window" and not helper:
+        return ActionResult.success(f"The share picker is open. Choose {what} and press Share. "
+                                    "Run python setup.py once and I'll pick it for you next "
+                                    "time.")
+    return ActionResult.success(f"I've opened the share picker for {what}. If it's still open, "
+                                "press Share.")
+
+
+_SCREEN_NAMES = {"#1": "first screen", "#2": "second screen", "#3": "third screen",
+                 "<": "left screen", ">": "right screen"}
+
+
+def meet_stop_share():
+    if not BRIDGE.connected():
+        return ActionResult.not_found("You're not sharing.")
+    try:
+        _call("tabs.activate", match="meet.google.com")
+    except browser_bridge.BridgeError:
+        return ActionResult.not_found("You're not in a Google Meet call.")
+    clicked = _click_first(_MEET_LABELS["stop_share"])
+    restored = _share_dnd(False)
+    if not clicked:
+        return ActionResult.not_found("You're not sharing.")
+    _SHARE_STATE["what"] = ""
+    return ActionResult.success("Stopped sharing" + (", and notifications are back." if restored
+                                                      else "."))
+
+
+def meet_share_status():
+    if not BRIDGE.connected():
+        return ActionResult.success("No — Chrome isn't connected, so you're not sharing through me.")
+    try:
+        _call("tabs.activate", match="meet.google.com")
+    except browser_bridge.BridgeError:
+        return ActionResult.success("You're not in a Google Meet call.")
+    if _presenting():
+        what = _SHARE_STATE.get("what")
+        return ActionResult.success(f"Yes, you're sharing {what}." if what else "Yes, you're sharing.")
+    return ActionResult.success("No, you're not sharing anything.")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

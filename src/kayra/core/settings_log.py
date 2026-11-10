@@ -71,7 +71,11 @@ LABELS = {
     "GESTURE_CLICK_SENSITIVITY": "Click sensitivity",
     "GESTURE_DIAGNOSTICS": "Gesture diagnostics",
     "SLEEPING": "Standby",
-    "CohereAPIKey": "Cohere API key",
+    "CLAUDE_API_KEY": "Claude API key",
+    "CLOUD_FIRST": "Prefer cloud models",
+    "CLAUDE_MODEL": "Claude model",
+    "GROQ_CHAT_MODEL": "Groq chat model",
+    "GEMINI_CHAT_MODEL": "Gemini model",
     "GROQ_API_KEY": "Groq API key",
     "GEMINI_API_KEY": "Gemini API key",
 }

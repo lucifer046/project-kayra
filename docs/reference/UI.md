@@ -30,8 +30,9 @@ views/  ──signals──▶  bridge.py (Qt) ──callbacks──▶ session.
 
 ### Threads the UI adds
 
-`kayra-ui-runner` (executes turns), `kayra-ui-listener` (blocks in `Listen()`), and a one-shot
-`kayra-ui-profile` daemon for the device probe. The listener is unavoidable: `Listen()` blocks
+`kayra-ui-runner` (executes turns), `kayra-ui-listener` (blocks in `Listen()`), a one-shot
+`kayra-ui-profile` daemon for the device probe, and a one-shot `kayra-key-test` daemon per
+press of Settings → Test (`bridge.test_provider`; the result returns on `providerTested`). The listener is unavoidable: `Listen()` blocks
 with no timeout, so one thread cannot also service the text box while the microphone is open.
 Do not add more.
 
@@ -334,6 +335,109 @@ no process-cleanup code of its own, and `tests/test_voice_control.py` asserts th
   threads parked in native code (PortAudio's callback, urllib3 sockets inside Selenium, ONNX
   Runtime's intra-op pool); returning from `main()` instead reliably added seconds to a quit the
   user had already asked for, and occasionally hung.
+
+### Responsive layout (2026-11-10)
+
+The window goes down to `Size.min_window_width × min_window_height` (480 × 520); it used to
+refuse to be narrower than 1040px, so a half-screen Hyprland tile simply cut it off. Nothing
+is pinned to a pixel width any more; each piece adapts from a width it can see:
+
+| Where | Rule | Decided by |
+|---|---|---|
+| Rail | below `Size.rail_compact_below` (1100) the rail is 60px, icons only, names in tooltips, the footer keeps only the state dot | `KayraWindow._apply_responsive` → `Sidebar.set_compact` |
+| Home | `wide` ≥ 840 (3 : 4 : 3 columns, no scroll) · `medium` ≥ 560 (orb on top, two panel columns, scrolls) · `narrow` (one column, scrolls) | Home's OWN width, `_apply_layout`; the panels are moved between grid cells, never rebuilt |
+| Settings rows | below `SettingRow.STACK_BELOW` the control moves UNDER its label | the row's OWN width (`resizeEvent`) |
+| Settings controls | `fit_field`: at most `Size.control_field`, shrinkable — never `setFixedWidth` | — |
+| Chat | the column is a widget capped at `chat_max` between two stretches | the layout itself |
+| System | the three score tiles stack below 560px; finding values wrap | the page's own width |
+| Every page | side margins `xl` → `base` below 640px (`View.adapt_margins`; Home and Chat manage their own) | the page's own width |
+
+- **Never `setFixedWidth` from a `resizeEvent` to size a column.** Chat did, and while the
+  window shrank the page's minimum stayed at the OLD width: the layout centred a column wider
+  than the page and pushed it past the edge. Cap with `setMaximumWidth` and let stretches
+  take the surplus.
+- **A label that cannot wrap is a minimum width for the whole page.** System's finding rows
+  (a long GPU name in `Mono`) held the page at ~490px until the value was allowed to wrap.
+- **Measuring overflow headlessly: flush `DeferredDelete`.** A rebuilt list's old rows wait
+  for deletion at their stale geometry and read as overflow; `QApplication.processEvents()`
+  does not run deferred deletes — `sendPostedEvents(None, QEvent.DeferredDelete)` does.
+  `tests/test_ui.py` sweeps every screen at seven sizes down to the minimum.
+
+### GPU rendering (2026-11-10)
+
+`ui/gpu.py` decides ONCE at startup (`configure_before_app()` before the QApplication: shared
+GL contexts, vsync; `probe()` after it). Qt Widgets still paint on the CPU — there is no switch
+that moves every widget to the GPU (that would be a Qt Quick rewrite) — so the work went where
+it pays:
+
+- **The backdrop is an OpenGL widget** (`backdrop.create_backdrop` → `GLAmbientBackdrop`, 4x
+  MSAA, 30 fps instead of 8). Having a GL widget moves the WINDOW's composition to the GPU: the
+  widget layer is blended over the GL layer as a texture, so the backdrop animating no longer
+  repaints every translucent card, the transcript and the dock on the CPU.
+- **Measured live on the reference laptop** (Wayland, AMD Radeon 780M, 1280x800 @ 2.25x, 6 s
+  each, `KAYRA_UI_PROFILE=1`): CPU mode painted the backdrop 52 times a second (its own 8 fps
+  PLUS every orb and dock repaint dragging it along) at 1.79 ms; GPU mode paints it 27.6 times
+  a second at 0.65 ms, only its own frames. Total UI paint time ~190 ms/s → ~82 ms/s. One CPU
+  backdrop frame measured 18.8 ms because it repaints the window above it.
+- **Shadows are cached layers** (`components/shadow.py` `ShadowLayer`), not
+  `QGraphicsDropShadowEffect`, on the dock and the drawer: a dock repaint measured 6.98 ms with
+  the effect and 2.16 ms with the layer (offscreen, 2.25x).
+- **The page fade was NOT changed.** A snapshot crossfade was tried again and reverted: the
+  measured reason it went the first time (`grab()` = 11.9 ms on every click) still holds; the
+  effect stays on the static outgoing page. Read the comment above `_animate_page_in` first.
+- **Off when it cannot help**: `KAYRA_UI_GPU=off`, a headless platform (the suite), no GL
+  context, or a SOFTWARE GL (llvmpipe/softpipe/swrast — slower than raster). Then everything
+  draws on the CPU and looks identical; the reason is in the `[UI] Rendering:` boot line.
+- Works the same on X11 and Wayland; nothing forces a platform.
+- **`KAYRA_UI_PROFILE=1`** logs per-component paint time and rate every 5 s (`ui/profile.py`;
+  a shared no-op when off). The orb, its badge, the dock and its buttons are instrumented.
+
+### The confirmation dialog (2026-11-10)
+
+`components/confirm.py` `ConfirmDialog.ask(parent, title, body, confirm_label)` — a scrim over
+the whole window with a themed panel, `min(440, width - 32)` wide, text wrapped. It replaced
+every `QMessageBox` (shutdown, delete memory, clear memories, remove key): on Hyprland those
+were separate floating windows with the compositor's border and the icon theme's buttons.
+Esc / a click on the scrim / Cancel answer no; focus starts on Cancel so Enter is the safe
+answer; the action button names the action ("Shut down", never "Yes"). Tests set
+`ConfirmDialog.ANSWER = True/False` (and back to None) instead of patching `exec`.
+
+### Settings and System, redesigned (2026-11-10, second pass)
+
+- **Settings is five sections** (General · Voice · AI models · Gestures · Proactive) behind a
+  `SegmentedControl` — a dropdown below 600px — instead of eleven cards in one scroll. Builders
+  add cards with `self._add(card)`, which targets the section opened by `self._section(key)`.
+- **The Save bar is pinned** (`#ActionBar`, added to the View's OUTER layout, outside the
+  scroll area).
+- **Live status readouts are `FactGrid` tiles** (label above value, reflowing 1–3 columns).
+  `FactGrid.setText("A: 1\nB: 2")` / `text()` keep the line form the cards already build.
+- **No free-text where there is a right answer.** Voice is a dropdown of the voices in the
+  installed `voices.bin` (shown as "Bella · American English, female", saved as `af_bella`,
+  applied to the running engine on Save — `ASSISTANT_VOICE` was never read before); language
+  is a list of names; cloud models are fixed lists (a successful Test replaces the list with
+  what that key can use). Empty text fields show their default as a placeholder.
+- **System → Device is a tile grid**: one tile per THING (a GPU with its memory and driver,
+  not three rows). Mounts with identical total/free are one filesystem (btrfs subvolumes) and
+  share one Storage tile.
+
+### Settings: cloud models (2026-11-10)
+
+One block per provider (Claude, Groq, Gemini): the key field (masked, never filled; the pill
+says `In keyring` / `Saved` / `Missing` — where, never what), the model box(es) (editable
+combos; Groq has a chat model and a command model), **Test** and **Remove key**.
+
+- **Save** writes model ids through `write_env_values` and every TYPED key through
+  `bridge.save_provider_key` → `config.save_secret`: the system keyring when there is one
+  (`.env` then holds `NAME=@keyring`), otherwise `.env` itself made 0600. Both are applied to
+  the running engine immediately (`reload_providers`). An untouched field never erases a key.
+- **Test** sends one tiny request with the typed key (or the stored one) and the model on
+  screen, off the GUI thread; a working key fills the model boxes with what it can use.
+- **Remove** asks first, then deletes the key from the keyring and `.env`.
+- The view never sees a key: `provider_key_status()` returns only "keyring" / "file" /
+  "missing", read through `config.stored_raw` (the unresolved marker).
+- **The suite must drive `_save` inside `NoEnvWrites`.** The first version of this test did
+  not, and created a `.env` full of stub values; the end-of-suite check now also fails when
+  the suite CREATES a `.env` where there was none.
 
 ### Settings: the speech device
 

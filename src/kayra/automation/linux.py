@@ -2066,6 +2066,16 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "tab_switch": lambda: W.tab_switch(target),
                  "tab_close": lambda: W.tab_close(target, params.get("all", False)),
                  "tabs_close_others": lambda: W.tabs_close_others(),
+                 "tabs_close_duplicates": lambda: W.tabs_close_duplicates(),
+                 "tabs_close_side": lambda: W.tabs_close_side(target),
+                 "tabs_mute_others": lambda: W.tabs_mute_others(params.get("on", True)),
+                 "tabs_recently_closed": lambda: W.tabs_recently_closed(),
+                 "tab_reopen": lambda: W.tab_reopen(target),
+                 "tabs_discard": lambda: W.tabs_discard(),
+                 "tab_find": lambda: W.tab_find(target),
+                 "page_reload": lambda: W.page_reload(params.get("hard", False)),
+                 "page_zoom": lambda: W.page_zoom(target),
+                 "page_copy": lambda: W.page_copy(target),
                  "tab_mute": lambda: W.tab_mute(target, params.get("on", True)),
                  "tab_pin": lambda: W.tab_pin(),
                  "page_click": lambda: W.page_click(target, params.get("nth", 1)),
@@ -2085,11 +2095,12 @@ def _dispatch_extended(domain, verb, target, params, action):
         if verb == "join":
             return W.meet_join(target)
         if verb == "share":
-            return W.meet_share(target or "monitor")
+            return W.meet_share(target or "monitor", params.get("name", ""),
+                                bool(params.get("audio")), bool(params.get("instead")))
         if verb == "stop_share":
-            result = W._click_first(W._MEET_LABELS["stop_share"]) if W.BRIDGE.connected() else None
-            return ActionResult.success("Stopped sharing.") if result else \
-                ActionResult.not_found("You're not sharing.")
+            return W.meet_stop_share()
+        if verb == "share_status":
+            return W.meet_share_status()
         return W.meet_toggle(verb, params.get("on"))
     if domain == "email":
         if verb in ("reply", "reply_all", "forward", "archive", "delete", "back", "unread", "star", "spam"):

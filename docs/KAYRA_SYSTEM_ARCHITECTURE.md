@@ -916,6 +916,11 @@ request and what happens when it does not.
 
 ### Two hierarchies, deliberately different
 
+> **Superseded 2026-11-10.** Cohere was removed and Claude (Haiku) added. Both routes are now
+> `Claude -> Groq -> Gemini`; any one key serves both, and the HTTP status decides a failure's
+> kind before any text matching. See `docs/reference/INTELLIGENCE.md`. The text below records
+> the earlier design and its measurements.
+
 ```
 DECISION (the DMM)   Cohere  ->  Groq  ->  Gemini
 CHAT                 Groq    ->  Gemini
@@ -2599,7 +2604,7 @@ assistant just quietly stopped honouring the user's configuration.
 |---|---|
 | Speech | `INPUT_LANGUAGE`, `ASSISTANT_VOICE`, `TTS_DEVICE_MODE` (`AUTO` \| `GPU` \| `CPU`) |
 | Model routing | `FORCE_ONLINE`, `LOCAL_BASE_URL`, `LOCAL_*`, `LOCAL_PROBE_TIMEOUT_SECONDS` |
-| Cloud keys | `CohereAPIKey`, `GROQ_API_KEY`, `GEMINI_API_KEY` |
+| Cloud keys | `CLAUDE_API_KEY`, `GROQ_API_KEY`, `GEMINI_API_KEY` (+ `CLOUD_FIRST`) |
 | Identity | `ASSISTANT_NAME`, `ASSISTANT_GENDER`, `USERNAME`, `USER_GENDER`, `LANGUAGE` |
 | Proactive | all `PROACTIVE_*` (19 knobs) |
 | Automation | `AUTOMATION_CONFIRM_TTL_SECONDS`, `AUTOMATION_SHELL_TIMEOUT_SECONDS`, `AUTOMATION_SCREENSHOT_KEEP`, `AUTOMATION_MAX_TIMERS` |
@@ -2961,7 +2966,7 @@ not *what to do about it* — it offers, it does not act. App identity comes fro
 title's tail segment, so two apps sharing a suffix collapse into one habit entry. The late-night
 window is wall-clock, not calendar-aware.
 
-**DMM.** Cloud DMM is Cohere-only with no fallback; if the key is missing while online, every
+**DMM.** The cloud DMM routes Claude -> Groq -> Gemini; if no key is set while online, every
 query degrades to `general`. Few-shot ordering is sensitive enough that appends require re-running
 the matrix.
 

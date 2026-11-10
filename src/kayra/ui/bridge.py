@@ -30,6 +30,8 @@ application are for values that genuinely have no event source: system metrics a
 log, both on multi-second intervals.
 """
 
+import threading
+
 from PySide6.QtCore import QObject, Signal
 
 from kayra.ui.session import KayraSession, SessionEvents
@@ -78,6 +80,7 @@ class KayraBridge(QObject):
     assistantMessage = Signal(str)          # one spoken sentence, as it is produced
     systemMessage = Signal(str, str)        # text, tone ("info" | "warning" | "danger")
     errorOccurred = Signal(str)
+    providerTested = Signal(str, dict)      # provider, probe result (Settings → Test)
 
     # ── Intent and automation ──
     intentClassified = Signal(str, list)    # utterance, tokens
@@ -162,6 +165,79 @@ class KayraBridge(QObject):
     def set_presence_category(self, name, enabled):
         """One presence category (greetings, context, late_night, work_session, system, humor)."""
         return self._session.set_presence_category(name, enabled)
+
+    def reload_providers(self):
+        """Applies saved cloud keys and model ids to the running engine. Returns changed names."""
+        return self._session.reload_providers()
+
+    # ── Cloud model keys ──────────────────────────────────────────────
+
+    def provider_key_status(self):
+        """{"Claude"|"Groq"|"Gemini": "keyring"|"file"|"missing"}. Never the key itself."""
+        try:
+            return self._session.provider_key_status()
+        except Exception:
+            return {}
+
+    def key_storage_label(self):
+        try:
+            return self._session.key_storage_label()
+        except Exception:
+            return "the .env file"
+
+    def model_routing(self):
+        try:
+            return self._session.model_routing()
+        except Exception:
+            return {}
+
+    def available_voices(self):
+        try:
+            return self._session.available_voices()
+        except Exception:
+            return []
+
+    def current_voice(self):
+        try:
+            return self._session.current_voice()
+        except Exception:
+            return ""
+
+    def apply_voice(self, voice):
+        try:
+            return self._session.apply_voice(voice)
+        except Exception:
+            return False
+
+    def provider_model_suggestions(self):
+        try:
+            return self._session.provider_model_suggestions()
+        except Exception:
+            return {}
+
+    def save_provider_key(self, provider, value):
+        """Stores a key (empty = remove) and applies it now. {"where", "applied"}."""
+        return self._session.save_provider_key(provider, value)
+
+    def test_provider(self, provider, typed_key, model):
+        """
+        Checks a key and model with one tiny request, OFF the GUI thread. The answer arrives on
+        `providerTested(provider, result)`.
+
+        A plain daemon thread, not a QThread: a QThread parented to a widget aborts the process
+        if the window closes mid-test (see the Qt traps in docs/reference/UI.md). The signal
+        belongs to the bridge, which lives as long as the application, and a cross-thread emit
+        is delivered queued on the GUI thread.
+        """
+        def work():
+            try:
+                result = self._session.test_provider(provider, typed_key, model)
+            except Exception as exc:
+                result = {"ok": False, "kind": "UNKNOWN", "models": [], "seconds": 0.0,
+                          "message": f"The test could not run: {type(exc).__name__}."}
+            self.providerTested.emit(provider, result)
+
+        threading.Thread(target=work, name="kayra-key-test", daemon=True).start()
 
     def set_tts_device(self, mode):
         """AUTO / GPU / CPU, applied to the running Kokoro session."""

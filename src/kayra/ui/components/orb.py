@@ -61,6 +61,7 @@ from PySide6.QtCore import Qt, QTimer, QPointF, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QRadialGradient, QBrush
 from PySide6.QtWidgets import QWidget
 
+from kayra.ui import profile
 from kayra.ui.theme import Color, Motion, STATE_COLORS
 
 SEGMENTS = 48
@@ -210,6 +211,7 @@ class AssistantOrb(QWidget):
     #                             PAINTING
     # ──────────────────────────────────────────────────────────────────
 
+    @profile.timed("orb")
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -413,6 +415,7 @@ class OrbBadge(QWidget):
         self._phase += 0.12
         self.update()
 
+    @profile.timed("orb-badge")
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)

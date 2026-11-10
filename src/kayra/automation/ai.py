@@ -13,8 +13,9 @@ deterministic fallback, so a dead provider costs wording, never the feature.
 * `summarize(...)`  — the shared CentralizedLLMEngine (local first, then the cloud chain),
   bounded by a wall-clock deadline. Returns the fallback on any failure or timeout.
 * `see(...)`        — a vision request. Local LM Studio first (private: the screenshot never
-  leaves the machine), then Gemini, then Groq, each only when configured. None when nothing
-  can see, and the caller falls back to OCR text.
+  leaves the machine), then Claude, Gemini and Groq, each only when configured; with
+  FORCE_ONLINE / CLOUD_FIRST the cloud backends go first. None when nothing can see, and the
+  caller falls back to OCR text.
 """
 
 import os
@@ -124,8 +125,22 @@ def _local_chat(system, user, timeout, max_tokens, temperature=0.0):
         return ""
 
 
+def _truthy(name):
+    return str(_env(name, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _cloud_forced():
-    return str(_env("FORCE_ONLINE", "")).strip().lower() in ("1", "true", "yes", "on")
+    """FORCE_ONLINE, or CLOUD_FIRST with a cloud key: the cloud answers before a local model."""
+    if _truthy("FORCE_ONLINE"):
+        return True
+    return _truthy("CLOUD_FIRST") and any(
+        _cloud_key(name) for name in ("CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
+                                      "GROQ_API_KEY", "GEMINI_API_KEY"))
+
+
+def _cloud_key(name):
+    value = str(_env(name, "")).strip()
+    return "" if value.lower().startswith(("your_", "gsk_your", "sk-ant-your")) else value
 
 
 def fast(system, user, timeout=8.0, max_tokens=120):
@@ -136,7 +151,7 @@ def fast(system, user, timeout=8.0, max_tokens=120):
     Falls back to `complete` (the engine's local/cloud chain) when no local server answers.
     Returns the reply verbatim, or "".
     """
-    if TEXT_MODEL is not None:                       # the test suite's scripted model
+    if TEXT_MODEL is not None or _cloud_forced():    # scripted model / cloud preferred
         return complete(system, user, timeout)
     text = _local_chat(system, user, timeout, max_tokens)
     return text if text.strip() else complete(system, user, timeout)
@@ -175,19 +190,31 @@ def _env(name, default=""):
 
 
 def _vision_providers():
-    """(label, base_url, api_key, model) for every configured vision backend, local first."""
-    providers = []
-    local = _env("VISION_LOCAL_BASE_URL") or _env("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
-    local_model = _env("VISION_LOCAL_MODEL") or _local_vision_model(local)
+    """
+    (label, base_url, api_key, model) for every configured vision backend.
+
+    Local first — private, the screenshot never leaves the machine — unless the cloud is
+    preferred (FORCE_ONLINE / CLOUD_FIRST). Then Claude, Gemini, Groq: Claude Haiku is the
+    fastest of the three on a screenshot, Gemini Flash the strongest reader of dense text.
+    """
+    cloud = []
+    claude_key = _cloud_key("CLAUDE_API_KEY") or _cloud_key("ANTHROPIC_API_KEY")
+    if claude_key:
+        cloud.append(("claude", None, claude_key,
+                      _env("VISION_CLAUDE_MODEL") or _env("CLAUDE_MODEL") or "claude-haiku-5-5"))
+    if _cloud_key("GEMINI_API_KEY"):
+        cloud.append(("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
+                      _cloud_key("GEMINI_API_KEY"),
+                      _env("VISION_GEMINI_MODEL") or _env("GEMINI_CHAT_MODEL") or "gemini-flash-latest"))
+    if _cloud_key("GROQ_API_KEY"):
+        cloud.append(("groq", "https://api.groq.com/openai/v1", _cloud_key("GROQ_API_KEY"),
+                      _env("VISION_GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")))
+    local = []
+    local_url = _env("VISION_LOCAL_BASE_URL") or _env("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
+    local_model = _env("VISION_LOCAL_MODEL") or _local_vision_model(local_url)
     if local_model:
-        providers.append(("local", local, _env("LOCAL_API_KEY", "lm-studio"), local_model))
-    if _env("GEMINI_API_KEY"):
-        providers.append(("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/",
-                          _env("GEMINI_API_KEY"), _env("VISION_GEMINI_MODEL", "gemini-2.5-flash")))
-    if _env("GROQ_API_KEY"):
-        providers.append(("groq", "https://api.groq.com/openai/v1", _env("GROQ_API_KEY"),
-                          _env("VISION_GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")))
-    return providers
+        local.append(("local", local_url, _env("LOCAL_API_KEY", "lm-studio"), local_model))
+    return cloud + local if _cloud_forced() else local + cloud
 
 
 _VISION_HINTS = ("gemma-3", "gemma-4", "gemma3", "gemma4", "llava", "vision", "-vl", "qwen2.5-vl",
@@ -216,13 +243,29 @@ def _openai_vision(base_url, api_key, model, question, image_bytes, mime, local=
         # Describing a screenshot in five sentences needs no reasoning pass; on a local
         # thinking model that pass is most of the wait. Cloud backends keep their defaults.
         **({"extra_body": {"reasoning_effort": "none"}} if local else {}),
-        messages=[{"role": "system", "content":
-                   "You are Kayra, a desktop assistant looking at the user's screen. Answer in "
-                   "plain spoken sentences, no markdown, no lists, at most five sentences."},
+        messages=[{"role": "system", "content": _VISION_SYSTEM},
                   {"role": "user", "content": [
                       {"type": "text", "text": question},
                       {"type": "image_url", "image_url": {"url": data_uri}}]}])
     return reply.choices[0].message.content
+
+
+_VISION_SYSTEM = ("You are Kayra, a desktop assistant looking at the user's screen. Answer in "
+                  "plain spoken sentences, no markdown, no lists, at most five sentences.")
+
+
+def _claude_vision(api_key, model, question, image_bytes, mime):
+    import anthropic
+    from kayra.intelligence.llm_engine import claude_speed_args, claude_text
+    client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=VISION_TIMEOUT_S)
+    reply = client.messages.create(
+        model=model, max_tokens=400, system=_VISION_SYSTEM,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": mime,
+                                         "data": base64.standard_b64encode(image_bytes).decode()}},
+            {"type": "text", "text": question}]}],
+        **claude_speed_args(model, "low"))
+    return claude_text(reply)
 
 
 def see(question, image_bytes, mime="image/jpeg"):
@@ -232,8 +275,11 @@ def see(question, image_bytes, mime="image/jpeg"):
         return (_clean(answer), "test") if answer else (None, None)
     for label, base_url, key, model in _vision_providers():
         try:
-            answer = _openai_vision(base_url, key, model, question, image_bytes, mime,
-                                    local=(label == "local"))
+            if label == "claude":
+                answer = _claude_vision(key, model, question, image_bytes, mime)
+            else:
+                answer = _openai_vision(base_url, key, model, question, image_bytes, mime,
+                                        local=(label == "local"))
         except Exception:
             continue
         if answer and answer.strip():

@@ -40,6 +40,7 @@ the barge-in watcher, the proactive agent — is a thread the backend already ow
 adds no others and starts no timers.
 """
 
+import os
 import queue
 import asyncio
 import threading
@@ -534,6 +535,120 @@ class KayraSession:
         except Exception as exc:
             self.events.error(f"Could not switch the speech device: {exc}")
             return None
+
+    # ── Cloud model keys (the Settings screen's provider card) ────────
+    # Keys are never handed back to the UI. The screen learns only WHETHER a key is stored and
+    # WHERE (keyring or file); a test runs here, with the stored key, when nothing was typed.
+
+    PROVIDER_KEY_NAMES = {"Claude": "CLAUDE_API_KEY", "Groq": "GROQ_API_KEY",
+                          "Gemini": "GEMINI_API_KEY"}
+
+    def provider_key_status(self):
+        """{provider: "keyring" | "file" | "missing"} — never the key."""
+        from kayra.core import config
+        status = {}
+        for provider, name in self.PROVIDER_KEY_NAMES.items():
+            raw = str(config.stored_raw(name) or "").strip()
+            if raw == "@keyring":
+                status[provider] = "keyring" if config.env(name) else "missing"
+            elif raw and not raw.lower().startswith(("your_", "gsk_your", "sk-ant-your")):
+                status[provider] = "file"
+            elif provider == "Claude" and config.env("ANTHROPIC_API_KEY"):
+                status[provider] = "file"
+            else:
+                status[provider] = "missing"
+        return status
+
+    def key_storage_label(self):
+        from kayra.core import credentials
+        return credentials.backend_label()
+
+    def model_routing(self):
+        """{"mode": "local"|"cloud", "local_url", "answering"} from the RUNNING engine; {} before boot."""
+        import sys
+        module = sys.modules.get("kayra.intelligence.llm_engine")
+        engine = getattr(getattr(module, "CentralizedLLMEngine", None), "_instance", None)
+        if engine is None or not getattr(engine, "_initialized", False):
+            return {}
+        try:
+            engine._sync_mode(force=True)
+            return engine.routing_summary()
+        except Exception:
+            return {}
+
+    def available_voices(self):
+        """The voice ids in the installed Kokoro voices file, sorted; [] when there is none."""
+        try:
+            import numpy as np
+            from kayra.core.paths import model_path
+            for name in ("voices-v1.0.bin", "voices.bin"):
+                path = model_path(name)
+                if os.path.exists(path):
+                    with np.load(path) as bundle:
+                        return sorted(bundle.files)
+        except Exception:
+            pass
+        return []
+
+    def current_voice(self):
+        engine = getattr(self._app, "tts_engine", None) if self._app else None
+        return str(getattr(engine, "voice", "") or "")
+
+    def apply_voice(self, voice):
+        """Switches the RUNNING voice; the next sentence uses it. False when nothing runs."""
+        engine = getattr(self._app, "tts_engine", None) if self._app else None
+        if engine is None or not voice or voice not in self.available_voices():
+            return False
+        engine.voice = voice
+        return True
+
+    def provider_model_suggestions(self):
+        from kayra.intelligence.llm_engine import PROVIDER_MODEL_SUGGESTIONS
+        return {name: list(models) for name, models in PROVIDER_MODEL_SUGGESTIONS.items()}
+
+    def save_provider_key(self, provider, value):
+        """
+        Stores (or, with an empty value, removes) a provider's key and applies it to the
+        running engine. Returns {"where": "keyring"|"file"|"removed"|"", "applied": [...]}.
+        """
+        from kayra.core import config
+        from kayra.core.settings_log import get_settings_recorder
+        name = self.PROVIDER_KEY_NAMES.get(provider)
+        if not name:
+            return {"where": "", "applied": []}
+        had = bool(config.env(name))
+        where = config.save_secret(name, value)
+        if where:
+            get_settings_recorder().record(name, value or "", old_value="x" if had else "")
+        return {"where": where, "applied": self.reload_providers() if where else []}
+
+    def test_provider(self, provider, typed_key, model):
+        """One tiny request with the typed key, or the stored one. Blocking: call off the GUI
+        thread. Returns the dict `llm_engine.probe_provider` returns."""
+        from kayra.core import config
+        from kayra.intelligence.llm_engine import probe_provider
+        name = self.PROVIDER_KEY_NAMES.get(provider, "")
+        key = (typed_key or "").strip() or config.env(name) or (
+            config.env("ANTHROPIC_API_KEY") if provider == "Claude" else "")
+        return probe_provider(provider, key, model)
+
+    def reload_providers(self):
+        """
+        Hands saved keys and model ids to the RUNNING model engine, if one exists. Returns the
+        providers whose key changed, or [] when there is no engine yet (it will read `.env`
+        when it is built). Read out of `sys.modules`: the UI must not import the engine — and
+        so build its clients — just to tell it something changed.
+        """
+        import sys
+        module = sys.modules.get("kayra.intelligence.llm_engine")
+        engine = getattr(getattr(module, "CentralizedLLMEngine", None), "_instance", None)
+        if engine is None or not getattr(engine, "_initialized", False):
+            return []
+        try:
+            return engine.reload_providers()
+        except Exception as exc:
+            self.events.error(f"Could not apply the new model keys: {exc}")
+            return []
 
     def set_proactive(self, enabled):
         agent = getattr(self._app, "proactive_agent", None) if self._app else None

@@ -37,7 +37,9 @@ import re
 import sys
 import time
 import argparse
+import shutil
 import subprocess
+import tempfile
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(TESTS_DIR)
@@ -94,6 +96,8 @@ SUITES = [
          note="injected clock; no provider is ever called"),
     dict(file="test_memory_store.py", category="unit", feature="Memory management",
          needs="none", writes="temp store only", seconds=3),
+    dict(file="test_credentials.py", category="unit", feature="API key storage",
+         needs="none", writes="temp .env only", seconds=1),
     dict(file="test_logging.py", category="unit", feature="Structured logging",
          needs="none", writes="nothing", seconds=3),
     dict(file="test_stt_backend.py", category="unit", feature="STT backend switching",
@@ -303,6 +307,11 @@ def main():
     if "manual" not in categories:
         print("Manual suites are never run here — see --list for how to run them by hand.")
 
+    # The automation audit log of every suite goes to a temporary file, never into the
+    # developer's logs/automation.log (BROWSER_CONTROL_PLAN §12, M0.6). Inherited by children.
+    audit_dir = tempfile.mkdtemp(prefix="kayra-test-audit-")
+    os.environ.setdefault("KAYRA_AUDIT_LOG", os.path.join(audit_dir, "automation.log"))
+
     results = []
     for entry in selected:
         extra = ["--live"] if (args.live and entry["file"] in
@@ -312,6 +321,7 @@ def main():
         results.append(run_suite(entry, python_exe, extra))
 
     totals = print_table(results)
+    shutil.rmtree(audit_dir, ignore_errors=True)
 
     broken = [r for r in results
               if r["status"] != "ok" and not r["status"].startswith("n/a")]

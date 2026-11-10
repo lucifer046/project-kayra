@@ -810,6 +810,13 @@ def normalize_command(command, context=None):
             parameters["name"] = lowered
         return Action(domain, action, target="current", parameters=parameters, raw=raw)
 
+    # 1b. A request to share the screen, however it arrived ("share screen", "click on share
+    # screen", "start screen sharing"): ONE meet.share, never a click or a new meeting (M0.1).
+    if _BARE_SHARE.match(lowered):
+        request = share_request(lowered)
+        if request is not None:
+            return _share_action(request, raw)
+
     # 2. Prefix tokens, longest first.
     for prefix, (domain, action) in _PREFIX_TOKENS:
         if lowered.startswith(prefix):
@@ -903,6 +910,153 @@ def merge_tab_steps(actions):
     return out
 
 
+def merge_share_steps(actions):
+    """
+    "share the LM Studio window" sometimes arrives as `focus lm studio` + `meet share window`
+    (the audit log of 2026-11-10). Run literally, the focus takes Meet out of the front and
+    the share then picks the wrong thing. The name belongs to the share (M0.3): the focus is
+    dropped and the share is told which window.
+    """
+    out = []
+    for action in actions:
+        previous = out[-1] if out else None
+        if previous is not None and action.domain == "meet" and action.action == "share" \
+                and previous.domain in ("window", "app") and previous.action in ("focus", "switch") \
+                and not action.parameters.get("name") and action.target in ("monitor", "window"):
+            action.target = "window"
+            action.parameters["name"] = previous.target
+            out[-1] = action
+            continue
+        if action.domain == "meet" and action.action == "share":
+            # One utterance shares ONE thing: a second share in the same batch (the DMM said
+            # it twice in different words) keeps whichever named something specific.
+            earlier = next((a for a in out if a.domain == "meet" and a.action == "share"), None)
+            if earlier is not None:
+                if action.parameters.get("name") and not earlier.parameters.get("name"):
+                    out[out.index(earlier)] = action
+                continue
+        out.append(action)
+    return out
+
+
+# ── Screen sharing (BROWSER_CONTROL_PLAN §12, M0.1 / M1) ──
+# Every way of asking to share, read ONCE into {surface, name, audio}. `surface` is what
+# getDisplayMedia calls it: monitor | window | browser. `name` is the window, tab or monitor
+# the user named ("lm studio", "youtube", "#2"), or "".
+_SHARE_WORD = re.compile(r"\b(shar(?:e|ing)|screen ?share|screensharing|present(?:ing| now)?)\b")
+_SHARE_STOP = re.compile(r"\b(stop|end|quit|cancel|finish)\b.*\b(shar|present)|"
+                         r"\b(shar\w*|present\w*)\b.*\b(stop|off)\b$")
+_SHARE_STATUS = re.compile(r"^(?:am i|are we|is (?:my|the) screen|is anything|what am i)\b.*"
+                           r"\b(shar|present)|^(?:sharing|share) status$")
+_SCREEN_WORDS = r"(?:entire |whole |full |my |the |this )*(?:screen|desktop|display|monitor)"
+_MONITOR_ORDINAL = re.compile(
+    r"\b(?:my |the )?(first|second|third|other|external|left|right|main|primary|laptop|built ?in)"
+    r" (?:screen|monitor|display)\b|\b(?:screen|monitor|display) (\d)\b")
+
+
+def share_request(text):
+    """
+    'start screen sharing' -> {'surface': 'monitor', 'name': ''}
+    'share the lm studio window' -> {'surface': 'window', 'name': 'lm studio'}
+    'present this tab' / 'share the youtube tab' -> {'surface': 'browser', 'name': '' | 'youtube'}
+    'share my second screen' -> {'surface': 'monitor', 'name': '#2'}
+    None when the words are not a request to share (or are a request to STOP sharing).
+    """
+    low = " ".join(re.sub(r"[^\w\s#-]", " ", str(text or "").lower()).split())
+    if not low or not _SHARE_WORD.search(low) or _SHARE_STOP.search(low) or _SHARE_STATUS.search(low):
+        return None
+    audio = bool(re.search(r"\bwith (?:the )?(?:system )?(?:audio|sound)\b", low))
+    low = re.sub(r"\s*\bwith (?:the )?(?:system )?(?:audio|sound)\b", "", low)
+    instead = bool(re.search(r"\binstead\b", low))
+    low = re.sub(r"\s*\binstead\b", "", low).strip()
+    out = {"surface": "monitor", "name": "", "audio": audio, "instead": instead}
+    m = _MONITOR_ORDINAL.search(low)
+    if m:
+        word = m.group(1) or m.group(2)
+        out["name"] = {"first": "#1", "main": "#1", "primary": "#1", "laptop": "#1",
+                       "built in": "#1", "builtin": "#1", "second": "#2", "other": "#2",
+                       "external": "#2", "third": "#3", "left": "<", "right": ">"}.get(word, f"#{word}")
+        return out
+    # The thing being shared: whatever follows the share verb, minus the filler words.
+    m = re.search(r"\b(?:shar(?:e|ing)|present(?:ing)?|screen ?share)\b\s*(.*)$", low)
+    rest = m.group(1) if m else ""
+    rest = re.sub(r"^(?:screen\s+)?(?:of|on|in)\s+(?:this|the|my)\s+(?:meet|meeting|call)\s*", "", rest)
+    rest = re.sub(r"^(?:screen|now)\b\s*", "", rest)
+    rest = re.sub(r"\s*\b(?:in|on|to|with|into) (?:the |this |my )?(?:meet|meeting|call|google meet)\b.*$", "", rest)
+    rest = re.sub(r"^(?:and |then )?(?:share |present )?", "", rest).strip()
+    if re.search(r"\btab\b", rest):
+        name = re.sub(r"\btab\b.*$", "", rest).strip()
+        name = re.sub(r"^(?:the|my|a|this|that|current|chrome|browser)\b\s*", "", name).strip()
+        name = re.sub(r"^(?:the|my|a|this|that|current|chrome|browser)\b\s*", "", name).strip()
+        out.update(surface="browser", name=name)
+        return out
+    if re.search(r"\b(?:window|app|application)\b", rest):
+        name = re.sub(r"\s*\b(?:window|app|application)\b.*$", "", rest).strip()
+        name = re.sub(r"^(?:the|my|a|this|that|one|an)\b\s*", "", name).strip()
+        out.update(surface="window", name="" if name in ("this", "that", "a", "") else name)
+        return out
+    if not rest or re.fullmatch(_SCREEN_WORDS + r"?(?: now)?", rest) or rest in ("everything", "it"):
+        return out
+    if re.match(r"(?:with|to|for)\b", rest):
+        return out
+    # "share LM Studio" — a name with no surface word is a window.
+    out.update(surface="window", name=re.sub(r"^(?:the|my)\b\s*", "", rest).strip())
+    return out
+
+
+def _share_action(request, raw):
+    surface = request["surface"]
+    params = {"name": request["name"]}
+    if request.get("audio"):
+        params["audio"] = True
+    if request.get("instead"):
+        params["instead"] = True
+    return Action("meet", "share", target=surface, parameters=params, raw=raw)
+
+
+# A DMM token that is a share request but arrived without the `meet` prefix — "share screen",
+# "click on share screen", "start screen sharing", "present now" (M0.1). Only phrasings that
+# name a SCREEN surface or presenting are taken; "click on share" on a video page stays a click.
+_BARE_SHARE = re.compile(
+    r"^(?:(?:browser )?(?:click|press|tap|hit)(?: on)?(?: the)? |start |begin |please )?"
+    r"(?:(?:start|begin) )?(?:screen ?shar(?:e|ing)|screensharing|present(?:ing)?(?: now)?$|"
+    r"present(?:ing)? (?:my|the|this|a) (?:\w+ )*(?:screen|window|tab)\b|"
+    r"shar(?:e|ing) (?:(?:my|the|this|a|entire|whole|full|second|other)\s+)*"
+    r"(?:screen|desktop|display|monitor|window|tab)\b|shar(?:e|ing) \S.* (?:window|tab)\b)")
+
+
+_ORDINALS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7,
+    "eighth": 8, "ninth": 9, "tenth": 10,
+}
+
+
+def tab_position(text):
+    """
+    "the third tab" -> "#3", "the last tab" -> "#-1", "the second last tab" -> "#-2",
+    "tab 4" -> "#4", "the tab on the right" -> "+1", "the tab on the left" -> "-1".
+    None when the words name a site instead of a position.
+    """
+    low = " ".join(str(text or "").lower().replace("-", " ").split())
+    low = re.sub(r"^(?:the|my)\s+", "", low)
+    m = re.fullmatch(r"tab (?:on|to) the (right|left)|(right|left) tab", low)
+    if m:
+        return "+1" if (m.group(1) or m.group(2)) == "right" else "-1"
+    m = re.fullmatch(r"(?:(second|third) )?last(?: tab)?|(?:(second|third) to last)(?: tab)?", low)
+    if m:
+        back = m.group(1) or m.group(2)
+        return f"#-{_ORDINALS.get(back, 1)}"
+    word = re.sub(r"\s+tab$", "", low)
+    if word in _ORDINALS:
+        return f"#{_ORDINALS[word]}"
+    m = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th) tab|(\d{1,2})(?:st|nd|rd|th)|tab (?:number )?(\d{1,2})", low)
+    if m:
+        number = int(next(g for g in m.groups() if g))
+        if number > 0:
+            return f"#{number}"
+    return None
+
+
 def _web_action(kind, payload, raw):
     """'browser …', 'meet …', 'email …', 'calendar …', 'message …' -> a structured action."""
     text = (payload or "").strip()
@@ -914,10 +1068,47 @@ def _web_action(kind, payload, raw):
         m = re.match(r"close (?:all )?(?:the )?other tabs|close all tabs except (?:this|the current)(?: one| tab)?", low)
         if m:
             return Action("browser", "tabs_close_others", target="others", raw=raw)
+        # ── Part 2b ──
+        m = re.fullmatch(r"(un)?mute (?:all |every )?(?:the )?(?:other tabs|tabs except (?:this|the current)(?: one| tab)?|everything (?:else|except (?:this|the current)(?: one| tab)?))", low)
+        if m:
+            return Action("browser", "tabs_mute_others", target="others",
+                          parameters={"on": not m.group(1)}, raw=raw)
+        if re.fullmatch(r"what (?:tabs? )?did i (?:just )?close|(?:show |list )?(?:my )?recently closed(?: tabs)?|what did i close", low):
+            return Action("browser", "tabs_recently_closed", target="closed", raw=raw)
+        m = re.fullmatch(r"(?:reopen|restore|bring back) (?:the )?(.+?) tab(?: (?:that )?i (?:just )?closed)?", low)
+        if m and m.group(1) not in ("last", "closed", "last closed"):
+            return Action("browser", "tab_reopen", target=m.group(1), raw=raw)
+        if re.fullmatch(r"(?:free up|save|reduce) (?:some )?memory(?: in chrome| in the browser)?|(?:put|send) (?:the |my )?(?:background |other )?tabs to sleep|(?:discard|sleep) (?:the |my )?(?:background |other )?tabs", low):
+            return Action("browser", "tabs_discard", target="background", raw=raw)
+        m = re.fullmatch(r"(?:find|which is|where is|show me) (?:the |my )?tab (?:where i was |that )?(?:reading |looking )?(?:about|on|with|mentioning|has) (.+)", low)
+        if m:
+            return Action("browser", "tab_find", target=m.group(1), raw=raw)
+        if re.fullmatch(r"hard (?:reload|refresh)(?: (?:this|the) page)?|(?:reload|refresh) (?:this page |the page )?without (?:the )?cache", low):
+            return Action("browser", "page_reload", target="current", parameters={"hard": True}, raw=raw)
+        m = re.fullmatch(r"(?:set )?(?:the )?(?:page )?zoom (?:the page )?(?:to |at )?(\d{2,3})(?: ?%| percent)?", low)
+        if m:
+            return Action("browser", "page_zoom", target=m.group(1), raw=raw)
+        m = re.fullmatch(r"copy (?:the |this )?(?:page'?s? |tab'?s? )?(link|url|address|title)(?: of (?:this|the) (?:page|tab))?", low)
+        if m:
+            return Action("browser", "page_copy", target="title" if m.group(1) == "title" else "link", raw=raw)
+        if re.fullmatch(r"close (?:all )?(?:the |my )?duplicate(?: tabs)?s?|close (?:the )?duplicates?(?: tabs)?|remove duplicate tabs", low):
+            return Action("browser", "tabs_close_duplicates", target="duplicates", raw=raw)
+        m = re.fullmatch(r"close (?:all )?(?:the |my )?(?:other )?tabs (?:to|on) the (right|left)", low)
+        if m:
+            return Action("browser", "tabs_close_side", target=m.group(1), raw=raw)
+        m = re.fullmatch(r"close (.+)", low)
+        position = tab_position(m.group(1)) if m else None
+        if position:
+            return Action("browser", "tab_close", target=position, parameters={"all": False},
+                          raw=raw)
         m = re.match(r"close (all )?(?:the |my )?(.+?) tabs?$", low)
         if m:
             return Action("browser", "tab_close", target=m.group(2),
                           parameters={"all": bool(m.group(1))}, raw=raw)
+        m = re.fullmatch(r"(?:switch|go|jump|move|take me) (?:to|over to) (.+)", low)
+        position = tab_position(m.group(1)) if m else None
+        if position:
+            return Action("browser", "tab_switch", target=position, raw=raw)
         m = re.match(r"(?:switch|go|jump|take me) to (?:the |my )?(.+?)(?: tab)?$", low)
         if m and m.group(1) not in ("top", "bottom"):
             return Action("browser", "tab_switch", target=m.group(1), raw=raw)
@@ -983,14 +1174,16 @@ def _web_action(kind, payload, raw):
                       confidence=0.5, raw=raw)
 
     if kind == "meet":
+        if _SHARE_STATUS.search(low):
+            return Action("meet", "share_status", target="current", raw=raw)
+        request = share_request(low)
+        if request is not None:
+            return _share_action(request, raw)
         if re.match(r"(?:join|start|open)\b", low):
             code = re.search(r"([a-z]{3}-[a-z]{4}-[a-z]{3})|(https?://meet\.google\.com/\S+)", low)
             return Action("meet", "join", target=code.group(0) if code else "new", raw=raw)
         if re.search(r"(share|present).*(stop|end)|(stop|end).*(shar|present)", low):
             return Action("meet", "stop_share", target="current", raw=raw)
-        if re.search(r"share|present", low):
-            surface = ("window" if "window" in low else "browser" if "tab" in low else "monitor")
-            return Action("meet", "share", target=surface, raw=raw)
         for word, op in (("mic", "mic"), ("microphone", "mic"), ("mute", "mic"),
                          ("camera", "camera"), ("video", "camera"), ("caption", "captions"),
                          ("hand", "hand"), ("leave", "leave"), ("hang up", "leave"),
@@ -1410,7 +1603,31 @@ _CONFIRM_PROMPTS = {
 }
 
 
+_TRUST_TTL_S = 3 * 3600          # "don't ask again" lasts for the call, at most three hours
+_TRUSTABLE = {"meet.share"}      # the ONLY confirmation that may be switched off by voice
+_DONT_ASK = re.compile(r"[\s,.!]*\b(?:and )?(?:(?:don'?t|do not|never|no need to) ask(?: me)?"
+                       r"(?: again| that again| for this call| this call)*|stop asking(?: me)?)\b.*$")
+
+
+def _share_what(action):
+    name = (action.parameters or {}).get("name") or ""
+    surface = action.target or "monitor"
+    if surface == "window":
+        return f"the {name} window" if name else "a window"
+    if surface == "browser":
+        return f"the {name} tab" if name else "a Chrome tab"
+    if name:
+        return {"#1": "your first screen", "#2": "your second screen", "#3": "your third screen",
+                "<": "your left screen", ">": "your right screen"}.get(name, f"the {name} screen")
+    return "your entire screen"
+
+
 def _confirm_prompt(action, reason):
+    if action.key == "meet.share":
+        # Says WHAT goes to everyone (M0.5): "Share the LM Studio window with everyone in the
+        # call?" — a reflexive yes to "share monitor?" is how the whole desktop got shared.
+        return (f"Share {_share_what(action)} with everyone in the call? You can say "
+                f"\"yes, don't ask again\" for the rest of this call.")
     prompt = _CONFIRM_PROMPTS.get(action.key)
     if prompt:
         return prompt
@@ -1459,6 +1676,9 @@ class AutomationRuntime:
         # "automation" token was really conversation, and the app answers it as chat.
         self.situation_fn = None
         self.chat_handoff = False
+        # Confirmations the user switched off by voice ("yes, don't ask again"): key -> expiry.
+        # Only `_TRUSTABLE` keys, cleared when the call ends (meet.leave).
+        self.trusted = {}
 
     def take_chat_handoff(self):
         """True once after a request the understanding layer judged to be conversation."""
@@ -1493,6 +1713,8 @@ class AutomationRuntime:
                 audit(AUDIT_BLOCKED, action, reason=reason)
                 spoken = self._refusal(action)
                 return ActionResult.blocked(spoken or f"I won't do that — {reason}.")
+            if verdict == Risk.CONFIRM and self.trusted.get(action.key, 0) > time.monotonic():
+                verdict = Risk.ALLOW                 # the user said "don't ask again" this call
             if verdict == Risk.CONFIRM:
                 prompt = _confirm_prompt(action, reason)
                 self.confirmations.request(action, prompt)
@@ -1509,6 +1731,8 @@ class AutomationRuntime:
             result = ActionResult.unsupported("I don't know how to do that yet.")
         result.action = action
 
+        if action.key == "meet.leave" and result.ok:
+            self.trusted.pop("meet.share", None)     # the call is over, so is the trust
         if result.status == Status.AMBIGUOUS:
             audit(AUDIT_AMBIGUOUS, action, candidates=result.detail.get("candidates"))
         elif result.ok:
@@ -1553,7 +1777,7 @@ class AutomationRuntime:
         self._set_state("AUTOMATING")
         outcomes = {"ok": 0, "failed": 0, "tokens": []}
         try:
-            for group in plan_actions(merge_tab_steps(actions)):
+            for group in plan_actions(merge_share_steps(merge_tab_steps(actions))):
                 if len(group) == 1:
                     results = [await asyncio.to_thread(self.execute_action, group[0])]
                     if _worth_rethinking(group[0], results[0]) and id(group[0]) not in from_model:
@@ -1641,12 +1865,19 @@ class AutomationRuntime:
         return self.confirmations.prompt if self.confirmations.peek() is not None else None
 
     def resolve_confirmation(self, reply):
+        action = self.confirmations.peek()
+        trust = False
+        if action is not None and action.key in _TRUSTABLE:
+            bare = _DONT_ASK.sub("", str(reply or "").lower()).strip(" ,.!")
+            if bare != str(reply or "").lower().strip(" ,.!") and read_confirmation_reply(bare or "yes"):
+                trust, reply = True, bare or "yes"
         verdict = read_confirmation_reply(reply)
         if verdict is None:
             return False, ""
-        action = self.confirmations.peek()
         if action is None:
             return False, ""
+        if trust and verdict is True:
+            self.trusted[action.key] = time.monotonic() + _TRUST_TTL_S
         if verdict is False:
             self.confirmations.cancel()
             audit(AUDIT_BLOCKED, action, reason="declined by user")
@@ -1660,6 +1891,8 @@ class AutomationRuntime:
             return True, "That request expired. Ask me again if you still want it."
         result = self.execute_action(approved, skip_policy=True)
         spoken = [result.message or "Done."]
+        if trust:
+            spoken.append("I won't ask again before sharing during this call.")
         if self.pending_plan:
             rest, self.pending_plan = self.pending_plan, []
             spoken += self.run_steps(rest)

@@ -650,16 +650,19 @@ def _readiness_findings():
 
     # Language model routing.
     force_online = env_bool("FORCE_ONLINE", False)
-    has_cohere = bool(env("CohereAPIKey"))
-    has_chat = bool(env("GROQ_API_KEY") or env("GEMINI_API_KEY"))
-    local_url = env("LOCAL_BASE_URL")
+    def _key(name):
+        value = str(env(name) or "").strip()
+        return "" if value.lower().startswith(("your_", "gsk_your", "sk-ant-your")) else value
 
-    if has_cohere and has_chat:
-        verdict, summary, advice = READY, "Cloud routing configured", ""
-    elif has_chat and not has_cohere:
-        verdict, summary = REQUIRES_CONFIGURATION, "Intent classification key missing"
-        advice = ("Without a Cohere key every request is treated as conversation, so automation "
-                  "commands will not run. Add CohereAPIKey in Settings.")
+    cloud = [label for label, names in (("Claude", ("CLAUDE_API_KEY", "ANTHROPIC_API_KEY")),
+                                        ("Groq", ("GROQ_API_KEY",)),
+                                        ("Gemini", ("GEMINI_API_KEY",)))
+             if any(_key(n) for n in names)]
+    local_url = env("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
+
+    if cloud:
+        # One key is enough: every cloud provider both classifies and converses.
+        verdict, summary, advice = READY, "Cloud routing: " + " > ".join(cloud), ""
     elif local_url and not force_online:
         verdict, summary, advice = GOOD, "Local model endpoint configured", \
             "Cloud keys are not required while the local server is reachable."

@@ -48,9 +48,15 @@ def env_values() -> dict:
     if dotenv_values is None:
         return {}
     try:
-        return dict(dotenv_values(env_file()) or {})
+        values = dict(dotenv_values(env_file()) or {})
     except Exception:
         return {}
+    # `NAME=@keyring` means the key lives in the system keyring (see `core.credentials`).
+    # Resolved here so no reader ever sees the marker or learns where the key is kept.
+    if any(str(v or "").strip() == "@keyring" for v in values.values()):
+        from kayra.core import credentials
+        credentials.resolve(values)
+    return values
 
 
 def load_environment(override: bool = False) -> dict:
@@ -66,7 +72,13 @@ def load_environment(override: bool = False) -> dict:
             load_dotenv(env_file(), override=override)
         except Exception:
             pass
-    return env_values()
+    values = env_values()
+    # `load_dotenv` exported a keyring MARKER as the value; replace it with the resolved key
+    # so a subsystem reading `os.environ` sees what `env()` sees.
+    for name, value in values.items():
+        if os.environ.get(name, "").strip() == "@keyring":
+            os.environ[name] = str(value or "")
+    return values
 
 
 def env(name: str, default=None):
@@ -115,6 +127,19 @@ def assistant_name(default: str = "Kayra") -> str:
     return (env("ASSISTANT_NAME") or default).strip() or default
 
 
+def stored_raw(name: str):
+    """
+    A setting exactly as written in `.env` — the `@keyring` marker NOT resolved. Lets the
+    Settings screen say WHERE a key is kept without ever reading the key itself.
+    """
+    if dotenv_values is None:
+        return None
+    try:
+        return (dotenv_values(env_file()) or {}).get(name)
+    except Exception:
+        return None
+
+
 def reset_cache():
     """Forgets the cached parse. For tests and for `setup.py` rewriting `.env` in-process."""
     env_values.cache_clear()
@@ -129,7 +154,9 @@ def reset_cache():
 # setup script from inside the package to save a few lines would be worse than this.
 
 SECRET_KEYS = frozenset({
-    "CohereAPIKey", "GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "HF_TOKEN",
+    "CLAUDE_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+    "OPENAI_API_KEY", "HF_TOKEN",
+    "CohereAPIKey",     # no longer used; still hidden if an old .env carries it
 })
 
 
@@ -202,9 +229,43 @@ def write_env_values(updates: dict) -> bool:
             pass
         return False
 
+    _owner_only(path)
+
     # The cached parse is now stale, and `os.environ` is what several subsystems read.
     reset_cache()
+    resolved = env_values()
     for name, value in updates.items():
         if value is not None:
-            os.environ[name] = str(value)
+            os.environ[name] = str(resolved.get(name, value) if value == "@keyring" else value)
     return True
+
+
+def _owner_only(path):
+    """
+    `.env` can hold API keys, so on POSIX it is readable by its owner only (0600). A file
+    written with the default umask is usually world-readable, which on a shared machine means
+    every other account can read the keys.
+    """
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def save_secret(name, value):
+    """
+    Stores an API key typed into Settings: in the system keyring when there is one (`.env`
+    then holds `NAME=@keyring`), otherwise in `.env` itself (owner-only). An empty value
+    REMOVES the key from both. Returns where it went: "keyring", "file" or "removed", or ""
+    on failure.
+    """
+    from kayra.core import credentials
+    value = str(value or "").strip()
+    if not value:
+        credentials.delete(name)
+        return "removed" if write_env_values({name: ""}) else ""
+    if credentials.store(name, value):
+        return "keyring" if write_env_values({name: credentials.MARKER}) else ""
+    return "file" if write_env_values({name: value}) else ""

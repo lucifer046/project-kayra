@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Part 1 of 7 done, plus the AI understanding layer (2026-11-10).**
-> See §10 for the parts and what is next (Part 2). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2a, 2b and 2M done (2026-11-10).**
+> See §10 for the parts and what is next (2M-live: try sharing in a real call; then 2c). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -433,12 +433,13 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 | H4 — Cross-app layer | H4 |
 
 - [x] A1 [x] A2 [x] A3 [x] A4 [x] A5 [x] A6  *(A6: GitHub "my repos" has no user-free URL — not added)*
-- [ ] B1 [ ] B2 [ ] B3 [ ] B4 [ ] B5 [ ] B6 [ ] B7 [ ] B8
-- [ ] C1 [ ] C2 [ ] C3 [ ] C4 [ ] C5 [ ] C6 [ ] C7 [ ] C8 [ ] C9 [ ] C10 [ ] C11
+- [x] B1 [~] B2 [x] B3 [ ] B4 [ ] B5 [x] B6 [x] B7 [x] B8  *(B2: duplicates / right / left done; "all YouTube tabs" + CONFIRM > 3 is 2c)*
+- [x] C1 [x] C2 [ ] C3 [ ] C4 [ ] C5 [ ] C6 [x] C7 [ ] C8 [ ] C9 [ ] C10 [ ] C11
 - [ ] D1 [ ] D2 [ ] D3 [ ] D4 [ ] D5
 - [ ] E1 [ ] E2 [ ] E3 [ ] E4 [ ] E5 [ ] E6 [ ] E7 [ ] E8
 - [ ] F1 [ ] F2 [ ] F3 [ ] F4 [ ] F5 [ ] F6
 - [ ] G1 [ ] G2 [x] G3 [ ] G4 [ ] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
+- §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [ ] M2.2 [ ] M2.3 [ ] M3 [ ] M4  *(M1.2: Chrome's tab list opens, the user picks the tab)*
 - [x] H0.1 [ ] H0.2 [ ] H0.3 [ ] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
 
 ## 9. Known state at the time of writing
@@ -468,12 +469,74 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 |---|---|---|
 | 1 | Tuning pass; A1–A6, G3 (`page.waitFor`), H0.1, `browser update` + self-updating extension | **done 2026-11-10** |
 | 1b | The understanding layer (`automation/interpreter.py`), requested by the user | **done 2026-11-10** |
-| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | next |
+| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | **in progress** — 2a done (B1 by position, B2 duplicates / right / left); 2b done (B3 mute the rest, B6 recently closed + reopen by name, B7 sleep tabs, B8 find the tab, C1 hard reload, C2 zoom to N %, C7 copy link/title) — 2026-11-10. Next (2c): B2 "all YouTube tabs" + CONFIRM > 3, B4 groups, B5 windows, C3 "open the third result", C4 find with highlight |
+| 2M | §12 Meetings and screen sharing. M0 bugs (misroutes, fake meet code, fixed waits, confirm, test log hygiene), M1 share a named window / tab / monitor (xdph picker helper), M2.1 DND | **done 2026-11-10** except M0.7 (try it in a live call — needs the user) and M2.2/M2.3, M3, M4 (next meeting slice, after 2c or when asked) |
+| N | §13 neighbouring features (browser N1, models N2, interface N3, voice N4, housekeeping N5) — pick up beside the part each neighbours | |
 | 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | |
 | 4 | E1–E8 Google Workspace (needs D3 answered) | |
 | 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | |
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Part 2M — meetings and screen sharing** (done 2026-11-10, extension 1.4.0). §12 in full.
+- M0.1 `common.share_request()` reads every phrasing ("share screen", "start screen sharing",
+  "present now", "share the LM Studio window", "share this tab", "share my second screen",
+  "… with sound", "… instead") into ONE `meet.share {surface, name, audio, instead}`; a bare
+  token ("click on share screen") is caught before the click/screen prefixes; "meet am i
+  sharing" is `meet.share_status`. The DMM preamble and `interpreter.CATALOG` (+ a worked
+  example) carry the shapes. Live check against the local gemma model: all nine test
+  phrasings produced the right token.
+- M0.2 `llm_engine._guard_meeting_code`: a code the user never said is dropped (or, when the
+  user said share, re-read as the share).
+- M0.3 `common.merge_share_steps`: `focus X` + `meet share window` -> one share of X; one share
+  per utterance.
+- M0.4 no fixed sleeps in `web_macros` (asserted): `_drive_pickers` acts on the windows that
+  actually appear and reads success from Meet's "Stop presenting".
+- M0.5 the question names what goes out; "yes, don't ask again" trusts `meet.share` only, until
+  `meet leave` (≤ 3 h).
+- M0.6 `KAYRA_AUDIT_LOG` (path | off); `run_all.py` -> temp file, `_harness.py` -> off. The
+  unit tier no longer writes `logs/automation.log` (checked: 14,258 lines before and after).
+- M1.1 `extension/kayra-share-picker/kayra-share-picker` (stdlib-only, wraps the configured
+  picker) + `automation/share_picker.py` (one-shot request in `$XDG_RUNTIME_DIR/kayra`, 0600;
+  `install`/`uninstall`/`status` of the `xdph.conf` line; `setup.py` offers it). Without it, a
+  named window is left for the user to pick — never Enter on the first entry.
+- M1.2 tab: Chrome's tab list opens; the user picks (no API selects a tab in Chrome's picker).
+- M1.3 monitor by position left to right, or the focused one; M1.4 switch while sharing, "am I
+  sharing?"; M1.5 `systemAudio: "include"` (extension 1.4.0, `__kayraShareAudio`).
+- M2.1 mako Do Not Disturb for the length of a share (`MEET_SHARE_DND`).
+- Tests: `tests/test_browser_control.py` [12] (sharing), [13] (the picker helper, run as the
+  portal runs it), [14] (audit log).
+- **Not done:** M0.7 — nothing here has been tried in a live Meet call. Next time the user is
+  in a call: install the helper (`python setup.py`), say "share the LM Studio window", and
+  record what each picker did in CHROME_BRIDGE.md.
+
+**Part 2a — tabs by position and bulk close** (done 2026-11-10, extension 1.2.2).
+- `common.tab_position()` turns "the third tab" / "tab 4" / "the last tab" / "the second last
+  tab" / "the tab on the right|left" into `#3`, `#4`, `#-1`, `#-2`, `+1`, `-1`; `tab_switch` and
+  `tab_close` accept those targets. Positions count in the FOCUSED window's tab strip.
+- `browser close duplicate tabs` (same page, ignoring `#fragment` and a trailing `/`; the active
+  copy and pinned tabs are kept) and `browser close tabs to the right|left` (pinned tabs kept;
+  CONFIRM-gated as `browser.tabs_close_side`).
+- Extension 1.2.2: `tabs.close {tabIds}`; `REQUIRED_VERSION` bumped, so 1.1.0+ extensions reload
+  themselves; an older one is never sent a tab-id close.
+- New shapes are in `interpreter.CATALOG` and the DMM preamble. Tests:
+  `tests/test_browser_control.py` section [10] (27 checks).
+
+**Part 2b — the rest of the tab and page basics** (done 2026-11-10, extension 1.3.0).
+- B3 `browser mute everything except this tab` / `unmute all other tabs` (`tabs.muteOthers`).
+- B6 `browser what did i just close` (`tabs.recentlyClosed`, newest first) and `browser reopen
+  the <site> tab i closed` (`tabs.restore {sessionId}` — a NAMED closed tab, not just the last).
+- B7 `browser free up memory in chrome` / `put background tabs to sleep` (`tabs.discard`: never
+  an active tab, never one playing sound, pinned kept). The honest limit from B7 stands: MV3
+  cannot say which tab uses the most memory, and Kayra does not guess.
+- B8 `browser find the tab about <topic>`: title/address match first, then the text of each tab
+  (≤ 30 tabs, 20 KB each, sleeping tabs by title only), switches to the best.
+- C1 `browser hard reload` (`tabs.reload {hard}`); C2 `browser zoom to 150 percent`
+  (`tabs.zoom`; zoom in/out/reset stay Ctrl+plus/minus/0); C7 `browser copy the link | page
+  title` (to the clipboard).
+- Every new command checks `_outdated((1, 3, 0))` first. Shapes are in `interpreter.CATALOG`
+  and the DMM preamble. Tests: `tests/test_browser_control.py` [11] (25 checks).
+- NOT verified against a live Chrome with the extension loaded (see `updates/UPDATE_V4.md` §7).
 
 **Part 1b — the understanding layer** (`automation/interpreter.py`). The user asked that
 Kayra not be only hard-coded rules: "it should ask AI whether this is automation or chat, like
@@ -509,3 +572,207 @@ proper human-alike intelligence."
   web player on Windows; Linux now does what Windows (and CLAUDE.md) describe.
 - "open the article I read yesterday" reached the app launcher; it is a history lookup now.
 - This section's stale "nothing committed yet" and the extension version.
+
+---
+
+## 11. UI: smooth, GPU-composited scrolling  *(planned 2026-11-10, not started)*
+
+Requested by the user after the GPU rendering pass ("the UI is very smooth now; scrolling
+still feels like CPU"). Measured before planning (offscreen, 1280x800 @ 2.25x): one scroll
+frame repaints the whole visible page — **27 ms median on Settings, 33 ms on System** — and a
+wheel notch jumps 60 px in a single frame. Two causes:
+
+1. **No interpolation.** Qt applies each wheel notch as one 60 px jump.
+2. **No blit scrolling.** The pages are translucent over the animated backdrop, so Qt cannot
+   move the already-drawn pixels; every scroll step repaints every visible card on the CPU,
+   capping scrolling near 30 fps (a 120 Hz display needs ≤ 8 ms a frame).
+
+### The plan
+
+**S1. Smooth scrolling everywhere** (one helper installed on every scroll area: the `View`
+base, the Chat transcript, any other `QScrollArea`):
+- mouse wheel: each notch glides ~200 ms with ease-out; rapid notches ACCUMULATE into one
+  continuous glide instead of restarting;
+- touchpad: pixel deltas follow the fingers 1:1; a flick coasts and decays (kinetic momentum);
+- keyboard: PageUp/PageDown/Home/End/arrows glide too;
+- frames paced from the window's own refresh (`QWindow.requestUpdate`), so 60 / 120 Hz
+  displays both get one step per refresh, not a fixed 16 ms timer;
+- off under reduced motion (`prefers_reduced_motion()`).
+
+**S2. A GPU scroll layer** (how browsers do it): while a scroll is in motion the page is shown
+as pre-rendered tiles held as GPU textures and each frame only moves them (~1 ms); at rest the
+live widgets swap back in.
+- tiles (viewport-sized strips above and below) are rendered while the page is idle, so the
+  first frame of a scroll does not stall (`QWidget.grab()` costs ~12 ms — see the page-fade
+  note in `docs/reference/UI.md`; never pay it on the input path);
+- any change to the page (a child repaint, a new chat message, a live meter) invalidates the
+  tiles; a page that changes while scrolling (System's live meters, a streaming reply) falls
+  back to live painting for that gesture — smooth motion, without the 1 ms frames;
+- Chat uses the layer only while nothing is streaming.
+
+**S3. Measure.** Extend `KAYRA_UI_PROFILE=1` with scroll frame time and frames per second;
+target < 8 ms per frame. Report before/after numbers measured on the reference laptop.
+
+**Tests:** the glide lands exactly on the target; rapid notches accumulate; reduced motion
+disables it; the layer never shows stale content and always returns to the live page; no
+scroll area is left without the helper.
+
+**The honest limit:** Qt Widgets still paint on the CPU; only a Qt Quick rewrite would put
+every frame of a live-changing page on the GPU. Not proposed.
+
+---
+
+## 12. Meetings and screen sharing  *(M0, M1, M2.1 done 2026-11-10 — see §10 "Part 2M"; M0.7 live test, M2.2–M4 open)*
+
+The user tried "start screen sharing of this meet and share the LM Studio window" in a live
+Google Meet call and nothing useful happened. What exists today: `web_macros.meet_share()` —
+entire screen only, built against Chrome's and the portal's pickers but **never tried in a live
+call**. Sharing a named window does not exist. None of this was in the plan before.
+
+### M0. Bugs found in the audit log (fix first)
+
+The real attempt, `logs/automation.log` 16:25–16:26 on 2026-11-10:
+
+| Said / did | What Kayra ran | Bug |
+|---|---|---|
+| (start sharing) | `meet.join abc-defg-hij` | the DMM preamble's EXAMPLE meeting code was emitted as a real one |
+| "share screen" | `mouse.click_text "share screen"` | a plain click, not `meet.share`; Chrome's picker opened and nobody chose |
+| "share the LM Studio window" | `window.focus lm studio` + `meet.share monitor` → CONFIRM | focused away from Meet, shared the whole MONITOR, then waited on an unanswered confirmation |
+| "meet start screen sharing" | `meet.join new` | "start …" is read as start a meeting |
+
+- M0.1 Parsing: "start screen sharing", "present (now)", "share my screen", "share the <X>
+  window", "share this tab", "share my second screen" → ONE `meet.share` with
+  `surface` (monitor | window | browser) and an optional `target` name; never a click, never
+  `meet.join`. Add the shapes to `interpreter.CATALOG` and the DMM preamble with the right
+  examples, and assert the old ones no longer misroute.
+- M0.2 Placeholder guard: any token argument that appears verbatim as an example in the DMM
+  preamble (`abc-defg-hij`, …) is rejected like the `general query` placeholder; a real Meet
+  code must match `[a-z]{3}-[a-z]{4}-[a-z]{3}` AND come from the user's words.
+- M0.3 Compound requests: "share the X window" must NOT run `window.focus X` first (it takes
+  Meet out of focus); the name belongs to the share.
+- M0.4 Readiness, not clocks: replace the fixed `SLEEP(1.5)` steps in `meet_share` with
+  `_until` waits for Chrome's picker, the portal picker and Meet's "Stop presenting".
+- M0.5 Confirmation: speak "Share your entire screen / the LM Studio window with everyone in
+  the call?" and accept a spoken yes (`resolve_confirmation`); offer a per-call "don't ask
+  again for sharing" opt-in.
+- M0.6 Test hygiene: the unit tier writes `AUTOMATION_*` lines into the developer's real
+  `logs/automation.log` (every run adds six `meet.*` entries). Route the audit logger to a temp
+  file under `EnvironmentGuard`, and assert the real log is untouched.
+- M0.7 Try it live in a real call on the reference laptop and tune; record what each picker
+  did in `docs/platforms/CHROME_BRIDGE.md` ("How share my entire screen works").
+
+### M1. Share exactly what was named
+
+- M1.1 **A named window** ("share the LM Studio window"). On Hyprland: ship a small picker
+  helper and set it as xdg-desktop-portal-hyprland's `screencopy:custom_picker_binary`. Kayra
+  writes the wanted selection (window handle by exact Hyprland identity, or monitor) to a
+  one-shot file; the helper prints it as `[SELECTION]window:<handle>` and deletes it; with no
+  request pending it execs the normal `hyprland-share-picker`, so manual sharing is unchanged.
+  `setup.py` offers the config change (asked, reversible). On X11 / other compositors: the
+  Chrome picker's window list, selected by title through the extension where possible, else say
+  "press Share on <title>".
+- M1.2 A specific Chrome tab ("share the YouTube tab"): `displaySurface: "browser"` plus
+  activating that tab first / `preferCurrentTab` where Meet allows.
+- M1.3 A specific monitor ("share my second screen"): monitor selection through the same helper.
+- M1.4 Switch mid-call ("share LM Studio instead"), "am I sharing?", "stop sharing" (exists).
+- M1.5 Share with sound ("share with audio"): `systemAudio: "include"` in the page hook.
+
+### M2. Privacy while presenting
+
+- M2.1 Do Not Disturb for the length of a share (Omarchy/mako `makoctl mode -a do-not-disturb`,
+  restored on stop) so notifications never appear on a shared screen.
+- M2.2 Before sharing a whole screen, warn when a sensitive window is visible on it (password
+  manager, WhatsApp, email, banking) — "WhatsApp is open on that screen; share anyway?".
+- M2.3 Kayra's own spoken lines stay quiet during a call (call detection exists; confirm it
+  covers a sharing session).
+
+### M3. In-call controls (Meet; Zoom/Teams/Discord web where the same labels exist)
+
+Raise / lower hand, send a reaction, captions on/off, pin or spotlight a person, "who's in
+the call?", send a message in the meeting chat, copy the meeting link and send it to someone
+(CONFIRM), switch microphone or speaker ("use my headphones in this call"). Extends E7.
+
+### M4. Around the call
+
+- M4.1 "Your meeting starts in 2 minutes — join?" (calendar + `speak_unprompted`), joining
+  from the calendar (E6).
+- M4.2 Present a Slides deck straight into the call (with E3).
+- M4.3 Save live captions during the call; afterwards "summarize this meeting" with action
+  items offered to Calendar / Docs (local model first).
+- M4.4 Local recording (wf-recorder / OBS), CONFIRM, with a visible indicator.
+- M4.5 The same share commands for Zoom, Teams and Discord in the browser (they use the same
+  `getDisplayMedia` path the page hook already wraps).
+
+**Tests:** parsing of every phrasing above (and the four misroutes), the placeholder guard,
+the picker helper (selection file written, consumed once, falls back to the normal picker),
+DND on/off around a share, readiness waits (no `SLEEP` in `meet_share`), and the audit log
+staying out of the developer's `logs/`.
+
+---
+
+## 13. Neighbouring features not covered elsewhere  *(planned 2026-11-10, not started)*
+
+Ideas that sit next to what was built in V4 (cloud models, key storage, the redesigned and
+GPU-composited UI, tab Parts 2a/2b) and that no section above covers. Each is small on its own;
+pick them up alongside the part they neighbour. Ask before any that spends money or changes
+the user's system.
+
+### N1. Browser, next to Parts 2a/2b
+
+- N1.1 **Save and restore a tab session** — "save these tabs as research", "open my research
+  tabs" (stored locally as titles + URLs; restore into a new window).
+- N1.2 **Reading list** — "read this later", "what's on my reading list", "open the next one"
+  (Chrome's `readingList` API, MV3, Chrome 120+).
+- N1.3 **Picture-in-picture** — "pop this video out" (`video.requestPictureInPicture()` in the
+  page; YouTube and any `<video>`).
+- N1.4 **Media on the page** — "skip ad", "play at 1.5x", "skip 30 seconds", "loop this video"
+  (page `<video>` element; the active YouTube tab first).
+- N1.5 **Screenshot of a tab / full page** — "screenshot this page" (`tabs.captureVisibleTab`;
+  full page by scroll-and-stitch), saved to Pictures and copied to the clipboard.
+- N1.6 **Tab hygiene suggestions** — "you have 14 tabs open, 5 are duplicates — close them?"
+  through `speak_unprompted` (proactive service, respects calls and standby).
+- N1.7 **Open the same page in another browser / profile** — "open this in Chromium",
+  "open this in my work profile".
+
+### N2. Models and keys, next to V4 §2
+
+- N2.1 **Usage and cost** — tokens and estimated spend per provider today / this month,
+  shown in Settings → AI models; an optional monthly cap that falls back to Groq/Gemini/local
+  when reached.
+- N2.2 **Model speed test** — Settings → "Compare": one fixed classification and one short
+  reply on every configured provider and the local model, with first-token and total times.
+- N2.3 **LM Studio management** — show which model is loaded, "load Qwen 3.5" / "unload the
+  model" (LM Studio's REST API), and warn when the loaded model has no vision.
+- N2.4 **Key health on boot** — test each stored key once in the background and say "your
+  Claude key has no credit" / "your Groq key was revoked" before the first request fails.
+- N2.5 **Re-run the DMM matrix from Settings** ("check how well Kayra understands commands on
+  this model"), with the 53-case score shown per provider.
+- N2.6 **Export / import settings** (without keys) to move a setup to another machine.
+
+### N3. Interface, next to the redesign and GPU work
+
+- N3.1 **Command palette** (Ctrl+K style): type any Kayra command or setting name, run it.
+- N3.2 **Keyboard shortcut list** — a "?" overlay listing every shortcut; editable shortcuts.
+- N3.3 **Text size and density** — "larger text" / "compact" in Settings, applied live through
+  the theme tokens (also helps the 2.25x display).
+- N3.4 **Light theme / follow the Omarchy theme** — the tokens are already centralised.
+- N3.5 **Voice preview** — a Play button next to the Voice dropdown that speaks a sample line.
+- N3.6 **Settings search** — filter all five sections by a word.
+- N3.7 **Performance panel** — the `KAYRA_UI_PROFILE` numbers and the GPU status shown in
+  System, instead of only in the log.
+- N3.8 **Notifications inbox** — what Kayra said while you were away (proactive lines, failed
+  actions) in one list on Home.
+
+### N4. Voice, next to the voice dropdown
+
+- N4.1 **Speaking speed and pitch** in Settings (Kokoro `speed`), applied live.
+- N4.2 **Per-language voice** — answer in Hindi with a Hindi voice when asked in Hindi.
+- N4.3 **Wake word** ("Kayra, …") as an option to the always-listening microphone, with a
+  local detector so nothing leaves the machine.
+
+### N5. Safety and housekeeping
+
+- N5.1 **Backup of memory and settings** (local zip, keys excluded) and restore.
+- N5.2 **Audit log viewer** in Automation: search, filter by risky actions, export.
+- N5.3 **Test hygiene sweep** — find every other place a unit suite writes to the developer's
+  `logs/`, `data/` or `Reports/` (M0.6 found one) and route it to a temp dir.

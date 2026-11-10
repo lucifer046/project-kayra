@@ -240,6 +240,8 @@ class Sidebar(QWidget):
         self.setFixedWidth(Size.sidebar)
 
         layout = QVBoxLayout(self)
+        self._layout = layout
+        self.compact = False
         # Padded on both sides now, so the rail reads as a COLUMN OF CARDS floating in a
         # panel rather than as full-bleed rows butted against the window edge. That single
         # change is most of what separates the new rail from a generic admin sidebar.
@@ -303,6 +305,38 @@ class Sidebar(QWidget):
         footer.addWidget(self.listening_label)
         layout.addLayout(footer)
 
+    def set_compact(self, compact):
+        """
+        Icons only (a narrow window) or icons and names. Idempotent.
+
+        The names move into tooltips and the status footer keeps only its dot, whose tooltip
+        carries the state — the rail stays a complete navigation surface at 60px instead of
+        disappearing, so no screen loses its way out on a narrow window.
+        """
+        compact = bool(compact)
+        if compact == self.compact:
+            return
+        self.compact = compact
+        self.setFixedWidth(Size.sidebar_collapsed if compact else Size.sidebar)
+        if compact:
+            self._layout.setContentsMargins(Space.xs, Space.base, Space.xs, Space.md)
+        else:
+            self._layout.setContentsMargins(Space.md, Space.base, Space.md, Space.md)
+        labels = {key: label for key, label, _glyph in self.DESTINATIONS}
+        for key, item in self._items.items():
+            item.setText("" if compact else labels.get(key, key))
+            item.setToolTip(labels.get(key, key) if compact else "")
+            item.setProperty("compact", "true" if compact else "false")
+            repolish(item)
+        for label in (self.state_label, self.detail_label):
+            label.setVisible(not compact)
+        if compact:
+            self.listening_label.setVisible(False)
+        self.badge.setToolTip(self.state_label.text() if compact else "")
+        for key, item in self._items.items():
+            if item.isChecked():
+                self.indicator.move_to(item, animate=False)
+
     def select(self, key):
         item = self._items.get(key)
         if item is None:
@@ -344,12 +378,14 @@ class Sidebar(QWidget):
         self.badge.set_state(ORB_STATE.get(state, "IDLE"))
         self.state_label.setText(text)
         self.detail_label.setText(detail or "")
+        if self.compact:
+            self.badge.setToolTip(text)
 
         quiet = state in (VoiceState.PAUSED, VoiceState.STANDBY)
         self.listening_label.setText("Listening paused" if quiet else "")
         self.listening_label.setProperty("paused", quiet)
         repolish(self.listening_label)
-        self.listening_label.setVisible(quiet)
+        self.listening_label.setVisible(quiet and not self.compact)
 
     def set_listening(self, listening):
         """

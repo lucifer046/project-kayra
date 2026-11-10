@@ -46,8 +46,8 @@ few-shot preamble and parses comma-separated task tokens, accepting only prefixe
 
 ```
 local server up?  → LM Studio / Ollama, nothing else
-DECISION (DMM)    → Cohere → Groq → Gemini
-CHAT              → Groq → Gemini
+DECISION (DMM)    → Claude → Groq → Gemini
+CHAT              → Claude → Groq → Gemini
 ```
 
 Eight failure kinds, per-provider cooldowns honouring `Retry-After`, at most one call per

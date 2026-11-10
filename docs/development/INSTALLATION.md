@@ -17,7 +17,7 @@ Two commands on every platform. The user never activates the virtual environment
 - **A speech-input browser:** Windows — Edge (preinstalled) or Chrome. Linux — Google Chrome.
 - **Linux system packages:** see the table in [`../platforms/LINUX.md`](../platforms/LINUX.md#system-packages).
 - **Optional:** an NVIDIA GPU + driver (speech on CUDA), a webcam (gestures), a local LLM
-  server (LM Studio / Ollama) or cloud keys (Cohere for intent, Groq/Gemini for chat).
+  server (LM Studio / Ollama) or cloud keys (Claude, Groq or Gemini — any one serves intent and chat).
 
 ## 2. What `setup.py` does
 

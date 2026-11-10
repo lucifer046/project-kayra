@@ -52,9 +52,10 @@ from PySide6.QtGui import QPainter, QColor, QPen, QPixmap, QRadialGradient, QLin
 from PySide6.QtWidgets import QWidget
 
 from kayra.ui.theme import Color, Motion
+from kayra.ui import profile
 
 
-class AmbientBackdrop(QWidget):
+class _BackdropLayer:
     """
     The animated ground. Add it as the FIRST child of a container and it stays behind.
 
@@ -64,13 +65,15 @@ class AmbientBackdrop(QWidget):
     """
 
     MOTES = 18
+    # Frames per second while drifting. The CPU version is slow on purpose (each frame used to
+    # repaint the whole window above it); the GPU version redraws only itself, so it can be
+    # smooth.
+    FPS = None
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def _init_layer(self):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        # This widget fills its entire rect on every paint, so Qt need not clear it first.
-        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.lower()
+        self._fps = self.FPS or Motion.backdrop_fps
 
         self._phase = 0.0
         self._animated = True
@@ -90,7 +93,7 @@ class AmbientBackdrop(QWidget):
                        for _ in range(self.MOTES)]
 
         self._timer = QTimer(self)
-        self._timer.setInterval(max(1, int(1000 / Motion.backdrop_fps)))
+        self._timer.setInterval(max(1, int(1000 / self._fps)))
         self._timer.timeout.connect(self._advance)
 
     # ──────────────────────────────────────────────────────────────────
@@ -135,7 +138,7 @@ class AmbientBackdrop(QWidget):
 
     def _advance(self):
         # One full cycle per `backdrop_cycle_s`. Kept small and exact by wrapping at tau.
-        self._phase += math.tau / (Motion.backdrop_cycle_s * Motion.backdrop_fps)
+        self._phase += math.tau / (Motion.backdrop_cycle_s * self._fps)
         if self._phase > math.tau:
             self._phase -= math.tau
         self.update()
@@ -148,12 +151,10 @@ class AmbientBackdrop(QWidget):
     #                             PAINTING
     # ──────────────────────────────────────────────────────────────────
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
+    def _render(self, painter):
         painter.setRenderHint(QPainter.Antialiasing, True)
         width, height = self.width(), self.height()
         if width <= 0 or height <= 0:
-            painter.end()
             return
 
         self._paint_wash(painter, width, height)
@@ -165,7 +166,6 @@ class AmbientBackdrop(QWidget):
 
         self._paint_bloom(painter, width, height)
         self._paint_motes(painter, width, height)
-        painter.end()
 
     def _paint_wash(self, painter, width, height):
         """The vertical ground. Two stops, four points of lightness between them."""
@@ -267,6 +267,69 @@ class AmbientBackdrop(QWidget):
             color.setAlphaF(0.05 + 0.20 * fade)
             painter.setBrush(color)
             painter.drawEllipse(QPointF(x * width, travel * height), radius, radius)
+
+
+class AmbientBackdrop(_BackdropLayer, QWidget):
+    """The CPU-drawn backdrop: the fallback, and what the headless test suite renders."""
+
+    FPS = None                       # Motion.backdrop_fps
+
+    def __init__(self, parent=None):
+        QWidget.__init__(self, parent)
+        # This widget always fills its whole rect, so Qt need not clear it first.
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self._init_layer()
+
+    def paintEvent(self, event):
+        with profile.measure("backdrop"):
+            painter = QPainter(self)
+            self._render(painter)
+            painter.end()
+
+
+def _gl_backdrop_class():
+    from PySide6.QtGui import QSurfaceFormat
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+    from kayra.ui.gpu import MSAA_SAMPLES
+
+    class GLAmbientBackdrop(_BackdropLayer, QOpenGLWidget):
+        """
+        The GPU-drawn backdrop. The same layers, painted through Qt's OpenGL paint engine:
+        the lattice pixmap becomes a texture once, gradients and motes are GPU fills.
+
+        Being a GL widget also switches the WINDOW to GPU composition: when this layer moves,
+        Qt re-blends the (unchanged) widget layer over it instead of asking every translucent
+        widget above it to repaint on the CPU.
+        """
+
+        FPS = Motion.backdrop_fps_gpu
+
+        def __init__(self, parent=None):
+            QOpenGLWidget.__init__(self, parent)
+            fmt = QSurfaceFormat.defaultFormat()
+            fmt.setSamples(MSAA_SAMPLES)       # the GL engine antialiases through MSAA
+            self.setFormat(fmt)
+            self._init_layer()
+
+        def paintGL(self):
+            with profile.measure("backdrop"):
+                painter = QPainter(self)
+                self._render(painter)
+                painter.end()
+
+    return GLAmbientBackdrop
+
+
+def create_backdrop(parent=None):
+    """The GPU backdrop when `ui.gpu` says the GPU is usable, else the CPU one."""
+    from kayra.ui import gpu
+    if gpu.enabled():
+        try:
+            return _gl_backdrop_class()(parent)
+        except Exception:
+            gpu.STATUS.enabled = False
+            gpu.STATUS.reason = "the OpenGL backdrop could not be created"
+    return AmbientBackdrop(parent)
 
 
 def prefers_reduced_motion():

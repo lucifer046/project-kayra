@@ -117,7 +117,10 @@ async function run(cmd, args) {
     }
     case "tabs.close": {
       let tabs;
-      if (args.exceptActive) {
+      if (Array.isArray(args.tabIds)) {
+        // 1.2.2: close exactly these tabs (by position, duplicates, to the right / left).
+        tabs = (await chrome.tabs.query({})).filter((t) => args.tabIds.includes(t.id));
+      } else if (args.exceptActive) {
         const keep = await activeTab();
         tabs = (await chrome.tabs.query({windowId: keep.windowId})).filter((t) => t.id !== keep.id && !t.pinned);
       } else if (args.match) {
@@ -163,7 +166,7 @@ async function run(cmd, args) {
       if (args.wait) await waitForLoad(tab.id, args.timeoutMs);
       return tabInfo(await chrome.tabs.get(tab.id));
     }
-    case "tabs.reload": { const t = await targetTab(args); await chrome.tabs.reload(t.id); return tabInfo(t); }
+    case "tabs.reload": { const t = await targetTab(args); await chrome.tabs.reload(t.id, {bypassCache: !!args.hard}); return tabInfo(t); }
     case "tabs.back": { const t = await targetTab(args); await chrome.tabs.goBack(t.id); return tabInfo(t); }
     case "tabs.forward": { const t = await targetTab(args); await chrome.tabs.goForward(t.id); return tabInfo(t); }
     case "tabs.duplicate": { const t = await targetTab(args); return tabInfo(await chrome.tabs.duplicate(t.id)); }
@@ -174,7 +177,42 @@ async function run(cmd, args) {
       await chrome.tabs.update(t.id, {muted});
       return {muted};
     }
-    case "tabs.restore": { const s = await chrome.sessions.restore(); return {restored: !!s}; }
+    case "tabs.restore": {
+      // 1.3.0: a specific closed tab or window by its session id ("reopen the YouTube tab I closed").
+      const s = args.sessionId ? await chrome.sessions.restore(args.sessionId) : await chrome.sessions.restore();
+      return {restored: !!s, title: s && s.tab ? s.tab.title : (s && s.window ? "a window" : "")};
+    }
+    // ── 1.3.0 ──────────────────────────────────────────────────────────
+    case "tabs.recentlyClosed": {
+      const items = await chrome.sessions.getRecentlyClosed({maxResults: Math.min(args.max || 10, 25)});
+      return items.map((it) => it.tab
+        ? {sessionId: it.tab.sessionId, kind: "tab", title: it.tab.title, url: it.tab.url}
+        : {sessionId: it.window.sessionId, kind: "window", title: `a window with ${it.window.tabs.length} tabs`,
+           url: ""});
+    }
+    case "tabs.muteOthers": {
+      const keep = await activeTab();
+      const others = (await chrome.tabs.query({})).filter((t) => t.id !== keep.id);
+      let changed = 0;
+      for (const t of others) {
+        const muted = !!(t.mutedInfo && t.mutedInfo.muted);
+        if (muted !== !!args.on) { await chrome.tabs.update(t.id, {muted: !!args.on}); changed += 1; }
+      }
+      return {changed};
+    }
+    case "tabs.discard": {
+      // Background tabs only: never the active tab of any window, never one playing sound.
+      const tabs = (await chrome.tabs.query({active: false, audible: false, discarded: false}))
+        .filter((t) => !t.pinned || args.includePinned);
+      let discarded = 0;
+      for (const t of tabs) { try { await chrome.tabs.discard(t.id); discarded += 1; } catch (e) { /* busy tab */ } }
+      return {discarded};
+    }
+    case "tabs.zoom": {
+      const t = await targetTab(args);
+      if (args.factor) await chrome.tabs.setZoom(t.id, Math.max(0.25, Math.min(5, args.factor)));
+      return {factor: await chrome.tabs.getZoom(t.id)};
+    }
 
     case "page.text": return inPage(await targetTab(args), pageText, [args.max || 15000]);
     case "page.click": return inPage(await targetTab(args), pageClick, [args.text, args.nth || 1]);

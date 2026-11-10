@@ -146,7 +146,7 @@ is running on the processor.
 All runtime config lives in `.env` (see `.env.example` for the full annotated list — never
 commit a real `.env`). Groups: speech (`INPUT_LANGUAGE`, `ASSISTANT_VOICE`, `TTS_DEVICE_MODE` —
 `AUTO` | `GPU` | `CPU`, validated and clamped), local-vs-cloud
-(`FORCE_ONLINE`, `LOCAL_*`), cloud API keys (`CohereAPIKey`, `GROQ_API_KEY`, `GEMINI_API_KEY`),
+(`FORCE_ONLINE`, `LOCAL_*`), cloud API keys (`CLAUDE_API_KEY`, `GROQ_API_KEY`, `GEMINI_API_KEY`),
 identity (`ASSISTANT_NAME`, `ASSISTANT_GENDER`, `USERNAME`, `USER_GENDER`, `LANGUAGE`), the
 proactive service (all `PROACTIVE_*` — master switch, tick cadence, the three cooldowns, the
 score threshold, the late-night window, habit-store caps, LLM phrasing), automation

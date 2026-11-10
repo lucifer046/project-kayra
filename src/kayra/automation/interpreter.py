@@ -63,12 +63,22 @@ INSIDE THE BROWSER PAGE (also inside web apps like WhatsApp, YouTube, X):
   browser read this page | browser summarize this page | browser find <text> on this page |
   browser what can i click | browser list tabs | browser switch to <site> tab |
   browser close <site> tab | browser mute this tab | browser pin this tab |
+  browser switch to the third tab | browser switch to the last tab |
+  browser switch to the tab on the right | browser close the second tab |
+  browser close duplicate tabs | browser close tabs to the right |
+  browser mute everything except this tab | browser what did i just close |
+  browser reopen the <site> tab i closed | browser free up memory in chrome |
+  browser find the tab about <topic> | browser hard reload | browser zoom to <n> percent |
+  browser copy the link | browser copy the page title |
   browser open the page i read yesterday about <topic> | browser bookmark <name>
 EMAIL (Gmail): email check | email open latest | email open the email from <name> |
   email read latest | email read this | email go to sent | email reply | email archive |
   email draft to <address> about <subject> saying <text> | email send
 CALENDAR / MEET: calendar today | calendar tomorrow | calendar add <event> <day> at <time> |
-  meet join <code> | meet mic off | meet camera off | meet share screen | meet leave
+  meet join <code the user said> | meet join new | meet mic off | meet camera off |
+  meet share screen | meet share the <app> window | meet share this tab |
+  meet share the <site> tab | meet share my second screen | meet share screen with audio |
+  meet share <app> instead | meet am i sharing | meet stop sharing | meet leave
 MESSAGES: message <contact>: <text>
 MEDIA & SYSTEM: play <song> | pause | resume | next track | previous track |
   system volume <0-100> | system mute | system brightness <0-100> | wifi on | wifi off |
@@ -109,6 +119,8 @@ Said: "can you make the tab quiet" | active tab: Lo-fi - YouTube
 -> {{"kind": "automation", "commands": ["browser mute this tab"]}}
 Said: "put google sheets in this tab" | active tab: New Tab
 -> {{"kind": "automation", "commands": ["open google sheets in this tab"]}}
+Said: "start screen sharing of this meet and share the LM Studio window" | active tab: Meet
+-> {{"kind": "automation", "commands": ["meet share the lm studio window"]}}
 Said: "who invented the telephone"
 -> {{"kind": "chat"}}
 Said: "open the budget thing"

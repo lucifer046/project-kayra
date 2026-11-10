@@ -804,6 +804,10 @@ def section_dmm_retries():
         _local_unhealthy = llm_engine.CentralizedLLMEngine._local_unhealthy
         _note_local_result = llm_engine.CentralizedLLMEngine._note_local_result
 
+        def _sync_mode(self, force=False):
+            # The live local/cloud re-check probes a real server; this rig has none, by design.
+            return None
+
         def __init__(self, responses):
             self.responses = list(responses)
             self.calls = 0
@@ -1192,6 +1196,10 @@ def section_turn_ownership():
         _local_unhealthy = llm_engine.CentralizedLLMEngine._local_unhealthy
         _note_local_result = llm_engine.CentralizedLLMEngine._note_local_result
 
+        def _sync_mode(self, force=False):
+            # The live local/cloud re-check probes a real server; this rig has none, by design.
+            return None
+
         def __init__(self):
             self.calls = 0
             self._local_empty_streak = 0
@@ -1254,6 +1262,10 @@ def section_local_health():
         _local_unhealthy = llm_engine.CentralizedLLMEngine._local_unhealthy
         _note_local_result = llm_engine.CentralizedLLMEngine._note_local_result
 
+        def _sync_mode(self, force=False):
+            # The live local/cloud re-check probes a real server; this rig has none, by design.
+            return None
+
         def __init__(self, exc):
             self.exc = exc
             self.calls = 0
@@ -1281,6 +1293,10 @@ def section_local_health():
         classify_intent = llm_engine.CentralizedLLMEngine.classify_intent
         _local_unhealthy = llm_engine.CentralizedLLMEngine._local_unhealthy
         _note_local_result = llm_engine.CentralizedLLMEngine._note_local_result
+
+        def _sync_mode(self, force=False):
+            # The live local/cloud re-check probes a real server; this rig has none, by design.
+            return None
 
         def __init__(self):
             self.calls = 0
@@ -1609,6 +1625,10 @@ def section_attempt_budget():
         classify_intent = llm_engine.CentralizedLLMEngine.classify_intent
         _local_unhealthy = llm_engine.CentralizedLLMEngine._local_unhealthy
         _note_local_result = llm_engine.CentralizedLLMEngine._note_local_result
+
+        def _sync_mode(self, force=False):
+            # The live local/cloud re-check probes a real server; this rig has none, by design.
+            return None
 
         def __init__(self, responses, clock):
             self.responses = list(responses)

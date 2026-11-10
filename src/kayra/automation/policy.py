@@ -36,6 +36,7 @@ DESIGN RULES (load-bearing)
 import os
 import re
 import time
+import logging
 import shlex
 import threading
 from collections import deque
@@ -279,7 +280,7 @@ _CONFIRM_ACTIONS = {
     # Round 3 (2026-11-10): things that spend, send, publish, remove or close a lot.
     "system.update_system", "system.install", "system.uninstall", "system.wifi_forget",
     "system.close_except", "system.close_hog",
-    "browser.tabs_close_others", "email.send", "message.send", "calendar.add",
+    "browser.tabs_close_others", "browser.tabs_close_side", "email.send", "message.send", "calendar.add",
     "meet.share",                # your whole screen goes to everyone in the call
     "diagnose.fix", "dev.git_commit", "email.delete", "email.spam",
 }
@@ -1005,6 +1006,28 @@ _audit_lock = threading.Lock()
 _SENSITIVE_PARAMS = {"text", "content", "clipboard", "password", "command_output"}
 
 
+def _audit_logger():
+    """
+    `logs/automation.log`, unless KAYRA_AUDIT_LOG says otherwise: a path (the test runner
+    points every suite at a temporary file) or "off" (no file; the in-memory ring still
+    records). The unit tier used to append six `meet.*` lines to the developer's own log on
+    every run, which made the real audit trail unreadable (BROWSER_CONTROL_PLAN §12, M0.6).
+    """
+    override = os.environ.get("KAYRA_AUDIT_LOG", "").strip()
+    if not override:
+        return setup_logger("kayra.automation", "automation.log")
+    if override.lower() in ("off", "none", "0"):
+        return False
+    logger = logging.getLogger("kayra.automation.redirected")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.FileHandler(override, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
 def audit(event: str, action=None, **fields):
     """
     Records one automation decision.
@@ -1031,7 +1054,9 @@ def audit(event: str, action=None, **fields):
 
     try:
         if _logger is None:
-            _logger = setup_logger("kayra.automation", "automation.log")
+            _logger = _audit_logger()
+        if _logger is False:
+            return entry
         payload = " ".join(f"{k}={v!r}" for k, v in entry.items() if k not in ("event", "ts"))
         _logger.info("%s %s", event, payload)
     except Exception:

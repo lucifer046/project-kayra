@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 
 from PySide6.QtCore import Qt, QObject, Signal, QSize, QPoint, QTimer
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget, QLineEdit, QComboBox
 
 from kayra.utils import print_banner, print_system, print_success, print_error
 
@@ -121,10 +121,14 @@ class StubBridge(QObject):
     # devices and their state travels separately — a screen that learned about one from the
     # other's signal is the class of bug the voice state machine exists to end.
     gestureStateChanged = Signal(dict)
+    providerTested = Signal(str, dict)
 
     def __init__(self, ready=True):
         super().__init__()
         self._ready = ready
+        self.key_status = {"Claude": "missing", "Groq": "file", "Gemini": "keyring"}
+        self.saved_keys = []
+        self.tested = []
         self.submitted = []
         self.interrupted = 0
         self.proactive = False
@@ -248,6 +252,43 @@ class StubBridge(QObject):
         self.presence_category_calls.append((name, bool(enabled)))
         self.presence_cats[name] = bool(enabled)
         return True
+
+    # ── cloud model keys (Settings → Cloud models) ──
+    def provider_key_status(self):
+        return dict(self.key_status)
+
+    def key_storage_label(self):
+        return "the system keyring"
+
+    def model_routing(self):
+        return {"mode": "local", "local_url": "http://127.0.0.1:1234/v1",
+                "answering": "LM Studio (qwen/qwen3.5-9b)"}
+
+    def available_voices(self):
+        return ["af_bella", "af_heart", "am_adam", "bf_emma", "jf_alpha"]
+
+    def current_voice(self):
+        return "af_bella"
+
+    def apply_voice(self, voice):
+        self.applied_voice = voice
+        return True
+
+    def provider_model_suggestions(self):
+        return {"Claude": ["claude-haiku-5-5", "claude-haiku-4-5"],
+                "Groq": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"],
+                "Gemini": ["gemini-flash-latest"]}
+
+    def save_provider_key(self, provider, value):
+        self.saved_keys.append((provider, value))
+        self.key_status[provider] = "keyring" if value else "missing"
+        return {"where": "keyring" if value else "removed", "applied": [provider]}
+
+    def test_provider(self, provider, typed_key, model):
+        self.tested.append((provider, typed_key, model))
+
+    def reload_providers(self):
+        return []
 
     def presence_available(self):
         return True
@@ -1092,6 +1133,14 @@ def section_hardware_portability(app):
 # │                      6. SETTINGS SAFETY                                │
 # └────────────────────────────────────────────────────────────────────────┘
 
+def view_files_for_dialogs():
+    import glob
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "src", "kayra", "ui")
+    return [p for p in glob.glob(os.path.join(root, "**", "*.py"), recursive=True)
+            if not p.endswith("confirm.py")]
+
+
 def section_settings(app):
     print_system("\n[6] Settings")
     from kayra.ui.views.settings import SettingsView
@@ -1102,7 +1151,6 @@ def section_settings(app):
 
     # No secret may ever be rendered.
     for env_key, field in view._secret_fields.items():
-        from PySide6.QtWidgets import QLineEdit
         check(f"{env_key} is masked", field.echoMode() == QLineEdit.Password)
         check(f"{env_key} value is never populated", field.text() == "")
 
@@ -1140,8 +1188,9 @@ def section_window(app):
     window.navigate_to("home")
 
     check("the window paints", paint(window, 1280, 820))
-    check("a minimum size is enforced",
-          window.minimumWidth() >= 900 and window.minimumHeight() >= 600)
+    check("a minimum size is enforced, small enough for a tiled or half-screen window",
+          400 <= window.minimumWidth() <= 520 and 400 <= window.minimumHeight() <= 560,
+          f"{window.minimumWidth()}x{window.minimumHeight()}")
 
     ambient = AmbientAssistant(bridge, window)
     check("the ambient assistant constructs", ambient is not None)
@@ -1497,6 +1546,160 @@ def section_refinement(app):
           window.stack.width() <= window.width(),
           f"stack {window.stack.width()} vs window {window.width()}")
     check("the window paints after repeated resizes", paint(window, 1040, 680))
+
+    # ── The confirmation: in the window, fitted to it, safe by default ──
+    from kayra.ui.components.confirm import ConfirmDialog
+    from PySide6.QtCore import QTimer
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtCore import QEvent as _QEvent
+    window.show()
+    for width, height in ((1920, 1080), (1040, 700), (Size.min_window_width,
+                                                       Size.min_window_height)):
+        window.resize(width, height)
+        app.processEvents()
+        dialog = ConfirmDialog(window, "Shut down Kayra?",
+                               "Voice input, speech and every background service stop, and "
+                               "the window closes. This does not shut down your computer.",
+                               confirm_label="Shut down")
+        dialog._fit()
+        dialog.show()
+        app.processEvents()
+        panel = dialog.panel.geometry()
+        check(f"the dialog covers the whole {width}px window", dialog.geometry() == window.rect())
+        check("...and its panel fits inside it with a margin",
+              panel.left() >= ConfirmDialog.MARGIN and panel.right() <= width - ConfirmDialog.MARGIN
+              and panel.top() >= 0 and panel.bottom() <= height,
+              f"{panel.getRect()} in {width}x{height}")
+        check(f"...centred, at most {ConfirmDialog.MAX_WIDTH}px wide",
+              panel.width() <= ConfirmDialog.MAX_WIDTH
+              and abs(panel.center().x() - dialog.width() // 2) <= 2,
+              f"{panel.getRect()} in {dialog.width()}")
+        check("...and the whole message is visible (no clipped text)",
+              dialog.body_label.height() >= dialog.body_label.heightForWidth(
+                  dialog.body_label.width()) - 2)
+        dialog.hide()
+        dialog.deleteLater()
+
+    def answer_after(action):
+        QTimer.singleShot(30, action)
+
+    def active_dialog():
+        found = [d for d in window.findChildren(ConfirmDialog) if d.isVisible()]
+        return found[-1] if found else None
+
+    answer_after(lambda: active_dialog().keyPressEvent(
+        QKeyEvent(_QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier)))
+    check("Esc answers no", ConfirmDialog.ask(window, "Q?", "Body", "Delete") is False)
+    answer_after(lambda: active_dialog().confirm_button.click())
+    check("the action button answers yes", ConfirmDialog.ask(window, "Q?", "Body", "Delete") is True)
+
+    def focus_then_cancel():
+        dialog = active_dialog()
+        check("focus starts on Cancel, so Enter is the SAFE answer",
+              dialog.cancel_button.hasFocus() or dialog.focusWidget() is dialog.cancel_button)
+        check("the action button says what it does, never 'Yes'",
+              dialog.confirm_button.text() == "Delete")
+        dialog.cancel_button.click()
+    answer_after(focus_then_cancel)
+    check("Cancel answers no", ConfirmDialog.ask(window, "Q?", "Body", "Delete") is False)
+    check("no stock message box is left in the UI",
+          not any("QMessageBox" in open(path, encoding="utf-8").read()
+                  for path in view_files_for_dialogs()))
+
+    # ── GPU rendering: a safe probe, a CPU fallback, no per-repaint effects ──
+    from kayra.ui import gpu, profile as ui_profile
+    from kayra.ui.components.backdrop import create_backdrop, AmbientBackdrop
+    status = gpu.probe()
+    headless = (QApplication.platformName() or "").lower() in gpu._HEADLESS
+    check("the probe answers with a reason (CPU when headless, the renderer when not)",
+          (not status.enabled and status.reason) if headless else bool(status.describe()),
+          status.describe())
+    gpu.STATUS = gpu.GpuStatus(False, "", "forced off by the suite")
+    check("with the GPU off, the backdrop is the CPU one",
+          isinstance(create_backdrop(None), AmbientBackdrop))
+    os.environ["KAYRA_UI_GPU"] = "off"
+    try:
+        check("KAYRA_UI_GPU=off is honoured", not gpu.probe().enabled
+              and "KAYRA_UI_GPU" in gpu.STATUS.reason)
+    finally:
+        os.environ.pop("KAYRA_UI_GPU", None)
+        gpu.STATUS = gpu.GpuStatus()          # every later window in the suite stays CPU
+    check("a software OpenGL renderer would not count as a GPU",
+          all(name in gpu._SOFTWARE for name in ("llvmpipe", "softpipe", "swrast")))
+    from PySide6.QtWidgets import QGraphicsDropShadowEffect
+    check("the dock carries no per-repaint shadow effect (a cached layer instead)",
+          not isinstance(window.dock.graphicsEffect(), QGraphicsDropShadowEffect)
+          and window.dock.shadow is not None)
+    check("...and the shadow follows the dock: under it, same visibility",
+          window.dock.shadow.isHidden() == window.dock.isHidden())
+    check("the profiler is free when off (one shared no-op)",
+          not ui_profile.enabled() and ui_profile.measure("x") is ui_profile.measure("y"))
+
+    # ── RESPONSIVE: every screen fits every width, down to the minimum ──
+    from PySide6.QtCore import QEvent
+
+    def settle():
+        for _ in range(4):
+            app.processEvents()
+            app.sendPostedEvents(None, QEvent.DeferredDelete)
+
+    def overflow(view):
+        holder = view.scroll.widget()
+        limit = view.scroll.viewport().width()
+        worst = 0
+        for child in holder.findChildren(QWidget):
+            if child.isVisible():
+                worst = max(worst, child.mapTo(holder, child.rect().topRight()).x() - limit)
+        return worst
+
+    window.show()
+    fits = []
+    for width, height in ((1920, 1080), (1280, 800), (1040, 700), (900, 700), (760, 640),
+                          (600, 600), (Size.min_window_width, Size.min_window_height)):
+        for key in ("home", "chat", "automation", "memory", "activity", "system", "settings"):
+            window.navigate_to(key)
+            window.resize(width, height)
+            settle()
+            spill = overflow(window.views[key])
+            if spill > 0:
+                fits.append(f"{key}@{width}: {spill}px")
+    check("no screen is wider than the window at any width from 1920 to the minimum",
+          not fits, ", ".join(fits[:4]))
+
+    window.resize(1280, 800)
+    settle()
+    check("a wide window shows the full rail", window.sidebar.width() == Size.sidebar
+          and not window.sidebar.compact)
+    window.resize(900, 700)
+    settle()
+    check("a narrow window keeps the rail, as icons only",
+          window.sidebar.width() == Size.sidebar_collapsed and window.sidebar.compact)
+    check("...whose destinations keep their names as tooltips",
+          all(item.text() == "" and item.toolTip() for item in window.sidebar._items.values()))
+    window.navigate_to("home")
+    for width, mode in ((1920, "wide"), (900, "wide"), (760, "medium"),
+                        (Size.min_window_width, "narrow")):
+        window.resize(width, 700)
+        settle()
+        check(f"Home at {width}px uses the {mode} layout",
+              window.views["home"].layout_mode == mode, str(window.views["home"].layout_mode))
+    home_view = window.views["home"]
+    check("a narrow Home scrolls vertically instead of squeezing",
+          home_view.scroll.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded)
+    check("the dock stays inside a minimum-width window",
+          window.dock.x() >= 0 and window.dock.x() + window.dock.width() <= window.host.width(),
+          f"{window.dock.x()}+{window.dock.width()} in {window.host.width()}")
+    window.navigate_to("settings")
+    window.resize(Size.min_window_width, 600)
+    settle()
+    from kayra.ui.views.settings import SettingRow
+    rows = [r for r in window.views["settings"].findChildren(SettingRow) if r.isVisible()]
+    check("on a narrow window settings controls sit UNDER their labels",
+          rows and all(r.stacked for r in rows))
+    window.resize(1440, 900)
+    settle()
+    rows = [r for r in window.views["settings"].findChildren(SettingRow) if r.isVisible()]
+    check("on a wide window they sit beside them again", rows and not any(r.stacked for r in rows))
 
     # ── STATE TRANSITIONS drive the orb and the composer ──
     from kayra.ui.views.chat import ChatView
@@ -1991,9 +2194,8 @@ def section_lifecycle_controls(app):
     bridge.set_listening(True)
 
     # Confirmed shutdown reaches the central path exactly once, and locks every control.
-    from PySide6.QtWidgets import QMessageBox
-    real_exec = QMessageBox.exec
-    QMessageBox.exec = lambda self: QMessageBox.Yes
+    from kayra.ui.components.confirm import ConfirmDialog
+    ConfirmDialog.ANSWER = True
     try:
         dock_press(dock.power_button)
         check("a confirmed shutdown reaches the central path", bridge.shutdown_called is True)
@@ -2011,19 +2213,19 @@ def section_lifecycle_controls(app):
         check("the screen says what is happening",
               "hutting down" in home.prompt.text(), home.prompt.text())
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
 
     # Cancelling must change nothing at all.
     bridge2 = StubBridge()
     window2 = docked_window(bridge2)
-    QMessageBox.exec = lambda self: QMessageBox.Cancel
+    ConfirmDialog.ANSWER = False
     try:
         dock_press(window2.dock.power_button)
         check("cancelling does NOT shut down", bridge2.shutdown_called is False)
         check("cancelling leaves the control usable",
               window2.dock.power_button.isEnabled() is True)
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
 
     # Shutdown must win over every other caption, including the paused-microphone line.
     # It does so STRUCTURALLY now rather than by an ordering of `if` statements in the view:
@@ -2185,9 +2387,115 @@ def section_lifecycle_controls(app):
     check("Home never needs a vertical scrollbar",
           gpu_home.scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff)
     check("the two columns flank the orb",
-          gpu_home.intelligence_panel.x() < gpu_home.orb.mapTo(gpu_home, QPoint(0, 0)).x()
-          < gpu_home.system_panel.x(),
+          gpu_home.intelligence_panel.mapTo(gpu_home, QPoint(0, 0)).x()
+          < gpu_home.orb.mapTo(gpu_home, QPoint(0, 0)).x()
+          < gpu_home.system_panel.mapTo(gpu_home, QPoint(0, 0)).x(),
           "the orb must stay the middle column at every width")
+
+    # ── Settings: cloud models — keys, model choice, Test, Remove ──
+    key_bridge = StubBridge()
+    keys_view = SettingsView(key_bridge)
+    check("Settings has one block per cloud provider",
+          set(keys_view._provider_ui) == {"Claude", "Groq", "Gemini"})
+    check("Cohere is gone from Settings", "CohereAPIKey" not in keys_view._secret_fields)
+    pills = {p: ui["pill"].text() for p, ui in keys_view._provider_ui.items()}
+    check("each key's pill says where it is kept, never the key",
+          pills == {"Claude": "Missing", "Groq": "Saved", "Gemini": "In keyring"}, str(pills))
+    check("a stored key's field is empty and says so",
+          keys_view._provider_ui["Gemini"]["field"].text() == ""
+          and "replace" in keys_view._provider_ui["Gemini"]["field"].placeholderText())
+    check("key fields are masked",
+          all(ui["field"].echoMode() == QLineEdit.Password
+              for ui in keys_view._provider_ui.values()))
+    groq_models = [c for c in keys_view._provider_ui["Groq"]["combos"]]
+    check("Groq offers a chat model and a separate command model", len(groq_models) == 2)
+    check("models are CHOSEN from a list, never typed (a typo became 'no model could answer')",
+          all(not c.isEditable() for ui in keys_view._provider_ui.values() for c in ui["combos"]))
+    check("the model list carries the real ids as item data",
+          keys_view._provider_ui["Claude"]["combos"][0].currentData() == "claude-haiku-5-5")
+
+    # ── Settings: voice is a real choice, and empty fields say what they default to ──
+    voice_combo = keys_view._controls["ASSISTANT_VOICE"][0]
+    check("Voice is a dropdown of the installed voices",
+          isinstance(voice_combo, QComboBox) and voice_combo.count() == 5
+          and not voice_combo.isEditable())
+    check("voices are shown in words, saved as ids",
+          voice_combo.currentData() == "af_bella"
+          and "Bella" in voice_combo.currentText() and "American English" in voice_combo.currentText(),
+          voice_combo.currentText())
+    name_field = keys_view._controls["ASSISTANT_NAME"][0]
+    check("an empty name field shows its default instead of looking broken",
+          "Kayra" in name_field.placeholderText(), name_field.placeholderText())
+    check("so does the local model endpoint",
+          "127.0.0.1:1234" in keys_view._controls["LOCAL_BASE_URL"][0].placeholderText())
+    check("ONE switch decides local vs cloud, and it is off by default",
+          "FORCE_ONLINE" not in keys_view._controls
+          and not keys_view._controls["CLOUD_FIRST"][0].isChecked())
+    check("the screen says what is answering right now",
+          "LM Studio (qwen/qwen3.5-9b)" in keys_view.routing_facts.text(),
+          keys_view.routing_facts.text())
+
+    # ── Settings: sections ──
+    check("Settings is split into sections, General first",
+          [k for k, _ in keys_view.SECTIONS][0] == "general"
+          and keys_view.current_section == "general")
+    keys_view.show_section("models")
+    check("switching section shows only that section",
+          keys_view._sections["general"][0].isHidden()
+          and not keys_view._sections["models"][0].isHidden())
+    check("the Save bar is outside the scrolling page",
+          keys_view.action_bar.parent() is keys_view)
+    check("the Claude model defaults to Haiku 5.5",
+          keys_view._provider_ui["Claude"]["combos"][0].currentText() == "claude-haiku-5-5")
+    check("Remove is disabled where there is no key to remove",
+          not keys_view._provider_ui["Claude"]["remove"].isEnabled()
+          and keys_view._provider_ui["Groq"]["remove"].isEnabled())
+
+    keys_view._provider_ui["Claude"]["field"].setText("sk-ant-typed")
+    keys_view._test_provider("Claude")
+    check("Test sends the typed key and the chosen model to the bridge",
+          key_bridge.tested == [("Claude", "sk-ant-typed", "claude-haiku-5-5")],
+          str(key_bridge.tested))
+    check("Test is disabled while a check is running",
+          not keys_view._provider_ui["Claude"]["test"].isEnabled())
+    keys_view._on_provider_tested("Claude", {"ok": True, "message": "Works.",
+                                             "models": ["claude-haiku-5-5", "claude-x-9"]})
+    claude_combo = keys_view._provider_ui["Claude"]["combos"][0]
+    check("a successful test re-enables Test and shows the result",
+          keys_view._provider_ui["Claude"]["test"].isEnabled()
+          and keys_view._provider_ui["Claude"]["result_pill"].text() == "Works")
+    check("...and offers the models the key can actually use, keeping the choice",
+          claude_combo.findText("claude-x-9") >= 0
+          and claude_combo.currentText() == "claude-haiku-5-5")
+
+    voice_combo.setCurrentIndex(voice_combo.findData("jf_alpha"))
+    with NoEnvWrites() as env_guard:
+        keys_view._save()
+    check("Save switches the running voice too", key_bridge.applied_voice == "jf_alpha",
+          str(getattr(key_bridge, "applied_voice", None)))
+    written = {k for update in env_guard.writes for k in update}
+    check("Save writes the model choices to .env",
+          {"CLAUDE_MODEL", "GROQ_CHAT_MODEL", "GROQ_DECISION_MODEL",
+           "GEMINI_CHAT_MODEL"} <= written, str(sorted(written))[:120])
+    check("...and never writes an API key through the plain settings path",
+          not written & {"CLAUDE_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"})
+    check("Save stores a typed key through the bridge (keyring or file)",
+          ("Claude", "sk-ant-typed") in key_bridge.saved_keys, str(key_bridge.saved_keys))
+    check("...clears the field, and the pill now says where it went",
+          keys_view._provider_ui["Claude"]["field"].text() == ""
+          and keys_view._provider_ui["Claude"]["pill"].text() == "In keyring")
+    check("an untouched key field never erases a stored key",
+          not any(p == "Groq" for p, _ in key_bridge.saved_keys))
+
+    from kayra.ui.components.confirm import ConfirmDialog
+    ConfirmDialog.ANSWER = True
+    try:
+        keys_view._remove_provider_key("Groq")
+    finally:
+        ConfirmDialog.ANSWER = None
+    check("Remove asks, then deletes the key through the bridge",
+          ("Groq", "") in key_bridge.saved_keys
+          and keys_view._provider_ui["Groq"]["pill"].text() == "Missing")
 
     # ── Settings: the device selector ──
     view = SettingsView(StubBridge())
@@ -2442,7 +2750,7 @@ def section_speech_backend(app):
 def section_memory_management(app):
     """Memory: stable ids, real deletion, the store's location, and the confirmations."""
     print_system("\n[14] Memory — ids, deletion, location")
-    from PySide6.QtWidgets import QMessageBox
+    from kayra.ui.components.confirm import ConfirmDialog
     from kayra.ui.views.memory import MemoryView, _MemoryRow
 
     bridge = StubBridge()
@@ -2467,17 +2775,16 @@ def section_memory_management(app):
           {row._memory_id for row in rows} == {m["id"] for m in bridge.memories})
 
     # Deleting confirms first, and cancelling changes nothing.
-    real_exec = QMessageBox.exec
-    QMessageBox.exec = lambda self: QMessageBox.Cancel
+    ConfirmDialog.ANSWER = False
     try:
         view._delete_saved(rows[0]._memory_id)
         check("cancelling a delete removes nothing", len(bridge.memories) == 2)
         check("and deletes nothing on the backend", bridge.deleted == [])
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
 
     # Confirming deletes exactly that id.
-    QMessageBox.exec = lambda self: QMessageBox.Yes
+    ConfirmDialog.ANSWER = True
     try:
         doomed = rows[0]._memory_id
         view._delete_saved(doomed)
@@ -2487,39 +2794,39 @@ def section_memory_management(app):
         check("the screen refreshed", "1 item" in view.saved_pill.text(),
               view.saved_pill.text())
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
 
     # A FAILED delete must not remove the row.
     bridge2 = StubBridge()
     bridge2.delete_ok = False
     view2 = MemoryView(bridge2)
     view2.on_show()
-    QMessageBox.exec = lambda self: QMessageBox.Yes
+    ConfirmDialog.ANSWER = True
     try:
         view2._delete_saved(bridge2.memories[0]["id"])
         check("a failed delete leaves the memory in place", len(bridge2.memories) == 2)
         check("and says so on screen", "failed" in view2.saved_pill.text().lower(),
               view2.saved_pill.text())
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
 
     # Clear all: stronger wording, and it only clears when confirmed.
     bridge3 = StubBridge()
     view3 = MemoryView(bridge3)
     view3.on_show()
-    QMessageBox.exec = lambda self: QMessageBox.Cancel
+    ConfirmDialog.ANSWER = False
     try:
         view3._clear_saved()
         check("cancelling 'clear all' clears nothing", len(bridge3.memories) == 2)
     finally:
-        QMessageBox.exec = real_exec
-    QMessageBox.exec = lambda self: QMessageBox.Yes
+        ConfirmDialog.ANSWER = None
+    ConfirmDialog.ANSWER = True
     try:
         view3._clear_saved()
         check("confirming 'clear all' empties the store", bridge3.memories == [])
         check("and reports how many went", bridge3.cleared == 2, str(bridge3.cleared))
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
     check("the empty state is shown, not created",
           view3.saved_empty.isVisible() or not view3.isVisible())
     check("the empty state is a permanent child, never destroyed",
@@ -2652,15 +2959,14 @@ def section_boot_ordering(app):
           window3.dock.mic_button.accessibleDescription())
 
     # ── 7. Shutdown must not be re-enabled by a late re-sync ──
-    from PySide6.QtWidgets import QMessageBox
+    from kayra.ui.components.confirm import ConfirmDialog
     bridge4 = StubBridge()
     window4 = docked_window(bridge4)
-    real_exec = QMessageBox.exec
-    QMessageBox.exec = lambda self: QMessageBox.Yes
+    ConfirmDialog.ANSWER = True
     try:
         dock_press(window4.dock.power_button)
     finally:
-        QMessageBox.exec = real_exec
+        ConfirmDialog.ANSWER = None
     bridge4.bootFinished.emit(True, "ready")
     window4.views["home"].on_show()
     app.processEvents()
@@ -2699,10 +3005,12 @@ def section_no_side_effects(before):
     than being discovered days later as a mysteriously changed setting.
     """
     print_system("\n[16] The suite has no side effects")
-    if before is None:
-        check("no .env on this machine to protect", True)
-        return
     from kayra.core.paths import env_file
+    if before is None:
+        # No `.env` to protect — so the suite must not have CREATED one either. A Save
+        # driven outside `NoEnvWrites` did exactly that once, writing the stub's values.
+        check("the suite did not create a .env", not os.path.exists(env_file()))
+        return
     try:
         after = open(env_file(), "rb").read()
     except OSError:
@@ -2868,18 +3176,17 @@ def section_gesture(app):
     check("a hidden preview stops its timer", not home.camera_preview._timer.isActive())
 
     # ── Shutdown disables the controls, and the preview goes dark ──
-    from PySide6.QtWidgets import QMessageBox as _QMB
+    from kayra.ui.components.confirm import ConfirmDialog
     quitting = StubBridge()
     quitting.gesture["camera"] = "ACTIVE"
     ending_window = docked_window(quitting)
     ending = ending_window.views["home"]
     app.processEvents()
-    real_exec = _QMB.exec
-    _QMB.exec = lambda self: _QMB.Yes
+    ConfirmDialog.ANSWER = True
     try:
         dock_press(ending_window.dock.power_button)
     finally:
-        _QMB.exec = real_exec
+        ConfirmDialog.ANSWER = None
     check("a shutting-down window disables the camera control",
           not ending_window.dock.camera_button.isEnabled())
     check("...and the gesture control",
@@ -3215,7 +3522,7 @@ def section_shell(app):
     check("the action layer delegates teardown rather than performing it",
           "shutdown(hard=True)" in controls_source
           and "taskkill" not in controls_source and "terminate" not in controls_source)
-    check("and it asks first", "QMessageBox" in controls_source)
+    check("and it asks first", "ConfirmDialog.ask" in controls_source)
     check("the dialog says it is not a machine shutdown",
           "does not shut down your computer" in controls_source)
 

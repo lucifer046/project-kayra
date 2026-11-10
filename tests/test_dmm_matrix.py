@@ -8,7 +8,7 @@ test_dmm_matrix.py — accuracy harness for `CentralizedLLMEngine.classify_inten
     .venv\\Scripts\\python tests\\test_dmm_matrix.py [--verbose]
 
 Every case is a real classification call against whichever DMM the engine routes to
-(Cohere online, local model offline), so this measures the shipped behaviour rather than a
+(the cloud DECISION route online — Claude, Groq, Gemini — or the local model), so this measures the shipped behaviour rather than a
 mock. Cases are grouped by the intent BOUNDARY they probe — the pairs that are semantically
 close and easy to confuse are the point of the matrix:
 
@@ -36,10 +36,10 @@ from kayra.utils import print_banner, print_info, print_success, print_error, pr
 
 VERBOSE = "--verbose" in sys.argv
 
-# Cohere trial keys rate-limit aggressively. Without pacing, roughly a fifth of the matrix
-# comes back as the rate-limit fallback ('general <query>') and scores as a misclassification,
+# Free cloud keys rate-limit aggressively. Without pacing, a share of the matrix can come
+# back as the rate-limit fallback ('general <query>') and scores as a misclassification,
 # which makes the numbers meaningless. Pace requests instead of measuring the API's quota.
-DELAY = 3.5
+DELAY = 1.0
 for _arg in sys.argv[1:]:
     if _arg.startswith("--delay="):
         DELAY = float(_arg.split("=", 1)[1])
@@ -162,7 +162,8 @@ def satisfied(expectation, tokens):
 
 def run_matrix():
     engine = CentralizedLLMEngine()
-    mode = "Cohere (online)" if engine.is_online else "Local model (offline)"
+    mode = (f"Cloud ({engine.router.describe('DECISION')})" if engine.is_online
+            else "Local model (offline)")
     print_info(f"DMM route: {mode}")
 
     per_cat = {}

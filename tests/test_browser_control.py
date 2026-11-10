@@ -530,8 +530,8 @@ def section_tuning():
         web_macros.SLEEP = saved_sleep
     source = open(web_macros.__file__).read()
     pauses = re.findall(r"SLEEP\((\d+(?:\.\d+)?)\)", source)
-    check("the only fixed pauses left are the two OS share-picker waits in meet_share",
-          sorted(pauses) == ["1.0", "1.0", "1.5", "1.5"], str(pauses))
+    check("no fixed pause is left in web_macros (the share pickers are waited for too, M0.4)",
+          pauses == [], str(pauses))
     with WebRig(Bridge(version="1.2.1")) as rig, Models("Two new emails."):
         rig.do("email read my emails")
         waited = [a for c, a in rig.bridge.calls if c == "page.waitFor"]
@@ -571,7 +571,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.2.1")
+        web_macros.BRIDGE = current = Bridge(version="1.4.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -620,6 +620,582 @@ def section_tuning():
             linux_apps.application_dirs = real_dirs
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │              PART 2 (first slice) — B1 by position, B2 bulk close      │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class TabBridge(Bridge):
+    """Two Chrome windows; the focused one has five tabs in strip order, the third active."""
+
+    def __init__(self, version="1.3.0"):
+        super().__init__(version=version)
+        self.closed = [{"sessionId": "s1", "kind": "tab", "title": "Rust lifetimes - YouTube",
+                        "url": "https://www.youtube.com/watch?v=9"},
+                       {"sessionId": "s2", "kind": "tab", "title": "Hacker News",
+                        "url": "https://news.ycombinator.com/"}]
+        self.texts = {12: "lofi beats to study to", 13: "Quarterly plan: the transformer "
+                      "architecture section, attention and transformers", 15: "pull requests"}
+        self.zoom = 1.0
+        self.tabs = [
+            {"id": 11, "title": "Inbox - Gmail", "url": "https://mail.google.com/mail/", "windowId": 1, "active": False, "pinned": True},
+            {"id": 12, "title": "Lo-fi - YouTube", "url": "https://www.youtube.com/watch?v=1", "windowId": 1, "active": False},
+            {"id": 13, "title": "Docs", "url": "https://docs.google.com/", "windowId": 1, "active": True},
+            {"id": 14, "title": "Lo-fi - YouTube", "url": "https://www.youtube.com/watch?v=1#t=30", "windowId": 1, "active": False},
+            {"id": 15, "title": "GitHub", "url": "https://github.com/", "windowId": 1, "active": False},
+            {"id": 21, "title": "Other window", "url": "https://example.com/", "windowId": 2, "active": True},
+        ]
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "ping":
+            return {"version": self.version}
+        if cmd == "tabs.list":
+            return list(self.tabs)
+        if cmd == "tabs.active":
+            return next(t for t in self.tabs if t["windowId"] == 1 and t["active"])
+        if cmd == "tabs.activate" and "tabId" in args:
+            self.calls.append((cmd, args))
+            return next(t for t in self.tabs if t["id"] == args["tabId"])
+        if cmd in ("tabs.muteOthers", "tabs.discard", "tabs.reload", "tabs.zoom",
+                   "tabs.recentlyClosed", "tabs.restore", "page.text"):
+            self.calls.append((cmd, args))
+            if cmd == "tabs.muteOthers":
+                return {"changed": 2}
+            if cmd == "tabs.discard":
+                return {"discarded": 3}
+            if cmd == "tabs.zoom":
+                self.zoom = args.get("factor", self.zoom)
+                return {"factor": self.zoom}
+            if cmd == "tabs.recentlyClosed":
+                return list(self.closed)
+            if cmd == "tabs.restore":
+                hit = next((c for c in self.closed if c["sessionId"] == args.get("sessionId")),
+                           self.closed[0])
+                return {"restored": True, "title": hit["title"]}
+            if cmd == "page.text":
+                return {"text": self.texts.get(args.get("tabId"), "")}
+            return {}
+        if cmd == "tabs.close" and "tabIds" in args:
+            self.calls.append((cmd, args))
+            before = len(self.tabs)
+            self.tabs = [t for t in self.tabs if t["id"] not in args["tabIds"]]
+            return {"closed": before - len(self.tabs)}
+        return super().call(cmd, timeout=timeout, **args)
+
+    def last(self, cmd):
+        return next((a for c, a in reversed(self.calls) if c == cmd), None)
+
+
+def section_tabs_by_position():
+    check.section("[10] Part 2 — tabs by position, duplicates, to the right")
+    table = (
+        ("browser switch to the third tab", "tab_switch", "#3"),
+        ("browser go to the last tab", "tab_switch", "#-1"),
+        ("browser go to the 2nd tab", "tab_switch", "#2"),
+        ("browser switch to tab 4", "tab_switch", "#4"),
+        ("browser go to the tab on the right", "tab_switch", "+1"),
+        ("browser close the second last tab", "tab_close", "#-2"),
+        ("browser close the first tab", "tab_close", "#1"),
+        ("browser close duplicate tabs", "tabs_close_duplicates", "duplicates"),
+        ("browser close tabs to the right", "tabs_close_side", "right"),
+        ("browser close the tabs on the left", "tabs_close_side", "left"),
+        # names are still names
+        ("browser switch to youtube", "tab_switch", "youtube"),
+        ("browser close the youtube tab", "tab_close", "youtube"),
+    )
+    for token, action, target in table:
+        a = n(token)
+        check(f"'{token}' -> browser.{action} {target!r}",
+              a.domain == "browser" and a.action == action and a.target == target,
+              f"{a.domain}.{a.action} {a.target!r}")
+    check("'go to the third tab' and 'close duplicate tabs' are in the understanding catalog",
+          "browser switch to the third tab" in interpreter.CATALOG
+          and "browser close duplicate tabs" in interpreter.CATALOG)
+
+    with WebRig(TabBridge()) as rig:
+        r = rig.do("browser switch to the third tab")
+        check("'the third tab' counts in the focused window's strip (Docs)",
+              r.ok and rig.bridge.last("tabs.activate") == {"tabId": 13}, (r.message,))
+        r = rig.do("browser go to the last tab")
+        check("'the last tab' is GitHub, not the other window's tab",
+              rig.bridge.last("tabs.activate") == {"tabId": 15}, r.message)
+        r = rig.do("browser go to the tab on the right")
+        check("'the tab on the right' is next to the ACTIVE one",
+              rig.bridge.last("tabs.activate") == {"tabId": 14}, r.message)
+        r = rig.do("browser switch to the ninth tab")
+        check("a position past the end says how many tabs there are",
+              not r.ok and "5 tabs" in r.message, r.message)
+        r = rig.do("browser close duplicate tabs")
+        check("duplicates: the second YouTube copy (same page, different #fragment) closes",
+              rig.bridge.last("tabs.close") == {"tabIds": [14]} and "Closed 1 tab" in r.message,
+              (rig.bridge.last("tabs.close"), r.message))
+        r = rig.do("browser close duplicate tabs")
+        check("...and running it again says there are none", "No duplicate" in r.message, r.message)
+        r = rig.do("browser close the first tab")
+        check("closing a tab by position closes exactly that tab",
+              rig.bridge.last("tabs.close") == {"tabIds": [11]}, rig.bridge.last("tabs.close"))
+        r = rig.do("browser close tabs to the right")
+        check("closing tabs to the right asks first (it closes several at once)",
+              r.status == Status.NEEDS_CONFIRMATION, r.status)
+
+    with WebRig(TabBridge(version="1.2.1")) as rig:
+        r = rig.do("browser close duplicate tabs")
+        check("an extension older than 1.2.2 is never sent a tab-id close",
+              rig.bridge.last("tabs.close") is None and not r.ok, r.message)
+
+
+def section_part_2b():
+    check.section("[11] Part 2b — mute the rest, recently closed, sleep, find, zoom, copy")
+    table = (
+        ("browser mute everything except this tab", "tabs_mute_others", "others"),
+        ("browser unmute all other tabs", "tabs_mute_others", "others"),
+        ("browser what did i just close", "tabs_recently_closed", "closed"),
+        ("browser reopen the youtube tab i closed", "tab_reopen", "youtube"),
+        ("browser free up memory in chrome", "tabs_discard", "background"),
+        ("browser put background tabs to sleep", "tabs_discard", "background"),
+        ("browser find the tab where i was reading about transformers", "tab_find", "transformers"),
+        ("browser hard reload", "page_reload", "current"),
+        ("browser zoom to 150 percent", "page_zoom", "150"),
+        ("browser copy the link", "page_copy", "link"),
+        ("browser copy the page title", "page_copy", "title"),
+        ("browser mute this tab", "tab_mute", "current"),          # unchanged
+    )
+    for token, action, target in table:
+        a = n(token)
+        check(f"'{token}' -> browser.{action} {target!r}",
+              a.domain == "browser" and a.action == action and a.target == target,
+              f"{a.domain}.{a.action} {a.target!r}")
+    check("the new shapes are in the understanding catalog",
+          all(phrase in interpreter.CATALOG for phrase in (
+              "browser what did i just close", "browser free up memory in chrome",
+              "browser find the tab about <topic>", "browser copy the link")))
+
+    copied = []
+    saved_copy = web_macros.COPY
+    web_macros.COPY = lambda text: (copied.append(text), True)[1]
+    try:
+        with WebRig(TabBridge()) as rig:
+            r = rig.do("browser mute everything except this tab")
+            check("muting the rest asks the extension to mute OTHER tabs",
+                  rig.bridge.last("tabs.muteOthers") == {"on": True} and "2 other tabs" in r.message,
+                  r.message)
+            r = rig.do("browser what did i just close")
+            check("'what did I just close' names the closed tabs",
+                  "Rust lifetimes" in r.message and "Hacker News" in r.message, r.message)
+            r = rig.do("browser reopen the hacker news tab i closed")
+            check("reopening a NAMED closed tab restores that session, not just the last one",
+                  rig.bridge.last("tabs.restore") == {"sessionId": "s2"}
+                  and "Hacker News" in r.message, (rig.bridge.last("tabs.restore"), r.message))
+            r = rig.do("browser reopen the netflix tab i closed")
+            check("...and says so when nothing closed matches", not r.ok, r.message)
+            r = rig.do("browser free up memory in chrome")
+            check("freeing memory puts background tabs to sleep and says they come back",
+                  "3 background tabs" in r.message and "reload" in r.message, r.message)
+            r = rig.do("browser find the tab where i was reading about transformers")
+            check("finding a tab reads the pages and switches to the best match (Docs)",
+                  rig.bridge.last("tabs.activate") == {"tabId": 13}, (rig.bridge.last("tabs.activate"), r.message))
+            r = rig.do("browser find the tab about github")
+            check("...a title or address match wins without reading every page",
+                  rig.bridge.last("tabs.activate") == {"tabId": 15}, r.message)
+            r = rig.do("browser hard reload")
+            check("hard reload bypasses the cache", rig.bridge.last("tabs.reload") == {"hard": True})
+            r = rig.do("browser zoom to 150 percent")
+            check("zoom to 150 percent sets factor 1.5",
+                  rig.bridge.last("tabs.zoom") == {"factor": 1.5} and "150 percent" in r.message,
+                  r.message)
+            r = rig.do("browser copy the link")
+            check("copy the link puts the active tab's address on the clipboard",
+                  copied[-1:] == ["https://docs.google.com/"] and r.ok, (copied, r.message))
+            r = rig.do("browser copy the page title")
+            check("copy the title copies the title", copied[-1:] == ["Docs"], copied)
+        with WebRig(TabBridge(version="1.2.2")) as rig:
+            r = rig.do("browser free up memory in chrome")
+            check("an extension older than 1.3.0 is never sent a 1.3.0 command",
+                  rig.bridge.last("tabs.discard") is None and not r.ok, r.message)
+    finally:
+        web_macros.COPY = saved_copy
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │          PART 2M — MEETINGS AND SCREEN SHARING (§12, M0/M1/M2.1)        │
+# └────────────────────────────────────────────────────────────────────────┘
+
+ENTER = ["wtype", "-k", "Return"]
+
+
+class ShareHelper:
+    """Stands in for share_picker: never reads ~/.config, never writes $XDG_RUNTIME_DIR."""
+
+    def __init__(self, installed=True):
+        self._installed, self.requests, self.cleared = installed, [], 0
+
+    def installed(self):
+        return self._installed
+
+    def request_window(self, window):
+        self.requests.append(("window", window.address))
+
+    def request_monitor(self, name):
+        self.requests.append(("monitor", name))
+
+    def clear(self):
+        self.cleared += 1
+
+
+class MeetBridge(Bridge):
+    """
+    A Meet call. Pressing Meet's share button makes a picker window appear in the fake
+    compositor (`on_share`); Meet shows "Stop presenting" once `presses_needed` Enters were
+    sent (`presses`), so the readiness loop has to keep looking until the share is real.
+    """
+
+    def __init__(self, presses, on_share=None, presses_needed=1, presenting=False, **kw):
+        super().__init__(version="1.4.0", tabs=[{"id": 3, "title": "Meet - abc",
+                                                 "url": "https://meet.google.com/abc-defg-hij"}], **kw)
+        self.presses, self.on_share = presses, on_share
+        self.presses_needed, self.presenting = presses_needed, presenting
+        self.base, self.armed = 0, False
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "page.controls":
+            self.calls.append((cmd, args))
+            if not self.presenting and self.armed and \
+                    self.presses() - self.base >= self.presses_needed:
+                self.presenting, self.armed = True, False
+            return [{"name": "Stop presenting" if self.presenting else "Share screen"}]
+        if cmd == "page.click":
+            self.calls.append((cmd, args))
+            if args["text"] == "Share screen":
+                self.base, self.armed = self.presses(), True
+                if self.on_share:
+                    self.on_share()
+                return {"clicked": True}
+            if args["text"] in ("Stop presenting", "Leave call"):
+                was, self.presenting = self.presenting, False
+                return {"clicked": was or args["text"] == "Leave call"}
+            return {"clicked": False}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def _share_rig(helper, picker=("google-chrome", "Choose what to share"), monitors=None,
+               presses_needed=1):
+    hypr = FakeHyprland([client("0xc", "google-chrome", "Meet - abc - Google Chrome", focus=0),
+                         client("0xl", "lm-studio", "LM Studio", focus=2)],
+                        active="0xc", monitors=monitors)
+    from test_linux_automation import RecordingRunner as Runner
+    runner = Runner(ALL_TOOLS + ("makoctl",))
+    bridge = MeetBridge(lambda: runner.calls.count(ENTER),
+                        on_share=(lambda: hypr.add(client("0xpick", picker[0], picker[1], focus=0)))
+                        if picker else None, presses_needed=presses_needed)
+    saved = web_macros.SHARE_HELPER
+    web_macros.SHARE_HELPER = helper
+    rig = WebRig(bridge, hypr=hypr, runner=runner)
+    rig._restore_helper = lambda: setattr(web_macros, "SHARE_HELPER", saved)
+    return rig
+
+
+def section_meetings():
+    check.section("[12] Part 2M — meetings and screen sharing (M0 bugs, M1 share what was named)")
+    table = (
+        # the four misroutes from logs/automation.log, 2026-11-10 16:25-16:26
+        ("click on share screen", "monitor", ""),
+        ("meet start screen sharing", "monitor", ""),
+        ("meet start screen sharing of this meet and share the lm studio window", "window", "lm studio"),
+        ("share the lm studio window", "window", "lm studio"),
+        # every phrasing in M0.1
+        ("share screen", "monitor", ""), ("start screen sharing", "monitor", ""),
+        ("present now", "monitor", ""), ("browser click on present now", "monitor", ""),
+        ("screen share", "monitor", ""), ("share my entire screen", "monitor", ""),
+        ("meet share entire screen", "monitor", ""), ("meet present", "monitor", ""),
+        ("meet share the lm studio window", "window", "lm studio"),
+        ("meet share lm studio", "window", "lm studio"),
+        ("meet share this tab", "browser", ""), ("meet share the youtube tab", "browser", "youtube"),
+        ("meet share my second screen", "monitor", "#2"),
+        ("meet share window", "window", ""),
+    )
+    for token, surface, name in table:
+        a = n(token)
+        check(f"'{token}' -> meet.share {surface} {name!r}",
+              a is not None and a.key == "meet.share" and a.target == surface
+              and a.parameters.get("name") == name,
+              f"{a.key if a else None} {a.target if a else ''} {a.parameters if a else ''}")
+    a = n("meet share my screen with audio")
+    check("'with audio' asks for system sound", a.parameters.get("audio") is True, a.parameters)
+    a = n("meet share lm studio instead")
+    check("'... instead' switches what is shared", a.parameters.get("instead") is True, a.parameters)
+    check("'meet am i sharing' is a status question", n("meet am i sharing").key == "meet.share_status")
+    check("'meet stop sharing' still stops", n("meet stop sharing").key == "meet.stop_share")
+    check("'meet join abc-defg-hij' still joins by code", n("meet join abc-defg-hij").key == "meet.join")
+    check("'click on share' on a page stays a click (no screen word)",
+          n("click on share").key == "mouse.click_text")
+    check("'present tense of go' is not a share", n("present tense of go") is None)
+    check("the share shapes are in the understanding catalog",
+          all(p in interpreter.CATALOG for p in ("meet share the <app> window", "meet share this tab",
+                                                 "meet am i sharing", "meet join new")))
+
+    # M0.3 — the name belongs to the share, never a focus that takes Meet out of the front.
+    merged = common.merge_share_steps([n("focus lm studio"), n("meet share window")])
+    check("'focus X' + 'meet share window' -> ONE share of the X window",
+          len(merged) == 1 and merged[0].key == "meet.share" and merged[0].target == "window"
+          and merged[0].parameters.get("name") == "lm studio", merged)
+    merged = common.merge_share_steps([n("meet share screen"), n("meet share the lm studio window")])
+    check("two shares in one utterance -> the one that named something",
+          len(merged) == 1 and merged[0].parameters.get("name") == "lm studio", merged)
+
+    # M0.2 — the preamble's example code is never a real meeting.
+    from kayra.intelligence import llm_engine as E
+    g = E._guard_meeting_code
+    check("a code the user never said, during a share request, becomes the share",
+          g("meet join abc-defg-hij", "start screen sharing") == "meet start screen sharing")
+    check("a code the user never said is dropped otherwise",
+          g("meet join abc-defg-hij", "open the meeting from my calendar") is None)
+    check("a code the user DID say (spoken with spaces) is kept",
+          g("meet join abc-defg-hij", "join meeting abc defg hij") == "meet join abc-defg-hij")
+    check("'meet join new' for 'start screen sharing' is re-read as the share",
+          g("meet join new", "start screen sharing") == "meet start screen sharing")
+    check("'meet join new' for 'start a new meeting and share my screen' is kept",
+          g("meet join new", "start a new meeting and share my screen") == "meet join new")
+    check("every other token passes untouched", g("meet mic off", "mute me") == "meet mic off"
+          and g("browser list tabs", "abc") == "browser list tabs")
+    preamble = open(E.__file__, encoding="utf-8").read()
+    check("the DMM preamble says sharing is ONE meet share token, never a click or a join",
+          "SCREEN SHARING is always ONE 'meet share' token" in preamble
+          and "'meet share the lm studio window'" in preamble)
+
+    # M0.5 — the confirmation says WHAT goes to everyone.
+    helper = ShareHelper(installed=True)
+    rig = _share_rig(helper)
+    try:
+        with rig:
+            r = rig.do("meet share the lm studio window")
+            check("the confirmation names the window and the audience",
+                  r.status == Status.NEEDS_CONFIRMATION and "the lm studio window" in r.message
+                  and "everyone in the call" in r.message, r.message)
+            ok, said = linux.resolve_confirmation("yes")
+            check("M1.1 with the helper: the portal is asked for THAT window (by address)",
+                  helper.requests == [("window", "0xl")], helper.requests)
+            check("the page hook is told to prefer a window",
+                  ("page.setMain", {"key": "__kayraShareSurface", "value": "window"}) in rig.bridge.calls)
+            check("LM Studio was NOT focused (Meet stays in front)",
+                  not any('"address:0xl"' in d and "focus" in d for d in rig.hypr.dispatched),
+                  rig.hypr.dispatched)
+            check("Chrome's picker got Enter once it appeared (readiness, not a clock)",
+                  rig.runner.calls.count(ENTER) == 1, rig.runner.calls)
+            check("Kayra says what is being shared", "sharing the lm studio window" in said, said)
+            check("M2.1 notifications are silenced for the share",
+                  ["makoctl", "mode", "-a", "do-not-disturb"] in rig.runner.calls, rig.runner.calls)
+            check("the one-shot request is withdrawn after the share", helper.cleared >= 1)
+            r = rig.do("meet am i sharing")
+            check("'am I sharing?' answers with what", "lm studio window" in r.message, r.message)
+            r = rig.do("meet stop sharing")
+            check("stopping clicks Meet's Stop presenting and brings notifications back",
+                  ("page.click", {"text": "Stop presenting", "nth": 1}) in rig.bridge.calls
+                  and ["makoctl", "mode", "-r", "do-not-disturb"] in rig.runner.calls, r.message)
+            r = rig.do("meet am i sharing")
+            check("...and then 'am I sharing?' says no", r.message.startswith("No"), r.message)
+    finally:
+        rig._restore_helper()
+
+    # "yes, don't ask again" — for this call only.
+    helper = ShareHelper(installed=True)
+    rig = _share_rig(helper, picker=None)
+    try:
+        with rig:
+            rig.do("meet share my screen")
+            ok, said = linux.resolve_confirmation("yes, don't ask again")
+            check("'yes, don't ask again' approves and says it will not ask again",
+                  ok and "won't ask again" in said, said)
+            rig.do("meet stop sharing")
+            r = rig.do("meet share my screen")
+            check("...so the next share in the call runs without asking",
+                  r.status != Status.NEEDS_CONFIRMATION, r.message)
+            rig.do("meet leave")
+            r = rig.do("meet share my screen")
+            check("leaving the call ends that trust", r.status == Status.NEEDS_CONFIRMATION, r.message)
+            linux.resolve_confirmation("no")
+            ok, said = linux.resolve_confirmation("don't ask again")
+            check("'don't ask again' with nothing pending is not an answer", not ok)
+    finally:
+        rig._restore_helper()
+    check("no other confirmation can be switched off by voice", common._TRUSTABLE == {"meet.share"})
+
+    # Without the helper: a NAMED window is the user's pick, never Enter on the first entry.
+    helper = ShareHelper(installed=False)
+    rig = _share_rig(helper, picker=("hyprland-preview-share-picker", "Share"))
+    try:
+        with rig:
+            rig.do("meet share the lm studio window")
+            ok, said = linux.resolve_confirmation("yes")
+            check("without the helper, a named window is never auto-picked in the portal",
+                  rig.runner.calls.count(ENTER) == 0 and "Choose the lm studio window" in said, said)
+            check("...and no request file is written", helper.requests == [])
+    finally:
+        rig._restore_helper()
+    # Without the helper, "my screen" keeps the old behaviour: the portal's first monitor.
+    rig = _share_rig(ShareHelper(installed=False), picker=("hyprland-preview-share-picker", "Share"))
+    try:
+        with rig:
+            rig.do("meet share my screen")
+            ok, said = linux.resolve_confirmation("yes")
+            check("without the helper, 'my screen' focuses the portal picker and presses Enter",
+                  any('"address:0xpick"' in d for d in rig.hypr.dispatched)
+                  and rig.runner.calls.count(ENTER) >= 1 and "entire screen" in said, said)
+    finally:
+        rig._restore_helper()
+
+    # M1.3 — a specific monitor, by position left to right.
+    monitors = [{"name": "HDMI-A-1", "x": 2000, "y": 0, "focused": False},
+                {"name": "eDP-1", "x": 0, "y": 0, "focused": True}]
+    helper = ShareHelper(installed=True)
+    rig = _share_rig(helper, monitors=monitors)
+    try:
+        with rig:
+            rig.do("meet share my second screen")
+            ok, said = linux.resolve_confirmation("yes")
+            check("'my second screen' asks the portal for the second monitor from the left",
+                  helper.requests == [("monitor", "HDMI-A-1")] and "HDMI-A-1" in said,
+                  (helper.requests, said))
+            helper.requests.clear()
+            rig.bridge.calls.clear()
+            rig.do("meet share my screen with audio")
+            linux.resolve_confirmation("yes")
+            check("M1.4 already presenting + a new share: the old one is stopped first",
+                  ("page.click", {"text": "Stop presenting", "nth": 1}) in rig.bridge.calls)
+            check("'my screen' is the FOCUSED monitor", helper.requests == [("monitor", "eDP-1")],
+                  helper.requests)
+            check("M1.5 'with audio' turns on system sound in the page hook (1.4.0)",
+                  ("page.setMain", {"key": "__kayraShareAudio", "value": True}) in rig.bridge.calls)
+            rig.do("meet share my third screen")
+            ok, said = linux.resolve_confirmation("yes")
+            check("a screen that does not exist is said so", "I don't see that screen" in said, said)
+    finally:
+        rig._restore_helper()
+
+    # M1.2 — a tab is chosen in Chrome's own list; Kayra opens it there and says which.
+    helper = ShareHelper(installed=True)
+    rig = _share_rig(helper)
+    try:
+        with rig:
+            rig.do("meet share the youtube tab")
+            ok, said = linux.resolve_confirmation("yes")
+            check("a tab share preselects Chrome's tab list and never presses Enter on it",
+                  ("page.setMain", {"key": "__kayraShareSurface", "value": "browser"}) in rig.bridge.calls
+                  and rig.runner.calls.count(ENTER) == 0 and "youtube tab" in said, said)
+    finally:
+        rig._restore_helper()
+
+    # Not in a call.
+    with WebRig(Bridge(version="1.4.0", tabs=[{"id": 1, "title": "x", "url": "https://x"}])) as rig:
+        rig.do("meet share my screen")
+        ok, said = linux.resolve_confirmation("yes")
+        check("no Meet tab -> 'You're not in a Google Meet call.'", "not in a Google Meet call" in said, said)
+
+    js = open(os.path.join(ROOT, "extension", "kayra-bridge", "meet_main.js"), encoding="utf-8").read()
+    check("the page hook adds system audio only when Kayra asked, once",
+          "__kayraShareAudio" in js and 'systemAudio = "include"' in js
+          and "window.__kayraShareAudio = null" in js)
+    manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
+    check("extension 1.4.0 and REQUIRED_VERSION agree",
+          manifest["version"] == "1.4.0" and web_macros.REQUIRED_VERSION == (1, 4, 0))
+
+
+def section_share_picker_helper():
+    check.section("[13] M1.1 — the portal picker helper (kayra-share-picker)")
+    import time
+    import tempfile
+    import subprocess
+    from kayra.automation import share_picker
+    h = share_picker.helper()
+    listing = ("101[HC>]google-chrome[HT>]Meet - abc[HE>]94006417367040[HA>]"
+               "202[HC>]lm-studio[HT>]LM Studio[HE>]94006417368000[HA>]"
+               "303[HC>]kitty[HT>]~[HE>]94006417369000[HA>]"
+               "404[HC>]kitty[HT>]htop[HE>]94006417370000[HA>]")
+    windows = h.parse_sharing_list(listing)
+    check("the portal's window list is parsed (handle, class, title, address)",
+          len(windows) == 4 and windows[1] == {"handle": "202", "class": "lm-studio",
+                                               "title": "LM Studio", "address": 94006417368000},
+          windows)
+    now = time.time()
+    req = {"kind": "window", "address": hex(94006417368000), "class": "x", "title": "y", "created": now}
+    check("a window is matched by its Hyprland address", h.select(req, windows, now) == "[SELECTION]/window:202")
+    req = {"kind": "window", "address": "0x1", "class": "lm-studio", "title": "LM Studio", "created": now}
+    check("...then by class and title", h.select(req, windows, now) == "[SELECTION]/window:202")
+    req = {"kind": "window", "address": "0x1", "class": "kitty", "title": "nvim", "created": now}
+    check("two windows of one class and no exact title -> the normal picker, never a guess",
+          h.select(req, windows, now) is None)
+    req = {"kind": "window", "address": hex(94006417368000), "created": now - 120}
+    check("a stale request is ignored", h.select(req, windows, now) is None)
+    check("a monitor request names the screen",
+          h.select({"kind": "monitor", "name": "HDMI-A-1", "created": now}, windows, now)
+          == "[SELECTION]/screen:HDMI-A-1")
+    check("an older portal without addresses still parses",
+          h.parse_sharing_list("7[HC>]a[HT>]b[HE>][HA>]")[0]["address"] is None)
+
+    with tempfile.TemporaryDirectory() as root:
+        env = {"XDG_RUNTIME_DIR": os.path.join(root, "run"), "XDG_CONFIG_HOME": os.path.join(root, "cfg")}
+        os.makedirs(env["XDG_RUNTIME_DIR"])
+
+        class W:
+            address, cls, initial_class, title = "0x" + format(94006417368000, "x"), "lm-studio", "lm-studio", "LM Studio"
+        path = share_picker.request_window(W, env)
+        check("the request file is private (0600, in a 0700 dir)",
+              oct(os.stat(path).st_mode & 0o777) == "0o600"
+              and oct(os.stat(os.path.dirname(path)).st_mode & 0o777) == "0o700")
+        fake = os.path.join(root, "normal-picker")
+        with open(fake, "w") as handle:
+            handle.write("#!/bin/sh\necho normal-picker-ran\n")
+        os.chmod(fake, 0o755)
+        os.makedirs(os.path.join(env["XDG_CONFIG_HOME"], "kayra"))
+        with open(h.fallback_record(env), "w") as handle:
+            handle.write(fake + "\n")
+        run_env = dict(os.environ, **env, XDPH_WINDOW_SHARING_LIST=listing)
+        out = subprocess.run([sys.executable, share_picker.helper_file()], env=run_env,
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        check("run by the portal with a request pending, it prints the selection", out == "[SELECTION]/window:202", out)
+        check("...and the request is consumed (answered once)", not os.path.exists(path))
+        out = subprocess.run([sys.executable, share_picker.helper_file()], env=run_env,
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        check("with no request it runs the picker that was configured before", out == "normal-picker-ran", out)
+
+        conf = share_picker.config_path(env)
+        os.makedirs(os.path.dirname(conf))
+        original = ("screencopy {\n    allow_token_by_default = true\n"
+                    "    custom_picker_binary = hyprland-preview-share-picker\n}\n")
+        with open(conf, "w") as handle:
+            handle.write(original)
+        os.remove(h.fallback_record(env))
+        check("status before install", not share_picker.installed(env))
+        said = share_picker.install(env)
+        text = open(conf).read()
+        check("install points xdph at the helper and keeps the other settings",
+              share_picker.installed(env) and "allow_token_by_default = true" in text
+              and text.count("custom_picker_binary") == 1, text)
+        check("...remembers the old picker as the fallback, and backs up xdph.conf",
+              open(h.fallback_record(env)).read().strip() == "hyprland-preview-share-picker"
+              and os.path.exists(conf + ".kayra-backup") and "hyprland-preview-share-picker" in said, said)
+        share_picker.uninstall(env)
+        check("uninstall puts the old picker back exactly", open(conf).read() == original, open(conf).read())
+        os.remove(conf)
+        share_picker.install(env)
+        check("with no xdph.conf, install writes a screencopy block",
+              share_picker.installed(env) and open(conf).read().startswith("screencopy {"))
+    check("the helper is executable", os.access(share_picker.helper_file(), os.X_OK))
+    source = open(share_picker.helper_file(), encoding="utf-8").read()
+    check("the helper imports nothing from Kayra (the portal runs it outside the venv)",
+          "kayra" not in "".join(l for l in source.splitlines() if l.startswith(("import", "from"))))
+
+
+def section_audit_log():
+    check.section("[14] M0.6 — the suites never write the developer's audit log")
+    from kayra.automation import policy
+    real = os.path.join(ROOT, "logs", "automation.log")
+    check("KAYRA_AUDIT_LOG is set for this suite", bool(os.environ.get("KAYRA_AUDIT_LOG")))
+    logger = policy._audit_logger()
+    target = getattr(logger.handlers[0], "baseFilename", "") if logger else ""
+    check("the audit logger is off or points outside the project's logs/",
+          logger is False or os.path.abspath(target) != os.path.abspath(real), target)
+    return os.path.getsize(real) if os.path.exists(real) else None
+
+
 def main():
     print_banner("BROWSER CONTROL (round 5)")
     print_info(f"Host: {describe_host()}")
@@ -632,7 +1208,17 @@ def main():
         section_app_windows()
         section_understanding()
         section_tuning()
+        section_tabs_by_position()
+        section_part_2b()
+        real = os.path.join(ROOT, "logs", "automation.log")
+        size_before = os.path.getsize(real) if os.path.exists(real) else None
+        section_meetings()
+        section_share_picker_helper()
+        section_audit_log()
+        size_after = os.path.getsize(real) if os.path.exists(real) else None
     check.section("[9] The suite has no side effects")
+    check("logs/automation.log did not grow during the share tests", size_before == size_after,
+          f"{size_before} -> {size_after}")
     check("nothing the developer owns was modified", not guard.modified(), guard.report())
     return check.finish()
 

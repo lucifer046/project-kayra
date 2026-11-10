@@ -346,7 +346,7 @@ def install_dependencies(python_exe):
 
 IMPORT_GROUPS = [
     ("Core",       ["dotenv", "rich", "requests", "psutil"]),
-    ("LLM",        ["openai", "cohere"]),
+    ("LLM",        ["openai", "anthropic"]),
     ("Speech-out", ["kokoro_onnx", "sounddevice", "numpy"]),
     ("Speech-in",  ["selenium", "mtranslate"]),
     ("Search",     ["ddgs", "bs4"]),
@@ -1200,6 +1200,15 @@ def read_env(path):
     return values
 
 
+def _owner_only(path):
+    """`.env` holds API keys: readable by its owner only on POSIX (0600)."""
+    if os.name == "posix":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def ensure_env_file():
     """
     Creates `.env` from `.env.example` when it is absent.
@@ -1215,6 +1224,7 @@ def ensure_env_file():
         fail(".env.example is missing; cannot create a starter .env.")
         return False
     shutil.copyfile(ENV_EXAMPLE, ENV_FILE)
+    _owner_only(ENV_FILE)
     ok("Created .env from .env.example.")
     return True
 
@@ -1253,6 +1263,7 @@ def set_env_values(updates):
 
     with open(ENV_FILE, "w", encoding="utf-8") as handle:
         handle.write("\n".join(output).rstrip() + "\n")
+    _owner_only(ENV_FILE)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1318,36 +1329,27 @@ def configure_models():
     if local_available:
         ok("Local LLM server detected. Kayra will route chat AND intent classification there.")
         info("No cloud API keys are required for this configuration.")
-        cloud_state = {"required": False, "cohere": bool(env.get("CohereAPIKey", "").strip()
-                                                         and "your_" not in env.get("CohereAPIKey", "")),
-                       "chat": _has_chat_key(env)}
+        cloud_state = {"required": False, "chat": _has_chat_key(env)}
         return local_available, cloud_state
 
     if force_online:
         info("Cloud routing is forced on.")
     else:
         warn("No local LLM server is running.")
-    info("Kayra will use the cloud path: Cohere for intent, Groq (or Gemini) for chat.")
+    info("Kayra will use the cloud path: Claude, then Groq, then Gemini — for both intent")
+    info("classification and conversation. ONE key is enough; more keys are fallbacks.")
 
     updates = {}
 
-    # Intent classification: Cohere only, no fallback. Without it every query degrades to
-    # plain conversation and no automation can ever be triggered.
-    if not _key_present(env, "CohereAPIKey"):
-        info("")
-        info("Cohere powers intent classification. Without it, Kayra can still chat but")
-        info("cannot run any commands. Free key: https://dashboard.cohere.com/api-keys")
-        value = ask_secret("Cohere API key (blank to skip)")
-        if value:
-            updates["CohereAPIKey"] = value
-    else:
-        ok("Cohere API key: SET")
-
-    # Chat generation: Groq primary, Gemini fallback. At least one is required.
     if not _has_chat_key(env):
         info("")
-        info("A chat model is required. Groq is the primary; Gemini is the fallback.")
-        info("Free keys: https://console.groq.com/keys  |  https://aistudio.google.com/apikey")
+        info("Claude Haiku is the fastest choice. It needs an API key from")
+        info("https://console.anthropic.com (pay-as-you-go; a claude.ai subscription does not")
+        info("include API access). Groq and Gemini have free keys:")
+        info("https://console.groq.com/keys  |  https://aistudio.google.com/apikey")
+        claude = ask_secret("Claude API key (blank to skip)")
+        if claude:
+            updates["CLAUDE_API_KEY"] = claude
         groq = ask_secret("Groq API key (blank to skip)")
         if groq:
             updates["GROQ_API_KEY"] = groq
@@ -1355,7 +1357,7 @@ def configure_models():
         if gemini:
             updates["GEMINI_API_KEY"] = gemini
     else:
-        ok("Chat API key: SET")
+        ok("Cloud model key: SET")
 
     # Real-time search and deep research use DuckDuckGo, which needs no credentials — so
     # nothing is asked for them.
@@ -1366,19 +1368,20 @@ def configure_models():
         ok(f"Saved {len(updates)} value(s) to .env.")
 
     env = read_env(ENV_FILE)
-    return False, {"required": True,
-                   "cohere": _key_present(env, "CohereAPIKey"),
-                   "chat": _has_chat_key(env)}
+    return False, {"required": True, "chat": _has_chat_key(env)}
 
 
 def _key_present(env, name):
     """True when a key is set to something that is not the placeholder from .env.example."""
     value = (env.get(name) or "").strip()
-    return bool(value) and "your_" not in value.lower() and value.lower() != "none"
+    return (bool(value) and "your_" not in value.lower() and "sk-ant-your" not in value.lower()
+            and value.lower() != "none")
 
 
 def _has_chat_key(env):
-    return _key_present(env, "GROQ_API_KEY") or _key_present(env, "GEMINI_API_KEY")
+    """Any cloud key: every provider both classifies intent and converses."""
+    return any(_key_present(env, name) for name in
+               ("CLAUDE_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"))
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1648,6 +1651,44 @@ def _linux_automation_summary():
         return "missing " + ", ".join(missing)
     return ("ready (Hyprland)" if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
             else "ready (no window management outside Hyprland)")
+
+
+def offer_share_picker(python_exe):
+    """
+    Hyprland only: offer Kayra's screen-share picker, which lets "share the LM Studio window"
+    pick that window itself (BROWSER_CONTROL_PLAN §12, M1.1). It wraps whatever picker is
+    configured now, so manual sharing is unchanged; `python -m kayra.automation.share_picker
+    uninstall` puts the old line back. Asked, never done silently. Returns a status word.
+    """
+    if not sys.platform.startswith("linux") or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "n/a"
+    step("Checking screen sharing by name (Hyprland)")
+    env = dict(os.environ, PYTHONPATH=os.path.join(PROJECT_ROOT, "src"))
+
+    def helper(verb):
+        done = subprocess.run([python_exe, "-m", "kayra.automation.share_picker", verb],
+                              capture_output=True, text=True, env=env, cwd=PROJECT_ROOT)
+        return done.returncode, (done.stdout or "").strip()
+
+    code, state = helper("status")
+    if code != 0:
+        warn("Could not check the screen-share picker.")
+        return "unknown"
+    if state.startswith("installed"):
+        ok("Kayra's share picker is set: \"share the <app> window\" picks that window.")
+        return "installed"
+    if state.startswith("no-portal"):
+        info("xdg-desktop-portal-hyprland is not installed; screen sharing by name is unavailable.")
+        return "no-portal"
+    info("Kayra can pick the window you name when you share your screen in a call. It adds one")
+    info("line to ~/.config/hypr/xdph.conf (backed up; your current picker stays the fallback).")
+    if not ask_yes_no("Set it up now?", default=True):
+        info("    Skipped. Later: PYTHONPATH=src .venv/bin/python -m kayra.automation.share_picker install")
+        return "skipped"
+    code, text = helper("install")
+    for line in text.splitlines():
+        info(f"    {line}")
+    return "installed" if code == 0 else "failed"
 
 
 def check_platform(python_exe):
@@ -1977,7 +2018,6 @@ def main():
 
     env_ok = ensure_env_file()
     local_available, cloud = configure_models() if env_ok else (False, {"required": True,
-                                                                        "cohere": False,
                                                                         "chat": False})
     model_state = check_models()
     hand_model = ensure_hand_model(python_exe) if deps_ok else "no-mediapipe"
@@ -1986,13 +2026,12 @@ def main():
                             "cuda_reason": "dependencies were not installed",
                             "variant": None, "ready": "cpu"})
     platform_state = check_platform(python_exe)
+    if deps_ok:
+        offer_share_picker(python_exe)
 
-    cloud_ok = (not cloud["required"]) or (cloud["cohere"] and cloud["chat"])
+    cloud_ok = (not cloud["required"]) or cloud["chat"]
     if cloud["required"]:
-        parts = []
-        parts.append("Cohere SET" if cloud["cohere"] else "Cohere MISSING")
-        parts.append("chat SET" if cloud["chat"] else "chat MISSING")
-        cloud_text = ", ".join(parts)
+        cloud_text = "cloud key SET" if cloud["chat"] else "cloud key MISSING"
     else:
         cloud_text = "not required (local model in use)"
 

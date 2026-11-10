@@ -65,6 +65,25 @@ process. A tier-1 suite must not read the host (battery, load, `.env`, memory st
   page summary, 7.8 s -> 1.8 s for a screen description on the reference laptop.
 - **Browser flows wait for readiness, not for a clock**: `web_macros._until` / `_wait_for`.
   Do not add a fixed `SLEEP` in front of a page action.
+- **Cloud models (2026-11-10): Claude (Haiku 5.5) -> Groq -> Gemini, for the DMM AND chat;
+  Cohere is gone.** Any one key serves both routes. Claude goes through the `anthropic` SDK,
+  imported lazily; `llm_engine.claude_speed_args` decides thinking/effort per model and no
+  sampling parameter is ever sent to Claude. `provider_router.classify_failure` reads the HTTP
+  status FIRST — a 404 or a "limit: 0" 429 is MODEL_UNAVAILABLE, never RATE_LIMITED (that
+  misreading made working keys look exhausted). Settings → Save applies keys live
+  (`reload_providers`, clears only the changed provider's cooldown). LM Studio is preferred
+  whenever it runs (re-checked live, `_sync_mode`); only `CLOUD_FIRST=True` overrides that.
+  Read settings through `_setting()`/`env()` — a blank `.env` value is NOT the default. Details: `docs/reference/INTELLIGENCE.md`.
+- **API keys from Settings go to the system keyring** (`core.credentials`; `.env` holds
+  `NAME=@keyring`, resolved inside `config.env_values`), else into `.env`, which every writer
+  now makes 0600. Settings → Cloud models has Test / Remove per provider.
+- **UI rendering uses the GPU where it pays** (`ui/gpu.py`): the backdrop is an OpenGL widget,
+  which moves the window's composition to the GPU; shadows are cached layers; confirmations are
+  the in-window `ConfirmDialog` (no `QMessageBox`). `KAYRA_UI_GPU=off` / `KAYRA_UI_PROFILE=1`.
+  Measurements and the reverted snapshot fade: `docs/reference/UI.md` → GPU rendering.
+- **The UI is responsive down to 480×520** (was a 1040px minimum): compact rail below 1100,
+  Home's wide/medium/narrow layouts, settings rows that stack. Never pin a column with
+  `setFixedWidth` in `resizeEvent`. See `docs/reference/UI.md` → Responsive layout.
 
 ## What this is
 
@@ -210,6 +229,14 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   `web_macros.TOP_RESULTS` does network I/O — every test rig must stub it (the Linux `Rig`
   does). A new extension feature must check `_outdated(min)`; 1.1.0+ extensions reload
   themselves. Tests: `tests/test_browser_control.py`.
+- **Part 2M — screen sharing (2026-11-10).** Every share phrasing is ONE `meet.share`
+  (`common.share_request`, caught before click/screen prefixes); `_guard_meeting_code` drops a
+  meeting code the user never said (the preamble's `abc-defg-hij` was joined once). A named
+  window/monitor goes to the Hyprland portal through `automation/share_picker.py` + the
+  stdlib-only `extension/kayra-share-picker/kayra-share-picker` (one-shot request, wraps the
+  configured picker); without it a named window is NEVER auto-picked. No fixed sleeps in
+  `web_macros` (asserted). Tests must stub `web_macros.SHARE_HELPER`. `KAYRA_AUDIT_LOG`
+  (path|off) keeps suites out of `logs/automation.log`. Not yet tried in a live call.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

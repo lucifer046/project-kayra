@@ -45,6 +45,7 @@ class ChatView(View):
     # clicked. The transcript starts at the top, which is what makes this read as a native
     # assistant application rather than as a documentation page with a chat box on it.
     title = ""
+    adapt_margins = False   # its own margins: the dock clearance (see __init__)
     subtitle = ""
 
     def __init__(self, bridge, parent=None):
@@ -88,10 +89,18 @@ class ChatView(View):
         self._build_transcript()
         self._build_composer()
 
+        # The column is a widget CAPPED at `Size.chat_max` and otherwise free to shrink, with a
+        # stretch either side. It used to be pinned with `setFixedWidth` from `resizeEvent`,
+        # which raised the page's own minimum to the old width while the window was shrinking:
+        # the layout then centred a column wider than the page and pushed it past the edge.
+        self.column_box = QWidget()
+        self.column_box.setLayout(self.column)
+        self.column_box.setMaximumWidth(Size.chat_max)
+        self.column_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         centred = QHBoxLayout()
         centred.setContentsMargins(0, 0, 0, 0)
         centred.addStretch(1)
-        centred.addLayout(self.column, 0)
+        centred.addWidget(self.column_box, 1000)
         centred.addStretch(1)
         self.content.addLayout(centred, 1)
 
@@ -474,11 +483,12 @@ class ChatView(View):
         becomes margin rather than longer lines.
         """
         super().resizeEvent(event)
-        available = max(320, self.width() - 2 * Space.lg)
+        side = Space.lg if self.width() >= 640 else Space.sm
+        left, top, right, bottom = self.content.getContentsMargins()
+        if left != side:
+            self.content.setContentsMargins(side, top, side, bottom)
+        available = max(240, self.width() - 2 * side)
         width = min(Size.chat_max, available)
-        self.transcript_scroll.setFixedWidth(width)
-        self.composer.setFixedWidth(width)
-        self.voice_note.setFixedWidth(width)
         # Bubbles wrap at a fraction of the column, not at a constant. On a narrow window a
         # 560px bubble would be the whole width and the asymmetry that distinguishes the two
         # speakers would be lost.

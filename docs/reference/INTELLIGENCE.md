@@ -52,8 +52,9 @@ holds PCM, revisit this — the blocker is the audio boundary, not the idea.
 ## The Decision-Making Model (DMM) — how intent classification works
 
 - `CentralizedLLMEngine.classify_intent()` sends the raw user query plus a large few-shot
-  preamble (`self.dmm_preamble` + `self.dmm_chat_history`, both set in `__init__`) to Cohere
-  (cloud) or a local model.
+  preamble (`self.dmm_preamble` + `self.dmm_chat_history`, both set in `__init__`) to the
+  cloud DECISION route (Claude -> Groq -> Gemini) or a local model. (Cohere until 2026-11-10;
+  the measurements below that name it are history.)
 - The model must respond with a comma-separated list of task tokens, each starting with one of
   the strings in `self.funcs`.
 - **Gotcha — duplicate matching**: several `funcs` entries are prefixes of one another
@@ -78,41 +79,102 @@ fallback was invented independently in two places inside `llm_engine.py` and the
 about almost everything — which is how one user request became four provider calls against an
 already rate-limited key.
 
-### The hierarchy
+### The hierarchy (2026-11-10: Claude added, Cohere removed)
 
 ```
-DECISION (the DMM)   Cohere  ->  Groq  ->  Gemini
-CHAT                 Groq    ->  Gemini
+DECISION (the DMM)   Claude  ->  Groq  ->  Gemini
+CHAT                 Claude  ->  Groq  ->  Gemini
 ```
 
-They are deliberately NOT the same list, and the distinction is explicit in `ROUTE_CHAINS`
-rather than implied by the ordering of `if` statements. Cohere leads DECISION because the DMM's
-few-shot token contract was written and measured against Command-R; it is not a chat provider
-here and appears nowhere in the CHAT chain. Groq leads CHAT because it is the fastest first
-token available, and is the DMM's first fallback rather than its primary because the
-intent-boundary matrix was tuned against Cohere.
+**One order for both routes, and any one key serves both.** Every provider is a general model
+that can classify AND converse; what differs between the routes is how a provider is CALLED,
+never who is asked:
 
-- **Local-first is unchanged and absolute.** With an LM Studio / Ollama server up, ALL traffic
-  goes there and the router is not consulted — a chain of one has no decisions in it.
-- **The DMM prompt contract is identical on all three providers.** The same strict system rule,
-  the same `dmm_preamble` and the same unsliced `dmm_chat_history` reach every one; only the
-  transport differs (Cohere's native `preamble`/`chat_history` parameters versus the
-  OpenAI-compatible message list Groq and Gemini speak). A fallback that changed the prompt
-  would be classifying a different question, and the token contract the whole automation layer
-  depends on would silently vary with whoever answered.
+| | DECISION (the DMM) | CHAT |
+|---|---|---|
+| Claude | `CLAUDE_DECISION_MODEL` (default = `CLAUDE_MODEL` = `claude-haiku-5-5`), `max_tokens` 128, thinking OFF + effort low, few-shot prefix CACHED | `CLAUDE_MODEL`, streamed, thinking off + `CLAUDE_EFFORT` (low) |
+| Groq | `GROQ_DECISION_MODEL` = `openai/gpt-oss-20b`, `reasoning_effort: low` | `GROQ_CHAT_MODEL` = `openai/gpt-oss-120b` |
+| Gemini | `GEMINI_DECISION_MODEL` (default = chat model), `reasoning_effort: none` | `GEMINI_CHAT_MODEL` = `gemini-flash-latest` |
+
+- **Why Cohere went.** `command-r-plus-08-2024` was a 2024 model on a ~1,000-call/month trial
+  key, and it was the only reason the two routes differed. Its client, key, Settings field and
+  setup prompt are gone (`CohereAPIKey` stays in `SECRET_KEYS` so an old `.env` never prints it).
+- **Claude is called through the official `anthropic` SDK**, imported lazily inside
+  `_build_cloud_clients` (importing `llm_engine` stays cheap; a missing package costs the Claude
+  provider, not the engine). `max_retries=0`, same timeout as the others.
+- **`claude_speed_args(model)`** is the one place that knows which Claude model takes which
+  speed fields: Haiku 5.x gets `thinking: disabled` + low effort; Opus/Sonnet 5.x get low effort
+  only (`disabled` is a 400 there); Haiku 4.5 and older get neither (they reject `effort`). No
+  sampling parameter is ever sent to Claude — the current API rejects non-default ones.
+- **The DMM's ~5.6K-token prefix is cached on Claude**: a breakpoint on the system block and one
+  on the LAST few-shot example, so only the user's words are uncached. Responses are read by
+  block TYPE (`claude_text`), never `content[0]` — Haiku 5.5 may lead with a thinking block.
+- **`to_claude_messages`** converts the OpenAI-shaped messages every chat caller builds: system
+  entries joined in order into Claude's `system`, user/assistant turns kept, a leading user turn
+  guaranteed.
+- **Gemini's `-latest` alias** is the default because `gemini-2.5-flash` was retired under a
+  working configuration (it answered 404 / "limit: 0", which the old text classifier called a
+  rate limit). Vision follows the same models (`VISION_CLAUDE_MODEL` / `VISION_GEMINI_MODEL`
+  blank = the chat model); vision order is local -> Claude -> Gemini -> Groq.
+- **A reasoning field a provider rejects** (Groq/Gemini DMM) is retried ONCE without it and
+  remembered (`_no_reasoning_field`) — an INVALID_REQUEST correction, not a transport retry.
+- **`CLOUD_FIRST=True`** (with any cloud key) makes the cloud chain answer even while a local
+  server runs, for the engine, `ai.fast`/`ai.summarize` and vision. Off by default: local-first
+  is otherwise unchanged and absolute. It is the ONE switch on the Settings screen ("Use cloud
+  models even when LM Studio is running"); `FORCE_ONLINE` still works from `.env` only.
+- **Local vs cloud is followed LIVE** (`_sync_mode`, at most every 10 s, at the start of
+  `classify_intent` and `generate_chat_stream`, and immediately on Settings → Save): LM Studio
+  started after Kayra is picked up, LM Studio quitting hands over to the cloud. It used to be
+  decided once at boot.
+- **Blank means unset** (`_setting`). Settings writes `LOCAL_BASE_URL=` for an empty field,
+  and `.get(name, default)` returned "" — the probe dialled port 80, found nothing, and every
+  request went to the cloud with LM Studio running. Found on the developer's machine.
+- **Keys apply without a restart.** Settings → Save calls `bridge.reload_providers()` →
+  `CentralizedLLMEngine.reload_providers()`: re-reads `.env`, rebuilds every cloud client,
+  and clears the cooldown of ONLY the providers whose key changed (a wrong key's 900 s
+  AUTH_FAILURE verdict used to outlive the corrected key). The local/cloud MODE stays a startup
+  decision, except that CLOUD_FIRST can switch a local session to the cloud.
+- **The exhausted-chain sentence names each provider and the real reason**
+  (`chain_failure_sentence`): "Claude is rate-limited; Gemini cannot serve the configured model
+  on this key". It used to say "every model is rate-limited" whenever any attempt was a 429.
+
+- **Local-first is otherwise unchanged and absolute.** With an LM Studio / Ollama server up (and
+  neither FORCE_ONLINE nor CLOUD_FIRST), ALL traffic goes there and the router is not consulted.
+- **The DMM prompt contract is identical on every provider.** The same strict system rule, the
+  same `dmm_preamble` and the same unsliced `dmm_chat_history` reach every one; only the
+  transport differs. A fallback that changed the prompt would be classifying a different
+  question.
 
 ### Failure classification
 
 Eight kinds — `RATE_LIMITED`, `AUTH_FAILURE`, `NETWORK_FAILURE`, `TIMEOUT`, `SERVER_ERROR`,
-`INVALID_REQUEST`, `MODEL_UNAVAILABLE`, `UNKNOWN` — decided once, from the exception's type name
-AND its string form. The kind determines two things and only two: how long the provider stands
-down, and whether the request is worth handing to anybody else.
+`INVALID_REQUEST`, `MODEL_UNAVAILABLE`, `UNKNOWN`. The kind determines two things and only two:
+how long the provider stands down, and whether the request is worth handing to anybody else.
 
-- **`INVALID_REQUEST` is the one kind that does NOT fall through.** Sending an identical
-  malformed request to two more providers is three failures instead of one.
-- **`AUTH_FAILURE` DOES fall through** — a missing Cohere key says nothing about the Groq key —
+- **The HTTP status decides first (2026-11-10).** `_STATUS_KINDS`: 400/413/422 invalid, 401/402/
+  403 auth, 404 model, 408 timeout, 429 rate limit, 529 and any 5xx server. Text matching on the
+  type name and message is the fallback for exceptions without a status, and it no longer
+  contains bare numbers ("429"/"500" inside a request id or a token count is not evidence).
+  **The bug this fixed:** the text check ran "429"/"quota" FIRST, so a retired Gemini model or a
+  key whose plan has no allowance for the model was reported as RATE_LIMITED, and the user was
+  told every model was rate-limited on keys with plenty of budget.
+- **A 429 that is NOT a rate limit** — "limit: 0", "free_tier", "credit balance", "billing",
+  "insufficient_quota" — is MODEL_UNAVAILABLE, and its Retry-After is ignored (it would only
+  bring the same refusal back every few seconds).
+- **`INVALID_REQUEST` falls through too (since 2026-11-10)**, with a 60 s cooldown: no two
+  providers receive the same request (Claude's shape differs from the OpenAI-shaped one), so a
+  400 from one says nothing about the next. Stopping the chain turned one refusal into "no
+  model could answer".
+- **No credit is an ACCOUNT problem, whatever the status.** Anthropic answers an account
+  without API credit with a **400** `invalid_request_error` ("Your credit balance is too low
+  to access the Anthropic API") — found live on the developer's key, which had a claude.ai
+  plan and no API credit. `is_no_credit()` classifies it as AUTH_FAILURE and the sentence says
+  "Claude has no API credit on its account" (plus "add a Groq or Gemini key" when there is no
+  fallback); Test says how to fix it.
+- **`AUTH_FAILURE` DOES fall through** — a missing Claude key says nothing about the Groq key —
   but it carries the longest cooldown (900s), because nothing about the next minute will fix a
-  wrong credential and retrying it every turn is the retry storm this exists to prevent.
+  wrong credential and retrying it every turn is the retry storm this exists to prevent. A key
+  saved in Settings clears it (see the hierarchy notes above).
 
 ### Cooldowns
 
