@@ -63,6 +63,21 @@ GMAIL = """<html><head><title>Inbox (1119) - me@gmail.com - Gmail</title></head>
 </main></body></html>"""
 
 
+RESULTS = """<html><head><title>Search</title></head><body>
+<nav><a href="https://nav.example/home">Home of the navigation menu</a></nav>
+<main>
+ <div><a href="https://a.example/1"><h3>First result about transformers</h3></a></div>
+ <div><a href="https://a.example/2"><h3>Second result about attention</h3></a></div>
+ <div><a href="https://a.example/2#again"><h3>Second result about attention</h3></a></div>
+ <div><a href="https://a.example/3"><h3>Third result about long context</h3></a></div>
+ <a href="https://a.example/x">short</a>
+ <p>Pricing is simple. The pricing page lists PRICING for teams.</p>
+ <textarea>pricing in a textarea is never marked</textarea>
+</main>
+<footer><a href="https://f.example/legal">Legal information and the footer links</a></footer>
+</body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -156,6 +171,33 @@ def main():
         check("'open the second unread email'", r["opened"] and d.title == "row3", r)
         r = call("gmailOpen", "first", 1, "nobody")
         check("no match is reported, nothing opened", not r["opened"], r)
+
+        check.section("[3] Part 2c — the Nth result (C3) and find with highlight (C4)")
+        d.get("data:text/html;base64," + base64.b64encode(RESULTS.encode()).decode())
+        r = call("pageResults", 0, "")
+        titles = [x["title"] for x in r["results"]]
+        check("the result list is the content links, not nav/footer, deduplicated by address",
+              r["count"] == 3 and titles[0].startswith("First result") and
+              not any("navigation" in t or "footer" in t for t in titles), r)
+        r = call("pageResults", 3, "")
+        check("'the third result' is the third", r["result"]["url"] == "https://a.example/3", r)
+        r = call("pageResults", -1, "")
+        check("'the last result' is the last", r["result"]["url"] == "https://a.example/3", r)
+        check("past the end is null", call("pageResults", 9, "")["result"] is None)
+        r = call("pageHighlight", "pricing", 0, False)
+        marks = d.execute_script("return document.querySelectorAll('mark[data-kayra-find]').length")
+        check("find highlights every match, case-insensitively, never inside a textarea",
+              r["count"] == 3 and marks == 3 and r["index"] == 1, (r, marks))
+        r = call("pageHighlight", "", 1, False)
+        check("next match steps to 2 of 3", r["index"] == 2 and r["count"] == 3, r)
+        r = call("pageHighlight", "", 2, False)
+        check("...and wraps around", r["index"] == 1, r)
+        call("pageHighlight", "", 0, True)
+        text = d.execute_script("return document.querySelector('p').textContent")
+        check("clear removes the marks and leaves the text exactly as it was",
+              d.execute_script("return document.querySelectorAll('mark').length") == 0
+              and text == "Pricing is simple. The pricing page lists PRICING for teams.", text)
+        check("finding nothing marks nothing", call("pageHighlight", "zebra", 0, False)["count"] == 0)
     finally:
         d.quit()
     return check.finish()

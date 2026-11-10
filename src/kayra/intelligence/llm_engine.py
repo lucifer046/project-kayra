@@ -668,7 +668,16 @@ class CentralizedLLMEngine:
                'browser close duplicate tabs'; 'close the tabs on the right' -> 'browser close
                tabs to the right'; 'what did I just close' -> 'browser what did i just close';
                'find the tab where I was reading about rust' -> 'browser find the tab about
-               rust'; 'copy this page's link' -> 'browser copy the link'; 'click
+               rust'; 'copy this page's link' -> 'browser copy the link'; 'open the third
+               result' / 'play the second video' -> 'browser open the third result' / 'browser
+               play the second video'; 'find pricing on this page' -> 'browser find pricing on
+               this page', then 'next match' -> 'browser next match'; 'close all my YouTube
+               tabs' -> 'browser close all youtube tabs'; 'close everything except the pinned
+               tabs' -> 'browser close all but pinned'; 'group my college tabs' -> 'browser group
+               my college tabs'; 'make the research group blue' / 'collapse the research group'
+               / 'rename this group to thesis' / 'ungroup the research group' -> 'browser ' +
+               the same words; 'move this tab to a new window' -> 'browser move this tab to a
+               new window'; 'merge my Chrome windows' -> 'browser merge my chrome windows'; 'click
                the sign in button' -> 'browser click on sign in'; 'type hello in the search
                box' -> 'browser type hello into search'; 'summarize this page' -> 'browser
                summarize this page'; 'read this article' -> 'browser read this page'; 'open

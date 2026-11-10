@@ -571,7 +571,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.4.0")
+        web_macros.BRIDGE = current = Bridge(version="1.5.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1094,8 +1094,8 @@ def section_meetings():
           "__kayraShareAudio" in js and 'systemAudio = "include"' in js
           and "window.__kayraShareAudio = null" in js)
     manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
-    check("extension 1.4.0 and REQUIRED_VERSION agree",
-          manifest["version"] == "1.4.0" and web_macros.REQUIRED_VERSION == (1, 4, 0))
+    check("the extension is at least 1.4.0 (system audio in a share)",
+          tuple(int(x) for x in manifest["version"].split(".")) >= (1, 4, 0))
 
 
 def section_share_picker_helper():
@@ -1195,6 +1195,225 @@ def section_audit_log():
           logger is False or os.path.abspath(target) != os.path.abspath(real), target)
     return os.path.getsize(real) if os.path.exists(real) else None
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 2c — B2 by site / but pinned, B4 groups, B5 windows, C3, C4      │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class GroupBridge(TabBridge):
+    """TabBridge at 1.5.0, with five YouTube tabs, tab groups, windows and a result list."""
+
+    def __init__(self, version="1.5.0"):
+        super().__init__(version=version)
+        for i, title in enumerate(("Lecture 4 - YouTube", "Lecture 5 - YouTube", "Lecture 6 - YouTube")):
+            self.tabs.append({"id": 30 + i, "title": title, "url": f"https://www.youtube.com/watch?v=l{i}",
+                              "windowId": 1, "active": False})
+        for t in self.tabs:
+            t.setdefault("groupId", -1)
+        self.groups = [{"id": 7, "title": "Research", "color": "grey", "collapsed": False,
+                        "windowId": 1, "tabs": 0}]
+        self.tabs[2]["groupId"] = 7          # Docs (active) is in Research
+        self.results = [{"title": f"Result {i}", "url": f"https://r.example/{i}"} for i in range(1, 6)]
+        self.marks = 0
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "groups.list":
+            for g in self.groups:
+                g["tabs"] = sum(t.get("groupId") == g["id"] for t in self.tabs)
+            return [dict(g) for g in self.groups]
+        if cmd.startswith(("groups.", "windows.", "page.results", "page.highlight")) or \
+                cmd in ("tabs.navigate", "tabs.open"):
+            self.calls.append((cmd, args))
+            if cmd == "groups.create":
+                gid = args.get("groupId") or 99
+                if gid == 99:
+                    self.groups.append({"id": 99, "title": args.get("title", ""), "color": "grey",
+                                        "collapsed": False, "windowId": 1})
+                for t in self.tabs:
+                    if t["id"] in args["tabIds"]:
+                        t["groupId"] = gid
+                return {"groupId": gid, "tabs": len(args["tabIds"])}
+            if cmd == "groups.update":
+                g = next(g for g in self.groups if g["id"] == args["groupId"])
+                g.update({k: v for k, v in args.items() if k in ("title", "color", "collapsed")})
+                return dict(g)
+            if cmd == "groups.ungroup":
+                hit = [t for t in self.tabs if t.get("groupId") == args.get("groupId")]
+                for t in hit:
+                    t["groupId"] = -1
+                return {"ungrouped": len(hit)}
+            if cmd == "windows.detach":
+                return {"windowId": 5, "title": "Docs"}
+            if cmd == "windows.merge":
+                return {"moved": 1, "windows": 1}
+            if cmd == "page.results":
+                nth = args.get("nth", 0)
+                if not nth:
+                    return {"site": "google", "count": len(self.results), "results": self.results}
+                index = nth - 1 if nth > 0 else len(self.results) + nth
+                ok = 0 <= index < len(self.results)
+                return {"site": "google", "count": len(self.results),
+                        "result": self.results[index] if ok else None}
+            if cmd == "page.highlight":
+                if args.get("clear"):
+                    self.marks = 0
+                    return {"cleared": True}
+                if args.get("text"):
+                    self.marks = 3 if args["text"] == "pricing" else 0
+                    return {"count": self.marks, "index": 1 if self.marks else 0}
+                return {"count": self.marks, "index": 2 if self.marks else 0}
+            return {"id": 9, "url": args.get("url")}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_part_2c():
+    check.section("[15] Part 2c — close by site, groups, windows, the Nth result, find with highlight")
+    table = (
+        ("browser open the third result", "page_result", "3"),
+        ("open the third result", "page_result", "3"),
+        ("browser play the second video", "page_result", "2"),
+        ("browser open the last result in a new tab", "page_result", "-1"),
+        ("browser open result 4", "page_result", "4"),
+        ("browser click the second result", "page_result", "2"),
+        ("browser what are the results", "page_results", "current"),
+        ("browser find pricing on this page", "page_find", "pricing"),
+        ("browser highlight transformer", "page_find", "transformer"),
+        ("browser next match", "page_find_step", "next"),
+        ("browser previous match", "page_find_step", "previous"),
+        ("browser clear highlights", "page_find_clear", "current"),
+        ("browser close all youtube tabs", "tab_close", "youtube"),
+        ("browser close all but pinned", "tabs_close_unpinned", "unpinned"),
+        ("browser close all tabs except pinned", "tabs_close_unpinned", "unpinned"),
+        ("browser group my college tabs", "tabs_group", "college"),
+        ("browser group the youtube tabs as music", "tabs_group", "youtube"),
+        ("browser list my tab groups", "groups_list", "all"),
+        ("browser add this tab to the research group", "group_add", "research"),
+        ("browser rename the research group to thesis", "group_rename", "research"),
+        ("browser rename this group to thesis", "group_rename", "current"),
+        ("browser make the research group blue", "group_color", "research"),
+        ("browser collapse the research group", "group_collapse", "research"),
+        ("browser expand all groups", "group_collapse", "all"),
+        ("browser ungroup the research group", "group_ungroup", "research"),
+        ("browser ungroup all", "group_ungroup", "all"),
+        ("browser close the research group", "group_close", "research"),
+        ("browser move this tab to a new window", "tab_detach", "current"),
+        ("browser move this tab to the other screen", "tab_detach", "current"),
+        ("browser merge my chrome windows", "windows_merge", "all"),
+        # unchanged neighbours
+        ("browser close the third tab", "tab_close", "#3"),
+        ("browser find the tab about rust", "tab_find", "rust"),
+        ("browser click on sign in", "page_click", "sign in"),
+    )
+    for token, action, target in table:
+        a = n(token)
+        check(f"'{token}' -> browser.{action} {target!r}",
+              a is not None and a.domain == "browser" and a.action == action and a.target == target,
+              f"{a.key if a else None} {a.target if a else ''}")
+    check("'open the first email' is still Gmail", n("open the first email").key == "email.open")
+    check("the new shapes are in the understanding catalog",
+          all(p in interpreter.CATALOG for p in ("browser open the third result", "browser next match",
+                                                 "browser group my <topic> tabs",
+                                                 "browser merge my chrome windows")))
+
+    with WebRig(GroupBridge()) as rig:
+        r = rig.do("browser close all youtube tabs")
+        check("B2: five YouTube tabs ASK first, naming some of them",
+              r.status == Status.NEEDS_CONFIRMATION and "5 youtube tabs" in r.message
+              and rig.bridge.last("tabs.close") is None, r.message)
+        rig.bridge.tabs.append({"id": 40, "title": "New - YouTube", "url": "https://youtube.com/x",
+                                "windowId": 1, "active": False, "groupId": -1})
+        ok, said = linux.resolve_confirmation("yes")
+        check("...'yes' closes exactly the five it found (not one opened since)",
+              sorted(rig.bridge.last("tabs.close")["tabIds"]) == [12, 14, 30, 31, 32]
+              and "Closed 5 tabs" in said, (rig.bridge.last("tabs.close"), said))
+    with WebRig(GroupBridge()) as rig:
+        rig.bridge.tabs = [t for t in rig.bridge.tabs if t["id"] not in (30, 31, 32)]
+        r = rig.do("browser close all youtube tabs")
+        check("B2: three or fewer close at once", r.ok and rig.bridge.last("tabs.close") == {"tabIds": [12, 14]},
+              r.message)
+        r = rig.do("browser close all but pinned")
+        check("B2: 'all but pinned' keeps the pinned Gmail tab (4 tabs: closed at once)",
+              r.ok and 11 not in rig.bridge.last("tabs.close")["tabIds"]
+              and 21 not in rig.bridge.last("tabs.close")["tabIds"], rig.bridge.last("tabs.close"))
+        linux.resolve_confirmation("no")
+
+    with WebRig(GroupBridge()) as rig:
+        r = rig.do("browser group the youtube tabs as music")
+        created = rig.bridge.last("groups.create")
+        check("B4: matching tabs become one named group",
+              created and sorted(created["tabIds"]) == [12, 14, 30, 31, 32] and created["title"] == "Music"
+              and "Grouped 5 tabs as Music" in r.message, (created, r.message))
+        r = rig.do("browser make the research group blue")
+        check("B4: colour", rig.bridge.last("groups.update") == {"groupId": 7, "color": "blue"}
+              and "blue" in r.message, r.message)
+        r = rig.do("browser rename this group to thesis")
+        check("B4: 'this group' is the active tab's group",
+              rig.bridge.last("groups.update") == {"groupId": 7, "title": "thesis"}, r.message)
+        r = rig.do("browser collapse the thesis group")
+        check("B4: collapse", rig.bridge.last("groups.update") == {"groupId": 7, "collapsed": True}, r.message)
+        r = rig.do("browser expand all groups")
+        check("B4: expand all", rig.bridge.last("groups.update")["collapsed"] is False and "Expanded" in r.message,
+              r.message)
+        r = rig.do("browser list my tab groups")
+        check("B4: list names the groups and their tab counts", "Thesis" in r.message or "thesis" in r.message,
+              r.message)
+        r = rig.do("browser ungroup the thesis group")
+        check("B4: ungroup", rig.bridge.last("groups.ungroup") == {"groupId": 7}, r.message)
+        r = rig.do("browser collapse the cooking group")
+        check("B4: an unknown group is said so", not r.ok and "cooking" in r.message, r.message)
+    with WebRig(GroupBridge()) as rig:
+        rig.do("browser group my transformer tabs")
+        check("B4: a topic not in any title is found in the page text",
+              rig.bridge.last("groups.create")["tabIds"] == [13], rig.bridge.last("groups.create"))
+        r = rig.do("browser group my netflix tabs")
+        check("...and none is said so", not r.ok, r.message)
+    with WebRig(GroupBridge(version="1.4.0")) as rig:
+        r = rig.do("browser group the youtube tabs")
+        check("an extension older than 1.5.0 is never sent a 1.5.0 command",
+              rig.bridge.last("groups.create") is None and not r.ok, r.message)
+
+    hypr = FakeHyprland([client("0xa", "google-chrome", "Docs - Google Chrome", focus=0)], active="0xa",
+                        monitors=[{"name": "eDP-1", "x": 0, "y": 0, "focused": True},
+                                  {"name": "HDMI-A-1", "x": 2000, "y": 0, "focused": False}])
+    with WebRig(GroupBridge(), hypr=hypr) as rig:
+        r = rig.do("browser move this tab to a new window")
+        check("B5: a tab gets its own window", rig.bridge.last("windows.detach") == {} and "own window" in r.message,
+              r.message)
+        r = rig.do("browser move this tab to the other screen")
+        check("B5: '… to the other screen' moves the new window with Hyprland",
+              any("move" in d and "0xa" in d for d in rig.hypr.dispatched) and "other screen" in r.message,
+              (rig.hypr.dispatched, r.message))
+        r = rig.do("browser merge my chrome windows")
+        check("B5: merge windows", "Moved 1 tab from 1 other window" in r.message, r.message)
+
+        r = rig.do("open the third result")
+        check("C3: the third result is opened in this tab",
+              rig.bridge.last("tabs.navigate") == {"url": "https://r.example/3"} and "third result" in r.message,
+              r.message)
+        r = rig.do("browser open the last result in a new tab")
+        check("C3: '… in a new tab' opens next to this one",
+              rig.bridge.last("tabs.open") == {"url": "https://r.example/5", "where": "next"}, r.message)
+        r = rig.do("browser open the ninth result")
+        check("C3: past the end is said so", not r.ok and "only 5" in r.message, r.message)
+        r = rig.do("browser what are the results")
+        check("C3: the results are read out, numbered", "1. Result 1" in r.message, r.message)
+
+        r = rig.do("browser find pricing on this page")
+        check("C4: find highlights and says how many", rig.bridge.last("page.highlight") == {"text": "pricing"}
+              and "3 matches" in r.message, r.message)
+        r = rig.do("browser next match")
+        check("C4: next match steps", rig.bridge.last("page.highlight") == {"step": 1} and "2 of 3" in r.message,
+              r.message)
+        r = rig.do("browser clear highlights")
+        check("C4: clear", rig.bridge.last("page.highlight") == {"clear": True}, r.message)
+        r = rig.do("browser next match")
+        check("C4: next with nothing highlighted is said so", not r.ok, r.message)
+
+    manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
+    check("extension 1.5.0 asks for tabGroups and nothing else new",
+          manifest["version"] == "1.5.0" and web_macros.REQUIRED_VERSION == (1, 5, 0)
+          and "tabGroups" in manifest["permissions"] and "debugger" not in manifest["permissions"]
+          and "downloads" not in manifest["permissions"])
+
 
 def main():
     print_banner("BROWSER CONTROL (round 5)")
@@ -1210,6 +1429,7 @@ def main():
         section_tuning()
         section_tabs_by_position()
         section_part_2b()
+        section_part_2c()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

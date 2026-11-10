@@ -327,6 +327,24 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-10 — round 5, part 2c: the rest of tabs and windows, results, find
+
+- **B2** "close all YouTube tabs", "close all but pinned": more than 3 tabs asks first. New in
+  the runtime: a handler can return NEEDS_CONFIRMATION with `detail["confirm"]` = the exact
+  action to run on "yes" (here with the tab ids it found), and `execute_action` registers it.
+- **B4** tab groups (`groups.list/create/update/ungroup`, extension 1.5.0 + `tabGroups`):
+  group by topic (title/address, else page text), rename, colour, collapse/expand (one or all),
+  add this tab, ungroup, close (asks above 3), list.
+- **B5** `windows.detach` ("move this tab to a new window", "… to the other screen" = then a
+  Hyprland move of the new window), `windows.merge`.
+- **C3** `page.results`: site-aware result lists (Google, YouTube, Amazon, Flipkart, GitHub,
+  Reddit, DuckDuckGo, Bing), else the Nth content link; "open the third result" with no
+  `browser` prefix is caught before `app.open`.
+- **C4** `page.highlight`: marks every match, scrolls to the current one, next / previous /
+  clear; "find X on this page" uses it from 1.5.0.
+- Tests: `tests/test_browser_control.py` [15], `tests/test_browser_extension.py` [3].
+- Not tried against a live Chrome with the extension loaded.
+
 ### 2026-11-10 — round 5, part 2M: meetings and screen sharing
 
 - **Four misroutes fixed** (the audit log of a live attempt): `common.share_request()` reads

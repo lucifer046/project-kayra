@@ -43,6 +43,13 @@ anywhere else; one is never needed for an unpacked extension.
 | "close the second tab", "close the last tab" | exactly that tab |
 | "close duplicate tabs" | closes extra copies of the same page (keeps the one you are on, and pinned tabs) |
 | "close the tabs to the right / left" | **asks first**; pinned tabs stay |
+| "close all YouTube tabs", "close all but pinned" | closes them; **more than 3 asks first**, and "yes" closes exactly the ones it listed |
+| "group my college tabs", "group the YouTube tabs as music" | the matching tabs (by title or address, else by what the pages say) become one named group |
+| "make the research group blue", "rename this group to thesis", "collapse / expand the research group", "expand all groups" | changes that group ("this group" = the one you're in) |
+| "add this tab to the research group", "ungroup the research group", "close the research group", "list my tab groups" | as said; closing a group of more than 3 tabs asks first |
+| "move this tab to a new window", "… to the other screen", "merge my Chrome windows" | the tab gets its own window (moved to the other monitor with Hyprland); every tab back in one window |
+| "open the third result", "play the second video", "open the last result in a new tab", "what are the results" | the result list of Google, YouTube, Amazon, Flipkart, GitHub, Reddit, DuckDuckGo, Bing; on other pages the Nth content link |
+| "find pricing on this page", "next match", "previous match", "clear highlights" | highlights every match, scrolls to the first, steps through them |
 | "mute everything except this tab", "unmute all other tabs" | every other tab |
 | "what did I just close?" | the last few closed tabs and windows |
 | "reopen the YouTube tab I closed" | that tab, not just the last one closed |
@@ -122,7 +129,7 @@ have yet, it sends `runtime.reload` (Chrome re-reads this folder) and says *"I'v
 the Kayra Bridge extension…"* — ask again a few seconds later. You can also say **"browser
 update"**. Only a 1.0.x extension needs the manual **reload arrow** on `chrome://extensions`.
 
-Current version: **1.4.0** (1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
+Current version: **1.5.0** (1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
 click matching and `page.waitFor` cheaper; 1.2.2 adds `tabs.close {tabIds}`; 1.3.0 adds
 `tabs.recentlyClosed`, `tabs.restore {sessionId}`, `tabs.muteOthers`, `tabs.discard`,
 `tabs.zoom` and `tabs.reload {hard}` — no new permissions). An older 1.1.0+ extension is
@@ -186,8 +193,12 @@ fakes. If a picker stays open, press Share and tell me what you saw.
 - **Risky clicks ask first.** "Click Delete / Send / Pay / Confirm / Submit / Publish /
   Unsubscribe …" all need your yes, as do sending email or messages, adding events, sharing
   your screen and closing other tabs.
-- **Minimal permissions.** tabs, scripting, history, bookmarks, sessions, alarms, storage.
-  No cookies, downloads, debugger or native messaging.
+- **Minimal permissions.** tabs, scripting, history, bookmarks, sessions, alarms, storage,
+  tabGroups (1.5.0, approved by the user 2026-11-10: it only creates, names, colours and
+  collapses groups — no page data; Chrome shows no prompt for it). No cookies, downloads,
+  debugger or native messaging.
+- **Bulk closes ask first.** More than 3 tabs (by site, all but pinned, a group) is a
+  question, and the "yes" closes exactly the tabs it listed.
 
 ## Why an extension, not remote debugging
 

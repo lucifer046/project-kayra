@@ -810,6 +810,13 @@ def normalize_command(command, context=None):
             parameters["name"] = lowered
         return Action(domain, action, target="current", parameters=parameters, raw=raw)
 
+    # 1a. "open the third result" with no `browser` prefix is the page's result list (C3),
+    # never an app called "the third result".
+    hit = result_request(re.sub(r"^browser\s+", "", lowered))
+    if hit:
+        return Action("browser", "page_result", target=str(hit[0]),
+                      parameters={"nth": hit[0], "new_tab": hit[1]}, raw=raw)
+
     # 1b. A request to share the screen, however it arrived ("share screen", "click on share
     # screen", "start screen sharing"): ONE meet.share, never a click or a new meeting (M0.1).
     if _BARE_SHARE.match(lowered):
@@ -1091,6 +1098,10 @@ def _web_action(kind, payload, raw):
         m = re.fullmatch(r"copy (?:the |this )?(?:page'?s? |tab'?s? )?(link|url|address|title)(?: of (?:this|the) (?:page|tab))?", low)
         if m:
             return Action("browser", "page_copy", target="title" if m.group(1) == "title" else "link", raw=raw)
+        # ── Part 2c ──
+        found = _part_2c_action(low, raw)
+        if found is not None:
+            return found
         if re.fullmatch(r"close (?:all )?(?:the |my )?duplicate(?: tabs)?s?|close (?:the )?duplicates?(?: tabs)?|remove duplicate tabs", low):
             return Action("browser", "tabs_close_duplicates", target="duplicates", raw=raw)
         m = re.fullmatch(r"close (?:all )?(?:the |my )?(?:other )?tabs (?:to|on) the (right|left)", low)
@@ -1247,6 +1258,105 @@ def _web_action(kind, payload, raw):
             who, body = (m.group(1), m.group(2)) if m else (text, "")
         return Action("message", "send", target=_strip(who, "to"),
                       parameters={"text": body.strip(), "app": "whatsapp"}, raw=raw)
+    return None
+
+
+# ── Part 2c (BROWSER_CONTROL_PLAN B2, B4, B5, C3, C4) ──
+GROUP_COLORS = {"grey": "grey", "gray": "grey", "blue": "blue", "red": "red", "yellow": "yellow",
+                "green": "green", "pink": "pink", "purple": "purple", "violet": "purple",
+                "cyan": "cyan", "teal": "cyan", "orange": "orange"}
+_RESULT_NOUNS = r"(?:search )?(?:result|video|link|product|repo|repository|post|item|listing|article|hit)s?"
+_RESULT_ORDINAL = (r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|"
+                   r"\d{1,2}(?:st|nd|rd|th)?)")
+_RESULT_RE = re.compile(
+    r"(?:open|click(?: on)?|go to|show me|play|visit|take me to) (?:the )?" + _RESULT_ORDINAL +
+    r" " + _RESULT_NOUNS + r"(?: on (?:this|the) page)?( in (?:a )?new tab)?|"
+    r"(?:open|click(?: on)?|go to) " + r"(?:search )?(?:result|video|link) (?:number )?(\d{1,2})"
+    r"( in (?:a )?new tab)?")
+_ORDINAL_N = {"first": 1, "top": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+              "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "last": -1}
+
+
+def result_request(low):
+    """'open the third result' -> (3, new_tab=False); 'play the last video' -> (-1, False)."""
+    m = _RESULT_RE.fullmatch(low.strip(" .?!"))
+    if not m:
+        return None
+    word = m.group(1) or m.group(3)
+    nth = _ORDINAL_N.get(word) or int(re.sub(r"\D", "", word) or 0)
+    return (nth, bool(m.group(2) or m.group(4))) if nth else None
+
+
+def _group_name(text):
+    name = re.sub(r"^(?:the|my|this|that)\s+", "", text.strip())
+    name = re.sub(r"\s+(?:tab )?group$", "", name).strip()
+    return "current" if name in ("", "this", "current", "this tab's", "the current") else name
+
+
+def _part_2c_action(low, raw):
+    """The Part 2c shapes, or None. Called before the older tab rules in `_web_action`."""
+    # C3 — the Nth result of a search / list page.
+    hit = result_request(low)
+    if hit:
+        return Action("browser", "page_result", target=str(hit[0]),
+                      parameters={"nth": hit[0], "new_tab": hit[1]}, raw=raw)
+    if re.fullmatch(r"(?:what are|read(?: me)?|list|show me) (?:the )?(?:search )?(?:results|videos)(?: on (?:this|the) page)?", low):
+        return Action("browser", "page_results", target="current", raw=raw)
+    # C4 — find with highlight, and step through it.
+    m = re.fullmatch(r"(?:find|highlight|search for|look for) (.+?) (?:on|in) (?:this |the )?page", low) \
+        or re.fullmatch(r"highlight (?:all |every )?(?:the )?(?:word |words )?(.+)", low)
+    if m:
+        return Action("browser", "page_find", target=m.group(1).strip("'\""), raw=raw)
+    if re.fullmatch(r"(?:go to (?:the )?)?(?:next|find next) (?:match|result|one|occurrence|highlight)|find next", low):
+        return Action("browser", "page_find_step", target="next", parameters={"step": 1}, raw=raw)
+    if re.fullmatch(r"(?:go to (?:the )?)?(?:previous|prev|last|find previous) (?:match|one|occurrence|highlight)|find previous", low):
+        return Action("browser", "page_find_step", target="previous", parameters={"step": -1}, raw=raw)
+    if re.fullmatch(r"(?:clear|remove|hide) (?:the |all )?(?:highlights?|highlighting|matches)|stop (?:finding|highlighting)|clear (?:the )?(?:find|search)", low):
+        return Action("browser", "page_find_clear", target="current", raw=raw)
+    # B2 — everything except the pinned tabs.
+    if re.fullmatch(r"close (?:all |every )?(?:the )?(?:tabs )?(?:but|except(?: for)?|other than) (?:the )?pinned(?: ones| tabs)?|close (?:all |every )?(?:the )?unpinned tabs?", low):
+        return Action("browser", "tabs_close_unpinned", target="unpinned", raw=raw)
+    # B4 — tab groups.
+    if re.fullmatch(r"(?:list|show|what are|what) (?:my |the )?(?:tab )?groups(?: do i have)?|what tab groups do i have", low):
+        return Action("browser", "groups_list", target="all", raw=raw)
+    m = re.fullmatch(r"(?:group|put|gather|collect) (?:all )?(?:of )?(?:my |the |these )?(.+?) tabs(?: (?:together|in(?:to)? (?:a|one) group))?(?: (?:as|into|in|called|named|under) (?:a group called |the )?(.+?)(?: group)?)?", low)
+    if m and m.group(1) not in ("other", "all", "these", "my", "the"):
+        return Action("browser", "tabs_group", target=m.group(1),
+                      parameters={"title": (m.group(2) or "").strip()}, raw=raw)
+    m = re.fullmatch(r"(?:add|move|put) (?:this|the current) tab (?:to|into|in) (?:the |my )?(.+?)(?: tab)? group", low)
+    if m:
+        return Action("browser", "group_add", target=_group_name(m.group(1)), raw=raw)
+    m = re.fullmatch(r"(?:rename|call|name) (?:the |my |this )?(.*?)(?:tab )?group (?:to |as )?(.+)", low)
+    if m:
+        return Action("browser", "group_rename", target=_group_name(m.group(1)),
+                      parameters={"title": m.group(2).strip()}, raw=raw)
+    m = re.fullmatch(r"(?:make|colou?r|change|turn|set) (?:the |my |this )?(.*?)(?:tab )?group(?:'?s? colou?r)? (?:to |as )?(\w+)", low)
+    if m and m.group(2) in GROUP_COLORS:
+        return Action("browser", "group_color", target=_group_name(m.group(1)),
+                      parameters={"color": GROUP_COLORS[m.group(2)]}, raw=raw)
+    m = re.fullmatch(r"(collapse|fold|close up|minimi[sz]e|expand|unfold|open up|open) (all (?:the |my )?(?:tab )?groups|(?:the |my |this )?(.*?)(?:tab )?group)", low)
+    if m:
+        collapse = m.group(1) in ("collapse", "fold", "close up", "minimise", "minimize")
+        target = "all" if m.group(2).startswith("all") else _group_name(m.group(3) or "")
+        return Action("browser", "group_collapse", target=target,
+                      parameters={"collapsed": collapse}, raw=raw)
+    m = re.fullmatch(r"ungroup (?:all(?: (?:the |my )?(?:tab )?groups)?|everything)", low)
+    if m:
+        return Action("browser", "group_ungroup", target="all", raw=raw)
+    m = re.fullmatch(r"ungroup (?:the |my |this )?(.*?)(?:tab|tabs|tab group|group)?", low)
+    if m:
+        return Action("browser", "group_ungroup", target=_group_name(m.group(1) or ""), raw=raw)
+    m = re.fullmatch(r"close (?:the |my |this )?(.+?) (?:tab )?group", low)
+    if m:
+        return Action("browser", "group_close", target=_group_name(m.group(1)), raw=raw)
+    # B5 — windows.
+    m = re.fullmatch(r"(?:move|send|put|pop|open) (?:this|the current) tab (?:out )?(?:in(?:to)?|to|as) (?:a |its own |a new |a separate )+window(?: on the other (?:screen|monitor|display))?|pop (?:this|the current) tab out|(?:move|send) (?:this|the current) tab to the other (?:screen|monitor|display)", low)
+    if m:
+        return Action("browser", "tab_detach", target="current",
+                      parameters={"monitor": bool(re.search(r"other (?:screen|monitor|display)", low))},
+                      raw=raw)
+    if re.fullmatch(r"(?:merge|combine|join) (?:all )?(?:my |the )?(?:chrome |browser )?windows(?: together| into one)?|(?:put|move|bring) all (?:my |the )?tabs (?:into|in) (?:one|this|a single) window", low):
+        return Action("browser", "windows_merge", target="all", raw=raw)
     return None
 
 
@@ -1730,6 +1840,17 @@ class AutomationRuntime:
         if result is None:
             result = ActionResult.unsupported("I don't know how to do that yet.")
         result.action = action
+
+        # A handler may find out only while acting that the request is bigger than it sounded
+        # ("close all YouTube tabs" -> 7 tabs, B2). It then returns NEEDS_CONFIRMATION with the
+        # exact action to run on "yes" (`detail["confirm"]`, already narrowed to what it found);
+        # nothing has happened yet. Registered here, like a policy confirmation.
+        if result.status == Status.NEEDS_CONFIRMATION and isinstance(
+                (result.detail or {}).get("confirm"), Action):
+            pending = result.detail["confirm"]
+            self.confirmations.request(pending, result.message)
+            audit(AUDIT_CONFIRM, pending, reason="larger than it sounded")
+            return result
 
         if action.key == "meet.leave" and result.ok:
             self.trusted.pop("meet.share", None)     # the call is over, so is the trust

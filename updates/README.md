@@ -10,6 +10,7 @@ order. Newest last.
 | [V3](UPDATE_V3.md) | 2026-11-10 | Tuning pass: fast speech model, fewer model calls, readiness waits, short CLAUDE.md | Performance, maintenance |
 | [V4](UPDATE_V4.md) | 2026-11-10 | Claude-first cloud models, keys in the keyring, redesigned GPU-composited UI, browser tabs (Part 2a/2b) | Major feature, fixes, security, performance |
 | [V5](UPDATE_V5.md) | 2026-11-10 | Meetings and screen sharing: four misroutes fixed, share the named window/monitor/tab (Part 2M) | Bug fixes, feature, test hygiene |
+| [V6](UPDATE_V6.md) | 2026-11-10 | Tabs and windows finished: close by site, tab groups, windows, the Nth result, find with highlight (Part 2c) | Feature |
 
 ## Adding an update
 

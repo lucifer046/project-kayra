@@ -62,7 +62,8 @@ async function activeTab() {
 
 function tabInfo(t) {
   return {id: t.id, title: t.title, url: t.url, active: t.active, windowId: t.windowId,
-          audible: !!t.audible, muted: !!(t.mutedInfo && t.mutedInfo.muted), pinned: t.pinned};
+          audible: !!t.audible, muted: !!(t.mutedInfo && t.mutedInfo.muted), pinned: t.pinned,
+          groupId: t.groupId === undefined ? -1 : t.groupId, index: t.index};
 }
 
 function matches(tab, needle) {
@@ -213,6 +214,66 @@ async function run(cmd, args) {
       if (args.factor) await chrome.tabs.setZoom(t.id, Math.max(0.25, Math.min(5, args.factor)));
       return {factor: await chrome.tabs.getZoom(t.id)};
     }
+
+    // ── 1.5.0: tab groups (B4), windows (B5), result lists (C3), find with highlight (C4) ──
+    case "groups.list": {
+      const groups = await chrome.tabGroups.query({});
+      const tabs = await chrome.tabs.query({});
+      return groups.map((g) => ({id: g.id, title: g.title || "", color: g.color, collapsed: g.collapsed,
+                                 windowId: g.windowId, tabs: tabs.filter((t) => t.groupId === g.id).length}));
+    }
+    case "groups.create": {
+      // tabIds -> a NEW group (or `groupId` to add them to an existing one), then title/colour.
+      const opts = {tabIds: args.tabIds};
+      if (args.groupId !== undefined && args.groupId !== null) opts.groupId = args.groupId;
+      const groupId = await chrome.tabs.group(opts);
+      const props = {};
+      if (args.title !== undefined) props.title = String(args.title);
+      if (args.color) props.color = args.color;
+      if (args.collapsed !== undefined) props.collapsed = !!args.collapsed;
+      if (Object.keys(props).length) await chrome.tabGroups.update(groupId, props);
+      return {groupId, tabs: args.tabIds.length};
+    }
+    case "groups.update": {
+      const props = {};
+      if (args.title !== undefined) props.title = String(args.title);
+      if (args.color) props.color = args.color;
+      if (args.collapsed !== undefined) props.collapsed = !!args.collapsed;
+      const g = await chrome.tabGroups.update(args.groupId, props);
+      return {id: g.id, title: g.title, color: g.color, collapsed: g.collapsed};
+    }
+    case "groups.ungroup": {
+      let ids = args.tabIds;
+      if (!ids) ids = (await chrome.tabs.query({})).filter((t) => t.groupId === args.groupId).map((t) => t.id);
+      if (ids.length) await chrome.tabs.ungroup(ids);
+      return {ungrouped: ids.length};
+    }
+    case "windows.detach": {
+      // "move this tab to a new window": the tab leaves its window and gets one of its own.
+      const t = await targetTab(args);
+      const win = await chrome.windows.create({tabId: t.id, focused: true});
+      return {windowId: win.id, title: t.title};
+    }
+    case "windows.merge": {
+      // "merge my Chrome windows": every tab of every other NORMAL window into the focused one.
+      const into = await chrome.windows.getLastFocused({windowTypes: ["normal"]});
+      const all = await chrome.windows.getAll({populate: true, windowTypes: ["normal"]});
+      let moved = 0, windows = 0;
+      for (const w of all) {
+        if (w.id === into.id || w.incognito !== into.incognito) continue;
+        const ids = w.tabs.map((t) => t.id);
+        if (!ids.length) continue;
+        await chrome.tabs.move(ids, {windowId: into.id, index: -1});
+        moved += ids.length; windows += 1;
+      }
+      return {moved, windows};
+    }
+    case "windows.count": {
+      const all = await chrome.windows.getAll({windowTypes: ["normal"]});
+      return {count: all.length};
+    }
+    case "page.results": return inPage(await targetTab(args), pageResults, [args.nth || 0, args.kind || ""]);
+    case "page.highlight": return inPage(await targetTab(args), pageHighlight, [args.text || "", args.step || 0, !!args.clear]);
 
     case "page.text": return inPage(await targetTab(args), pageText, [args.max || 15000]);
     case "page.click": return inPage(await targetTab(args), pageClick, [args.text, args.nth || 1]);
@@ -490,6 +551,109 @@ function pageFind(text) {
   let count = 0, at = body.indexOf(want);
   while (want && at !== -1) { count++; at = body.indexOf(want, at + want.length); }
   return {count};
+}
+
+// C3: the result list of the page, site-aware. nth = 0 lists them; nth = N (or -1 = last)
+// returns that one. Only links with an http(s) address; duplicates by address dropped.
+function pageResults(nth, kind) {
+  const host = location.hostname;
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+  const pick = (selector, linkOf) => Array.from(document.querySelectorAll(selector))
+    .map((el) => { const a = linkOf ? linkOf(el) : el; return a && a.href ? {a, label: (el.innerText || a.innerText || a.getAttribute("aria-label") || a.title || "").trim()} : null; })
+    .filter((x) => x && visible(x.a));
+  let items = [];
+  let site = "page";
+  if (/(^|\.)google\./.test(host) && location.pathname.startsWith("/search")) {
+    site = "google"; items = pick("#search a h3, #rso a h3", (h) => h.closest("a"));
+  } else if (/youtube\.com$/.test(host)) {
+    site = "youtube"; items = pick("ytd-video-renderer a#video-title, ytd-rich-item-renderer a#video-title-link, ytd-compact-video-renderer a#thumbnail, a#video-title");
+  } else if (/(^|\.)amazon\./.test(host)) {
+    site = "amazon"; items = pick("div[data-component-type='s-search-result'] h2 a, div[data-component-type='s-search-result'] a:has(h2)");
+  } else if (/flipkart\.com$/.test(host)) {
+    site = "flipkart"; items = pick("a[href*='/p/']");
+  } else if (/github\.com$/.test(host)) {
+    site = "github"; items = pick("[data-testid='results-list'] .search-title a, .repo-list-item a.v-align-middle, div.search-title a");
+  } else if (/reddit\.com$/.test(host)) {
+    site = "reddit"; items = pick("a[data-testid='post-title'], shreddit-post a[slot='title'], a[slot='full-post-link']");
+  } else if (/duckduckgo\.com$/.test(host)) {
+    site = "duckduckgo"; items = pick("a[data-testid='result-title-a'], h2 a.result__a");
+  } else if (/bing\.com$/.test(host)) {
+    site = "bing"; items = pick("#b_results h2 a");
+  }
+  if (!items.length) {
+    // Generic: links with real text inside the main content, not the header, nav or footer.
+    const root = document.querySelector("main, [role=main], article, #content") || document.body;
+    items = pick("a[href]").filter(({a, label}) => root.contains(a) && label.length >= 12 &&
+      !a.closest("nav, header, footer, [role=navigation], [role=banner], [role=contentinfo], aside"));
+  }
+  const seen = new Set(); const list = [];
+  for (const it of items) {
+    if (!/^https?:/.test(it.a.href)) continue;
+    const key = it.a.href.split("#")[0];
+    if (seen.has(key)) continue;
+    seen.add(key); list.push({title: it.label.replace(/\s+/g, " ").slice(0, 120), url: it.a.href});
+  }
+  if (!nth) return {site, count: list.length, results: list.slice(0, 10)};
+  const index = nth > 0 ? nth - 1 : list.length + nth;
+  if (index < 0 || index >= list.length) return {site, count: list.length, result: null};
+  return {site, count: list.length, result: list[index]};
+}
+
+// C4: find on the page WITH highlight, and step through the matches. Marks are <mark
+// data-kayra-find>; the current one gets an outline and is scrolled to. clear = unwrap them.
+function pageHighlight(text, step, clear) {
+  const unwrap = () => {
+    document.querySelectorAll("mark[data-kayra-find]").forEach((m) => {
+      const parent = m.parentNode;
+      parent.replaceChild(document.createTextNode(m.textContent), m);
+      parent.normalize();
+    });
+  };
+  const show = (state) => {
+    const marks = document.querySelectorAll("mark[data-kayra-find]");
+    marks.forEach((m, i) => { m.style.outline = i === state.i ? "2px solid #ff6d00" : "none";
+                              m.style.background = i === state.i ? "#ffb74d" : "#fff176"; });
+    if (marks[state.i]) marks[state.i].scrollIntoView({block: "center", behavior: "instant"});
+    return {count: marks.length, index: marks.length ? state.i + 1 : 0, text: state.text};
+  };
+  if (clear) { unwrap(); window.__kayraFind = null; return {cleared: true}; }
+  if (!text && step) {
+    const state = window.__kayraFind;
+    const count = document.querySelectorAll("mark[data-kayra-find]").length;
+    if (!state || !count) return {count: 0, index: 0, text: ""};
+    state.i = (state.i + step + count) % count;
+    return show(state);
+  }
+  unwrap();
+  const want = String(text || "").toLowerCase();
+  if (!want) return {count: 0, index: 0, text: ""};
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => {
+      const p = n.parentElement;
+      if (!p || /^(SCRIPT|STYLE|NOSCRIPT|TEXTAREA|INPUT)$/.test(p.tagName)) return NodeFilter.FILTER_REJECT;
+      if (p.closest("[contenteditable=true]")) return NodeFilter.FILTER_REJECT;
+      return n.nodeValue.toLowerCase().includes(want) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    }});
+  const nodes = [];
+  while (walker.nextNode() && nodes.length < 300) nodes.push(walker.currentNode);
+  let made = 0;
+  for (const node of nodes) {
+    let current = node;
+    while (current && made < 500) {
+      const at = current.nodeValue.toLowerCase().indexOf(want);
+      if (at === -1) break;
+      const match = current.splitText(at);
+      const rest = match.splitText(want.length);
+      const mark = document.createElement("mark");
+      mark.setAttribute("data-kayra-find", "");
+      match.parentNode.replaceChild(mark, match);
+      mark.appendChild(match);
+      made += 1;
+      current = rest;
+    }
+  }
+  window.__kayraFind = {i: 0, text: String(text)};
+  return show(window.__kayraFind);
 }
 
 function pageControls(limit) {

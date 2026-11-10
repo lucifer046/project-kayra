@@ -30,7 +30,7 @@ from kayra.automation import browser_bridge
 # Kayra's lane into the Hyprland screen-share portal. Replaced by a fake in the test suite:
 # the real one reads ~/.config/hypr/xdph.conf and writes under $XDG_RUNTIME_DIR.
 from kayra.automation import share_picker as SHARE_HELPER
-from kayra.automation.policy import ActionResult, Status
+from kayra.automation.policy import Action, ActionResult, Status
 
 BRIDGE = browser_bridge            # the test suite replaces this with a fake extension
 SLEEP = time.sleep
@@ -44,7 +44,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 4, 0)
+REQUIRED_VERSION = (1, 5, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -473,7 +473,7 @@ def tab_switch(name):
     return ActionResult.success(f"Here's {_short(tab.get('title') or name)}.")
 
 
-def tab_close(name, all_tabs=False):
+def tab_close(name, all_tabs=False, confirmed_ids=None, action=None):
     missing = _need_bridge()
     if missing:
         return missing
@@ -482,6 +482,8 @@ def tab_close(name, all_tabs=False):
         if tab is None:
             return ActionResult.not_found(problem)
         return _close_ids([tab["id"]])
+    if all_tabs:
+        return _close_many(_matching_tabs(name), f"{name} tab", f"{name} tabs", action, confirmed_ids)
     result = _call("tabs.close", match=_site_key(name), all=all_tabs) or {}
     if result.get("ambiguous"):
         titles = [_short(t.get("title", "")) for t in result["ambiguous"]]
@@ -491,6 +493,271 @@ def tab_close(name, all_tabs=False):
     if not closed:
         return ActionResult.not_found(f"I don't see a {name} tab.")
     return ActionResult.success(f"Closed {closed} tab{'s' if closed != 1 else ''}.")
+
+
+# ── Part 2c: B2 by site / all but pinned, B4 groups, B5 windows, C3 results, C4 highlight ──
+
+CONFIRM_ABOVE = 3          # B2: closing more tabs than this asks first
+
+
+def _matching_tabs(name):
+    """Tabs whose title or address contains the name (a site name is its domain first)."""
+    key, plain = _site_key(name).lower(), str(name or "").lower().strip()
+    tabs = _call("tabs.list") or []
+    hits = [t for t in tabs if key and key in f"{t.get('title', '')} {t.get('url', '')}".lower()]
+    if not hits and plain != key:
+        hits = [t for t in tabs if plain in f"{t.get('title', '')} {t.get('url', '')}".lower()]
+    return hits
+
+
+def _close_many(tabs, noun, plural, action=None, confirmed_ids=None):
+    """
+    Closes `tabs`; more than CONFIRM_ABOVE asks first (nothing closes until "yes"), and the
+    approved action carries the exact tab ids found, so "yes" never closes a tab that opened
+    in the meantime.
+    """
+    if confirmed_ids is not None:
+        return _close_ids(confirmed_ids)
+    ids = [t["id"] for t in tabs]
+    if not ids:
+        return ActionResult.not_found(f"I don't see a {noun}.")
+    if len(ids) > CONFIRM_ABOVE and action is not None:
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed_ids": ids}, raw=action.raw)
+        titles = ", ".join(_short(t.get("title", ""), 30) for t in tabs[:3])
+        return ActionResult(Status.NEEDS_CONFIRMATION,
+                            f"That's {len(ids)} {plural}, like {titles}. Close all of them?",
+                            {"confirm": approved})
+    return _close_ids(ids)
+
+
+def tabs_close_unpinned(confirmed_ids=None, action=None):
+    """B2: "close all but pinned" — every unpinned tab in the focused window."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tabs, _active = _strip_tabs()
+    tabs = [t for t in (tabs or []) if not t.get("pinned")]
+    if not tabs and confirmed_ids is None:
+        return ActionResult.success("Every tab here is pinned.")
+    return _close_many(tabs, "unpinned tab", "unpinned tabs", action, confirmed_ids)
+
+
+def _groups():
+    return _call("groups.list") or []
+
+
+def _find_group(name):
+    """A group by its title (exact, then contains), or the active tab's for "current"."""
+    groups = _groups()
+    if not groups:
+        return None, "You don't have any tab groups."
+    if name in ("current", "", None):
+        active = _call("tabs.active") or {}
+        gid = active.get("groupId", -1)
+        group = next((g for g in groups if g.get("id") == gid), None)
+        return (group, None) if group else (None, "This tab isn't in a group.")
+    want = str(name).lower().strip()
+    exact = [g for g in groups if g.get("title", "").lower() == want]
+    hits = exact or [g for g in groups if want and want in g.get("title", "").lower()]
+    if len(hits) == 1:
+        return hits[0], None
+    if not hits:
+        return None, f"I don't see a {name} group."
+    return None, f"You have {len(hits)} groups called {name}."
+
+
+def _group_label(group):
+    return f"the {group.get('title')} group" if group.get("title") else "that group"
+
+
+def tabs_group(topic, title=""):
+    """B4: "group my college tabs (as studies)" — matching tabs into a new, named group."""
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    words = [w for w in re.findall(r"[a-z0-9]+", str(topic).lower()) if w not in _STOP_WORDS]
+    if not words:
+        return ActionResult.failure("Which tabs should I group?")
+    tabs = _matching_tabs(topic)
+    if not tabs:
+        # Not in a title or address: read the tabs, the way "find the tab about X" does.
+        for tab in (_call("tabs.list") or [])[:30]:
+            try:
+                text = str((_call("page.text", tabId=tab["id"], max=20000) or {}).get("text", "")).lower()
+            except Exception:
+                text = ""
+            if sum(text.count(w) for w in words) >= 2:
+                tabs.append(tab)
+    tabs = [t for t in tabs if not t.get("pinned")]
+    if not tabs:
+        return ActionResult.not_found(f"I don't see any {topic} tabs.")
+    name = (title or topic).strip().title()
+    windows = {t.get("windowId") for t in tabs}
+    if len(windows) > 1:
+        # A group lives in one window: use the window holding most of them.
+        home = max(windows, key=lambda w: sum(t.get("windowId") == w for t in tabs))
+        tabs = [t for t in tabs if t.get("windowId") == home]
+    _call("groups.create", tabIds=[t["id"] for t in tabs], title=name)
+    return ActionResult.success(f"Grouped {len(tabs)} tab{'s' if len(tabs) != 1 else ''} as {name}.")
+
+
+def groups_list():
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    groups = _groups()
+    if not groups:
+        return ActionResult.success("You don't have any tab groups.")
+    parts = [f"{g.get('title') or 'an unnamed group'} ({g.get('tabs', 0)} tabs"
+             + (", collapsed)" if g.get("collapsed") else ")") for g in groups[:6]]
+    return ActionResult.success(f"You have {len(groups)} tab group{'s' if len(groups) != 1 else ''}: "
+                                + ", ".join(parts) + ".")
+
+
+def group_add(name):
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    group, problem = _find_group(name)
+    if group is None:
+        return ActionResult.not_found(problem)
+    active = _call("tabs.active") or {}
+    if active.get("windowId") != group.get("windowId"):
+        return ActionResult.failure(f"{_group_label(group).capitalize()} is in another window.")
+    _call("groups.create", tabIds=[active["id"]], groupId=group["id"])
+    return ActionResult.success(f"Added this tab to {_group_label(group)}.")
+
+
+def group_update(name, **props):
+    """Rename, recolour, collapse or expand one group — or every group for "all"."""
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    if name == "all":
+        groups = _groups()
+        if not groups:
+            return ActionResult.success("You don't have any tab groups.")
+        for g in groups:
+            _call("groups.update", groupId=g["id"], **props)
+        verb = "Collapsed" if props.get("collapsed") else "Expanded"
+        return ActionResult.success(f"{verb} {len(groups)} group{'s' if len(groups) != 1 else ''}.")
+    group, problem = _find_group(name)
+    if group is None:
+        return ActionResult.not_found(problem)
+    _call("groups.update", groupId=group["id"], **props)
+    if "title" in props:
+        return ActionResult.success(f"Renamed {_group_label(group)} to {props['title']}.")
+    if "color" in props:
+        return ActionResult.success(f"{_group_label(group).capitalize()} is {props['color']} now.")
+    return ActionResult.success(f"{'Collapsed' if props.get('collapsed') else 'Expanded'} "
+                                f"{_group_label(group)}.")
+
+
+def group_ungroup(name):
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    if name == "all":
+        groups = _groups()
+        total = sum((_call("groups.ungroup", groupId=g["id"]) or {}).get("ungrouped", 0) for g in groups)
+        return ActionResult.success(f"Ungrouped {total} tabs." if groups else "You don't have any tab groups.")
+    group, problem = _find_group(name)
+    if group is None:
+        return ActionResult.not_found(problem)
+    count = (_call("groups.ungroup", groupId=group["id"]) or {}).get("ungrouped", 0)
+    return ActionResult.success(f"Ungrouped {_group_label(group)} ({count} tabs).")
+
+
+def group_close(name, confirmed_ids=None, action=None):
+    """Closes the tabs of one group; more than CONFIRM_ABOVE asks first."""
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    if confirmed_ids is not None:
+        return _close_ids(confirmed_ids)
+    group, problem = _find_group(name)
+    if group is None:
+        return ActionResult.not_found(problem)
+    tabs = [t for t in (_call("tabs.list") or []) if t.get("groupId") == group["id"]]
+    return _close_many(tabs, f"tab in {_group_label(group)}", f"tabs in {_group_label(group)}", action)
+
+
+def tab_detach(to_other_monitor=False):
+    """B5: "move this tab to a new window" (and "… to the other screen")."""
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    result = _call("windows.detach") or {}
+    title = _short(result.get("title") or "This tab", 40)
+    if not to_other_monitor:
+        return ActionResult.success(f"{title} has its own window now.")
+    L = _L()
+    try:
+        many = len(L.HYPR.monitors()) >= 2
+    except Exception:
+        many = False
+    if not many:
+        return ActionResult.success(f"{title} has its own window now; there's only one screen.")
+    window = _until(lambda: (lambda w: w if w is not None and L._is_browser_window(w) else None)(
+        L.active_window()), 2.0)
+    if window is None:
+        return ActionResult.success(f"{title} has its own window; I couldn't move it to the other screen.")
+    moved = L._dispatch_window("move", "movewindow mon:+1", window, monitor="+1")
+    return ActionResult.success(f"{title} is on the other screen now." if moved else
+                                f"{title} has its own window; I couldn't move it to the other screen.")
+
+
+def windows_merge():
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    result = _call("windows.merge") or {}
+    moved, windows = result.get("moved", 0), result.get("windows", 0)
+    if not moved:
+        return ActionResult.success("All your tabs are already in one window.")
+    return ActionResult.success(f"Moved {moved} tab{'s' if moved != 1 else ''} from {windows} "
+                                f"other window{'s' if windows != 1 else ''} into this one.")
+
+
+_ORDINAL_WORDS = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth",
+                  7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth", -1: "last"}
+
+
+def page_result(nth, new_tab=False):
+    """C3: "open the third result" — on Google, YouTube, Amazon, Flipkart, GitHub, Reddit,
+    DuckDuckGo, Bing, else the Nth content link of the page."""
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    found = _until(lambda: (lambda r: r if r.get("count") else None)(
+        _call("page.results", nth=int(nth)) or {}), 3.0) or {}
+    result = found.get("result")
+    which = _ORDINAL_WORDS.get(int(nth), f"number {nth}")
+    if not found.get("count"):
+        return ActionResult.not_found("I don't see a list of results on this page.")
+    if not result:
+        return ActionResult.not_found(f"There are only {found['count']} results here.")
+    if new_tab:
+        _call("tabs.open", url=result["url"], where="next")
+    else:
+        _call("tabs.navigate", url=result["url"])
+    title = _short(result.get("title") or result["url"])
+    return ActionResult.success(f"Opened the {which} result{' in a new tab' if new_tab else ''}: {title}.")
+
+
+def page_results():
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    found = _call("page.results", nth=0) or {}
+    results = found.get("results") or []
+    if not results:
+        return ActionResult.not_found("I don't see a list of results on this page.")
+    spoken = "; ".join(f"{i}. {_short(r.get('title') or r.get('url'), 60)}"
+                       for i, r in enumerate(results[:5], 1))
+    return ActionResult.success(f"The top results: {spoken}. Say \"open the second result\" "
+                                "to open one.", results=results)
 
 
 def tabs_close_others():
@@ -563,9 +830,36 @@ def page_find(text):
     missing = _need_bridge()
     if missing:
         return missing
+    if _version() >= (1, 5, 0):
+        # C4: highlighted on the page, the first one scrolled to; "next match" steps on.
+        found = _call("page.highlight", text=text) or {}
+        count = found.get("count", 0)
+        if not count:
+            return ActionResult.success(f"\"{text}\" isn't on this page.")
+        more = " Say next match to go on." if count > 1 else ""
+        return ActionResult.success(f"Found {count} match{'es' if count != 1 else ''} for "
+                                    f"\"{text}\" and highlighted them; here's the first.{more}")
     count = (_call("page.find", text=text) or {}).get("count", 0)
     return ActionResult.success(f"\"{text}\" appears {count} time{'s' if count != 1 else ''} on "
                                 "this page." if count else f"\"{text}\" isn't on this page.")
+
+
+def page_find_step(step):
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    found = _call("page.highlight", step=int(step)) or {}
+    if not found.get("count"):
+        return ActionResult.not_found("There's nothing highlighted. Say find, then the words.")
+    return ActionResult.success(f"Match {found['index']} of {found['count']}.")
+
+
+def page_find_clear():
+    stop = _bridge_at((1, 5, 0))
+    if stop:
+        return stop
+    _call("page.highlight", clear=True)
+    return ActionResult.success("Cleared the highlights.")
 
 
 def page_controls():

@@ -237,6 +237,11 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   configured picker); without it a named window is NEVER auto-picked. No fixed sleeps in
   `web_macros` (asserted). Tests must stub `web_macros.SHARE_HELPER`. `KAYRA_AUDIT_LOG`
   (path|off) keeps suites out of `logs/automation.log`. Not yet tried in a live call.
+- **Part 2c (2026-11-10, extension 1.5.0 + tabGroups).** Tab groups, windows, "open the third
+  result" (`page.results`, site table + generic), find with highlight (`page.highlight`). A
+  handler that finds a request bigger than it sounded returns NEEDS_CONFIRMATION with
+  `detail["confirm"]` (the exact action, e.g. with `confirmed_ids`); `execute_action` registers
+  it. Bulk tab closes ask above 3.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

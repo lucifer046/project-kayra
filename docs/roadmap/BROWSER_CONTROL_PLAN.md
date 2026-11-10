@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2a, 2b and 2M done (2026-11-10).**
-> See §10 for the parts and what is next (2M-live: try sharing in a real call; then 2c). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c) and 2M done (2026-11-10).**
+> See §10 for the parts and what is next (Part 3; 2M still needs a live-call try). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -386,7 +386,7 @@ most recent message), learn from how the user talks, and reuse what it learned.
   college, roll number?) — never passwords/cards.
 - **D3** May Kayra read Drive/Docs **file names** (in Chrome only, never stored) to search them?
 - **D4** URLs of the user's IITM portals for the site registry.
-- **D5** Extra permissions: `downloads` (C11), `tabGroups` (B4). `debugger` is NOT to be added.
+- **D5** Extra permissions: `downloads` (C11) — still to ask; `tabGroups` (B4) — **approved 2026-11-10**, in 1.5.0. `debugger` is NOT to be added.
 
 ## 7a. Which local model runs the page agent  *(decided 2026-11-10)*
 
@@ -433,8 +433,8 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 | H4 — Cross-app layer | H4 |
 
 - [x] A1 [x] A2 [x] A3 [x] A4 [x] A5 [x] A6  *(A6: GitHub "my repos" has no user-free URL — not added)*
-- [x] B1 [~] B2 [x] B3 [ ] B4 [ ] B5 [x] B6 [x] B7 [x] B8  *(B2: duplicates / right / left done; "all YouTube tabs" + CONFIRM > 3 is 2c)*
-- [x] C1 [x] C2 [ ] C3 [ ] C4 [ ] C5 [ ] C6 [x] C7 [ ] C8 [ ] C9 [ ] C10 [ ] C11
+- [x] B1 [x] B2 [x] B3 [x] B4 [x] B5 [x] B6 [x] B7 [x] B8
+- [x] C1 [x] C2 [x] C3 [x] C4 [ ] C5 [ ] C6 [x] C7 [ ] C8 [ ] C9 [ ] C10 [ ] C11
 - [ ] D1 [ ] D2 [ ] D3 [ ] D4 [ ] D5
 - [ ] E1 [ ] E2 [ ] E3 [ ] E4 [ ] E5 [ ] E6 [ ] E7 [ ] E8
 - [ ] F1 [ ] F2 [ ] F3 [ ] F4 [ ] F5 [ ] F6
@@ -469,7 +469,7 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 |---|---|---|
 | 1 | Tuning pass; A1–A6, G3 (`page.waitFor`), H0.1, `browser update` + self-updating extension | **done 2026-11-10** |
 | 1b | The understanding layer (`automation/interpreter.py`), requested by the user | **done 2026-11-10** |
-| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | **in progress** — 2a done (B1 by position, B2 duplicates / right / left); 2b done (B3 mute the rest, B6 recently closed + reopen by name, B7 sleep tabs, B8 find the tab, C1 hard reload, C2 zoom to N %, C7 copy link/title) — 2026-11-10. Next (2c): B2 "all YouTube tabs" + CONFIRM > 3, B4 groups, B5 windows, C3 "open the third result", C4 find with highlight |
+| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | **done 2026-11-10** — 2c done (B2 by site + all but pinned with CONFIRM > 3, B4 groups, B5 windows, C3 the Nth result, C4 find with highlight; extension 1.5.0 + tabGroups); 2a done (B1 by position, B2 duplicates / right / left); 2b done (B3 mute the rest, B6 recently closed + reopen by name, B7 sleep tabs, B8 find the tab, C1 hard reload, C2 zoom to N %, C7 copy link/title) — 2026-11-10. Next (2c): B2 "all YouTube tabs" + CONFIRM > 3, B4 groups, B5 windows, C3 "open the third result", C4 find with highlight |
 | 2M | §12 Meetings and screen sharing. M0 bugs (misroutes, fake meet code, fixed waits, confirm, test log hygiene), M1 share a named window / tab / monitor (xdph picker helper), M2.1 DND | **done 2026-11-10** except M0.7 (try it in a live call — needs the user) and M2.2/M2.3, M3, M4 (next meeting slice, after 2c or when asked) |
 | N | §13 neighbouring features (browser N1, models N2, interface N3, voice N4, housekeeping N5) — pick up beside the part each neighbours | |
 | 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | |
@@ -477,6 +477,28 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | |
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Part 2c — the rest of tabs and windows** (done 2026-11-10, extension 1.5.0 + `tabGroups`,
+approved by the user for D5).
+- B2 `browser close all youtube tabs`, `browser close all but pinned`: > 3 tabs asks first; the
+  approved action carries the exact tab ids (`confirmed_ids`), so "yes" never closes a tab
+  opened in between. Mechanism: a handler returns NEEDS_CONFIRMATION with `detail["confirm"]`
+  and `AutomationRuntime.execute_action` registers it ("larger than it sounded").
+- B4 `browser group my <topic> tabs [as <name>]` (title/address match, else page text ≥ 2
+  mentions, one window), `rename`, `make … <colour>`, `collapse/expand` (one / all), `add this
+  tab to …`, `ungroup` (one / all), `close the … group` (> 3 asks), `list my tab groups`.
+  "this group" = the active tab's.
+- B5 `browser move this tab to a new window` / `… to the other screen` (Hyprland moves the new
+  window), `browser merge my chrome windows` (same incognito-ness only).
+- C3 `open the third result` / `play the second video` / `… in a new tab` / `what are the
+  results` — `page.results` (site table + generic content links; nav/header/footer/aside
+  excluded, deduplicated by address). Caught before `app.open` without the `browser` prefix.
+- C4 `find X on this page` highlights (`page.highlight`, `<mark data-kayra-find>`, never inside
+  inputs/textareas/contenteditable), `next match`, `previous match` (wraps), `clear highlights`.
+- Live local DMM: 11/11 new phrasings produced the right token; DMM matrix 50/53 (baseline).
+- Tests: `test_browser_control.py` [15] (36 + flows), `test_browser_extension.py` [3] (real
+  headless Chrome: result list, highlight, step, wrap, clear restores the text exactly).
+- **Not verified** against the live Chrome with the extension connected (as for 2a/2b).
 
 **Part 2M — meetings and screen sharing** (done 2026-11-10, extension 1.4.0). §12 in full.
 - M0.1 `common.share_request()` reads every phrasing ("share screen", "start screen sharing",

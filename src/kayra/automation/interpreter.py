@@ -70,6 +70,17 @@ INSIDE THE BROWSER PAGE (also inside web apps like WhatsApp, YouTube, X):
   browser reopen the <site> tab i closed | browser free up memory in chrome |
   browser find the tab about <topic> | browser hard reload | browser zoom to <n> percent |
   browser copy the link | browser copy the page title |
+  browser open the third result | browser play the second video |
+  browser open the first result in a new tab | browser what are the results |
+  browser find <text> on this page | browser next match | browser previous match |
+  browser clear highlights | browser close all <site> tabs | browser close all but pinned |
+  browser group my <topic> tabs | browser group the <site> tabs as <name> |
+  browser list my tab groups | browser add this tab to the <name> group |
+  browser rename the <name> group to <new name> | browser make the <name> group <colour> |
+  browser collapse the <name> group | browser expand all groups |
+  browser ungroup the <name> group | browser close the <name> group |
+  browser move this tab to a new window | browser move this tab to the other screen |
+  browser merge my chrome windows |
   browser open the page i read yesterday about <topic> | browser bookmark <name>
 EMAIL (Gmail): email check | email open latest | email open the email from <name> |
   email read latest | email read this | email go to sent | email reply | email archive |
