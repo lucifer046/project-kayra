@@ -41,8 +41,12 @@ def _engine_text(messages):
     return "".join(CentralizedLLMEngine().generate_chat_stream(messages) or [])
 
 
-def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700):
-    """A short spoken answer from a model, or `fallback`. Never raises, never hangs."""
+def complete(system, user, timeout=DEFAULT_TIMEOUT_S):
+    """
+    The model's reply VERBATIM (code fences and all), or "" on failure/timeout. For callers
+    that parse structure (JSON); `summarize` is for speech and strips fenced blocks, which
+    used to swallow a ```json reply whole.
+    """
     model = TEXT_MODEL or _engine_text
     box = {}
 
@@ -53,10 +57,15 @@ def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=70
         except Exception as e:                       # provider down, no key, rate limited
             box["error"] = e
 
-    thread = threading.Thread(target=work, name="kayra-ai-summary", daemon=True)
+    thread = threading.Thread(target=work, name="kayra-ai-call", daemon=True)
     thread.start()
     thread.join(timeout)
-    text = _clean(box.get("text", ""))
+    return str(box.get("text") or "")
+
+
+def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700):
+    """A short spoken answer from a model, or `fallback`. Never raises, never hangs."""
+    text = _clean(complete(system, user, timeout))
     if not text:
         return fallback
     if len(text) > max_chars:

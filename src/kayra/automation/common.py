@@ -1377,6 +1377,24 @@ def plan_actions(actions):
     return groups
 
 
+# Results that mean "the rules found nothing and nothing happened" — the only results the
+# understanding layer may take a second look at. Never for power, files, the shell, reads or
+# timers: those either did something already or must not be second-guessed.
+_RETHINK_STATUSES = frozenset({Status.NOT_FOUND, Status.UNSUPPORTED})
+_NEVER_RETHINK = frozenset({"system", "file", "files", "shell", "info", "timer", "dev",
+                            "diagnose", "plan", "trigger", "scene"})
+
+
+def _is_guess(action):
+    """The parser's own catch-all: 'browser <anything>' read as a click, at low confidence."""
+    return action.domain == "browser" and action.action == "page_click" and action.confidence < 1.0
+
+
+def _worth_rethinking(action, result):
+    return (result is not None and result.status in _RETHINK_STATUSES
+            and action.domain not in _NEVER_RETHINK)
+
+
 _CONFIRM_PROMPTS = {
     # These are reached ONLY once `resolve_power_target` has returned COMPUTER, so the
     # wording can be specific about the target. It has to be: a prompt that says "your
@@ -1436,6 +1454,32 @@ class AutomationRuntime:
         self.timers = TimerService(notify=notify)
         # Steps of a multi-step plan (a scene, a planned goal) waiting behind a confirmation.
         self.pending_plan = []
+        # The understanding layer (automation/interpreter.py). `situation_fn` returns what is
+        # on screen (the backend sets it); `chat_handoff` is raised when the model decides an
+        # "automation" token was really conversation, and the app answers it as chat.
+        self.situation_fn = None
+        self.chat_handoff = False
+
+    def take_chat_handoff(self):
+        """True once after a request the understanding layer judged to be conversation."""
+        flag, self.chat_handoff = self.chat_handoff, False
+        return flag
+
+    def _situation(self):
+        try:
+            return self.situation_fn() if self.situation_fn else {}
+        except Exception:
+            return {}
+
+    def _understand(self, request, reason=""):
+        """Ask the understanding layer. Returns an Interpretation (kind 'none' when off/failed)."""
+        from kayra.automation import interpreter
+        result = interpreter.interpret(request, self._situation(), reason,
+                                       normalize=lambda t: normalize_command(t, self.context),
+                                       classify=classify_action)
+        print_info(f"[AI] understood {request!r} as {result.kind}"
+                   + (f": {result.commands}" if result.commands else ""))
+        return result
 
     # ── one action ──
     def execute_action(self, action, skip_policy=False):
@@ -1479,23 +1523,41 @@ class AutomationRuntime:
         if not commands:
             return ""
         actions, unmapped = [], []
+        from_model = set()          # ids of actions the understanding layer proposed
+        spoken = []
         for command in commands:
             action = normalize_command(command, self.context)
+            if action is None or _is_guess(action):
+                # The rules don't understand it (or only guessed): ask what was MEANT.
+                understood = await asyncio.to_thread(self._understand, command)
+                if understood.kind == "automation":
+                    for token in understood.commands:
+                        proposed = normalize_command(token, self.context)
+                        if proposed is not None:
+                            from_model.add(id(proposed))
+                            actions.append(proposed)
+                    continue
+                if understood.kind == "chat":
+                    self.chat_handoff = True
+                    continue
+                if understood.kind == "ask":
+                    return understood.question
             if action is None:
                 unmapped.append(command)
                 print_warning(f"Skipping unmapped automation token: '{command}'")
                 continue
             actions.append(action)
         if not actions:
-            return "I'm not sure how to do that." if unmapped else ""
+            return "" if self.chat_handoff else ("I'm not sure how to do that." if unmapped else "")
 
         self._set_state("AUTOMATING")
-        spoken = []
         outcomes = {"ok": 0, "failed": 0, "tokens": []}
         try:
             for group in plan_actions(merge_tab_steps(actions)):
                 if len(group) == 1:
                     results = [await asyncio.to_thread(self.execute_action, group[0])]
+                    if _worth_rethinking(group[0], results[0]) and id(group[0]) not in from_model:
+                        results = await asyncio.to_thread(self._rethink, group[0], results[0])
                 else:
                     results = await asyncio.gather(
                         *(asyncio.to_thread(self.execute_action, a) for a in group))
@@ -1516,6 +1578,37 @@ class AutomationRuntime:
             self._emit(outcomes)
         return " ".join(spoken)
 
+    def _rethink(self, action, result):
+        """
+        The rules ran and found nothing ("I couldn't find an app called XYZ chat"). Nothing
+        happened, so asking the understanding layer and running what it proposes is safe —
+        every proposal still goes through the policy. Returns the results to report.
+        """
+        understood = self._understand(action.raw or action.target, result.message)
+        if understood.kind == "chat":
+            self.chat_handoff = True
+            return [ActionResult(Status.OK, "")]
+        if understood.kind == "ask":
+            return [ActionResult(Status.AMBIGUOUS, understood.question)]
+        if understood.kind != "automation":
+            if (result.detail or {}).get("web_fallback"):
+                # The model had nothing better: the last resort is the web (top result or a
+                # search), exactly what the rules would have done without a model.
+                retry = Action(action.domain, action.action, target=action.target,
+                               parameters={**action.parameters, "web": True}, raw=action.raw)
+                return [self.execute_action(retry)]
+            return [result]
+        out = []
+        for token in understood.commands:
+            proposed = normalize_command(token, self.context)
+            if proposed is None:
+                continue
+            outcome = self.execute_action(proposed)
+            out.append(outcome)
+            if outcome.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS) or not outcome.ok:
+                break
+        return out or [result]
+
     async def automation(self, commands):
         return await self.translate_and_execute(commands)
 
@@ -1534,6 +1627,8 @@ class AutomationRuntime:
             if action is None:
                 continue
             result = self.execute_action(action)
+            if _worth_rethinking(action, result) and (result.detail or {}).get("web_fallback"):
+                result = self._rethink(action, result)[-1]
             if result.message:
                 spoken.append(result.message)
             if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):

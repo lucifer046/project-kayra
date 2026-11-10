@@ -215,7 +215,7 @@ def plan_goal(goal):
               f"\nSaved modes you may use with 'scene <name>': {names}.\n"
               "Reply with ONLY a JSON array of command strings, at most 10. Never include "
               "shutdown, restart, delete, install or terminal commands. If nothing fits, reply [].")
-    raw = ai.summarize(system, goal, fallback="[]", timeout=30.0, max_chars=2000)
+    raw = ai.complete(system, goal, timeout=30.0) or "[]"   # verbatim: fences must survive
     match = re.search(r"\[.*\]", raw, re.S)
     try:
         tokens = json.loads(match.group(0)) if match else []

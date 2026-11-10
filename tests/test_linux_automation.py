@@ -173,11 +173,16 @@ class Rig:
         from kayra.automation import web_macros
         # "open <unknown>" may look the name up on the web; never from a unit test.
         self._top, web_macros.TOP_RESULTS = web_macros.TOP_RESULTS, (lambda q: [])
+        # The understanding layer asks a model; never from a unit test unless one opts in.
+        from kayra.automation import interpreter
+        self._interp, interpreter.ACTIVE = interpreter.ACTIVE, False
         return self
 
     def __exit__(self, *exc):
         from kayra.automation import web_macros
         web_macros.TOP_RESULTS = self._top
+        from kayra.automation import interpreter
+        interpreter.ACTIVE = self._interp
         (linux.HYPR, linux.RUNNER, linux.SLEEP, linux.LAUNCH_TIMEOUT_S,
          linux.CLOSE_TIMEOUT_S) = self._saved
         linux.CONFIRMATIONS.cancel()

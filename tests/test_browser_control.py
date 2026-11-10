@@ -32,8 +32,8 @@ from test_linux_automation import (FakeHyprland, RecordingRunner, client,  # noq
 from test_assistant_automation import FakeBridge, WebRig  # noqa: E402
 
 from kayra.utils import print_banner, print_info  # noqa: E402
-from kayra.automation import (common, linux, linux_apps, sites, targets,  # noqa: E402
-                              web_macros)
+from kayra.automation import (ai, common, linux, linux_apps, sites, targets,  # noqa: E402
+                              web_macros, interpreter)
 from kayra.automation.policy import Status  # noqa: E402
 
 check = Checker("browser control")
@@ -353,6 +353,114 @@ def section_app_windows():
               "page.click" in rig.bridge.cmds() and r.ok, (rig.bridge.cmds(), r.message))
 
 
+class Model:
+    """A scripted model for the understanding layer. Records every prompt it was shown."""
+
+    def __init__(self, *replies):
+        self.replies, self.prompts = list(replies), []
+
+    def __enter__(self):
+        self._saved = (ai.TEXT_MODEL, interpreter.ACTIVE)
+        interpreter.ACTIVE = True
+
+        def answer(messages):
+            self.prompts.append(messages[-1]["content"])
+            return self.replies.pop(0) if self.replies else ""
+        ai.TEXT_MODEL = answer
+        return self
+
+    def __exit__(self, *exc):
+        ai.TEXT_MODEL, interpreter.ACTIVE = self._saved
+        return False
+
+
+def run_tokens(tokens):
+    return asyncio.run(linux.translate_and_execute(tokens))
+
+
+def section_understanding():
+    check.section("[8] The understanding layer — a model works out what you MEANT")
+    whatsapp = [client("0xw1", "chrome-web.whatsapp.com__-Default", "WhatsApp")]
+    with WebRig(Bridge(), hypr=FakeHyprland(whatsapp, active="0xw1")) as rig:
+        with Model('{"kind": "automation", "commands": ["browser click on PR and outreach core team"]}') as m:
+            spoken = run_tokens(["open PR and outreach core team chat"])
+            check("'open XYZ chat' with WhatsApp in front: the rules miss, the model clicks the chat",
+                  ("page.click", {"text": "pr and outreach core team", "nth": 1}) in rig.bridge.calls
+                  or any(c == "page.click" and "outreach" in a["text"].lower()
+                         for c, a in rig.bridge.calls), (rig.bridge.calls[-3:], spoken))
+            check("…the model was told what is on screen (WhatsApp in front)",
+                  m.prompts and "web.whatsapp.com" in m.prompts[0], m.prompts[:1])
+            check("…and what the rules tried", m.prompts and "couldn't find" in m.prompts[0].lower())
+            check("exactly one model call (its own proposals are never re-interpreted)",
+                  len(m.prompts) == 1, len(m.prompts))
+
+    with WebRig(Bridge()) as rig:
+        with Model('```json\n{"kind": "automation", "commands": ["browser mute this tab"]}\n```') as m:
+            spoken = run_tokens(["make this tab quiet please"])
+            check("an unparseable request becomes the command it meant (a fenced reply is fine)",
+                  "tabs.mute" in rig.bridge.cmds(), (rig.bridge.cmds(), spoken))
+        with Model('{"kind": "chat"}'):
+            spoken = run_tokens(["whats a good name for my cat"])
+            check("a question that reached automation is handed to CHAT, nothing runs",
+                  spoken == "" and linux.take_chat_handoff() and not linux.take_chat_handoff(),
+                  spoken)
+        with Model('{"kind": "ask", "question": "Do you mean the Budget sheet or the Budget doc?"}'):
+            spoken = run_tokens(["open the budget thing"])
+            check("genuinely ambiguous: ONE question back, nothing opened",
+                  spoken.startswith("Do you mean") and not rig.bridge.opened(), spoken)
+        with Model('{"kind": "automation", "commands": ["system shutdown the computer", '
+                   '"terminal rm -rf ~", "delete file notes.txt", "plan take over the world", '
+                   '"browser click on settings"]}'):
+            calls = len(rig.bridge.calls)
+            run_tokens(["do the thing with the stuff"])
+            check("power, shell, file deletion and plans are NEVER accepted from a model",
+                  not any("--incognito" in a or "systemctl" in " ".join(a) for a in rig.runner.spawned)
+                  and not any("rm" in " ".join(a[0]) for a in rig.runner.ran)
+                  and linux.CONFIRMATIONS.peek() is None, linux.CONFIRMATIONS.peek())
+            check("…while the safe proposal in the same reply still runs",
+                  any(c == "page.click" for c, _ in rig.bridge.calls[calls:]))
+        with Model('{"kind": "automation", "commands": ["email send"]}'):
+            calls = len(rig.bridge.calls)
+            spoken = run_tokens(["fire off that mail i wrote"])
+            check("a model proposal that needs a yes STILL asks first; nothing clicked",
+                  linux.CONFIRMATIONS.peek() is not None
+                  and not any(c == "page.click" for c, _ in rig.bridge.calls[calls:]), spoken)
+            linux.CONFIRMATIONS.cancel()
+        with Model(""):
+            with Results([]):
+                spoken = run_tokens(["open qwerty zxcv chat"])
+            check("model unreachable: the honest original answer stands",
+                  "couldn't find" in spoken.lower() or "can't" in spoken.lower(), spoken)
+        with Model('{"kind": "none"}') as m:
+            with Results([{"url": "https://www.zzzfoods.in/", "title": "Zzz"}]):
+                before = len(rig.bridge.opened())
+                spoken = run_tokens(["open zzz foods"])
+            check("unknown name: the model is asked FIRST, the web result is the last resort",
+                  len(m.prompts) == 1 and rig.bridge.opened()[before:]
+                  and rig.bridge.opened()[-1][1]["url"] == "https://www.zzzfoods.in/", spoken)
+        with Model("I think you want to open sheets!"):
+            spoken = run_tokens(["blorp the glorp"])
+            check("a reply that is not JSON proposes nothing", "not sure" in spoken.lower(), spoken)
+        with Model('{"kind": "automation", "commands": ["open google sheets"]}') as m:
+            interpreter.ACTIVE = False
+            run_tokens(["blorp the glorp"])
+            check("switched off (ACTIVE False / AUTOMATION_AI_INTERPRETER=off): no model call",
+                  not m.prompts)
+        with Model() as m:
+            run_tokens(["open google sheets", "volume up" if n("volume up") else "pause"])
+            check("everything the rules handle never pays for a model call", not m.prompts, m.prompts)
+
+    examples = ["open notion in this tab", "google search cats", "browser click on the second reply",
+                "browser type hello into search", "browser search this page for pricing",
+                "browser scroll to pricing", "browser summarize this page", "browser what can i click",
+                "browser switch to gmail tab", "browser mute this tab", "email open latest",
+                "email draft to a@b.com about lunch saying hi", "calendar add standup tomorrow at 10am",
+                "meet mic off", "message rahul: running late", "system volume 40", "take screenshot",
+                "set timer 5 minutes", "type hello", "new tab", "close tab", "go back"]
+    unknown = [e for e in examples if n(e) is None or common._is_guess(n(e))]
+    check("every catalog example the model is shown is a real command", not unknown, unknown)
+
+
 def main():
     print_banner("BROWSER CONTROL (round 5)")
     print_info(f"Host: {describe_host()}")
@@ -363,6 +471,7 @@ def main():
         section_without_bridge()
         section_extension_versions()
         section_app_windows()
+        section_understanding()
     check.section("[9] The suite has no side effects")
     check("nothing the developer owns was modified", not guard.modified(), guard.report())
     return check.finish()

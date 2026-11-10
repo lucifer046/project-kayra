@@ -124,6 +124,7 @@ Automation = None
 pending_confirmation = None
 resolve_confirmation = None
 shutdown_automation = None
+take_chat_handoff = None
 is_interrupt_phrase = None
 create_default_agent = None
 
@@ -576,7 +577,7 @@ def bootstrap():
     global _BOOTSTRAPPED, BOOT, env_vars, assistant_name
     global engine, emotion_engine, EMOTION_ENABLED
     global Chatbot, RealTimeSearchEngine, DeepResearchEngine, Automation
-    global pending_confirmation, resolve_confirmation, shutdown_automation
+    global pending_confirmation, resolve_confirmation, shutdown_automation, take_chat_handoff
     global is_interrupt_phrase, create_default_agent, PROACTIVE_AVAILABLE, proactive_agent
 
     if _BOOTSTRAPPED:
@@ -642,6 +643,8 @@ def bootstrap():
         Automation, pending_confirmation = _hands.Automation, _hands.pending_confirmation
         resolve_confirmation = _hands.resolve_confirmation
         shutdown_automation = _hands.shutdown_automation
+        # The understanding layer may decide an "automation" request was conversation.
+        take_chat_handoff = getattr(_hands, "take_chat_handoff", lambda: False)
         # Linux: the Chrome bridge, the trigger/health watcher and the notification log.
         # They speak through `speak_unprompted`, never through a turn.
         if hasattr(_hands, "start_services"):
@@ -670,6 +673,9 @@ def bootstrap():
 
         def shutdown_automation():
             return 0
+
+        def take_chat_handoff():
+            return False
 
     try:
         from kayra.intelligence.emotion_engine import EmotionEngine
@@ -2282,6 +2288,15 @@ async def Execute_Task(intent_array, original_query, mood=None):
                 (pending_confirmation() or "") if pending_confirmation else "")
         if spoken and isinstance(spoken, str):
             _say(spoken)
+        # The DMM sent it to automation, but the understanding layer judged it to be a
+        # question or conversation ("what's a good name for my cat"): answer it as chat.
+        if take_chat_handoff and take_chat_handoff():
+            set_state(STATE_SPEAKING)
+            _voice_flow("Speaking")
+            answer = await asyncio.to_thread(Chatbot, original_query,
+                                             tts_engine if TTS_ENABLED else None, mood)
+            if isinstance(answer, str):
+                _announce_reply(answer)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

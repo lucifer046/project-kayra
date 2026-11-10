@@ -327,6 +327,30 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-10 — the understanding layer: a model works out what you meant
+
+**Why:** everything after the DMM was rules (tables and patterns). Fast and exact for what
+they know, but "open PR and outreach core team chat" with WhatsApp in front, or "make this tab
+quiet", fell through to *"I couldn't find an app…"*.
+
+**What changed**
+- `automation/interpreter.py` (new): one bounded model call, given what the user said, what
+  the rules tried, what is on screen and the catalog of commands. It answers automation
+  commands, *chat*, *ask one question*, or *none*. Its commands are parsed and judged by the
+  policy like spoken ones; power, shell, plans, triggers and file delete/move/rename are never
+  accepted from it.
+- `automation/common.py`: `AutomationRuntime` asks it only when a token is unparseable, only a
+  guess, or ran and found nothing; `take_chat_handoff()`; unknown names go rules → model →
+  web result.
+- `automation/linux.py`: `situation()` (app / web app in front, Chrome's active tab).
+- `app.py`: a request the model judged to be conversation is answered by the Chatbot.
+- `automation/ai.py`: `complete()` returns the reply verbatim; the goal planner uses it too
+  (a ```json reply used to be stripped to nothing).
+- Verified live with the local model: WhatsApp chat → `browser click on PR and outreach core
+  team` (7.2 s), "make this tab quiet" → `browser mute this tab` (3.8 s), "what's a good name
+  for my cat" → chat (1.9 s).
+- Tests: `tests/test_browser_control.py` section 8 (scripted fake model): 123 checks.
+
 ### 2026-11-10 — round 5, part 1: open anything, anywhere, the way you say it
 
 Plan: `docs/roadmap/BROWSER_CONTROL_PLAN.md` (items A1–A6, G3, H0.1).

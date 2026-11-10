@@ -466,6 +466,13 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
 
+**Added after Part 1, at the user's request — the understanding layer**
+(`automation/interpreter.py`): when the rules fail, a model reads the request with the screen
+context and proposes commands / chat / one question. It already covers much of H0.2 ("open X"
+inside the app in front) without hard-coding; Part 5 still adds the WhatsApp site functions and
+the semantic matcher. Every later part should add its new command shapes to
+`interpreter.CATALOG` (the test asserts every catalog example parses).
+
 **Tuning applied in Part 1** (found while reading rounds 1–4):
 - `REQUIRED_VERSION` was declared but never checked, so an old extension silently ignored new
   arguments. It is now checked before any feature that needs it, and an out-of-date 1.1.0+

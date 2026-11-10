@@ -223,9 +223,21 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   `web_macros` (tabs/pages/Gmail/Calendar/WhatsApp/Meet), `screen_ai`, `workflows` (scenes,
   planner, triggers, the ONE `kayra-watch` thread, briefing, recall, call detection),
   `linux_system`, `status_file` (+ `extension/omarchy-kayra-widget`). Rules that matter:
-  * Models only REWORD or SEE; they never decide whether something runs. Planned steps are
-    validated by `normalize_command` + `classify_action` and run through `run_steps`, which
-    parks the rest of a plan behind a confirmation.
+  * Models REWORD, SEE, or PROPOSE; they never AUTHORISE. Planned steps and the
+    understanding layer's commands are validated by `normalize_command` + `classify_action`
+    (DENY dropped, CONFIRM still asks) and run through the same executor; `run_steps` parks
+    the rest of a plan behind a confirmation.
+  * **The understanding layer** (`automation/interpreter.py`, 2026-11-10): when the rules
+    cannot parse a token, only guessed (`browser <anything>` as a click), or ran and found
+    NOTHING (NOT_FOUND/UNSUPPORTED — nothing happened), `AutomationRuntime` asks a model what
+    the user meant, with the screen context (`linux.situation()`: app/web app in front, Chrome's
+    active tab) and `interpreter.CATALOG`. Replies: automation commands / chat (the app answers
+    via `take_chat_handoff()` → Chatbot) / ask one question / none. Never accepted from it:
+    shell, plans, triggers, power, file delete/move/rename. Its own proposals are never
+    re-interpreted (one model call per request). Unknown names: rules → model → web result.
+    Only the failure path pays the call. `interpreter.ACTIVE` is switched off by every test
+    rig; `AUTOMATION_AI_INTERPRETER=off` disables it. Parse model JSON with `ai.complete`
+    (verbatim) — `ai.summarize` strips code fences and used to swallow ```json replies.
   * Every new `system …` phrase sits BEFORE the power needles in `_SYSTEM_VERBS` ("sleep timer",
     "restart the docker container" must never reach the power gate). Asserted in test_assistant_automation.
   * Background speech goes through `common.announce` → `app.speak_unprompted`, which holds

@@ -1868,7 +1868,15 @@ def _dispatch(action):
                                               "its web version.")
                         return opened
                     return result
-                if targets.website_url(target) or web_macros.web_worthy(target):
+                if targets.website_url(target):
+                    return web_macros.open_site(target, None)
+                if web_macros.web_worthy(target):
+                    from kayra.automation import interpreter
+                    if interpreter.ACTIVE and interpreter.enabled() and not params.get("no_ai"):
+                        # Not an app, not a site we know. Let the understanding layer read
+                        # it first ("the budget thing", "XYZ chat" inside WhatsApp); the
+                        # runtime comes back here with `web` set if the model has nothing.
+                        return ActionResult.not_found(result.message, web_fallback=True)
                     return web_macros.open_site(target, None)
             return result
         if verb == "close":
@@ -2203,6 +2211,40 @@ translate_and_execute = RUNTIME.translate_and_execute
 pending_confirmation = RUNTIME.pending_confirmation
 resolve_confirmation = RUNTIME.resolve_confirmation
 shutdown_automation = RUNTIME.shutdown
+take_chat_handoff = RUNTIME.take_chat_handoff
+
+
+def situation():
+    """
+    What is on screen, for the understanding layer: the app in front, the web app / site it
+    shows, and Chrome's active tab. Cheap reads only (one compositor query, one extension call
+    with a short timeout); never a screenshot.
+    """
+    out = {}
+    try:
+        front = active_window()
+        if front is not None and not front.kayra_owned:
+            out["app"] = front.initial_class or front.cls
+            out["window_title"] = (front.title or "")[:120]
+            site = next((linux_apps.site_of_window_class(c) for c in front.classes
+                         if linux_apps.site_of_window_class(c)), None)
+            if site:
+                out["site"] = site
+    except Exception:
+        pass
+    try:
+        from kayra.automation import web_macros
+        if web_macros.BRIDGE.connected():
+            out["bridge"] = True
+            tab = web_macros.BRIDGE.call("tabs.active", timeout=2.0) or {}
+            out["tab_title"] = str(tab.get("title") or "")[:120]
+            out["tab_url"] = str(tab.get("url") or "")[:200]
+    except Exception:
+        pass
+    return out
+
+
+RUNTIME.situation_fn = situation
 
 
 async def Automation(commands):
