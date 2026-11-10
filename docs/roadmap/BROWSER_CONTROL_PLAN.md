@@ -69,8 +69,9 @@ Rules (each has bitten before):
   (`linux._browser_in_front`). Keep it.
 - **Spoken results are one or two plain sentences** and say what actually happened
   ("Opened Budget 2026, the newest of 3 matches"), never "Done." for a navigation.
-- **Wait for readiness, not fixed sleeps:** add an extension command
-  `page.waitFor {text|selector|urlIncludes, timeoutMs}` and use it instead of `SLEEP(1.5)`.
+- **Wait for readiness, not fixed sleeps:** `web_macros._wait_for` (the extension's
+  `page.waitFor`) or `web_macros._until` (try the action, short poll, try again). Never a
+  fixed `SLEEP` in front of a page action — a test in `test_browser_control.py` counts them.
 - Logs/audit carry counts and ids, never email bodies, sheet contents or document text.
 
 ## 3. Safety (unchanged rules, extended)
@@ -444,7 +445,8 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 
 - Rounds 1–4 were committed in `1261170` (feature/linux-desktop-automation); Part 1 in
   `2a8e51b`; the understanding layer in `677eba3`, made fast in `c0ee678`.
-- Extension in the repo is **1.2.0** (Part 1). From 1.1.0 on it updates itself: when Kayra
+- Extension in the repo is **1.2.1** (Part 1 + the 2026-11-10 tuning pass; see the changelog in
+  `docs/platforms/LINUX_AUTOMATION.md`). From 1.1.0 on it updates itself: when Kayra
   needs a newer command it sends `runtime.reload` and says so; only a 1.0.x extension still
   needs the manual reload on chrome://extensions.
 - Unit tier: 4529 checks green (`tests/test_browser_control.py`: 130); extension integration

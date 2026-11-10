@@ -1445,10 +1445,12 @@ def click_on_text(phrase, verb="click_text"):
     if monitor is None:
         return ActionResult.unsupported("Clicking on text needs the Hyprland session.")
     import tempfile
-    handle, path = tempfile.mkstemp(prefix="kayra-ocr-", suffix=".png")
+    # PPM, not PNG: this file is read once by tesseract and deleted, so compressing it is pure
+    # cost (measured 151 ms -> 35 ms for a 2880x1800 capture; the OCR itself is ~1.2 s).
+    handle, path = tempfile.mkstemp(prefix="kayra-ocr-", suffix=".ppm")
     os.close(handle)
     try:
-        if not _ok("grim", "-o", str(monitor.get("name")), path, timeout=6.0):
+        if not _ok("grim", "-o", str(monitor.get("name")), "-t", "ppm", path, timeout=6.0):
             return ActionResult.failure("I couldn't capture the screen.")
         words = ocr_words(path)
     finally:
@@ -2263,7 +2265,8 @@ def start_services(speaker=None):
     from kayra.automation import browser_bridge, workflows, linux_system
     if speaker is not None:
         common.set_announcer(speaker)
-    from kayra.automation import status_file
+    from kayra.automation import status_file, web_macros
+    browser_bridge.BRIDGE.on_hello = web_macros.refresh_stale_extension
     started = {"bridge": browser_bridge.start(), "watcher": workflows.ensure_watcher(),
                "notifications": linux_system.start_notification_log(),
                "status": status_file.start()}

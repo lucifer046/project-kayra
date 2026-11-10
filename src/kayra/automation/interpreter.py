@@ -206,7 +206,8 @@ def interpret(request, situation=None, reason="", normalize=None, classify=None)
         return Interpretation("none")
     # Thinking OFF: this is a one-line decision, and a thinking model spends ~85 % of its
     # time reasoning before it — measured 4 s -> 0.5 s on the reference laptop.
-    raw = ai.fast(_SYSTEM.format(catalog=CATALOG, limit=MAX_COMMANDS), user, timeout=TIMEOUT_S)
+    raw = ai.fast(_SYSTEM.format(catalog=CATALOG, limit=MAX_COMMANDS), user, timeout=TIMEOUT_S,
+                  max_tokens=160)
     data = _parse(raw)
     if not data:
         return Interpretation("none", raw=raw)

@@ -39,6 +39,39 @@ from kayra.core.paths import model_path as model_file
 from kayra.core import logbus
 from kayra.utils import print_info, print_warning, print_error, console, now_ms, speech_safe_text
 
+# ── Which Kokoro file to load, fastest first ─────────────────────────────
+# MEASURED on the reference laptop (Ryzen 9 8945HS, RTX 4060 Laptop), synthesis time divided by
+# audio length for a 6.5 s sentence, 2026-11-10:
+#
+#     file                      processor     NVIDIA GPU    VRAM
+#     kokoro-v1.0.fp16.onnx       0.22          0.04       +637 MiB
+#     kokoro-v1.0.onnx (fp32)     0.22          0.03      +1151 MiB
+#     kokoro-v1.0.int8.onnx       1.06          0.95       +381 MiB
+#
+# THE QUANTIZED FILE IS THE SLOW ONE, on both devices. It was believed to be the fast one for
+# months (and `models/kokoro.onnx`, long described as "full precision", is byte-for-byte that
+# int8 file). Its quantized operators have no CUDA kernels — that is the "547 Memcpy nodes"
+# warning — and ONNX Runtime's CPU kernels for them are slower than the float ones here. So:
+# half precision first (same speed as fp32, half the download and half the VRAM), then full
+# precision, and the quantized files only when nothing else is installed.
+VOICE_MODELS = ("kokoro-v1.0.fp16.onnx", "kokoro-v1.0.onnx", "kokoro-v1.0.int8.onnx",
+                "kokoro.onnx")
+VOICE_FILES = ("voices-v1.0.bin", "voices.bin")
+_QUANTIZED_BYTES = range(80_000_000, 110_000_000)     # the int8 graph is ~92 MB; fp16 ~177 MB
+
+
+def is_quantized_voice_model(path):
+    """True for the slow int8 graph, by name or — for the historical `kokoro.onnx` — by size."""
+    name = os.path.basename(str(path)).lower()
+    if "int8" in name:
+        return True
+    if "fp16" in name or name == "kokoro-v1.0.onnx":
+        return False
+    try:
+        return os.path.getsize(path) in _QUANTIZED_BYTES
+    except OSError:
+        return False
+
 
 # Sample rate the Kokoro v1.0 checkpoints synthesize at.
 SAMPLE_RATE = 24000
@@ -158,7 +191,7 @@ class DynamicVoiceEngine:
         "enough", "cancel", "nevermind", "never mind",
     )
 
-    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin",
+    def __init__(self, model_filename=None, voices_filename=None,
                  warm_up=True, device_mode=None):
         # Paths and configuration both come from the core, never from a local guess at
         # where the project root is relative to this file.
@@ -180,34 +213,28 @@ class DynamicVoiceEngine:
         else:
             gender = env_vars.get("ASSISTANT_GENDER", "Female").strip().lower()
 
-        model_path = model_file(model_filename)
-        voices_path = model_file(voices_filename)
-
-        # Automatic fallback to standard filenames if default filenames are not present
-        if not os.path.exists(model_path) or not os.path.exists(voices_path):
-            alt_model_path = model_file("kokoro.onnx")
-            alt_voices_path = model_file("voices.bin")
-            if os.path.exists(alt_model_path) and os.path.exists(alt_voices_path):
-                model_path = alt_model_path
-                voices_path = alt_voices_path
-                # The full-precision graph synthesizes at roughly 1.0-1.4x real time on a
-                # typical CPU, which is the single largest remaining contributor to
-                # speaking latency. The int8 checkpoint this class asks for by default is
-                # several times faster at effectively identical audio quality.
-                print_warning(
-                    "Using full-precision kokoro.onnx. Dropping the quantized "
-                    f"'{model_filename}' + '{voices_filename}' into models/ cuts speech "
-                    "synthesis latency substantially."
-                )
-            else:
-                # Direct CWD check
-                if os.path.exists(model_filename) and os.path.exists(voices_filename):
-                    model_path = os.path.abspath(model_filename)
-                    voices_path = os.path.abspath(voices_filename)
+        # WHICH MODEL FILE. With no explicit file the fastest one present wins — see
+        # `VOICE_MODELS` for the measured order. An explicit filename is honoured as given and
+        # only then falls back to the same search, so an older caller keeps working.
+        model_path = model_file(model_filename) if model_filename else ""
+        voices_path = model_file(voices_filename) if voices_filename else ""
+        if not (model_path and os.path.exists(model_path)):
+            model_path = next((model_file(name) for name in VOICE_MODELS
+                               if os.path.exists(model_file(name))), model_path)
+        if not (voices_path and os.path.exists(voices_path)):
+            voices_path = next((model_file(name) for name in VOICE_FILES
+                                if os.path.exists(model_file(name))), voices_path)
+        if model_path and is_quantized_voice_model(model_path):
+            print_warning(
+                "Speech is using the QUANTIZED Kokoro model, which synthesizes at roughly real "
+                "time. Run setup.py to fetch kokoro-v1.0.fp16.onnx (about 5x faster on the "
+                "processor, 25x on an NVIDIA GPU).")
 
         # Verify physical model presence
-        if not os.path.exists(model_path) or not os.path.exists(voices_path):
-            print_error(f"Core voice matrix components missing: Check {model_path}")
+        if not model_path or not voices_path or not os.path.exists(model_path) \
+                or not os.path.exists(voices_path):
+            print_error("Core voice matrix components missing: no Kokoro model in models/ "
+                        f"(looked for {', '.join(VOICE_MODELS)}).")
             sys.exit(1)
 
         self._model_path = model_path
@@ -764,7 +791,7 @@ class TextToSpeechEngine(DynamicVoiceEngine):
     used to request the full-precision files by name, so a quantized model sitting in
     models/ was never picked up.
     """
-    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin",
+    def __init__(self, model_filename=None, voices_filename=None,
                  warm_up=True, device_mode=None):
         super().__init__(model_filename=model_filename, voices_filename=voices_filename,
                          warm_up=warm_up, device_mode=device_mode)

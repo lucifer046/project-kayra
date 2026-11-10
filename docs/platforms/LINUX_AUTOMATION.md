@@ -327,6 +327,52 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-10 — tuning pass: less waiting, fewer model calls, no idle churn
+
+Measured on the reference laptop (gemma-4-e4b in LM Studio, RTX 4060 Laptop).
+
+| What | Before | After |
+|---|---|---|
+| Page / email / calendar summary (`ai.summarize`) | 10.1 s | 2.1 s (direct local call, thinking off) |
+| "What's on my screen" (local vision) | 7.8 s | 1.8 s (thinking off) |
+| WhatsApp send, fixed pauses | 5.5 s always | as soon as each step is ready |
+| Meet join / calendar add / email read, fixed pauses | 1.5-3 s each | readiness waits |
+| "pause", "next tab", "volume 40" | one model call (~0.4 s local) | no model call |
+| OCR screen capture | 151 ms (PNG) | 35 ms (PPM); the OCR itself is still ~1.2 s |
+| Bridge frame unmasking, 600 KB | ~100 ms | 2 ms |
+| `triggers.json` | rewritten every 20 s | written only on change; re-read only when its mtime moves |
+| App index | re-parsed every 5 min | re-parsed when an applications folder changes |
+| Bridge accept loop | one wake-up a second | none while idle |
+
+**What changed**
+- `automation/ai.py`: `_local_chat` (one keep-alive session, thinking off, the HTTP timeout is
+  the bound); `summarize` uses it when a local server is up and the cloud is not forced;
+  local vision sends `reasoning_effort: none`; "no local model" is cached for 30 s, not
+  forever (a server started after Kayra used to be ignored for the whole run); Qwen 3.5 is
+  recognised as a vision model.
+- `automation/web_macros.py`: `_until` (try, short poll, try again) replaces the fixed pauses in
+  WhatsApp, Meet join, calendar add and Gmail; the only fixed pauses left are the two OS
+  share-picker waits in `meet_share`, which are untested live and were left alone. Unknown
+  site names found by the web lookup are remembered in `data/learned_sites.json` (bounded,
+  only when the host carries the spoken name). `refresh_stale_extension` reloads an
+  out-of-date extension once when it connects.
+- Extension 1.2.1: `pageClick` scores names first and checks visibility only for matches;
+  `page.waitFor` waits on a `MutationObserver` in the page instead of re-reading it every
+  250 ms.
+- `automation/diagnostics.py`: probes run side by side (`PARALLEL`). `workflows.briefing`
+  fetches the weather while Chrome answers for calendar and mail.
+- `automation/browser_bridge.py`, `workflows.py`, `linux_apps.py`: the three idle-cost fixes
+  in the table.
+- `intelligence/llm_engine.py`: `fast_intent` (exact whole-utterance commands skip the model);
+  the local DMM call sends `reasoning_effort: none`.
+
+**Not done, on purpose:** the Hyprland event socket (replacing the 0.1-0.2 s window polls),
+the extension pushing the active tab, capturing only the focused window for OCR (changes
+which matches are found), backing off the extension's 30 s reconnect alarm (slower
+auto-connect), caching `_have()` (microseconds, and tests swap the runner).
+
+Tests: `tests/test_browser_control.py` section 8b (173 checks in the suite).
+
 ### 2026-11-10 — the understanding layer: a model works out what you meant
 
 **Why:** everything after the DMM was rules (tables and patterns). Fast and exact for what

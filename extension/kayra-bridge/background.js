@@ -189,11 +189,14 @@ async function run(cmd, args) {
         if (args.urlIncludes && !(t.url || "").includes(args.urlIncludes)) ok = false;
         if (ok && args.titleIncludes && !(t.title || "").includes(args.titleIncludes)) ok = false;
         if (ok && (args.text || args.selector)) {
-          try { ok = !!(await inPage(t, pageHas, [args.text || "", args.selector || ""])); }
+          // The page waits on ITS OWN changes (a MutationObserver) and answers the moment the
+          // condition holds, instead of being re-injected and re-read every 250 ms.
+          const left = Math.min(2000, Math.max(100, deadline - Date.now()));
+          try { ok = !!(await inPage(t, pageWaitFor, [args.text || "", args.selector || "", left])); }
           catch (e) { ok = false; }      // the page is still navigating
         }
         if (ok) return {ok: true, title: t.title, url: t.url};
-        await new Promise((r) => setTimeout(r, 250));
+        await new Promise((r) => setTimeout(r, 120));
       }
       return {ok: false, timedOut: true};
     }
@@ -223,6 +226,30 @@ function pageHas(text, selector) {
   if (selector && !document.querySelector(selector)) return false;
   if (text && !(document.body && (document.body.innerText || "").toLowerCase().includes(String(text).toLowerCase()))) return false;
   return true;
+}
+
+function pageWaitFor(text, selector, timeoutMs) {
+  // Resolves true as soon as `selector` matches and `text` is visible, false at the timeout.
+  // The selector is tested first (cheap); the visible-text read forces layout, so it runs at
+  // most once per 150 ms however fast the page is mutating.
+  const want = String(text || "").toLowerCase();
+  const holds = () => {
+    if (selector && !document.querySelector(selector)) return false;
+    if (want && !(document.body && (document.body.innerText || "").toLowerCase().includes(want))) return false;
+    return true;
+  };
+  if (holds()) return true;
+  return new Promise((resolve) => {
+    let timer = null, done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true; observer.disconnect(); clearTimeout(timer); clearTimeout(limit); resolve(value);
+    };
+    const check = () => { timer = null; if (holds()) finish(true); };
+    const observer = new MutationObserver(() => { if (!timer) timer = setTimeout(check, 150); });
+    observer.observe(document.documentElement, {childList: true, subtree: true, characterData: true, attributes: !!selector});
+    const limit = setTimeout(() => finish(holds()), timeoutMs || 2000);
+  });
 }
 
 function pageText(max) {
@@ -274,15 +301,20 @@ function pageClick(text, nth) {
     if ((" " + n + " ").includes(" " + want + " ")) return 1;
     return 0;
   };
+  // ORDER MATTERS FOR COST. Names are scored first and visibility is checked only for the
+  // few elements that matched: `getComputedStyle` + a layout read on every candidate of a
+  // Gmail- or YouTube-sized page was most of the time a click took. `innerText` also forces
+  // layout, so it is read only for elements small enough to be a control at all.
   const scored = [];
   for (const el of all) {
-    if (el.matches("input[type=password]") || !visible(el)) continue;
-    const text = (el.innerText || "").trim();
+    if (el.matches("input[type=password]")) continue;
+    const raw = el.textContent || "";
+    const text = raw.length <= 400 ? (el.innerText || "").trim() : "";
     const names = [el.getAttribute("aria-label"), el.getAttribute("data-tooltip"), el.getAttribute("title"),
                    el.value, text.length <= 80 ? text : "", el.getAttribute("alt")].filter(Boolean);
     let score = 0, label = names[0] || text;
     for (const n of names) { const sc = scoreName(n); if (sc > score) { score = sc; label = n; } }
-    if (score) scored.push({el, score, label});
+    if (score && visible(el)) scored.push({el, score, label});
   }
   let top = [];
   if (scored.length) {

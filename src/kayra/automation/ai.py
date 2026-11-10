@@ -19,6 +19,7 @@ deterministic fallback, so a dead provider costs wording, never the feature.
 
 import os
 import re
+import time
 import base64
 import threading
 
@@ -63,28 +64,71 @@ def complete(system, user, timeout=DEFAULT_TIMEOUT_S):
     return str(box.get("text") or "")
 
 
-_LOCAL_MODEL = {}
+_LOCAL_MODEL = {}                 # base_url -> (model id or None, monotonic time it was learned)
+_LOCAL_MISS_TTL_S = 30.0          # "no local model" is re-checked: LM Studio may start after Kayra
+_HTTP = {"session": None}
+
+
+def _http():
+    """One keep-alive session for the local server: no TCP handshake per decision."""
+    if _HTTP["session"] is None:
+        import requests
+        _HTTP["session"] = requests.Session()
+    return _HTTP["session"]
+
+
+def _local_base():
+    return _env("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1").replace("localhost", "127.0.0.1")
 
 
 def _local_text_model(base_url):
     """The local model to use for quick decisions: LOCAL_DECISION_MODEL, else the first loaded
-    chat model in LM Studio (never an embedding model). Cached per base URL."""
+    chat model in LM Studio (never an embedding model). A hit is cached for the process; a MISS
+    only for `_LOCAL_MISS_TTL_S`, so a server started after Kayra is picked up (it used to be
+    cached as absent forever, which silently sent every quick decision down the slow path)."""
     configured = _env("LOCAL_DECISION_MODEL") or _env("LOCAL_CHAT_MODEL")
     if configured and configured != "local-model":
         return configured
-    if base_url in _LOCAL_MODEL:
-        return _LOCAL_MODEL[base_url]
+    cached = _LOCAL_MODEL.get(base_url)
+    if cached and (cached[0] or time.monotonic() - cached[1] < _LOCAL_MISS_TTL_S):
+        return cached[0]
     try:
-        import requests
-        data = requests.get(base_url.rstrip("/") + "/models", timeout=1.0).json()
+        data = _http().get(base_url.rstrip("/") + "/models", timeout=1.0).json()
         name = next((m["id"] for m in data.get("data", []) if "embed" not in m["id"].lower()), None)
     except Exception:
         name = None
-    _LOCAL_MODEL[base_url] = name
+    _LOCAL_MODEL[base_url] = (name, time.monotonic())
     return name
 
 
-def fast(system, user, timeout=8.0, max_tokens=200):
+def _local_chat(system, user, timeout, max_tokens, temperature=0.0):
+    """
+    One non-streamed reply from the local server with THINKING OFF, or "" when there is no
+    local model or it failed. The HTTP timeout is the bound: when it expires the connection is
+    closed and the server stops generating, so a slow answer does not keep the GPU busy behind
+    the user's back (a thread that is merely abandoned does).
+    """
+    base = _local_base()
+    model = _local_text_model(base)
+    if not model:
+        return ""
+    try:
+        reply = _http().post(base.rstrip("/") + "/chat/completions", timeout=timeout, json={
+            "model": model, "temperature": temperature, "max_tokens": max_tokens,
+            "reasoning_effort": "none",
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}]}).json()
+        return reply["choices"][0]["message"].get("content") or ""
+    except Exception:
+        _LOCAL_MODEL.pop(base, None)          # re-learn the model next time (it may have changed)
+        return ""
+
+
+def _cloud_forced():
+    return str(_env("FORCE_ONLINE", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def fast(system, user, timeout=8.0, max_tokens=120):
     """
     A quick structured decision: the local model with THINKING OFF, temperature 0, a small
     output budget. Measured on the reference laptop (gemma-4-e4b): ~0.5 s instead of ~4 s,
@@ -94,27 +138,24 @@ def fast(system, user, timeout=8.0, max_tokens=200):
     """
     if TEXT_MODEL is not None:                       # the test suite's scripted model
         return complete(system, user, timeout)
-    base = _env("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1").replace("localhost", "127.0.0.1")
-    model = _local_text_model(base)
-    if model:
-        try:
-            import requests
-            reply = requests.post(base.rstrip("/") + "/chat/completions", timeout=timeout, json={
-                "model": model, "temperature": 0, "max_tokens": max_tokens,
-                "reasoning_effort": "none",
-                "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": user}]}).json()
-            text = reply["choices"][0]["message"].get("content") or ""
-            if text.strip():
-                return text
-        except Exception:
-            pass
-    return complete(system, user, timeout)
+    text = _local_chat(system, user, timeout, max_tokens)
+    return text if text.strip() else complete(system, user, timeout)
 
 
 def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700):
-    """A short spoken answer from a model, or `fallback`. Never raises, never hangs."""
-    text = _clean(complete(system, user, timeout))
+    """
+    A short spoken answer from a model, or `fallback`. Never raises, never hangs.
+
+    With a local server up (and the cloud not forced) this is a direct thinking-off call: a
+    few spoken sentences do not need a reasoning pass, and on a thinking model that pass is
+    most of the wait. Otherwise the engine's chain answers.
+    """
+    text = ""
+    if TEXT_MODEL is None and not _cloud_forced():
+        text = _clean(_local_chat(system, user, timeout, max_tokens=max(160, max_chars // 2),
+                                  temperature=0.3))
+    if not text:
+        text = _clean(complete(system, user, timeout))
     if not text:
         return fallback
     if len(text) > max_chars:
@@ -150,14 +191,13 @@ def _vision_providers():
 
 
 _VISION_HINTS = ("gemma-3", "gemma-4", "gemma3", "gemma4", "llava", "vision", "-vl", "qwen2.5-vl",
-                 "qwen3-vl", "minicpm-v", "moondream", "pixtral", "llama-4", "smolvlm", "idefics")
+                 "qwen3-vl", "qwen3.5", "qwen-3.5", "qwen3_5", "minicpm-v", "moondream", "pixtral", "llama-4", "smolvlm", "idefics")
 
 
 def _local_vision_model(base_url):
     """A loaded local model that can take images, picked by name. None when none is loaded."""
     try:
-        import requests
-        data = requests.get(base_url.rstrip("/") + "/models", timeout=1.5).json()
+        data = _http().get(base_url.rstrip("/") + "/models", timeout=1.5).json()
     except Exception:
         return None
     for model in data.get("data", []):
@@ -167,12 +207,15 @@ def _local_vision_model(base_url):
     return None
 
 
-def _openai_vision(base_url, api_key, model, question, image_bytes, mime):
+def _openai_vision(base_url, api_key, model, question, image_bytes, mime, local=False):
     from openai import OpenAI
     client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0, timeout=VISION_TIMEOUT_S)
     data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
     reply = client.chat.completions.create(
-        model=model, max_tokens=500, temperature=0.2,
+        model=model, max_tokens=300, temperature=0.2,
+        # Describing a screenshot in five sentences needs no reasoning pass; on a local
+        # thinking model that pass is most of the wait. Cloud backends keep their defaults.
+        **({"extra_body": {"reasoning_effort": "none"}} if local else {}),
         messages=[{"role": "system", "content":
                    "You are Kayra, a desktop assistant looking at the user's screen. Answer in "
                    "plain spoken sentences, no markdown, no lists, at most five sentences."},
@@ -189,7 +232,8 @@ def see(question, image_bytes, mime="image/jpeg"):
         return (_clean(answer), "test") if answer else (None, None)
     for label, base_url, key, model in _vision_providers():
         try:
-            answer = _openai_vision(base_url, key, model, question, image_bytes, mime)
+            answer = _openai_vision(base_url, key, model, question, image_bytes, mime,
+                                    local=(label == "local"))
         except Exception:
             continue
         if answer and answer.strip():

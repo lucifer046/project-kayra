@@ -7,6 +7,7 @@ order. Newest last.
 |---|---|---|---|
 | [V1](UPDATE_V1.md) | 2026-09-10 (recorded 2026-11-09) | Baseline: the repository as cloned (commit `929371b`) | Baseline snapshot |
 | [V2](UPDATE_V2.md) | 2026-11-09 | Cross-platform architecture, Linux/Omarchy support, dependency modernization | Major feature, reliability, dependencies, docs |
+| [V3](UPDATE_V3.md) | 2026-11-10 | Tuning pass: fast speech model, fewer model calls, readiness waits, short CLAUDE.md | Performance, maintenance |
 
 ## Adding an update
 

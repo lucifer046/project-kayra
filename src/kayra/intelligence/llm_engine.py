@@ -11,6 +11,7 @@ Cloud Chat Priority: Groq (primary) -> Gemini (fallback on quota/rate-limit)
 DMM: Cohere Command-R (cloud) or local model (offline)
 """
 
+import re
 import time
 import socket
 import requests
@@ -159,6 +160,63 @@ def _attempt_timeout_seconds(budget_left=None):
     if budget_left is not None:
         timeout = min(timeout, max(0.05, float(budget_left)))
     return timeout
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                 THE FAST PATH: commands that ARE their token           │
+# └────────────────────────────────────────────────────────────────────────┘
+# "pause", "next tab", "volume 40": the whole utterance already IS the token the classifier
+# would emit, so asking a model costs a round-trip (~0.4 s local, ~0.7 s cloud) to be told what
+# was said. The rule that keeps this safe is the one the local control vocabulary uses: the
+# match is EXACT on the WHOLE utterance (name and "please" removed), never a prefix or a
+# substring — so "pause" is here and "pause for a second and tell me a joke" is not, and
+# "stop the music" still reaches the model. Words that are also ordinary conversation on their
+# own ("search", "save", "print", "find", "enter", "restore", "battery") are deliberately
+# absent, as are the broad closes. `DMM_FAST_PATH=off` disables it.
+_FAST_COMMANDS = frozenset({
+    "pause", "resume", "next track", "previous track",
+    "new tab", "close tab", "next tab", "previous tab", "reopen tab", "duplicate tab",
+    "go back", "go forward", "refresh", "reload",
+    "maximize", "minimize", "minimize all", "show desktop", "snap left", "snap right",
+    "close window", "switch window", "alt tab", "task view", "fullscreen",
+    "zoom in", "zoom out", "reset zoom",
+    "undo", "redo", "select all", "copy", "paste", "cut",
+    "read clipboard", "clear clipboard",
+    "take screenshot", "screenshot", "scroll up", "scroll down",
+    "cancel timer", "list timers", "wifi on", "wifi off",
+})
+_FAST_PATTERNS = (
+    (re.compile(r"^(?:set )?(?:the )?volume (?:to )?(\d{1,3})(?: percent)?$"), "system volume {0}"),
+    (re.compile(r"^(?:set )?(?:the )?brightness (?:to )?(\d{1,3})(?: percent)?$"), "system brightness {0}"),
+    (re.compile(r"^mute$"), "system mute"),
+    (re.compile(r"^unmute$"), "system unmute"),
+)
+
+
+def _fast_path_enabled(engine):
+    value = str((getattr(engine, "env_vars", None) or {}).get("DMM_FAST_PATH", "on"))
+    return value.strip().lower() not in ("0", "off", "false", "no", "disabled")
+
+
+def fast_intent(text, assistant_name=""):
+    """The token for an utterance that is itself a complete command, else None. No model."""
+    cleaned = re.sub(r"[^\w\s%]", " ", str(text or "").lower()).replace("%", " percent")
+    words = cleaned.split()
+    name = str(assistant_name or "").lower().strip()
+    words = [w for w in words if w != "please" and (not name or w != name)]
+    while words and words[0] in ("hey", "ok", "okay"):
+        words.pop(0)
+    if not words or len(words) > 6:
+        return None
+    cleaned = " ".join(words)
+    if cleaned in _FAST_COMMANDS:
+        return cleaned
+    for pattern, template in _FAST_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            return template.format(*match.groups())
+    return None
+
 
 
 class CentralizedLLMEngine:
@@ -1044,6 +1102,12 @@ class CentralizedLLMEngine:
                   f"cancelled: superseded by turn #{logbus.latest_turn()}")
             return []
 
+        if not retries and _fast_path_enabled(self):
+            token = fast_intent(prompt, (getattr(self, "env_vars", None) or {}).get("ASSISTANT_NAME", "Kayra"))
+            if token:
+                debug(Subsystem.DMM, f"fast path: {token}")
+                return [token]
+
         if not self.is_online and self._local_unhealthy():
             # The model has answered nothing for several requests running. Five more attempts
             # cannot change that, and the user is waiting.
@@ -1300,12 +1364,24 @@ class CentralizedLLMEngine:
                 client = client.with_options(timeout=timeout)
             except Exception:
                 client = self.local_client
-        response = client.chat.completions.create(
-            model=self.local_decision_model,
-            messages=self._dmm_messages(prompt),
-            temperature=0.1,
-            max_tokens=128,
-        )
+        # THINKING OFF. The DMM answers with a handful of tokens; a thinking model (Qwen 3.x,
+        # Gemma 4) that reasons first can spend the whole 128-token budget on hidden reasoning
+        # and return EMPTY content, which is the retry storm above. Measured on gemma-4-e4b the
+        # few-shot prompt already suppresses thinking (3-9 output tokens, ~0.4 s warm), so this
+        # costs nothing there and is what keeps a heavier thinking model on the same contract.
+        # A server that rejects the field is asked once more without it, and remembered.
+        request = dict(model=self.local_decision_model, messages=self._dmm_messages(prompt),
+                       temperature=0.1, max_tokens=128)
+        if getattr(self, "_local_no_think", True):
+            try:
+                response = client.chat.completions.create(
+                    extra_body={"reasoning_effort": "none"}, **request)
+                return response.choices[0].message.content
+            except Exception as e:
+                if "reasoning" not in str(e).lower() and type(e).__name__ != "BadRequestError":
+                    raise
+                self._local_no_think = False
+        response = client.chat.completions.create(**request)
         return response.choices[0].message.content
 
     # ┌────────────────────────────────────────────────────────────────────────┐

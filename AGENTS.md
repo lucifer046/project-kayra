@@ -6,7 +6,8 @@ this repository. Read this first; follow the links when you need depth.
 | You need | Read |
 |---|---|
 | Rules, conventions, what not to touch | **this file** |
-| Every subtle gotcha, with the bug that taught it | [`CLAUDE.md`](CLAUDE.md) (long; search it) |
+| The always-needed context: data flow, cross-platform rules, imports, paths, module map | [`CLAUDE.md`](CLAUDE.md) (short; loaded every session) |
+| Every subtle gotcha of ONE subsystem, with the bug that taught it | [`docs/reference/`](docs/reference/) — indexed at the top of `CLAUDE.md`; read the one you are changing |
 | How the system fits together | [`docs/architecture/OVERVIEW.md`](docs/architecture/OVERVIEW.md) → [`SYSTEM_DESIGN.md`](docs/architecture/SYSTEM_DESIGN.md) |
 | Startup / turn / shutdown sequence | [`docs/architecture/EXECUTION_FLOW.md`](docs/architecture/EXECUTION_FLOW.md) |
 | What each module owns | [`docs/architecture/MODULES.md`](docs/architecture/MODULES.md) |
@@ -184,7 +185,8 @@ suite does not mean the UI looks right; render it. See `tests/TESTING.md`.
 
 ## Before you finish a change
 
-- Update the doc that describes what you changed (this file, `CLAUDE.md`, or `docs/…`).
+- Update the doc that describes what you changed (this file, the matching `docs/reference/*.md`,
+  or `docs/…`). `CLAUDE.md` is loaded into every session: keep it short, put detail in a reference.
 - For a major feature, security fix, dependency or breaking change, add the next
   `updates/UPDATE_V<n>.md` report and its row in `updates/README.md` (format described there).
 - Run the unit tier on your platform and say which platform/Python you ran it on.

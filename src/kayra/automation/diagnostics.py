@@ -391,16 +391,30 @@ def scope_for(text):
 # └────────────────────────────────────────────────────────────────────────┘
 
 LAST = {"findings": [], "fixes": [], "report": None, "scope": None}
+PARALLEL = True         # probes side by side; a test rig that asserts call ORDER switches it off
 
 
 def run(scope="full"):
-    findings = []
-    for probe in SCOPES.get(scope, SCOPES["full"]):
+    probes = list(SCOPES.get(scope, SCOPES["full"]))
+
+    def one(probe):
         try:
-            findings.extend(probe())
+            return list(probe())
         except Exception as e:             # one broken probe must not sink the diagnosis
-            findings.append(Finding(probe.__name__.replace("probe_", ""), WARN,
-                                    f"could not check ({type(e).__name__})"))
+            return [Finding(probe.__name__.replace("probe_", ""), WARN,
+                            f"could not check ({type(e).__name__})")]
+
+    # The probes are independent reads (a ping, the journal, the package database, sysfs), and
+    # nearly all of the time is spent WAITING on them. Side by side the diagnosis takes as long
+    # as the slowest probe rather than the sum; results keep the probes' declared order.
+    if PARALLEL and len(probes) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(6, len(probes)),
+                                thread_name_prefix="kayra-probe") as pool:
+            results = list(pool.map(one, probes))
+    else:
+        results = [one(probe) for probe in probes]
+    findings = [finding for group in results for finding in group]
     findings.sort(key=lambda f: _RANK[f.level])
     fixes = [f.fix for f in findings if f.fix is not None]
     LAST.update(findings=findings, fixes=fixes, scope=scope)

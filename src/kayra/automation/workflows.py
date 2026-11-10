@@ -476,13 +476,33 @@ def _snapshot():
             "online": diagnostics.default_gateway() is not None}
 
 
+_TRIGGER_CACHE = {"stamp": None, "data": []}
+
+
+def _load_triggers_cached():
+    """The trigger list, re-read from disk only when the file changed (mtime + size). The
+    watcher asks every 20 s; with no change that is one `stat`, not an open + JSON parse."""
+    try:
+        info = os.stat(_data(TRIGGER_FILE))
+        stamp = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        _TRIGGER_CACHE.update(stamp=None, data=[])
+        return []
+    if stamp != _TRIGGER_CACHE["stamp"]:
+        _TRIGGER_CACHE.update(stamp=stamp, data=_load(TRIGGER_FILE, []))
+    return json.loads(json.dumps(_TRIGGER_CACHE["data"]))      # callers mutate their copy
+
+
 def evaluate_triggers(now=None, snapshot=None):
     """Fires every trigger whose condition is met. Returns the spoken lines. Watcher-called."""
     now = now or time.time()
-    triggers = _load(TRIGGER_FILE, [])
+    triggers = _load_triggers_cached()
     if not triggers:
         return []
     snapshot = snapshot if snapshot is not None else _snapshot()
+    for trigger in triggers:
+        trigger.setdefault("state", {})        # the evaluator adds it; not a change by itself
+    before = json.dumps(triggers, sort_keys=True, default=str)
     fired, keep = [], []
     for trigger in triggers:
         met = _condition_met(trigger, now, snapshot)
@@ -494,7 +514,10 @@ def evaluate_triggers(now=None, snapshot=None):
                 keep.append(trigger)
         else:
             keep.append(trigger)
-    _save(TRIGGER_FILE, keep)
+    # Written only when something actually changed (a trigger fired, or its remembered state
+    # moved). This used to rewrite the file every 20 s for as long as any trigger existed.
+    if json.dumps(keep, sort_keys=True, default=str) != before:
+        _save(TRIGGER_FILE, keep)
     lines = []
     for trigger in fired:
         lines.append(_fire(trigger))
@@ -600,17 +623,25 @@ def briefing():
     L = _L()
     now = datetime.datetime.now()
     facts = [f"Time: {now:%A %d %B, %-I:%M %p}"]
-    sky = weather()
-    if sky:
-        facts.append(f"Weather: {sky}")
+    # The weather is a network call (up to 4 s); it runs while Chrome is being asked about the
+    # calendar and the inbox. Those two stay in sequence: they drive the same browser.
+    sky_box = []
+    sky_thread = threading.Thread(target=lambda: sky_box.append(weather()),
+                                  name="kayra-weather", daemon=True)
+    sky_thread.start()
+    browser_facts = []
     if web_macros.BRIDGE.connected():
         try:
             agenda = web_macros.calendar_agenda("today")
-            facts.append(f"Calendar: {agenda.message}")
+            browser_facts.append(f"Calendar: {agenda.message}")
             mail = web_macros.email_check()
-            facts.append(f"Email: {mail.message}")
+            browser_facts.append(f"Email: {mail.message}")
         except Exception:
             pass
+    sky_thread.join(5.0)
+    if sky_box and sky_box[0]:
+        facts.append(f"Weather: {sky_box[0]}")
+    facts.extend(browser_facts)
     facts.append(L.battery_sentence())
     findings = diagnostics.probe_crashes(days=1) + diagnostics.probe_disk()[:2]
     issues = [f.text for f in findings if f.level != diagnostics.OK]

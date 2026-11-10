@@ -564,23 +564,32 @@ def _performance_findings(profile):
                        "Kayra's own footprint is roughly 470MB with the speech session up.",
                        advice))
 
-    # Speech synthesis is the single biggest latency item, and it is CPU-bound. The quantized
-    # model is the one change that measurably improves it, so it is reported as a performance
-    # fact rather than buried in configuration.
+    # Speech synthesis used to be the single biggest latency item. Which FILE is installed
+    # decides it: the float graphs synthesize ~5x faster than real time on a processor and
+    # ~25x on an NVIDIA GPU, the quantized int8 graph at roughly real time on either (measured;
+    # see `output.text_to_speech.VOICE_MODELS`). Sizes tell the files apart without loading one.
     from kayra.core.paths import model_path
-    quantized = os.path.isfile(model_path("kokoro-v1.0.int8.onnx"))
-    full = os.path.isfile(model_path("kokoro.onnx"))
-    if quantized:
-        verdict, summary, advice = READY, "Quantized model installed", ""
-    elif full:
-        verdict, summary = GOOD, "Full-precision model"
-        advice = ("Installing the quantized 'kokoro-v1.0.int8.onnx' and 'voices-v1.0.bin' pair "
-                  "into models/ measurably reduces the delay before Kayra starts speaking.")
+
+    def _size(name):
+        try:
+            return os.path.getsize(model_path(name))
+        except OSError:
+            return 0
+    fast = _size("kokoro-v1.0.fp16.onnx") or _size("kokoro-v1.0.onnx")
+    slow = _size("kokoro-v1.0.int8.onnx") or _size("kokoro.onnx")
+    if fast:
+        verdict, summary, advice = READY, "Fast (float) model installed", ""
+        detail = "Synthesis runs several times faster than real time."
+    elif slow:
+        verdict, summary = GOOD, "Quantized model"
+        detail = "Synthesis runs at roughly real time."
+        advice = ("Run setup.py to fetch 'kokoro-v1.0.fp16.onnx' into models/: replies start "
+                  "about five times sooner on the processor and far sooner on an NVIDIA GPU.")
     else:
         verdict, summary, advice = NOT_AVAILABLE, "No speech model found", \
             "Place a Kokoro ONNX model in models/ to enable spoken replies."
-    out.append(Finding("Speech synthesis model", verdict, summary,
-                       "Synthesis runs on the CPU at roughly real time.", advice))
+        detail = "Spoken replies are unavailable."
+    out.append(Finding("Speech synthesis model", verdict, summary, detail, advice))
 
     # VENDOR-NEUTRAL. The detail line states what was measured about whatever adapter is
     # actually present — an AMD or Intel machine is described in its own terms rather than

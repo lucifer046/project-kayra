@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import Checker, EnvironmentGuard, describe_host, run  # noqa: E402
 from test_linux_automation import (FakeHyprland, RecordingRunner, client,  # noqa: E402
                                    ALL_TOOLS, with_desktop_tree)
-from test_assistant_automation import FakeBridge, WebRig  # noqa: E402
+from test_assistant_automation import FakeBridge, Models, WebRig  # noqa: E402
 
 from kayra.utils import print_banner, print_info  # noqa: E402
 from kayra.automation import (ai, common, linux, linux_apps, sites, targets,  # noqa: E402
@@ -477,6 +477,149 @@ def section_understanding():
     check("every catalog example the model is shown is a real command", not unknown, unknown)
 
 
+def section_tuning():
+    check.section("[8b] Tuning pass (2026-11-10): no model, no clock, no churn where none is needed")
+    import tempfile
+    import time as _time
+    from kayra.intelligence import llm_engine
+    from kayra.automation import browser_bridge, workflows
+
+    # ── the classifier's exact-command fast path ──
+    fast = llm_engine.fast_intent
+    check("every fast-path literal is a token the classifier may emit AND the parser understands",
+          all(n(c) is not None for c in llm_engine._FAST_COMMANDS))
+    for said, token in (("Pause.", "pause"), ("Kayra, next tab please", "next tab"),
+                        ("volume 40", "system volume 40"), ("Set the volume to 70%", "system volume 70"),
+                        ("brightness 30", "system brightness 30"), ("mute", "system mute")):
+        check(f"fast path: {said!r} -> {token!r}", fast(said, "Kayra") == token and n(token) is not None,
+              str(fast(said, "Kayra")))
+    for said in ("stop the music", "pause for a second and tell me a joke", "copy that", "search",
+                 "stop", "undo that", "exit", "close everything", "close all", "save", "print",
+                 "what is a tab", "open chrome", "volume", "go to sleep", ""):
+        check(f"fast path leaves {said!r} to the model", fast(said, "Kayra") is None)
+    check("no power, lifecycle or broad-close word can come from the fast path",
+          not any(re.search(r"shut|restart|sleep|exit|close all|close everything|delete|power", c)
+                  for c in llm_engine._FAST_COMMANDS))
+
+    class Engine:                                   # classify_intent on a stub: no model exists
+        env_vars = {}
+        is_online = False
+    check("classify_intent answers a complete command without touching a model",
+          llm_engine.CentralizedLLMEngine.classify_intent(Engine(), "Next tab.") == ["next tab"])
+    Engine.env_vars = {"DMM_FAST_PATH": "off"}
+    check("DMM_FAST_PATH=off switches it off", not llm_engine._fast_path_enabled(Engine()))
+
+    # ── readiness instead of fixed pauses ──
+    tries = []
+    check("_until returns the first truthy attempt at once",
+          web_macros._until(lambda: (tries.append(1), "ok")[1], 2.5) == "ok" and len(tries) == 1)
+    saved_sleep, naps, tries = web_macros.SLEEP, [], []
+    web_macros.SLEEP = naps.append
+    try:
+        got = web_macros._until(lambda: (tries.append(1), len(tries) >= 3)[1], 2.5)
+        check("_until retries in short polls until ready", got is True and naps == [0.25, 0.25], str(naps))
+        naps.clear()
+        check("_until gives up after its budget, counted in attempts",
+              not web_macros._until(lambda: None, 1.0) and len(naps) == 4, str(naps))
+
+        def navigating():
+            raise browser_bridge.BridgeError("frame was detached")
+        check("a page that is mid-navigation is retried, not fatal",
+              web_macros._until(navigating, 0.5) is None)
+    finally:
+        web_macros.SLEEP = saved_sleep
+    source = open(web_macros.__file__).read()
+    pauses = re.findall(r"SLEEP\((\d+(?:\.\d+)?)\)", source)
+    check("the only fixed pauses left are the two OS share-picker waits in meet_share",
+          sorted(pauses) == ["1.0", "1.0", "1.5", "1.5"], str(pauses))
+    with WebRig(Bridge(version="1.2.1")) as rig, Models("Two new emails."):
+        rig.do("email read my emails")
+        waited = [a for c, a in rig.bridge.calls if c == "page.waitFor"]
+        check("reading the inbox waits for the message list", any(a.get("selector") == "tr.zA" for a in waited),
+              str(waited))
+
+    # ── learned sites are never read or written under a substituted lookup ──
+    with Results([{"url": "https://www.swiggy.com/", "title": "Swiggy"}]):
+        check("a test rig's lookup neither recalls nor remembers",
+              web_macros.recall_site("swiggy") is None
+              and web_macros.remember_site("swiggy", "https://www.swiggy.com/") is False)
+    saved_path, saved_top = web_macros._learned_path, web_macros.TOP_RESULTS
+    with tempfile.TemporaryDirectory() as folder:
+        web_macros._learned_path = lambda: os.path.join(folder, "learned_sites.json")
+        web_macros.TOP_RESULTS = web_macros._ddgs_top
+        try:
+            check("a result whose host carries the name is remembered",
+                  web_macros.remember_site("Swiggy", "https://www.swiggy.com/restaurants")
+                  and web_macros.recall_site("swiggy") == "https://swiggy.com/")
+            check("a first-result guess on some other host is not",
+                  web_macros.remember_site("swiggy", "https://en.wikipedia.org/wiki/Swiggy") is False)
+        finally:
+            web_macros._learned_path, web_macros.TOP_RESULTS = saved_path, saved_top
+
+    # ── the bridge ──
+    mask, payload = b"\x11\x22\x33\x44", bytes(range(256)) * 3 + b"xyz"
+    slow = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    check("frame unmasking matches the per-byte definition (and handles empty)",
+          browser_bridge._unmask(payload, mask) == slow and browser_bridge._unmask(b"", mask) == b"")
+    check("the accept loop has no polling timeout",
+          "settimeout(1.0)" not in open(browser_bridge.__file__).read())
+    saved_bridge, saved_flag = web_macros.BRIDGE, web_macros._REFRESHED["done"]
+    try:
+        web_macros._REFRESHED["done"] = False
+        web_macros.BRIDGE = old = Bridge(version="1.2.0")
+        check("an out-of-date extension is reloaded once when it says hello",
+              web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
+              and not web_macros.refresh_stale_extension())
+        web_macros._REFRESHED["done"] = False
+        web_macros.BRIDGE = current = Bridge(version="1.2.1")
+        check("a current one is left alone",
+              not web_macros.refresh_stale_extension() and not current.calls)
+    finally:
+        web_macros.BRIDGE, web_macros._REFRESHED["done"] = saved_bridge, saved_flag
+
+    # ── the watcher writes the trigger file only when something changed ──
+    saved_data, saved_cache = workflows._data, dict(workflows._TRIGGER_CACHE)
+    with tempfile.TemporaryDirectory() as folder:
+        workflows._data = lambda name: os.path.join(folder, name)
+        workflows._TRIGGER_CACHE.update(stamp=None, data=[])
+        try:
+            far = _time.time() + 3600
+            workflows._save(workflows.TRIGGER_FILE, [{"condition": {"type": "after", "due": far},
+                                                      "tokens": ["say stretch"], "created": 0}])
+            path = os.path.join(folder, workflows.TRIGGER_FILE)
+            before = os.stat(path).st_mtime_ns
+            for _ in range(3):
+                workflows.evaluate_triggers(snapshot={})
+            check("three idle ticks do not rewrite triggers.json", os.stat(path).st_mtime_ns == before)
+            lines = workflows.evaluate_triggers(now=far + 1, snapshot={})
+            check("a trigger that fires is removed from the file",
+                  json.load(open(path)) == [] and lines, str(lines))
+        finally:
+            workflows._data = saved_data
+            workflows._TRIGGER_CACHE.update(saved_cache)
+
+    # ── the app index re-parses only when a folder changed ──
+    with tempfile.TemporaryDirectory() as folder:
+        index, loads = linux_apps._Index(), []
+        real_load, real_dirs = index._load, linux_apps.application_dirs
+        index._load = lambda dirs=None: (loads.append(1), real_load(dirs))[1]
+        linux_apps.application_dirs = lambda environ=None: [folder]
+        try:
+            index.ensure(); index.ensure()
+            index._checked_at = 0.0
+            index.ensure()
+            check("an unchanged folder is stat-ed, not re-parsed", len(loads) == 1, str(loads))
+            with open(os.path.join(folder, "new.desktop"), "w") as handle:
+                handle.write("[Desktop Entry]\nType=Application\nName=New App\nExec=newapp\n")
+            os.utime(folder, ns=(_time.time_ns() + 10**9, _time.time_ns() + 10**9))
+            index._checked_at = 0.0
+            index.ensure()
+            check("installing an app is picked up on the next lookup",
+                  len(loads) == 2 and index.by_name("new app") is not None, str(loads))
+        finally:
+            linux_apps.application_dirs = real_dirs
+
+
 def main():
     print_banner("BROWSER CONTROL (round 5)")
     print_info(f"Host: {describe_host()}")
@@ -488,6 +631,7 @@ def main():
         section_extension_versions()
         section_app_windows()
         section_understanding()
+        section_tuning()
     check.section("[9] The suite has no side effects")
     check("nothing the developer owns was modified", not guard.modified(), guard.report())
     return check.finish()

@@ -1385,34 +1385,90 @@ def _has_chat_key(env):
 # │                     7. MODEL ASSETS                                    │
 # └────────────────────────────────────────────────────────────────────────┘
 
+FAST_VOICE_FILE = "kokoro-v1.0.fp16.onnx"
+FAST_VOICE_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+                  "model-files-v1.0/kokoro-v1.0.fp16.onnx")
+FAST_VOICE_SHA256 = "c1610a859f3bdea01107e73e50100685af38fff88f5cd8e5c56df109ec880204"
+FAST_VOICE_BYTES = 177_464_787
+VOICE_MODEL_FILES = (FAST_VOICE_FILE, "kokoro-v1.0.onnx", "kokoro-v1.0.int8.onnx", "kokoro.onnx")
+VOICE_DATA_FILES = ("voices-v1.0.bin", "voices.bin")
+
+
+def _sha256(path):
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_fast_voice_model():
+    """
+    Fetches the half-precision Kokoro graph (177 MB) into models/. True when it is installed.
+    The file is written beside its target as `.part`, checked against a pinned SHA-256, and
+    only then renamed — so an interrupted download or a captive-portal page is never loaded.
+    """
+    import urllib.request
+    target = os.path.join(MODELS_DIR, FAST_VOICE_FILE)
+    partial = target + ".part"
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    try:
+        with urllib.request.urlopen(FAST_VOICE_URL, timeout=60) as response, \
+                open(partial, "wb") as handle:
+            shutil.copyfileobj(response, handle)
+        if _sha256(partial) != FAST_VOICE_SHA256:
+            raise ValueError("the download does not match the expected file")
+        os.replace(partial, target)
+    except Exception as exc:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        fail(f"Could not download {FAST_VOICE_FILE}: {type(exc).__name__}: {exc}")
+        info(f"    Download manually: {FAST_VOICE_URL}  ->  models/{FAST_VOICE_FILE}")
+        return False
+    ok(f"Downloaded {FAST_VOICE_FILE}.")
+    return True
+
+
 def check_models():
     """
-    Reports which speech model files are present.
+    Reports which speech model files are present, and offers the fast one when it is missing.
 
-    Nothing is downloaded automatically: these are hundreds of megabytes, and a setup script
-    that silently pulls that much data over someone's connection is not being helpful.
+    WHICH FILE IS FAST was measured on the reference laptop (2026-11-10) and is the opposite of
+    what this script said for months: the float graphs synthesize ~5x faster than real time on
+    a processor and ~25x on an NVIDIA GPU, while the quantized int8 graph runs at roughly real
+    time on either. `models/kokoro.onnx` as shipped in the repository IS that int8 file.
+
+    A 177 MB download is asked about, never taken silently.
     """
     step("Checking speech model assets")
-    if not os.path.isdir(MODELS_DIR):
-        warn(f"models/ does not exist ({MODELS_DIR}).")
+    present = [name for name in VOICE_MODEL_FILES
+               if os.path.isfile(os.path.join(MODELS_DIR, name))]
+    voices = any(os.path.isfile(os.path.join(MODELS_DIR, name)) for name in VOICE_DATA_FILES)
+
+    if voices and (FAST_VOICE_FILE in present or "kokoro-v1.0.onnx" in present):
+        ok("Fast Kokoro model present (float graph).")
+        return "fast"
+    if not voices:
+        fail("No Kokoro voice data (voices-v1.0.bin) found in models/.")
         _print_model_help()
         return "missing"
 
-    quantized = (os.path.join(MODELS_DIR, "kokoro-v1.0.int8.onnx"),
-                 os.path.join(MODELS_DIR, "voices-v1.0.bin"))
-    full = (os.path.join(MODELS_DIR, "kokoro.onnx"),
-            os.path.join(MODELS_DIR, "voices.bin"))
-
-    if all(os.path.exists(p) for p in quantized):
-        ok("Quantized Kokoro model present (fastest speech synthesis).")
+    if present:
+        ok("Quantized Kokoro model present.")
+        warn("It synthesizes at roughly real time. The half-precision model is about 5x "
+             "faster on the processor and 25x on an NVIDIA GPU.")
+    else:
+        warn("No Kokoro model found in models/.")
+    info(f"    {FAST_VOICE_FILE} is {FAST_VOICE_BYTES // 1_000_000} MB, from the kokoro-onnx "
+         "releases on GitHub.")
+    if ask_yes_no("Download it now for fast speech?", default=True) \
+            and download_fast_voice_model():
+        return "fast"
+    if present:
         return "quantized"
-    if all(os.path.exists(p) for p in full):
-        ok("Full-precision Kokoro model present.")
-        warn("The quantized model (kokoro-v1.0.int8.onnx + voices-v1.0.bin) synthesizes "
-             "several times faster at effectively identical quality.")
-        _print_model_help()
-        return "full"
-
     fail("No usable Kokoro voice model found in models/.")
     _print_model_help()
     return "missing"
@@ -1482,7 +1538,7 @@ def ensure_hand_model(python_exe):
 
 def _print_model_help():
     info("    Download from: https://github.com/thewh1teagle/kokoro-onnx/releases")
-    info("    Place kokoro-v1.0.int8.onnx and voices-v1.0.bin into models/")
+    info("    Place kokoro-v1.0.fp16.onnx and voices-v1.0.bin into models/")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1957,7 +2013,7 @@ def main():
         "local_llm": "available" if local_available else "not running (cloud path)",
         "cloud": cloud_text,
         "cloud_ok": cloud_ok,
-        "models": {"quantized": "quantized (fast)", "full": "full precision",
+        "models": {"fast": "float graph (fast)", "quantized": "quantized (real-time speed)",
                    "missing": "MISSING"}[model_state],
         "models_ok": model_state != "missing",
         "tts_device": ("GPU ready (CUDAExecutionProvider verified)"

@@ -533,7 +533,8 @@ def has_tts_model():
     try:
         from kayra.core.paths import model_path
         return any(os.path.isfile(model_path(name))
-                   for name in ("kokoro-v1.0.int8.onnx", "kokoro.onnx"))
+                   for name in ("kokoro-v1.0.fp16.onnx", "kokoro-v1.0.onnx",
+                               "kokoro-v1.0.int8.onnx", "kokoro.onnx"))
     except Exception:
         return False
 

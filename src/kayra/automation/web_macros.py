@@ -40,7 +40,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 2, 0)
+REQUIRED_VERSION = (1, 2, 1)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -80,6 +80,25 @@ def _self_update():
     return RELOADED_HINT
 
 
+_REFRESHED = {"done": False}
+
+
+def refresh_stale_extension():
+    """
+    Called when the extension says hello. An extension older than the code in this repository
+    (but new enough to reload itself) is told to reload ONCE per Kayra run, so fixes to the
+    page functions reach the user's Chrome without anyone saying "browser update".
+    """
+    if _REFRESHED["done"] or not ((1, 1, 0) <= _version() < REQUIRED_VERSION):
+        return False
+    _REFRESHED["done"] = True
+    try:
+        BRIDGE.call("runtime.reload", timeout=3.0)
+        return True
+    except Exception:
+        return False
+
+
 def _outdated(minimum=REQUIRED_VERSION):
     """An ActionResult when the connected extension is older than `minimum`, else None."""
     if _version() >= tuple(minimum):
@@ -102,6 +121,30 @@ def _wait_for(timeout_ms=8000, **condition):
     except browser_bridge.BridgeError:
         return False
     return bool(result.get("ok"))
+
+
+POLL_S = 0.25
+
+
+def _until(attempt, timeout_s=2.5):
+    """
+    Readiness by TRYING: runs `attempt()` every POLL_S until it returns something truthy or
+    `timeout_s` has been spent, and returns that value (or the last falsy one). This replaces
+    the fixed pauses that used to sit in front of every click and keystroke: a page that is
+    ready is acted on at once, and a slow one gets longer than the old pause allowed. Counted
+    in attempts, not wall-clock, so a test rig with a no-op SLEEP finishes instantly.
+    """
+    result = None
+    for index in range(max(1, int(timeout_s / POLL_S) + 1)):
+        if index:
+            SLEEP(POLL_S)
+        try:
+            result = attempt()
+        except browser_bridge.BridgeError:
+            result = None                    # the page is navigating; try again
+        if result:
+            return result
+    return result
 
 
 def _need_bridge():
@@ -462,6 +505,63 @@ def _ddgs_top(query, limit=5):
 
 TOP_RESULTS = _ddgs_top                    # the test suite replaces this; no network in tests
 
+# What the web lookup found last time, so "open swiggy" pays the (up to 6 s) lookup ONCE.
+# Only names that resolved to a host carrying the spoken name are remembered — a first-result
+# guess is not a fact worth keeping. Bounded; used only with the real lookup, so a test rig
+# that substitutes TOP_RESULTS neither reads nor writes the user's file.
+LEARNED_SITES_FILE = "learned_sites.json"
+LEARNED_SITES_MAX = 200
+
+
+def _learned_path():
+    from kayra.core.paths import data_path
+    return data_path(LEARNED_SITES_FILE)
+
+
+def _learned_sites():
+    import json
+    try:
+        with open(_learned_path(), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _learned_key(name):
+    return " ".join(str(name or "").lower().split())
+
+
+def recall_site(name):
+    if TOP_RESULTS is not _ddgs_top:
+        return None
+    url = _learned_sites().get(_learned_key(name))
+    return url if isinstance(url, str) and url.startswith("http") else None
+
+
+def remember_site(name, url):
+    if TOP_RESULTS is not _ddgs_top:
+        return False
+    squashed = re.sub(r"[^a-z0-9]", "", _learned_key(name))
+    if not squashed or squashed not in re.sub(r"[^a-z0-9]", "", _host(url)):
+        return False
+    import json
+    import os
+    sites = _learned_sites()
+    sites.pop(_learned_key(name), None)
+    sites[_learned_key(name)] = "https://" + _host(url) + "/"
+    while len(sites) > LEARNED_SITES_MAX:
+        sites.pop(next(iter(sites)))
+    path = _learned_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(sites, handle, indent=1)
+        os.replace(path + ".tmp", path)
+        return True
+    except OSError:
+        return False
+
 
 def best_result(name, results):
     """The result whose HOST carries the spoken name ('swiggy' -> swiggy.com), else the first."""
@@ -483,10 +583,14 @@ def open_site(name, where=None):
         return open_in(url, where, display_name(targets.canonical_website(name)))
     if targets.is_explicit_url(name):
         return open_in(targets.normalize_url(name), where, _host(name))
+    known = recall_site(name)
+    if known:
+        return open_in(known, where, _host(known))
     hit = best_result(name, TOP_RESULTS(name) or [])
     if hit:
         result = open_in(hit["url"], where, _host(hit["url"]))
         if result.ok:
+            remember_site(name, hit["url"])
             result.message = (f"I don't have an app called {name}, so I opened "
                               f"{_host(hit['url'])}, the top web result.")
         return result
@@ -559,14 +663,14 @@ def email_open(which="first", nth=1, query=""):
     _ensure_tab("mail.google.com", GMAIL)
     _focus_chrome()
     result = {}
-    for _attempt in range(3):              # the list may still be rendering after a switch
+    for _attempt in range(12):             # the list may still be rendering after a switch
         try:
             result = _call("gmail.open", which=which, nth=nth, query=query) or {}
         except browser_bridge.BridgeError as e:
             return ActionResult.failure(str(e))
         if result.get("opened") or "visible" not in str(result.get("reason", "")):
             break
-        SLEEP(1.0)
+        SLEEP(POLL_S)
     if not result.get("opened"):
         if query:
             return ActionResult.not_found(f"I don't see an email from or about {query} here.")
@@ -612,7 +716,9 @@ def email_read(sender="latest", which=None, nth=1, query=""):
             opened = email_open(which, nth, query)
             if not opened.ok:
                 return opened
-            SLEEP(2.0)
+            # The opened message, not a fixed pause. Gmail marks every rendered message with
+            # `data-message-id`; if that ever changes this costs what the old pause did.
+            _wait_for(selector="[data-message-id]", timeout_ms=2500)
         page = _page_text(12000)
         text = page.get("text", "")
         spoken = ai.summarize(
@@ -622,7 +728,7 @@ def email_read(sender="latest", which=None, nth=1, query=""):
             text[:12000], fallback=" ".join(text.split())[:700] or "The email is open.")
         return ActionResult.success(spoken)
     _ensure_tab("mail.google.com", GMAIL)
-    SLEEP(1.5)
+    _wait_for(selector="tr.zA", timeout_ms=2500)
     page = _page_text(8000)
     focus = "" if sender in ("latest", "inbox", "", None) else f" Only mention emails from {sender}."
     spoken = ai.summarize(
@@ -671,7 +777,7 @@ def calendar_agenda(day="today"):
         _call("tabs.navigate", url=url, wait=True, timeoutMs=20000, timeout=25.0)
     except browser_bridge.BridgeError:
         _call("tabs.open", url=url, wait=True, timeoutMs=20000, timeout=25.0)
-    SLEEP(1.5)
+    _wait_for(selector="[role=main] [role=grid], [role=main] [role=gridcell]", timeout_ms=2500)
     page = _page_text(6000)
     spoken = ai.summarize(
         f"You are Kayra reading the user's Google Calendar day view for {day}. In at most 4 "
@@ -727,8 +833,7 @@ def calendar_add(text):
            f"&text={quote_plus(title)}&dates={when:%Y%m%dT%H%M%S}/{end:%Y%m%dT%H%M%S}")
     if BRIDGE.connected():
         _call("tabs.open", url=url, wait=True, timeoutMs=20000, timeout=25.0)
-        SLEEP(2.0)
-        saved = (_call("page.click", text="Save", nth=1) or {}).get("clicked")
+        saved = _until(lambda: (_call("page.click", text="Save", nth=1) or {}).get("clicked"), 4.0)
         if saved:
             return ActionResult.success(f"Added {title} on {when:%A} at {when:%-I:%M %p}.")
     else:
@@ -748,14 +853,15 @@ def message_send(contact, text):
     if not contact or not text:
         return ActionResult.failure("Who should I message, and what should I say?")
     _ensure_tab("web.whatsapp.com", "https://web.whatsapp.com/")
-    SLEEP(3.0)
-    if not (_call("page.type", field="search", text=contact, clear=True) or {}).get("typed"):
+    # Each step is tried until the page is ready for it (WhatsApp can take ten seconds to load
+    # and under one when it is already open) instead of pausing 3 + 1.5 + 1 seconds every time.
+    if not _until(lambda: (_call("page.type", field="search", text=contact, clear=True)
+                           or {}).get("typed"), 10.0):
         return ActionResult.failure("WhatsApp isn't ready. Is it logged in?")
-    SLEEP(1.5)
-    if not (_call("page.click", text=contact, nth=1) or {}).get("clicked"):
+    if not _until(lambda: (_call("page.click", text=contact, nth=1) or {}).get("clicked"), 4.0):
         return ActionResult.not_found(f"I couldn't find {contact} in WhatsApp.")
-    SLEEP(1.0)
-    typed = _call("page.type", field="type a message", text=text, submit=True) or {}
+    typed = _until(lambda: (lambda r: r if r.get("typed") else None)(
+        _call("page.type", field="type a message", text=text, submit=True) or {}), 3.0) or {}
     if not typed.get("typed"):
         return ActionResult.failure("I opened the chat but couldn't type the message.")
     return ActionResult.success(f"Sent to {contact}.")
@@ -794,10 +900,9 @@ def meet_join(code="new"):
     else:
         url = code if code.startswith("http") else f"https://meet.google.com/{code}"
     _call("tabs.open", url=url, wait=True, timeoutMs=25000, timeout=30.0)
-    SLEEP(3.0)
     if code in ("new", "", None):
         return ActionResult.success("I've started a new meeting.")
-    if _click_first(_MEET_LABELS["join"]):
+    if _until(lambda: _click_first(_MEET_LABELS["join"]), 6.0):
         return ActionResult.success("Joining the meeting.")
     return ActionResult.success("The meeting is open. Say \"meet join\" again when the Join "
                                 "button appears.")

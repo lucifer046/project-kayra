@@ -106,7 +106,9 @@ have yet, it sends `runtime.reload` (Chrome re-reads this folder) and says *"I'v
 the Kayra Bridge extension…"* — ask again a few seconds later. You can also say **"browser
 update"**. Only a 1.0.x extension needs the manual **reload arrow** on `chrome://extensions`.
 
-Current version: **1.2.0** (adds `tabs.open` with `where`, and `page.waitFor`).
+Current version: **1.2.1** (1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
+click matching and `page.waitFor` cheaper — no new commands). An older 1.1.0+ extension is
+reloaded automatically, once, when it connects.
 
 ## How "share my entire screen" works
 

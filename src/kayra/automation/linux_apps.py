@@ -266,11 +266,19 @@ def parse_desktop_file(path, desktop_id):
 
 
 class _Index:
-    TTL = 300.0
+    # The index used to be thrown away and re-parsed (a recursive glob plus every .desktop
+    # file) every five minutes, on whichever "open X" came next. Now the application folders
+    # are STAT-ed — at most once every RECHECK seconds — and re-parsed only when one changed:
+    # installing or removing an app touches its folder. TTL remains as a slow backstop for a
+    # file edited in place, which changes no folder time.
+    TTL = 3600.0
+    RECHECK = 5.0
 
     def __init__(self):
         self._lock = threading.Lock()
         self._loaded_at = 0.0
+        self._checked_at = 0.0
+        self._signature = None
         self._by_id = {}
         self._by_name = {}
         self._by_short = {}
@@ -278,6 +286,7 @@ class _Index:
     def invalidate(self):
         with self._lock:
             self._loaded_at = 0.0
+            self._checked_at = 0.0
 
     def _load(self, dirs=None):
         by_id = {}
@@ -296,11 +305,31 @@ class _Index:
         self._by_id = {k.lower(): v for k, v in by_id.items()}
         self._by_name, self._by_short = by_name, by_short
 
+    @staticmethod
+    def _stamp(dirs):
+        stamp = []
+        for directory in dirs:
+            try:
+                stamp.append((directory, os.stat(directory).st_mtime_ns))
+            except OSError:
+                stamp.append((directory, None))
+        return tuple(stamp)
+
     def ensure(self, dirs=None):
         with self._lock:
-            if dirs is not None or time.monotonic() - self._loaded_at > self.TTL:
+            now = time.monotonic()
+            if dirs is not None:
                 self._load(dirs)
-                self._loaded_at = time.monotonic()
+                self._loaded_at, self._signature = now, None
+                return
+            if self._loaded_at and now - self._checked_at < self.RECHECK:
+                return
+            self._checked_at = now
+            signature = self._stamp(application_dirs())
+            if (not self._loaded_at or signature != self._signature
+                    or now - self._loaded_at > self.TTL):
+                self._load()
+                self._loaded_at, self._signature = now, signature
 
     def by_id(self, desktop_id):
         self.ensure()
