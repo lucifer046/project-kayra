@@ -42,7 +42,7 @@ import json
 from kayra.automation import ai
 
 MAX_COMMANDS = 4
-TIMEOUT_S = 20.0
+TIMEOUT_S = 8.0
 NEVER_FROM_MODEL = frozenset({"shell", "plan", "trigger"})
 _POWER = frozenset({"shutdown", "restart", "sign_out", "sleep", "hibernate", "logout",
                     "reboot", "suspend"})
@@ -97,7 +97,23 @@ Rules:
 - Keep names and text exactly as the person said them. Never invent email addresses, \
 contacts, file names or URLs.
 - Never output shutdown, restart, delete, install, terminal or shell commands.
-- Prefer one command when one is enough."""
+- Prefer one command when one is enough.
+- A factual question or anything to just answer is {{"kind": "chat"}}.
+
+Examples:
+Said: "open PR and outreach core team chat" | in front: web.whatsapp.com
+-> {{"kind": "automation", "commands": ["browser click on PR and outreach core team"]}}
+Said: "open the design team 2026 group" | in front: web.whatsapp.com
+-> {{"kind": "automation", "commands": ["browser click on design team 2026"]}}
+Said: "can you make the tab quiet" | active tab: Lo-fi - YouTube
+-> {{"kind": "automation", "commands": ["browser mute this tab"]}}
+Said: "put google sheets in this tab" | active tab: New Tab
+-> {{"kind": "automation", "commands": ["open google sheets in this tab"]}}
+Said: "who invented the telephone"
+-> {{"kind": "chat"}}
+Said: "open the budget thing"
+-> {{"kind": "ask", "question": "Do you mean a Google Sheet, a Doc or a file called budget?"}}
+Copy names EXACTLY as said, every word ("PR", "and", numbers), minus the words chat/group."""
 
 
 def enabled():
@@ -188,7 +204,9 @@ def interpret(request, situation=None, reason="", normalize=None, classify=None)
         user += f"\nKayra's rules tried and got: {reason}"
     if not ACTIVE:
         return Interpretation("none")
-    raw = ai.complete(_SYSTEM.format(catalog=CATALOG, limit=MAX_COMMANDS), user, timeout=TIMEOUT_S)
+    # Thinking OFF: this is a one-line decision, and a thinking model spends ~85 % of its
+    # time reasoning before it — measured 4 s -> 0.5 s on the reference laptop.
+    raw = ai.fast(_SYSTEM.format(catalog=CATALOG, limit=MAX_COMMANDS), user, timeout=TIMEOUT_S)
     data = _parse(raw)
     if not data:
         return Interpretation("none", raw=raw)
@@ -201,4 +219,9 @@ def interpret(request, situation=None, reason="", normalize=None, classify=None)
         commands = validate(data.get("commands"), normalize, classify)
         if commands:
             return Interpretation("automation", commands, raw=raw)
+        return Interpretation("none", raw=raw)
+    if kind not in ("none", "ask"):
+        # A shape outside the contract ("google search", "answer"…) means the model wanted to
+        # ANSWER something, not run a command: the safe reading is conversation.
+        return Interpretation("chat", raw=raw)
     return Interpretation("none", raw=raw)

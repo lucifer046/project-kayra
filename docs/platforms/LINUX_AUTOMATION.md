@@ -349,7 +349,12 @@ quiet", fell through to *"I couldn't find an app…"*.
 - Verified live with the local model: WhatsApp chat → `browser click on PR and outreach core
   team` (7.2 s), "make this tab quiet" → `browser mute this tab` (3.8 s), "what's a good name
   for my cat" → chat (1.9 s).
-- Tests: `tests/test_browser_control.py` section 8 (scripted fake model): 123 checks.
+- **Speed (same day):** the first version took ~4 s warm (7.2 s cold). Measured: prompt size
+  barely mattered (865 vs 59 tokens: 4.0 vs 3.7 s); ~140 of ~160 output tokens were the
+  model's hidden THINKING. `ai.fast()` calls the local model with thinking off, temperature 0
+  and a 200-token cap, plus worked examples in the prompt: **12/12 correct, median 0.51 s,
+  worst 0.78 s**. Unknown reply shapes are read as chat.
+- Tests: `tests/test_browser_control.py` section 8 (scripted fake model): 130 checks.
 
 ### 2026-11-10 — round 5, part 1: open anything, anywhere, the way you say it
 

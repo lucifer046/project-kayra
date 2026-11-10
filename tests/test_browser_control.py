@@ -242,13 +242,13 @@ def section_opening():
     def apps():
         hypr = FakeHyprland()
         with WebRig(Bridge(), hypr=hypr) as rig:
-            r = rig.do("open whatsapp web")
+            rig.do("open whatsapp web")
             check("'open whatsapp web' launches the WhatsApp web app, not a tab",
                   any("WhatsApp.desktop" in " ".join(a) or "omarchy-launch-webapp" in " ".join(a)
                       for a in rig.runner.spawned)
                   and not rig.bridge.opened(), (rig.runner.spawned, rig.bridge.opened()))
             rig.runner.spawned.clear()
-            r = rig.do("open whatsapp web in the browser")
+            rig.do("open whatsapp web in the browser")
             check("'… in the browser' opens a tab instead",
                   rig.bridge.opened() and not rig.runner.spawned
                   and rig.bridge.opened()[-1][1]["url"] == "https://web.whatsapp.com/",
@@ -438,6 +438,10 @@ def section_understanding():
             check("unknown name: the model is asked FIRST, the web result is the last resort",
                   len(m.prompts) == 1 and rig.bridge.opened()[before:]
                   and rig.bridge.opened()[-1][1]["url"] == "https://www.zzzfoods.in/", spoken)
+        with Model('{"kind": "google search", "queries": ["who invented the telephone"]}'):
+            spoken = run_tokens(["who invented the telephone"])
+            check("a reply outside the contract ('google search') is read as CHAT, nothing opens",
+                  spoken == "" and linux.take_chat_handoff(), spoken)
         with Model("I think you want to open sheets!"):
             spoken = run_tokens(["blorp the glorp"])
             check("a reply that is not JSON proposes nothing", "not sure" in spoken.lower(), spoken)
@@ -450,6 +454,18 @@ def section_understanding():
             run_tokens(["open google sheets", "volume up" if n("volume up") else "pause"])
             check("everything the rules handle never pays for a model call", not m.prompts, m.prompts)
 
+    check("the fast call asks for NO thinking and a deterministic, short answer",
+          '"reasoning_effort": "none"' in open(ai.__file__).read()
+          and "ai.fast(" in open(interpreter.__file__).read())
+    calls = []
+    saved = (ai.TEXT_MODEL, ai.requests if hasattr(ai, "requests") else None)
+    ai.TEXT_MODEL = lambda messages: (calls.append(1), '{"kind": "chat"}')[1]
+    check("with a scripted model the fast path never touches the network",
+          ai.fast("s", "u") == '{"kind": "chat"}' and calls == [1])
+    ai.TEXT_MODEL = saved[0]
+    for line in re.findall(r'-> \{\{"kind": "automation", "commands": \["(.+?)"\]', interpreter._SYSTEM):
+        a = n(line)
+        check(f"the worked example '{line}' is a real command", a is not None and not common._is_guess(a))
     examples = ["open notion in this tab", "google search cats", "browser click on the second reply",
                 "browser type hello into search", "browser search this page for pricing",
                 "browser scroll to pricing", "browser summarize this page", "browser what can i click",

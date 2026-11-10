@@ -235,7 +235,7 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
     via `take_chat_handoff()` → Chatbot) / ask one question / none. Never accepted from it:
     shell, plans, triggers, power, file delete/move/rename. Its own proposals are never
     re-interpreted (one model call per request). Unknown names: rules → model → web result.
-    Only the failure path pays the call. `interpreter.ACTIVE` is switched off by every test
+    Only the failure path pays the call, and it is `ai.fast()`: local model, THINKING OFF (`reasoning_effort: none`), temperature 0 — ~0.5 s instead of ~4 s on gemma-4-e4b, because ~85 % of a thinking model's output there is hidden reasoning. Keep the worked examples in `_SYSTEM`; accuracy without thinking depends on them (12/12 measured). `interpreter.ACTIVE` is switched off by every test
     rig; `AUTOMATION_AI_INTERPRETER=off` disables it. Parse model JSON with `ai.complete`
     (verbatim) — `ai.summarize` strips code fences and used to swallow ```json replies.
   * Every new `system …` phrase sits BEFORE the power needles in `_SYSTEM_VERBS` ("sleep timer",

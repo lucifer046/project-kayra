@@ -63,6 +63,55 @@ def complete(system, user, timeout=DEFAULT_TIMEOUT_S):
     return str(box.get("text") or "")
 
 
+_LOCAL_MODEL = {}
+
+
+def _local_text_model(base_url):
+    """The local model to use for quick decisions: LOCAL_DECISION_MODEL, else the first loaded
+    chat model in LM Studio (never an embedding model). Cached per base URL."""
+    configured = _env("LOCAL_DECISION_MODEL") or _env("LOCAL_CHAT_MODEL")
+    if configured and configured != "local-model":
+        return configured
+    if base_url in _LOCAL_MODEL:
+        return _LOCAL_MODEL[base_url]
+    try:
+        import requests
+        data = requests.get(base_url.rstrip("/") + "/models", timeout=1.0).json()
+        name = next((m["id"] for m in data.get("data", []) if "embed" not in m["id"].lower()), None)
+    except Exception:
+        name = None
+    _LOCAL_MODEL[base_url] = name
+    return name
+
+
+def fast(system, user, timeout=8.0, max_tokens=200):
+    """
+    A quick structured decision: the local model with THINKING OFF, temperature 0, a small
+    output budget. Measured on the reference laptop (gemma-4-e4b): ~0.5 s instead of ~4 s,
+    because ~85 % of a thinking model's output on these one-line answers is hidden reasoning.
+    Falls back to `complete` (the engine's local/cloud chain) when no local server answers.
+    Returns the reply verbatim, or "".
+    """
+    if TEXT_MODEL is not None:                       # the test suite's scripted model
+        return complete(system, user, timeout)
+    base = _env("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1").replace("localhost", "127.0.0.1")
+    model = _local_text_model(base)
+    if model:
+        try:
+            import requests
+            reply = requests.post(base.rstrip("/") + "/chat/completions", timeout=timeout, json={
+                "model": model, "temperature": 0, "max_tokens": max_tokens,
+                "reasoning_effort": "none",
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}]}).json()
+            text = reply["choices"][0]["message"].get("content") or ""
+            if text.strip():
+                return text
+        except Exception:
+            pass
+    return complete(system, user, timeout)
+
+
 def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700):
     """A short spoken answer from a model, or `fallback`. Never raises, never hangs."""
     text = _clean(complete(system, user, timeout))
