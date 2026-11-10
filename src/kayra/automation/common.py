@@ -429,7 +429,7 @@ def RunShellCommand(command, timeout=None):
         print_info(output[:2000])
     if completed.returncode == 0:
         return ActionResult.success("Done.", returncode=0, output_chars=len(output))
-    return ActionResult.failure(f"That finished with an error.", returncode=completed.returncode)
+    return ActionResult.failure("That finished with an error.", returncode=completed.returncode)
 
 
 # ── Screenshot retention ──────────────────────────────────────────────────
@@ -823,6 +823,15 @@ def normalize_command(command, context=None):
     if found is not None:
         return found
 
+    # 1a-fix. Fix round V11: closing a search, a described search, a scroll with a place, and
+    # WhatsApp chats named with "in whatsapp" / "chat" — before the prefix rules misread them.
+    found = _bare_fix(lowered.strip(" .?!"), raw)
+    if found is not None:
+        return found
+    found = _bare_part_6(lowered.strip(" .?!"), raw)      # Part 6, when it can only be that
+    if found is not None:
+        return found
+
     # 1a'. Part 3 phrasings the DMM may send without the `browser` prefix: they are about
     # the page in front, never an app ("translate this page", "bookmark this page").
     if _BARE_PAGE.match(lowered):
@@ -1092,11 +1101,189 @@ def tab_position(text):
     return None
 
 
+# ── Fix round V11: scrolling, one search action, closing a search, WhatsApp by name ──
+# What may be scrolled. "side" = the list on the left (chats, labels); everything else is
+# whatever fills the middle of the view: the open mail, the chat, the page.
+_SCROLL_WHERE = {"chat list": "side", "chats": "side", "sidebar": "side", "side bar": "side", "list": "side",
+                 "menu": "side", "mail": "", "email": "", "message": "", "messages": "", "thread": "",
+                 "chat": "", "conversation": "", "group": "", "inbox": "", "page": "", "sheet": "",
+                 "spreadsheet": "", "doc": "", "document": "", "article": "", "screen": "", "window": "",
+                 "tab": "", "site": "", "website": "", "results": "", "feed": ""}
+_SCROLL_FILLER = frozenset("the this my to of in on a at it here now whole current open one that all way "
+                           "please page just bit little".split())
+_SCROLL_ENDS = ((r"\b(?:very )?(?:top|start|beginning|first message)\b", "top"),
+                (r"\b(?:very )?(?:bottom|end|last message|latest message)\b", "bottom"),
+                (r"\b(?:back )?up(?:wards?)?\b", "up"), (r"\bdown(?:wards?)?\b|\bfurther\b|\bmore\b", "down"))
+
+
+def scroll_request(low):
+    """
+    'scroll the mail to the bottom' -> {"direction": "bottom", "where": "", "amount": 1.0}.
+    None when the words name something to scroll TO ("scroll to pricing"): that is a search
+    of the page, handled by the older rule.
+    """
+    low = low.strip(" .?!")
+    m = re.fullmatch(r"(?:go|jump|take me|move|get)(?: back)? to the (top|bottom|end|start|beginning) of "
+                     r"(?:the|this|my) ([a-z ]+)", low)
+    if m and m.group(2) in _SCROLL_WHERE:
+        return {"direction": "top" if m.group(1) in ("top", "start", "beginning") else "bottom",
+                "where": _SCROLL_WHERE[m.group(2)], "amount": 1.0}
+    m = re.fullmatch(r"(?:please )?(?:can you )?(?:keep )?scroll(?:ing)?\b(.*)", low)
+    if not m:
+        return None
+    rest, direction, amount, where = f" {m.group(1)} ", None, 1.0, ""
+    for pattern, name in _SCROLL_ENDS:
+        if re.search(pattern, rest):
+            direction, rest = name, re.sub(pattern, " ", rest, count=1)
+            break
+    if " all the way " in rest and direction in ("up", "down"):
+        direction = "top" if direction == "up" else "bottom"
+    for pattern, factor in ((r"\ba (?:little |tiny |small )?bit\b|\ba little\b|\bslightly\b|\bslowly\b", 0.4),
+                            (r"\bhalf(?: a| the)?(?: page)?\b", 0.6), (r"\ba lot\b|\bfast(?:er)?\b|\btwo pages\b", 2.0)):
+        if re.search(pattern, rest):
+            amount, rest = factor, re.sub(pattern, " ", rest, count=1)
+            break
+    for name in sorted(_SCROLL_WHERE, key=len, reverse=True):
+        if re.search(rf"\b{name}\b", rest):
+            where, rest = _SCROLL_WHERE[name], re.sub(rf"\b{name}\b", " ", rest, count=1)
+            break
+    if any(word not in _SCROLL_FILLER for word in rest.split()):
+        return None
+    return {"direction": direction or "down", "where": where, "amount": amount}
+
+
+_SEARCH_BOX = r"(?:the |this |that )?search(?: bar| box| button| icon| field| option| input)?"
+_SEARCH_CLOSE_RE = re.compile(
+    r"(?:close|clear|cancel|exit|dismiss|hide|leave|stop|remove|delete|erase|empty|reset|get out of|come out of|go out of) "
+    r"(?:the |this |my |that )?(?:text (?:in|from|of) (?:the )?)?(?:[a-z]+ )?search(?:ing)?"
+    r"(?: bar| box| field| results?| panel| mode| input| text| query)*"
+    r"(?: (?:in|on|of|from) (?:the |my )?[a-z]+(?: web)?)?"
+    r"(?: and (?:go|step|get|take me) back(?: to (?:the |my )?(?:chats?|chat list|inbox|normal))?)?|"
+    r"(?:go|step|get|take me) back to (?:my |the )?(?:chats|chat list)")
+_WA_CLOSE_CHAT = re.compile(r"(?:close|exit|leave|get out of|come out of) (?:this |the |that |current |open )*"
+                            r"(?:whats ?app )?(?:chat|group|conversation)(?: (?:in|on) whats ?app)?")
+_WA_NTH = re.compile(r"(?:the )?(first|second|third|fourth|fifth|top|1st|2nd|3rd|4th|5th) (?:search )?(?:result|one|chat|group)\b.*")
+
+
+def search_request(low, text=None):
+    """
+    The words to search for when the user describes the STEPS of a search — "click on the
+    search button and search for council details", "search for rahul in the search bar" — or
+    None. It is one action: find the search box, click it, type, submit. It used to be a
+    click on a button called "search button and search for council details".
+    """
+    low = low.strip(" .?!")
+    m = re.fullmatch(r"(?:click|tap|press|go to|open|focus|select|use)(?: on| in)? " + _SEARCH_BOX +
+                     r"(?:,| and| then)+ (?:search(?: for)?|type(?: in)?|write|enter|look for|look up|find) (.+?)"
+                     r"(?:(?:,| and| then)+ (?:press|hit|click|tap)(?: on)? (?:the )?(?:enter|search|go)(?: button| key)?)?", low) \
+        or re.fullmatch(r"(?:search(?: for)?|look for|look up|find) (.+?) (?:in|on|using|with|from|through) " + _SEARCH_BOX, low)
+    if not m:
+        return None
+    query = m.group(1).strip()
+    found = re.search(re.escape(query), text or "", re.I)
+    return found.group(0) if found else query
+
+
+_WA_SUFFIX = r"(?: (?:on|in|from) (?:my )?whats ?app(?: web)?)"
+_WA_NAMED_RE = re.compile(r"(?:(?:open|go to|show|show me|switch to|read|summari[sz]e|catch me up on|what(?:'s| is) new in|"
+                          r"search(?: for)?|find|look for|look up) .+" + _WA_SUFFIX +
+                          r"|search (?:my )?whats ?app for .+)(?: and open (?:it|that|the (?:chat|group|first one)))?")
+_WA_SEARCH = re.compile(r"(?:search|find|look for|look up)(?: (?:my )?whats ?app)?(?: for)? (?:the |my |our )?(.+?)"
+                        r"(?: chat| group| conversation)?" + _WA_SUFFIX + r"?"
+                        r"( and open (?:it|that|the (?:chat|group|first one)))?")
+_WA_READ_RECENT = re.compile(r"(?:read|summari[sz]e)(?: me)? (?:the |my )?(?:most )?(?:recent|latest|last|new|newest) chats?")
+_NUM = r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|couple of|few)"
+_WA_AGE = r"(?:last|latest|recent|most recent|newest|new|past|previous)"
+# "read the last three messages of mota panda", "open and read the latest 3 recent chats from X"
+_WA_LAST_N = re.compile(
+    r"(?:open (?:and|then) )?(?:read|show|tell|give|check|summari[sz]e|what (?:are|were))(?: me)?(?: out)? (?:the |my )?"
+    r"((?:" + _WA_AGE + r" |" + _NUM + r" )+)(?:chats?|messages?|texts?|msgs?) "
+    r"(?:of|from|in|by|with|on) (?:the |my |our )?(.+?)(?: chat| group| conversation)?" + _WA_SUFFIX + r"?")
+_WA_LAST_N_POSS = re.compile(
+    r"(?:open (?:and|then) )?(?:read|show|tell me|summari[sz]e)(?: me)?(?: out)? (.+?)(?:'s|s') "
+    r"((?:" + _WA_AGE + r" |" + _NUM + r" )+)(?:chats?|messages?|texts?|msgs?)" + _WA_SUFFIX + r"?")
+_WA_LAST_HERE = re.compile(r"(?:read|show|tell|give)(?: me)?(?: out)? (?:the |my )?((?:" + _WA_AGE + r" |" + _NUM + r" )+)"
+                           r"(?:chats?|messages?|texts?|msgs?)(?: here| in (?:this|the) (?:chat|group))?")
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+                "nine": 9, "ten": 10, "couple of": 2, "few": 3}
+
+
+def last_messages_request(low):
+    """('mota panda', 3) for "read the last three messages of mota panda"; None otherwise.
+    count 0 = the words gave no number ("the latest messages from X")."""
+    low = low.strip(" .?!")
+    m = _WA_LAST_N.fullmatch(low)
+    name, words = (m.group(2), m.group(1)) if m else (None, None)
+    if not m:
+        m = _WA_LAST_N_POSS.fullmatch(low)
+        if not m:
+            return None
+        name, words = m.group(1), m.group(2)
+    name = re.sub(r"^(?:the|my|our)\s+", "", name.strip())
+    found = re.search(r"\d{1,2}|couple of|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|few)\b", words)
+    count = 0 if not found else int(found.group(0)) if found.group(0).isdigit() else _COUNT_WORDS[found.group(0)]
+    if not name or name in ("this", "it", "that", "here", "whatsapp", "whats app"):
+        name = "current" if count else "recent"      # no chat named: the open one / the newest
+    return name, min(count, 30)
+
+
+_WA_RECENT = re.compile(r"(?:the )?(?:most )?(?:recent|latest|last|newest|new)(?: one| chat| message| messages)?")
+
+
+def _bare_fix(lowered, raw):
+    """Shapes the DMM sends without a prefix and that the prefix rules get WRONG: "close the
+    search bar" (an app called "search bar"), "open graphics team group in whatsapp" (an app),
+    "scroll the mail to bottom" (nothing), "click on the search button and search for X"."""
+    if _SEARCH_CLOSE_RE.fullmatch(lowered):
+        return Action("browser", "search_close", target="search", raw=raw)
+    query = search_request(lowered, raw)
+    if query:
+        return Action("browser", "search_here", target=query, raw=raw)
+    if lowered.startswith(("scroll", "keep scroll", "please scroll")) or " of the " in lowered or " of this " in lowered:
+        request = scroll_request(lowered)
+        if request:
+            return Action("browser", "page_scroll", target=request["direction"], parameters=request, raw=raw)
+    if _WA_NAMED_RE.fullmatch(lowered) or _WA_READ_RECENT.fullmatch(lowered) or last_messages_request(lowered):
+        return _web_action("message", raw, raw)
+    if _WA_CLOSE_CHAT.fullmatch(lowered) and re.search(r"\b(?:chat|conversation|whats ?app)\b", lowered):
+        return Action("message", "close", target="current", raw=raw)     # "close the chat"
+    # "open the graphics team group": a Chrome tab group by that name, else WhatsApp's group.
+    if re.fullmatch(r"open (?:the |my |our )?.+ group", lowered) and "tab group" not in lowered:
+        return _part_2c_action(lowered, raw)
+    return _named_chat(lowered, raw)
+
+
+def _named_chat(low, raw):
+    """'open rahul chat' with nothing saying WhatsApp: a chat is a WhatsApp chat unless an app
+    or a site is really called that ("google chat")."""
+    m = re.fullmatch(r"(?:open|go to|show me|switch to) (?:the |my |our )?(.+?) (?:chat|conversation|dm)", low)
+    if m and m.group(1) not in _NOT_A_NAME and not (targets.website_url(f"{m.group(1)} chat")
+                                                    or _known_app(f"{m.group(1)} chat")):
+        return _web_action("message", re.sub(r"^browser\s+", "", raw, flags=re.I), raw)
+    return None
+
+
 def _web_action(kind, payload, raw):
     """'browser …', 'meet …', 'email …', 'calendar …', 'message …' -> a structured action."""
     text = (payload or "").strip()
     low = text.lower().strip(" .?!")
     if kind == "browser":
+        if _SEARCH_CLOSE_RE.fullmatch(low):
+            return Action("browser", "search_close", target="search", raw=raw)
+        if _WA_NAMED_RE.fullmatch(low) or _WA_READ_RECENT.fullmatch(low) or last_messages_request(low):
+            return _web_action("message", payload, raw)      # "browser open X group in whatsapp"
+        found = _named_chat(low, raw)
+        if found is not None:
+            return found
+        found = part_6_action(low, raw, text)              # Part 6: forms, video, site search, shopping
+        if found is not None:
+            return found
+        query = search_request(low, text)
+        if query:
+            return Action("browser", "search_here", target=query, raw=raw)
+        request = scroll_request(low)
+        if request:
+            return Action("browser", "page_scroll", target=request["direction"], parameters=request, raw=raw)
         m = re.match(r"(?:list|show|what are)?\s*(?:my\s+)?(?:open\s+)?tabs$|what tabs", low)
         if m:
             return Action("browser", "tabs_list", target="all", raw=raw)
@@ -1320,16 +1507,42 @@ def _web_action(kind, payload, raw):
                         r"(?:any |show |read |list |check )?(?:my )?unread(?: chats| messages| whatsapp messages)?|"
                         r"(?:do i have )?(?:any )?new messages(?: on whatsapp)?", low):
             return Action("message", "unread", target="whatsapp", raw=raw)
+        if _WA_CLOSE_CHAT.fullmatch(low):
+            return Action("message", "close", target="current", raw=raw)
+        if re.fullmatch(r"(?:open|search|show|find|go to|check)(?: (?:it|that|the|a|chat|group|one))*", low):
+            return None          # a verb with no name is not a chat called "it", nor a message to "open"
+        asked = last_messages_request(low)
+        if asked:
+            return Action("message", "read", target=asked[0], parameters={"today": False, "count": asked[1]}, raw=raw)
+        m = _WA_LAST_HERE.fullmatch(low)
+        if m:                                    # "read the last three messages": the open chat
+            found = re.search(r"\d{1,2}|couple of|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|few)\b", m.group(1))
+            count = 0 if not found else int(found.group(0)) if found.group(0).isdigit() else _COUNT_WORDS[found.group(0)]
+            return Action("message", "read", target="recent" if not count else "current",
+                          parameters={"today": False, "count": min(count, 30)}, raw=raw)
+        m = re.fullmatch(r"(?:open|click(?: on)?|select|go to|show me)(?: search)? result (?:number )?(\d{1,2})", low) \
+            or re.fullmatch(r"(?:open|click(?: on)?|select|go to|show me) " + _WA_NTH.pattern + _WA_SUFFIX + r"?", low)
+        if m:
+            word = m.group(1)
+            return Action("message", "open", target=f"#{_ORDINAL_N.get(word) or int(re.sub(r'[^0-9]', '', word) or 1)}", raw=raw)
+        m = _WA_SEARCH.fullmatch(low)
+        if m and ":" not in text and " saying " not in low:
+            return Action("message", "search", target=m.group(1).strip(),
+                          parameters={"open": bool(m.group(2))}, raw=raw)
         m = re.fullmatch(r"(?:open|go to|show|switch to|show me|click(?: on)?) (?:the |my |our )?(.+?)"
-                         r"(?: chat| group| conversation| dm)?(?: on whatsapp| in whatsapp)?", low)
+                         r"(?: chat| group| conversation| dm)?" + _WA_SUFFIX + r"?", low)
         if m and ":" not in text and " saying " not in low:
             name = re.sub(r"\s+(?:chat|group|conversation|dm)$", "", m.group(1)).strip()
+            if _WA_RECENT.fullmatch(name):
+                name = "recent"                  # "open the latest chat": the newest one
             return Action("message", "open", target=name, raw=raw)
         m = re.fullmatch(r"(?:read|summari[sz]e|catch me up on|what(?:'s| is) new in|what did (?:they|people|everyone) say in)"
-                         r" (?:the |my |our )?(.+?)(?: chat| group| conversation)?( today)?(?: on whatsapp)?", low)
+                         r" (?:the |my |our )?(.+?)(?: chat| group| conversation)?( today)?" + _WA_SUFFIX + r"?", low)
         if m and ":" not in text:
             name = m.group(1).strip()
             name = "current" if name in ("this", "it", "this chat", "the chat", "messages", "the messages") else name
+            if _WA_RECENT.fullmatch(name):
+                name = "recent"                  # the open chat, else the one with the newest message
             return Action("message", "read", target=name, parameters={"today": bool(m.group(2))}, raw=raw)
         text = re.sub(r"^(?:tell|text|message|ping|whatsapp|send (?:a )?(?:message|text) to)\s+", "", text, flags=re.I)
         if ":" in text:
@@ -1457,6 +1670,392 @@ def part_4_action(low, raw, text=None):
     return None
 
 
+# ── Part 6 (BROWSER_CONTROL_PLAN D1–D5 forms, F1 video, F2/F3 site search and shopping) ──
+# Decision D1 (2026-11-11): shopping is search and open ONLY — "add this to cart", "buy it",
+# "checkout" become a click the policy REFUSES (policy._SHOPPING_STOP). D2: the form profile
+# holds name, email, phone, postal address, college, roll number, date of birth and gender.
+_SHOP_STOP_SAID = re.compile(
+    r"(?:please )?(?:(add)(?: (?:this|it|that|the product|this product|this item|the item|one))? to (?:the |my )?"
+    r"(?:cart|bag|basket|trolley)|(buy)(?: (?:this|it|that|one))?(?: now| for me)?|(order) (?:this|it|that)(?: for me)?|"
+    r"(place) (?:the |my |an )?order|(?:proceed to |go to )?(check) ?out|(pay)(?: for (?:it|this))?(?: now)?|"
+    r"(?:go to|open|show me|view) (?:the |my )?(cart|bag|basket))")
+_SHOP_TARGET = {"add": "add to cart", "buy": "buy now", "order": "place order", "place": "place order",
+                "check": "checkout", "pay": "pay now", "cart": "go to cart", "bag": "go to cart",
+                "basket": "go to cart"}
+_FORM_FILL_RE = re.compile(
+    r"(?:auto ?fill|fill(?: in| out| up)?|complete) (?:this |the |that )?(?:form|page|fields?|application)"
+    r"(?: (?:with|using|from) (?:my )?(?:details|info|information|data|profile|saved details))?(?: for me)?|"
+    r"fill (?:in |out )?my (?:details|info|information|data)(?: (?:in|on|into) (?:this|the) (?:form|page))?|"
+    r"auto ?fill(?: (?:it|this|the form))?|put my details (?:in|into) (?:this|the) form")
+_SUBMIT_RE = re.compile(r"(?:submit|send) (?:this|the|my) (?:form|application|response|responses|answers)|"
+                        r"submit(?: it| this| now| the page)?|(?:press|click|hit)(?: on)? (?:the )?submit(?: button)?")
+_FIELD_WORDS = r"(?: drop ?down| dropdown| drop-down| field| menu| list| options?| question| box| select)"
+_CHOOSE_RE = re.compile(r"(?:select|choose|pick|set) (.+?) (?:in|from|for|as) (?:the |my )?(.+?)(" + _FIELD_WORDS + r")?")
+_KNOWN_FORM_FIELDS = re.compile(r"(?:gender|sex|country|state|city|course|branch|programme|program|year|semester|"
+                                r"category|department|degree|batch|section|title|salutation|nationality|religion|"
+                                r"blood group|size|colour|color|quantity|language|month|day)")
+_CHECK_RE = re.compile(r"(tick|check|untick|uncheck|un tick|un check|deselect|unselect|select|turn on|turn off|switch on|switch off)"
+                       r"(?: off)? (?:the |on |that )?(.+?)( (?:check ?box|box|tick ?box|radio button|toggle|switch|option))?")
+_DATE_RE = re.compile(r"(?:set|fill|enter|put|change|pick|choose) (?:in )?(?:the |my )?(.*?(?:date of birth|birth ?date|date|dob|"
+                      r"birthday|deadline)(?: of [a-z]+)?)(?: field| box)? (?:to|as|with|:) (.+)")
+_KEY_RE = re.compile(r"(?:press|hit|tap) (?:the )?(enter|return|tab|shift tab|escape|esc|space(?:bar)?|backspace|delete|"
+                     r"(?:up|down|left|right)(?: arrow)?|page up|page down|home|end)(?: key| button)?"
+                     r"(?: (\d+) times| (twice|thrice))?")
+_UPLOAD_RE = re.compile(r"(upload|attach|add|put|select|choose) (?:my |the |a |an |this )?(.+?)(?: file)?"
+                        r"( here| to (?:this|the) (?:page|form|site|email|mail|application|message)| in (?:this|the) (?:form|page)|"
+                        r" to it| in it| to the upload(?: box| field)?)?")
+_PROFILE_SET_RE = re.compile(
+    r"(?:remember|save|store|note|keep)(?: that)? my (.+?) (?:is|as|=|:) (.+)|"
+    r"(?:remember|save|store|note) (.+?) as my (.+)|"
+    r"(?:set|update|change) my (.+?) (?:to|as) (.+?) (?:for forms|in my (?:form )?profile)|"
+    r"my (.+?) is (.+?) (?:for forms|in my (?:form )?profile)")
+_PROFILE_SHOW_RE = re.compile(
+    r"what (?:details|info|information) (?:do you have|have you got|did i give you|have you saved)(?: for forms| about me| of mine)?|"
+    r"what(?:'s| is) in my (?:form )?profile|(show|read|tell me|list) (?:me )?my (?:form )?(?:profile|details for forms|form details|saved details)")
+_PROFILE_FORGET_RE = re.compile(
+    r"forget my (.+?)(?: from (?:my )?(?:form )?profile| for forms)?|"
+    r"(?:delete|remove|clear|erase) my (.+?) (?:from (?:my )?(?:form )?profile|for forms)|"
+    r"(?:delete|remove|clear|erase|forget) (?:my |the )?(?:form profile|form details|details for forms|saved form details)")
+_SECS = r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?)"
+_SEEK_FWD = re.compile(r"(?:skip|jump|go|fast ?forward|forward|move|seek)(?: ahead| forward)?(?: by)? " + _SECS +
+                       r"(?: ahead| forward)?(?: in (?:the|this) video)?")
+_SEEK_BACK = re.compile(r"(?:go back|rewind|skip back|jump back|move back|seek back|back)(?: by)? " + _SECS +
+                        r"(?: back)?(?: in (?:the|this) video)?|(?:go|skip|jump|move) " + _SECS + r" back(?:wards?)?")
+_SEEK_TO = re.compile(r"(?:go|jump|skip|seek|move) to (\d{1,2}):(\d{2})(?::(\d{2}))?(?: in (?:the|this) video)?|"
+                      r"(?:go|jump|skip|seek) to (\d+) minutes?(?: and (\d+) seconds?)?(?: in (?:the|this) video)?|"
+                      r"(?:restart|replay) (?:the |this )?video|start (?:the |this )?video (?:over|again)|"
+                      r"go (?:back )?to the (?:start|beginning) of (?:the|this) video")
+_SPEED_RE = re.compile(r"(?:set |change )?(?:the )?(?:playback |video )?speed (?:to )?(\d+(?:\.\d+)?|half|normal)(?: ?x| times)?|"
+                       r"play (?:it |this |the video )?(?:at )?(\d+(?:\.\d+)?) ?(?:x|times)(?: speed)?|(\d+(?:\.\d+)?) ?x speed|"
+                       r"(?:play (?:it |the video )?at )?(normal|regular|default) speed|"
+                       r"(?:speed up|play faster|faster) (?:the |this )?video|(?:the )?video faster|"
+                       r"slow (?:the |this )?video down|slow down (?:the |this )?video|play (?:it |the video )?slower")
+_CAPTIONS_RE = re.compile(r"(?:turn|switch) (on|off) (?:the )?(?:captions|subtitles|cc|closed captions)|"
+                          r"(?:turn|switch) (?:the )?(?:captions|subtitles|cc) (on|off)|(?:captions|subtitles) (on|off)|"
+                          r"(show|hide|enable|disable) (?:the )?(?:captions|subtitles)")
+_VIDEO_SIMPLE = (
+    (r"skip (?:the |this )?(?:ads?|advertisement|commercial)s?(?: now)?", "skipAd", None),
+    (r"(?:play )?(?:the )?next video|skip (?:this|the) video|play the next one", "next", None),
+    (r"like (?:this|the) video|(?:give (?:it|this video) a )(?:like|thumbs up)|thumbs up (?:this|the) video", "like", True),
+    (r"(?:unlike|remove (?:my |the )?like (?:from|on)) (?:this|the) video|unlike (?:it|this)", "like", False),
+    (r"(?:save|add|put) (?:this |it |the video |this video )?(?:to|in|on) (?:my )?watch later(?: list)?|watch (?:this|it) later", "watchLater", None),
+    (r"(?:make|put|turn) (?:the |this )?video (?:full ?screen|in full ?screen)|full ?screen (?:the |this )?video|"
+     r"video (?:in )?full ?screen|(?:watch|play) (?:it |this |the video )?in full ?screen", "fullscreen", None),
+    (r"(?:turn on |switch to |use |open )?(?:the )?(?:theat(?:er|re)|cinema) mode", "theater", None),
+    (r"(?:open |use |switch to )?(?:the )?mini ?player", "miniplayer", None),
+    (r"(?:pause|stop) (?:the |this )?video", "pause", None),
+    (r"(?:play|resume|continue|unpause) (?:the |this )?video", "play", None),
+    (r"mute (?:the |this )?video", "mute", True),
+    (r"unmute (?:the |this )?video", "mute", False),
+    (r"how (?:long is|much longer is) (?:this|the) video|how much (?:time )?is left(?: in (?:the|this) video)?|"
+     r"where am i in (?:the|this) video|what video is this|what(?:'s| is) (?:this|the) video called", "state", None),
+)
+_IMAGES_RE = re.compile(r"(?:show me |find |search for |search |get me |look up )?(?:images|pictures|pics|photos) of (?!my\b)(.+)")
+_SITE_SEARCH_RE = re.compile(r"search (?:on )?(.+?) for (.+)|(?:search|look up|look for|find|show me) (?:for )?(.+?) (?:on|in) "
+                             r"(?!this\b|the page\b|the site\b|this page\b|this site\b)(.+?)(?: website| site| dot com)?|"
+                             r"(.+?) search (?:for )?(.+)")
+_NOT_SEARCH_SITES = frozenset({"drive", "docs", "sheets", "slides", "forms", "gmail", "whatsapp web", "calendar",
+                               "keep", "classroom", "photos", "contacts"})
+_SORT_WORDS = ((r"low(?:est)? to high(?:est)?|cheapest|lowest price|price ascending|least expensive|low price", "price_asc"),
+               (r"high(?:est)? to low(?:est)?|most expensive|highest price|price descending|costliest", "price_desc"),
+               (r"(?:best|top|highest|customer) rat(?:ed|ing)s?|ratings?|reviews?|best reviewed", "rating"),
+               (r"newest|latest|new arrivals|most recent|recent", "newest"),
+               (r"popular(?:ity)?|best ?sell(?:ing|ers?)|relevance", "popular"))
+_SHOP_REFINE_RE = re.compile(
+    r"sort (?:it |them |the results |this |the products |by )?(?:by )?(.+)|"
+    r"(?:show|list)(?: me)? (?:the )?(cheapest|most expensive|best rated|top rated|newest|latest)(?: ones?| products?| items?| results?)?(?: first)?|"
+    r"(?:only )?(?:show|filter|keep)(?: me)?(?: only)?(?: (?:the )?(?:results|ones|products|items))?(?: that are| which are)?(?: priced)? "
+    r"((?:under|below|less than|over|above|more than|between|from) .+)")
+_PRODUCT_RE = re.compile(
+    r"how much (?:is|does) (?:this|it|that)(?: one)?(?: cost| product| item)?|"
+    r"what(?:'s| is) (?:the |its )?(?:price|cost|rating|star rating)(?: of (?:this|it|the) ?(?:product|item)?)?(?: here)?|"
+    r"(?:read|tell me|give me) (?:the |about )?(?:this |the )?product(?: details| info)?|"
+    r"(?:what|how) (?:are|is) (?:the |its )?(?:ratings?|reviews? score|stars?)(?: of this(?: product)?)?|"
+    r"is (?:this|it) (?:in stock|available)|what(?:'s| is) this product")
+_SHOP_HOSTS = re.compile(r"(?:^|\.)(?:amazon\.[a-z.]+|flipkart\.com|myntra\.com|meesho\.com|ajio\.com|nykaa\.com|"
+                         r"croma\.com|reliancedigital\.in|snapdeal\.com|tatacliq\.com|ebay\.[a-z.]+|bestbuy\.com|"
+                         r"walmart\.com|etsy\.com|decathlon\.in)$")
+_VIDEO_HOSTS = re.compile(r"(?:^|\.)(?:youtube\.com|youtu\.be|vimeo\.com|twitch\.tv|netflix\.com|primevideo\.com|"
+                          r"hotstar\.com|jiocinema\.com|dailymotion\.com|coursera\.org|udemy\.com|nptel\.ac\.in)$")
+_TIMES = {"twice": 2, "thrice": 3}
+
+
+def _num(text):
+    """'one point five' -> '1.5', 'ten' -> '10' (the speech recogniser writes both)."""
+    from kayra.automation.web_macros import spoken_numbers
+    out = spoken_numbers(text)
+    out = re.sub(r"(\d) (?:point|dot) (\d+)", r"\1.\2", out)
+    return re.sub(r"\b(\d+) thousand\b", lambda m: str(int(m.group(1)) * 1000), out)
+
+
+def _seconds(amount, unit):
+    value = float(amount)
+    return int(value * 60) if unit.startswith("m") else int(value)
+
+
+def price_filter(query):
+    """('earbuds', lo, hi) from 'earbuds under 2000' / 'between 500 and 1000' / 'over 2k rupees'."""
+    q = _num(query.lower())
+    money = r"(?:rs\.? ?|₹ ?|inr )?(\d[\d,]*)(k)?(?: ?rupees| ?rs\.?| ?inr| ?bucks)?"
+    amount = lambda m, i: int(m.group(i).replace(",", "")) * (1000 if m.group(i + 1) else 1)
+    lo = hi = 0
+    m = re.search(r"\s*\b(?:between|from) " + money + r" (?:and|to|-) " + money + r"\b", q)
+    if m:
+        lo, hi = amount(m, 1), amount(m, 3)
+    else:
+        m = re.search(r"\s*\b(?:under|below|less than|cheaper than|within|up ?to|max(?:imum)?|not more than) " + money, q)
+        if m:
+            hi = amount(m, 1)
+        else:
+            m = re.search(r"\s*\b(?:over|above|more than|at least|min(?:imum)?|starting (?:at|from)) " + money, q)
+            if m:
+                lo = amount(m, 1)
+    rest = (q[:m.start()] + q[m.end():]).strip() if m else query
+    return (rest if m else query), lo, hi
+
+
+def sort_request(text):
+    """'price low to high' -> 'price_asc', or ''."""
+    low = text.lower()
+    for words, key in _SORT_WORDS:
+        if re.search(r"\b(?:" + words + r")\b", low):
+            return key
+    return ""
+
+
+def _site_search_action(low, raw, text):
+    m = _IMAGES_RE.fullmatch(low)
+    if m:
+        found = re.search(re.escape(m.group(1)), text, re.I)
+        return Action("browser", "site_search", target=found.group(0) if found else m.group(1),
+                      parameters={"site": "images"}, raw=raw)
+    m = _SITE_SEARCH_RE.fullmatch(low)
+    tail = re.search(r",? (?:(?:sorted|sort|ordered) by .+|(?:cheapest|lowest price|best rated|newest) first|"
+                     r"(?:under|below|less than|between|over|above) .+)$", low)
+    if tail and not (m and targets.canonical_website((m.group(1) or m.group(4) or m.group(5) or "").strip())):
+        # "search for X on flipkart sorted by price": the clause after the site belongs to the query.
+        head = _SITE_SEARCH_RE.fullmatch(low[:tail.start()])
+        if head and (head.group(3) or head.group(1)):
+            low = (f"search {head.group(1)} for {head.group(2)}" if head.group(1)
+                   else f"search {head.group(4)} for {head.group(3)}") + low[tail.start():]
+            text = low
+            m = _SITE_SEARCH_RE.fullmatch(low)
+    if not m:
+        return None
+    name, query = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3)) if m.group(3) else (m.group(5), m.group(6))
+    site = targets.canonical_website(name.strip())
+    if not site or site in _NOT_SEARCH_SITES or site == "google" or (m.group(5) and site == "youtube"):
+        return None                    # "google search X" / "youtube search X" stay the tokens they were
+    from kayra.automation import sites
+    if site not in ("amazon", "flipkart") and not sites.search_url(site, "x"):
+        return None
+    found = re.search(re.escape(query.strip()), text, re.I)
+    query = found.group(0) if found else query.strip()
+    params = {"site": site}
+    query, where = _split_where(query)
+    if where:
+        params["where"] = where
+    sorted_by = re.search(r",? (?:sorted|sort|ordered|order) by (.+)$|,? (cheapest|lowest price|best rated|newest) first$", query, re.I)
+    if site in ("amazon", "flipkart"):
+        if sorted_by:
+            params["sort"] = sort_request(sorted_by.group(1) or sorted_by.group(2))
+            query = query[:sorted_by.start()].strip()
+        lead = re.match(r"(?:the )?(cheapest|best rated|top rated|newest|latest) ", query, re.I)
+        if lead:
+            params["sort"] = sort_request(lead.group(1))
+            query = query[lead.end():]
+        query, lo, hi = price_filter(query)
+        if lo:
+            params["lo"] = lo
+        if hi:
+            params["hi"] = hi
+    if not query.strip():
+        return None
+    return Action("browser", "site_search", target=query.strip(), parameters=params, raw=raw)
+
+
+def _video_action(low, raw):
+    num = _num(low)
+    for pattern, op, value in _VIDEO_SIMPLE:
+        if re.fullmatch(pattern, low):
+            params = {"op": op}
+            if value is not None:
+                params["value"] = value
+            key = "video_subscribe" if op == "subscribe" else "video"
+            return Action("browser", key, target=op, parameters=params, raw=raw)
+    if re.fullmatch(r"subscribe(?: to)?(?: (?:this|the|that) channel| them| him| her| this creator| to (?:this|the) channel)?", low):
+        return Action("browser", "video_subscribe", target="subscribe", parameters={"op": "subscribe"}, raw=raw)
+    m = _SEEK_FWD.fullmatch(num)
+    if m:
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": _seconds(m.group(1), m.group(2))}, raw=raw)
+    m = _SEEK_BACK.fullmatch(num)
+    if m:
+        amount, unit = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": -_seconds(amount, unit)}, raw=raw)
+    if re.fullmatch(r"rewind(?: (?:a bit|a little|the video))?|go back a (?:bit|little) in (?:the|this) video", low):
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": -10}, raw=raw)
+    if re.fullmatch(r"fast ?forward(?: (?:a bit|a little|the video))?", low):
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": 10}, raw=raw)
+    m = _SEEK_TO.fullmatch(num)
+    if m:
+        if m.group(1):
+            secs = int(m.group(1)) * 60 + int(m.group(2)) if not m.group(3) else \
+                int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        elif m.group(4):
+            secs = int(m.group(4)) * 60 + int(m.group(5) or 0)
+        else:
+            secs = 0
+        return Action("browser", "video", target="seekTo", parameters={"op": "seekTo", "value": secs}, raw=raw)
+    m = _SPEED_RE.fullmatch(num)
+    if m:
+        said = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        if said:
+            value = {"half": 0.5, "normal": 1.0, "regular": 1.0, "default": 1.0}.get(said)
+            value = value if value is not None else float(said)
+        else:
+            value = "+0.25" if re.search(r"faster|speed up", low) else "-0.25"
+        return Action("browser", "video", target="rate", parameters={"op": "rate", "value": value}, raw=raw)
+    m = _CAPTIONS_RE.fullmatch(low)
+    if m:
+        word = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        return Action("browser", "video", target="captions",
+                      parameters={"op": "captions", "value": word in ("on", "show", "enable")}, raw=raw)
+    return None
+
+
+def part_6_action(low, raw, text=None):
+    """Forms, the video, site search and shopping (Part 6), or None."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    # D1 — shopping stops before the cart: the click is built so the policy can refuse it.
+    m = _SHOP_STOP_SAID.fullmatch(low)
+    if m:
+        word = next(g for g in m.groups() if g)
+        return Action("browser", "page_click", target=_SHOP_TARGET[word], parameters={"nth": 1}, raw=raw)
+    # D3 the profile, D3 fill, D4 submit
+    m = _PROFILE_SET_RE.fullmatch(low)
+    if m:
+        from kayra.automation import form_profile as P
+        groups = m.groups()
+        words, value = next((groups[i], groups[i + 1]) for i in (0, 2, 4, 6) if groups[i])
+        if groups[2]:
+            words, value = groups[3], groups[2]          # "save X as my email"
+        key = P.key_for(words)
+        if key:
+            found = re.search(re.escape(value), text, re.I)
+            return Action("browser", "profile_set", target=key,
+                          parameters={"text": found.group(0) if found else value}, raw=raw)
+    m = _PROFILE_SHOW_RE.fullmatch(low)
+    if m:
+        return Action("browser", "profile_show", target="profile",
+                      parameters={"read": bool(m.group(1)) or "what" in low and "in my" in low}, raw=raw)
+    m = _PROFILE_FORGET_RE.fullmatch(low)
+    if m:
+        from kayra.automation import form_profile as P
+        words = m.group(1) or m.group(2)
+        if not words or re.fullmatch(r"(?:form )?(?:profile|details|form details|details for forms|saved details|everything)", words):
+            return Action("browser", "profile_clear", target="all", raw=raw)
+        key = P.key_for(words)
+        if key:
+            return Action("browser", "profile_forget", target=key, raw=raw)
+    if _FORM_FILL_RE.fullmatch(low):
+        return Action("browser", "form_fill", target="current", raw=raw)
+    if _SUBMIT_RE.fullmatch(low):
+        return Action("browser", "form_submit", target="current", raw=raw)
+    # D1 dates, ticks and drop-downs
+    m = _DATE_RE.fullmatch(low)
+    if m:
+        from kayra.automation import form_profile as P
+        if P.parse_date(_num(m.group(2))):
+            return Action("browser", "form_choose", target=P.parse_date(_num(m.group(2))),
+                          parameters={"field": m.group(1), "kind": "date", "option": P.parse_date(_num(m.group(2)))}, raw=raw)
+    m = _CHECK_RE.fullmatch(low)
+    if m:
+        verb, label, box = m.group(1), m.group(2), m.group(3)
+        if verb in ("tick", "untick", "un tick", "uncheck", "un check", "deselect", "unselect") or box:
+            if not (verb in ("select", "turn on", "turn off", "switch on", "switch off", "check") and not box):
+                state = verb in ("tick", "check", "select", "turn on", "switch on")
+                return Action("browser", "form_choose", target=label.strip(),
+                              parameters={"field": label.strip(), "kind": "check", "state": state}, raw=raw)
+    m = _CHOOSE_RE.fullmatch(low)
+    if m and not re.match(r"(?:all|everything|the (?:first|second|third|last) (?:result|one|tab))$", m.group(1)):
+        found = re.search(re.escape(m.group(1)), text, re.I)
+        return Action("browser", "form_choose", target=found.group(0) if found else m.group(1),
+                      parameters={"field": m.group(2).strip(), "kind": "select",
+                                  "said_field": bool(m.group(3)) or bool(_KNOWN_FORM_FIELDS.fullmatch(m.group(2).strip()))},
+                      raw=raw)
+    # D5 upload
+    m = _UPLOAD_RE.fullmatch(low)
+    if m and (m.group(1) in ("upload", "attach") or m.group(3)) and m.group(2) not in ("it", "this", "that", "a file", "file"):
+        what = re.sub(r"^(?:my|the|a|an|this)\s+", "", m.group(2)).strip()
+        if what and not re.match(r"(?:note|reminder|tab|bookmark|row|label|event)\b", what):
+            return Action("browser", "file_upload", target=what, raw=raw)
+    # D2 real keys into the page
+    m = _KEY_RE.fullmatch(_num(low))
+    if m:
+        count = int(m.group(2)) if m.group(2) else _TIMES.get(m.group(3) or "", 1)
+        return Action("browser", "page_key", target=m.group(1), parameters={"count": count}, raw=raw)
+    # F1 the video
+    found = _video_action(low, raw)
+    if found is not None:
+        return found
+    # F2/F3 site search, sort and filter results, the product
+    found = _site_search_action(low, raw, text)
+    if found is not None:
+        return found
+    m = _SHOP_REFINE_RE.fullmatch(_num(low))
+    if m:
+        said = m.group(1) or m.group(2) or ""
+        sort = sort_request(said) if said else ""
+        _, lo, hi = price_filter(m.group(3) or said)
+        if sort or lo or hi:
+            return Action("browser", "shop_refine", target=sort or "price",
+                          parameters={"sort": sort, "lo": lo, "hi": hi}, raw=raw)
+    if _PRODUCT_RE.fullmatch(low):
+        return Action("browser", "product_info", target="current", raw=raw)
+    return None
+
+
+def part_6_direct(low, text, situation_fn=None):
+    """['browser …'] when a Part 6 utterance is a complete command whatever is on screen (or is
+    one given what is in front); None when the classifier should decide."""
+    action = part_6_action(low, f"browser {text}", text)
+    if action is None:
+        return None
+    verb = action.action
+    host = front_site(situation_fn) if verb in ("video", "shop_refine", "product_info", "form_choose") else ""
+    if verb == "page_click":
+        return [f"browser {text}"]                         # shopping stop: refused, rules-first
+    if verb in ("form_fill", "form_submit", "profile_set", "profile_show", "profile_forget", "profile_clear",
+                "file_upload", "site_search", "video_subscribe"):
+        if verb == "form_submit" and not re.search(r"\bform|application|response|answers|submit button\b", low):
+            return None                                    # a bare "submit it": the model decides
+        if verb == "file_upload" and not re.match(r"(?:upload|attach)\b", low):
+            return None
+        return [f"browser {text}"]
+    if verb == "video":
+        explicit = re.search(r"\b(?:video|ads?|advertisement|captions|subtitles|watch later|theat(?:er|re) mode|"
+                             r"mini ?player|speed|\d(?:\.\d+)? ?x)\b", low)
+        return [f"browser {text}"] if explicit or _VIDEO_HOSTS.search(host or "") else None
+    if verb == "form_choose":
+        params = action.parameters
+        if params.get("kind") in ("check", "date") or params.get("said_field"):
+            return [f"browser {text}"]
+        return None
+    if verb in ("shop_refine", "product_info"):
+        return [f"browser {text}"] if _SHOP_HOSTS.search(host or "") else None
+    return None
+
+
+def _bare_part_6(lowered, raw):
+    """A Part 6 shape the DMM sent without the `browser` prefix, when it can only be that."""
+    text = raw.strip()
+    tokens = part_6_direct(lowered, text, None)
+    if tokens:
+        return part_6_action(lowered, raw, text)
+    return None
+
+
 # ── Rules before the classifier (tuning pass V9) ──
 # A whole utterance that the rules understand COMPLETELY and that can only mean one command is
 # routed straight to them, skipping the classifier model (~0.45 s on the local model, and its
@@ -1472,7 +2071,7 @@ _DIRECT_BROWSER = frozenset({
     "download_open", "download_show", "download_control", "page_help", "ws_open", "ws_search",
     "ws_create", "ws_share", "slides_present", "ws_recent", "ws_download", "keep_note",
     "form_responses", "classroom_due", "tabs_close_duplicates", "tabs_close_side",
-    "tabs_mute_others", "tabs_recently_closed", "tabs_discard", "tab_find",
+    "tabs_mute_others", "tabs_recently_closed", "tabs_discard", "tab_find", "search_close",
 })
 _NEEDS_SHEET = frozenset({"sheet_cell", "sheet_calc", "sheet_row"})
 _NEEDS_SLIDES = frozenset({"slides_nav"})
@@ -1537,13 +2136,36 @@ def direct_tokens(utterance, situation_fn=None):
     if re.fullmatch(r"what'?s? (?:is )?(?:my |the )?next (?:meeting|event|call)(?: on my calendar)?|"
                     r"when is my next (?:meeting|event|call)", low):
         return ["calendar next meeting"]
+    # Fix round V11: shapes that are a complete command whatever is in front.
+    if _WA_NAMED_RE.fullmatch(low) or _WA_READ_RECENT.fullmatch(low):
+        return [f"message {text}"]                      # "open graphics team group in whatsapp"
+    if last_messages_request(low) and not re.search(r"\b(?:e-?mails?|mails?|gmail|inbox)\b", low):
+        return [f"message {text}"]                      # "read the last three messages of mota panda"
+    found = part_6_direct(low, text, situation_fn)
+    if found:
+        return found                                    # Part 6: forms, video, site search, shopping
+    if search_request(low, text):
+        return [f"browser {text}"]                      # "click on the search bar and search for X"
+    if low not in ("scroll down", "scroll up") and scroll_request(low):
+        return [f"browser {text}"]                      # "scroll the mail to the bottom"
     # H0.2 — the app in front. With WhatsApp in front, "open X", "click on X", "go to X chat"
     # are a CHAT (the bug report: "open XYZ chat" -> "no app called XYZ chat"), "read it" is the
     # open chat, and "who messaged me" is WhatsApp's unread list.
     if front_site(situation_fn) == "web.whatsapp.com":
+        if _WA_CLOSE_CHAT.fullmatch(low):
+            return ["message close this chat"]              # "close the group" is the open chat here
+        if _WA_LAST_HERE.fullmatch(low):
+            return [f"message {text}"]                      # "read the last three messages"
+        m = re.fullmatch(r"(?:open|click(?: on)?|select|go to|show me) " + _WA_NTH.pattern, low)
+        if m:
+            return [f"message open result {_ORDINAL_N.get(m.group(1)) or int(m.group(1)[0])}"]
+        if _WA_SEARCH.fullmatch(low) and _bare_workspace(low, text) is None and not re.search(
+                r"\b(?:google|youtube|web|internet|online|gmail|mail|drive|docs|sheets|amazon|flipkart|maps)\b", low):
+            return [f"message {text}"]                      # "search for general panchayat [and open it]"
         m = re.fullmatch(r"(?:open|go to|click(?: on)?|switch to|show me) (?:the |my |our )?(.+?)"
                          r"( chat| group| conversation)?", low)
-        if m and not re.match(r"(?:new tab|settings|a new|chrome|whatsapp)\b", m.group(1)):
+        if m and not re.match(r"(?:new tab|settings|a new|chrome|whatsapp)\b", m.group(1)) \
+                and _bare_workspace(low, text) is None:      # "open the budget sheet" is still a Sheet
             name = m.group(1)
             said_chat = bool(m.group(2))
             # "open youtube" in front of WhatsApp is still YouTube: a known site or app is a
@@ -1553,6 +2175,9 @@ def direct_tokens(utterance, situation_fn=None):
                 return [f"message open {found.group(0) if found else name}"]
         if re.fullmatch(r"(?:read|summari[sz]e) (?:it|this|this chat|the messages|the chat)|what did (?:they|people) say", low):
             return ["message read this"]
+        if re.fullmatch(r"(?:read|summari[sz]e|what are|tell me) (?:me )?(?:the |my )?(?:most )?(?:recent|latest|last|new|newest) "
+                        r"(?:chat|messages?)", low):
+            return ["message read the recent chat"]
         if re.fullmatch(r"(?:who|anyone) (?:messaged|texted|wrote to) me(?: today)?|(?:any |show |read )?unread(?: chats| messages)?", low):
             return ["message who messaged me"]
     # "close it" / "go back to it": only while a tab is remembered (G1).
@@ -1785,8 +2410,10 @@ def _part_2c_action(low, raw):
     if m:
         collapse = m.group(1) in ("collapse", "fold", "close up", "minimise", "minimize")
         target = "all" if m.group(2).startswith("all") else _group_name(m.group(3) or "")
+        # "open the graphics team group": a tab group when one has that name, else WhatsApp's.
+        or_chat = m.group(1) == "open" and target not in ("all", "current") and "tab group" not in low
         return Action("browser", "group_collapse", target=target,
-                      parameters={"collapsed": collapse}, raw=raw)
+                      parameters={"collapsed": collapse, "or_chat": or_chat}, raw=raw)
     m = re.fullmatch(r"ungroup (?:all(?: (?:the |my )?(?:tab )?groups)?|everything)", low)
     if m:
         return Action("browser", "group_ungroup", target="all", raw=raw)
@@ -2141,8 +2768,10 @@ def _is_guess(action):
 
 
 def _worth_rethinking(action, result):
+    # "X isn't open" is a complete, honest answer to "close X": a model asked to rethink it
+    # closed something ELSE (the chat inside WhatsApp, for "close WhatsApp").
     return (result is not None and result.status in _RETHINK_STATUSES
-            and action.domain not in _NEVER_RETHINK)
+            and action.domain not in _NEVER_RETHINK and action.key not in ("app.close", "message.close"))
 
 
 _CONFIRM_PROMPTS = {
@@ -2157,6 +2786,10 @@ _CONFIRM_PROMPTS = {
     "file.delete": "That will delete it. Should I go ahead?",
     "app.kill": "That will force-close it and you may lose unsaved work. Should I go ahead?",
     "window.close_all": "That will close every open window. Should I go ahead?",
+    # Part 6
+    "browser.form_submit": "Submit this form? Once it's sent I can't take it back.",
+    "browser.profile_clear": "Forget every detail you gave me for forms?",
+    "browser.video_subscribe": "Subscribe to this channel?",
 }
 
 
@@ -2407,6 +3040,8 @@ class AutomationRuntime:
             proposed = normalize_command(token, self.context)
             if proposed is None:
                 continue
+            if (proposed.key, proposed.target, proposed.parameters) == (action.key, action.target, action.parameters):
+                continue       # the model proposed the SAME thing: it just failed, do not run it twice
             outcome = self.execute_action(proposed)
             out.append(outcome)
             if outcome.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS) or not outcome.ok:

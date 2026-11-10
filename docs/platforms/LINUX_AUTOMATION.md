@@ -327,6 +327,143 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — round 5, part 6 (slice 6a): forms, the video, site search, shopping (extension 1.12.0)
+
+Decisions asked first and answered by the user: **D1** shopping = search and open only (no
+add-to-cart, no cart page, no checkout); **D2** the form profile may hold name, email, phone,
+postal address, college, roll number, date of birth and gender.
+
+- **D1 fields**: `form_choose` — drop-downs (native and Google Forms' `role=listbox`), radio
+  options, check boxes, date fields; "set the country to India" falls back from the text box to
+  the drop-down. **D2**: `page_key` (real keys via wtype). **D3**: `automation/form_profile.py`
+  (0600 file, validation, spoken emails / numbers / dates, local field matching by autocomplete,
+  type and label; someone-else fields and secret fields never) and `form_fill` (a late
+  confirmation naming the fields; the pending action holds field numbers and keys, not values;
+  never submits; says what is still empty). **D4** `form_submit` (CONFIRM; an invalid form is
+  not reported as sent; a pay/order button is never pressed). **D5** `file_upload` (newest
+  matching file, late confirmation naming it, a one-shot trusted-key hook in the page so a real
+  Space opens the chooser, Ctrl+L + path + Enter, the name read back).
+- **F1** `video` / `video_subscribe` — speed (absolute and a quarter step), seek and jump,
+  captions, skip ad, next, like / unlike, watch later, full screen / theatre / mini player
+  (YouTube's own keys after the page releases focus), play / pause / mute, "how much is left".
+- **F2** `site_search` — "search <site> for X", "X on <site>", "images of X"; Amazon and
+  Flipkart price ranges ("under 2000", "between 500 and 1000", "2k", "two thousand") and sort.
+  "google search …" and "youtube search …" are unchanged. **F3** `shop_refine` (re-sort /
+  filter the results in front) and `product_info` (schema.org Product, Amazon and Flipkart
+  markup, Open Graph).
+- **Policy**: `policy._SHOPPING_STOP` DENIES cart / buy / checkout / order / pay clicks (also
+  OCR clicks); `browser.form_submit`, `browser.profile_clear`, `browser.video_subscribe` are
+  CONFIRM. `interpreter._USER_ONLY`: the model can never set / forget / submit details or
+  choose an upload.
+- **Rules first**: `common.part_6_direct` — complete shapes skip the classifier; the
+  context-dependent ones (seek, product, sort) only with a video or a shop in front.
+- Tests: `test_browser_control.py` [21] (185 new), `test_browser_extension.py` [10] (37 new),
+  `test_dmm_browser.py` +16 cases (95/95 on the local model, 78 rules-first).
+- **Not done (slice 6b)**: F4 ask ChatGPT / Claude / Gemini, F5 WhatsApp extras (reply to the
+  open chat, send a file), F6 LinkedIn / Reddit pages, G5 multi-step requests.
+- **Not verified live**: no real form was filled or submitted, no file uploaded through the
+  real portal chooser, no live YouTube / Amazon / Flipkart page used.
+
+### 2026-11-11 — fix round V11, third pass from the audit log (01:19–01:23)
+
+- **"close WhatsApp" closed the chat.** `app.close whatsapp` answered "WhatsApp isn't open"
+  (its web-app window runs in Chrome's "Profile 1", so its class is not the entry's
+  `StartupWMClass` `…__-Default`); the understanding layer then turned that into `message
+  close`. Fixes: `linux._shows_site` — a web app's windows are matched by SITE, any profile
+  (this also removes the 8 s wait on every "open whatsapp", which never saw its window);
+  with no window, the site's TAB is closed through the bridge; `app.close` / `message.close`
+  are never rethought by a model; `wa_close` never opens WhatsApp.
+- **"open and read the last three latest recent chats of mota panda"** reached the classifier,
+  which answered with its own example (`message read core team today`).
+  `common.last_messages_request` is rules-first: (name, count) from "the last N messages /
+  chats of|from|in X", "X's last N messages"; `wa_read(name, count=N)` reads exactly N, as
+  they are. "read the last three messages" with WhatsApp in front is the open chat. Mail words
+  ("emails from Ravi") are excluded.
+- **A name heard wrong** ("public relation and outreach coding"): when WhatsApp's own search
+  showed chats for one of the words but none matched well, the closest two are offered
+  instead of "not found".
+- `message open` with no name became a message to someone called "open" (the log's
+  `message.send target='open'`): now not parsed.
+- Tests: `test_browser_control.py` [20], the cases marked LOG (733 checks in the suite).
+
+### 2026-11-11 — fix round V11, second pass from the audit log (extension 1.11.0)
+
+`logs/automation.log` 01:00–01:05: every `message.open` for a chat that was not on screen
+failed in ~40 ms, ran a SECOND time ~1 s later, and sometimes succeeded then.
+
+- **Cause.** `_wa_find` typed into WhatsApp's search and read the chat list in the same
+  instant, before WhatsApp had filtered it (`_ready` returned at once: the stale list was
+  "non-empty"). The retry sometimes saw the first attempt's results. Fix: `chat.search`
+  (`pageChatSearch`) types and waits INSIDE the page until the list has changed and held still
+  for 350 ms, or says "nothing found" and holds still, or 1.6 s pass with the same list.
+  A stale "nothing found" from the previous search is not trusted (found by the Chrome test).
+- **Search again by words.** The whole name, then its two longest words: "general punchayat"
+  finds "General Panchayat" through "general".
+- **The search is always closed** after a lookup — found (`_wa_open`) or not — through
+  `_wa_search_close` (`page.searchClose`, then `chat.search ""` when text is left).
+- **Replace, never append.** `page.search` / `chat.search` select the box's own content with a
+  Range (no dependence on the window having focus), delete, insert, and read the value back
+  (`exact`); a page that refused gets the real keyboard (Ctrl+A, type).
+- **`search_close` is verified.** `page.searchClose` is async and returns `left`; with text
+  left the real keys are sent (Ctrl+A, Backspace, Escape) and the page asked again; still text
+  → a FAILURE is said, never "closed". Wording widened: "close the whatsapp search", "delete
+  the text in the search bar", "clear the search text".
+- **Ran twice.** `_rethink` no longer executes a model proposal identical to the action that
+  just failed.
+- **New**: `message search <name> [and open it]` (`wa_search`: results said, search left open),
+  `message open result <n>` ("open the first one" — the log's "first search result not the
+  second one"), `message close this chat` (`chat.close`; "close the group" with WhatsApp in
+  front and no tab groups — the log's three `group_close` failures).
+- Tests: `test_browser_control.py` [20] now 107 checks (the log's cases are marked LOG),
+  `test_browser_extension.py` [9] (a list that filters 0.5 s after typing).
+
+### 2026-11-11 — fix round V11: scroll, search, close search, names (extension 1.10.0)
+
+Reported by the user after using Parts 4 and 5. Each was traced through the parser first.
+
+- **Scrolling did nothing in web apps.** `page.scroll` called `window.scrollBy`; Gmail, WhatsApp,
+  Docs scroll a box inside the page. The extension now scrolls the scrollable ancestor of what
+  is in the middle of the view (`where="side"`: the left list; WhatsApp: `#main` / `#pane-side`),
+  else the largest scrollable box, else the window, and returns `moved` / `atEnd` / `canScroll`.
+  `web_macros.page_scroll` says "Done" only when it moved, names an end as an end, and sends
+  the real Page Down / Ctrl+End keys when nothing scrolls by script (Sheets' canvas).
+  `common.scroll_request` parses "scroll the mail to bottom", "scroll up a bit", "scroll the
+  chat list down", "go to the top of the page" (direction, where, amount); "scroll to <words>"
+  is still a scroll TO those words. `linux._page_scroll`: another app in front gets real keys /
+  the wheel, never a hidden Chrome tab.
+- **"open graphics team group [in whatsapp]"** was a Chrome tab-group expand / an app launch.
+  `common._bare_fix` + `_WA_NAMED_RE`: "… in/on/from whatsapp" is a chat from anywhere (rules
+  first, and in `normalize_command` for a DMM token); "open X chat" is a chat unless an app or
+  site is called that; "open X group" is `group_collapse` with `or_chat` → `web_macros.group_open`
+  (a tab group when one has the name, else `wa_open`). With WhatsApp in front, "open the budget
+  sheet" is a Sheet again (it was sent to a chat).
+- **Editions.** `semantic_match.edition`: names that are what was said plus only numbers
+  ("Graphics Team (2026-27)", "(2025-26)") are editions of one chat — the one with the latest
+  message is picked, no question. One shared word ("graphics") still asks. `year_ranges`:
+  "2026 2027" = "2026-27" = "2026 to 27" on both sides, for chats and files.
+- **"read the recent chat"** looked for a chat called "recent". Now `recent` = the open chat,
+  else the first non-pinned (or unread) row. Reading a chat with N unread reads those N
+  ("2 new in …"). A chat found through WhatsApp's search leaves the search closed.
+- **"click on the search button and search for X"** was one click on a button of that name.
+  `common.search_request` → `search_here`; from 1.10.0 it is `page.search` (box found by
+  type/role/name, magnifier pressed first when the box is hidden, cleared, typed, Enter — no
+  Enter on live-filter apps, `_LIVE_SEARCH`). On the Sheets/Docs/Slides HOME list it navigates
+  to Google's own search (it used to press Ctrl+F there).
+- **"close the search bar"** (was: close an app called "search bar"): `browser.search_close` →
+  `page.searchClose` (empty, the box's own Cancel/Clear, Escape, focus back to the open chat's
+  message box on WhatsApp), highlights cleared, Gmail `#search/…` → `#inbox`, an editor's find
+  bar gets Escape. Rules-first (`_DIRECT_BROWSER`).
+- **File names.** `rank_titles`: a title that STARTS with the phrase 85; equal scores keep the
+  page's order (most recently opened first) instead of "shortest title first". `_find_files`:
+  the query is sent with numbers as digits, then without numbers, then the recent list is
+  matched locally (≥ 40 only). Same-name-different-year files open the first listed; other
+  near-ties still ask.
+- `pageType` with an empty text and `clear` now really empties a contenteditable box (WhatsApp's
+  search was left filtered after a failed lookup).
+- Tests: `test_browser_control.py` [20] (78 checks), `test_browser_extension.py` [8] (real
+  Chrome: inner-box scrolling, hidden search box, close search), 7 cases in `test_dmm_browser.py`.
+  Not tried on live, logged-in Gmail / WhatsApp / Sheets.
+
 ### 2026-11-10 — round 5, part 5: WhatsApp, app context, the semantic matcher
 
 - **H0.2** `common.front_site` + the rules-first route: with WhatsApp in front (web-app window or

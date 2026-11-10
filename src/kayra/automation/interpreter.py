@@ -60,6 +60,8 @@ INSIDE THE BROWSER PAGE (also inside web apps like WhatsApp, YouTube, X):
   browser click on <visible label or name> | browser click on the second <label> |
   browser type <text> into <field> | browser search this page for <text> |
   browser scroll down | browser scroll up | browser scroll to <text> |
+  browser scroll the <mail | chat | page> to the <top | bottom> | browser scroll the chat list down |
+  browser search for <text> in the search bar | browser close the search |
   browser read this page | browser summarize this page | browser find <text> on this page |
   browser what can i click | browser list tabs | browser switch to <site> tab |
   browser close <site> tab | browser mute this tab | browser pin this tab |
@@ -103,6 +105,24 @@ INSIDE THE BROWSER PAGE (also inside web apps like WhatsApp, YouTube, X):
   browser add a note saying <text> | browser open the responses of my <name> form |
   browser what assignments are due |
   browser open the page i read yesterday about <topic> | browser bookmark <name>
+FORMS (decision D2: the user's saved details; Kayra never presses submit unless asked):
+  browser fill this form with my details | browser select <option> in the <field> dropdown |
+  browser choose <option> for <field> | browser tick <label> | browser untick <label> |
+  browser set the <field> date to <date> | browser fill the <field> field with my <email | phone> |
+  browser submit this form | browser press <enter | tab | escape | down arrow> |
+  browser upload my <resume | file name> here | browser remember my <field> is <value> |
+  browser what details do you have for forms | browser forget my <field>
+VIDEO (YouTube and any page with a video): browser skip the ad | browser speed <1.5> |
+  browser normal speed | browser skip <10> seconds | browser go back <30> seconds |
+  browser go to <2:30> | browser turn on captions | browser next video | browser like this video |
+  browser subscribe to this channel | browser save this to watch later |
+  browser make the video full screen | browser theater mode | browser pause the video |
+  browser how much is left in this video
+SITES & SHOPPING (search and open only — never add to a cart, buy or pay):
+  browser search <amazon | flipkart | github | wikipedia | reddit | site> for <query> |
+  browser search amazon for <product> under <price> | browser images of <thing> |
+  browser sort by price low to high | browser show only under <price> | browser how much is this |
+  browser what's the rating
 EMAIL (Gmail): email search for <text> | email show unread from this week | email compose |
   email open my <name> label | email check | email open latest | email open the email from <name> |
   email read latest | email read this | email go to sent | email reply | email archive |
@@ -113,7 +133,8 @@ CALENDAR / MEET: calendar next meeting | calendar join my next meeting | calenda
   meet share screen | meet share the <app> window | meet share this tab |
   meet share the <site> tab | meet share my second screen | meet share screen with audio |
   meet share <app> instead | meet am i sharing | meet stop sharing | meet leave
-MESSAGES (WhatsApp): message <contact>: <text> | message open <chat or group> |
+MESSAGES (WhatsApp): message <contact>: <text> | message open <chat or group> | message search for <name> | message open result <n> |
+  message close this chat |
   message read <chat> | message read <chat> today | message read this | message who messaged me
 MEDIA & SYSTEM: play <song> | pause | resume | next track | previous track |
   system volume <0-100> | system mute | system brightness <0-100> | wifi on | wifi off |
@@ -214,6 +235,11 @@ def _parse(raw):
     return data if isinstance(data, dict) else None
 
 
+# Part 6: a model may never write, forget or submit the user's details, or pick a file to upload
+# — those come from the user's own words only.
+_USER_ONLY = frozenset({"profile_set", "profile_forget", "profile_clear", "form_submit", "file_upload"})
+
+
 def validate(commands, normalize, classify):
     """Only commands the parser understands and the policy does not forbid. Order kept."""
     from kayra.automation.policy import Risk
@@ -232,6 +258,8 @@ def validate(commands, normalize, classify):
             continue
         if action.domain == "browser" and action.action == "page_click" and action.confidence < 1.0:
             continue                                   # the parser's own guess, not a command
+        if action.domain == "browser" and action.action in _USER_ONLY:
+            continue                                   # the user's own details and decisions
         if classify(action)[0] == Risk.DENY:
             continue
         clean.append(command)

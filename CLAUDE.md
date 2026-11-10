@@ -263,6 +263,22 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   WhatsApp text is summarized with `ai.summarize(..., local_only=True)` — never a cloud model.
   `message.send` is a late confirmation naming the RESOLVED chat (not in the static CONFIRM set);
   it re-checks the open chat before sending.
+- **Fix round V11 (2026-11-11, extension 1.11.0).** A page that filters as you type must be WAITED for inside the page (`chat.search`): typing then reading at once reads the stale list. Every search Kayra opens it also closes, and `search_close` is verified (`left`), never assumed. Web apps scroll a BOX, not the window:
+  `page.scroll` picks the box in view and returns `moved`; never say "Done" without it. One
+  search action (`page.search`, `common.search_request`) and its undo (`browser.search_close`).
+  "… in whatsapp" / "X chat" / "X group" (tab group first) are chats from anywhere
+  (`common._bare_fix`). Same name + different years = editions: latest wins, no question
+  (`semantic_match.edition`, `year_ranges`). Changelog: `docs/platforms/LINUX_AUTOMATION.md`.
+- **Part 6a (2026-11-11, extension 1.12.0) — forms, video, site search.** D1 = shopping is
+  SEARCH AND OPEN only: `policy._SHOPPING_STOP` DENIES cart/buy/checkout/pay clicks. D2 = the
+  form profile (`automation/form_profile.py`, `data/profile.json` 0600) — values are matched
+  locally, redacted in the audit log (`text` param), and NEVER kept in a pending action (the
+  approved fill carries field numbers + keys). One page function `pageForm(op)` tags fields
+  `data-kayra-field`; submit refuses an invalid form and pay buttons. Upload = a one-shot
+  trusted-key hook (a REAL Space is the user gesture) + Ctrl+L path in the chooser.
+  `interpreter._USER_ONLY`: the model never sets/submits details or picks an upload.
+  Context-dependent shapes (seek, product, sort) are rules-first only with a video / shop in
+  front (`common.part_6_direct`). Tests must use `TempProfile` / `web_macros.FILE_ROOTS`.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

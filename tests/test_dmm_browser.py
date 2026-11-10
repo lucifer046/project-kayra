@@ -39,6 +39,8 @@ SHEET = {"tab_url": "https://docs.google.com/spreadsheets/d/x/edit"}
 SLIDES = {"tab_url": "https://docs.google.com/presentation/d/x/edit"}
 WEB = {"tab_url": "https://example.com/article"}
 WA = {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+YT = {"app": "google-chrome", "tab_url": "https://www.youtube.com/watch?v=x"}
+SHOP = {"app": "google-chrome", "tab_url": "https://www.amazon.in/dp/B0"}
 
 # (said, screen, expected action key, expected target or None = any)
 CASES = (
@@ -108,12 +110,37 @@ CASES = (
     ("click on design team 2026", WA, "message.open", "design team 2026"),
     ("who messaged me", WA, "message.unread", None),
     ("read it", WA, "message.read", None),
+    # the V11 fix round: whatever is in front
+    ("scroll the mail to bottom", WEB, "browser.page_scroll", "bottom"),
+    ("scroll the chat up a bit", WA, "browser.page_scroll", "up"),
+    ("open graphics team group in whatsapp", WEB, "message.open", "graphics team"),
+    ("read the recent chat", WEB, "message.read", "recent"),
+    ("click on the search button and search for council details", WEB, "browser.search_here", "council details"),
+    ("close the search bar", WA, "browser.search_close", None),
+    ("open council details 2026-27 sheet", WA, "browser.ws_open", "council details 2026-27"),
     ("open youtube", WA, "browser.open_url", None),
     # …and from anywhere
     ("open the PR group on WhatsApp", WEB, "message.open", None),
     ("who messaged me on WhatsApp", WEB, "message.unread", None),
     ("what did they say in the core team today", WEB, "message.read", None),
     ("tell Rahul I'm running late", WEB, "message.send", "rahul"),
+    # Part 6: forms, the video, site search and shopping
+    ("fill this form with my details", WEB, "browser.form_fill", None),
+    ("select India in the country dropdown", WEB, "browser.form_choose", "India"),
+    ("tick I agree", WEB, "browser.form_choose", None),
+    ("submit this form", WEB, "browser.form_submit", None),
+    ("upload my resume here", WEB, "browser.file_upload", "resume"),
+    ("remember my phone number is 98765 43210", WEB, "browser.profile_set", "phone"),
+    ("skip the ad", YT, "browser.video", "skipAd"),
+    ("skip 10 seconds", YT, "browser.video", "seek"),
+    ("play at 1.5x", YT, "browser.video", "rate"),
+    ("turn on captions", YT, "browser.video", "captions"),
+    ("search amazon for earbuds under 2000", WEB, "browser.site_search", "earbuds"),
+    ("images of red pandas", WEB, "browser.site_search", "red pandas"),
+    ("how much is this", SHOP, "browser.product_info", None),
+    ("sort by price low to high", SHOP, "browser.shop_refine", None),
+    ("add this to cart", SHOP, "browser.page_click", "add to cart"),
+    ("what's the price of gold today", WEB, "chat", None),
     # must stay conversation / web questions (never automation)
     ("who invented the telephone", WEB, "chat", None),
     ("what's the total of 25 and 30", WEB, "chat", None),

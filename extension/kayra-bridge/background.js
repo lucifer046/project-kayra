@@ -364,6 +364,9 @@ async function run(cmd, args) {
     case "chat.open": return inPage(await targetTab(args), pageChatOpen, [args.name || ""]);
     case "chat.messages": return untilReady(args, pageChatMessages, [args.limit || 30], (r) => r && r.chat);
     case "chat.composer": return inPage(await targetTab(args), pageChatComposer, []);
+    // ── 1.11.0: search WhatsApp and WAIT for its results; close the open chat ──
+    case "chat.search": return inPage(await targetTab(args), pageChatSearch, [args.text || "", args.max || 60, args.settleMs || 4000]);
+    case "chat.close": return inPage(await targetTab(args), pageChatClose, []);
 
     case "page.text": return inPage(await targetTab(args), pageText, [args.max || 15000]);
     case "page.click": return inPage(await targetTab(args), pageClick, [args.text, args.nth || 1]);
@@ -391,7 +394,14 @@ async function run(cmd, args) {
     }
     case "runtime.reload": setTimeout(() => chrome.runtime.reload(), 200); return {reloading: true};
     case "page.type": return inPage(await targetTab(args), pageType, [args.field || "", args.text || "", !!args.submit, !!args.clear]);
-    case "page.scroll": return inPage(await targetTab(args), pageScroll, [args.direction || "down", args.until || ""]);
+    case "page.scroll": return inPage(await targetTab(args), pageScroll, [args.direction || "down", args.until || "", args.where || "", args.amount || 1]);
+    // ── 1.10.0: one search action for every web app, and its undo ──
+    case "page.search": return inPage(await targetTab(args), pageSearch, [args.text || "", !!args.submit]);
+    case "page.searchClose": return inPage(await targetTab(args), pageSearchClose, []);
+    // ── 1.12.0: forms, the video, the product (Part 6) ──
+    case "page.form": return inPage(await targetTab(args), pageForm, [args.op || "list", args]);
+    case "page.video": return inPage(await targetTab(args), pageVideo, [args.op || "state", args.value === undefined ? null : args.value]);
+    case "page.product": return untilReady(args, pageProduct, [], (r) => r && r.found);
     case "page.find": return inPage(await targetTab(args), pageFind, [args.text]);
     case "page.controls": return inPage(await targetTab(args), pageControls, [args.limit || 60]);
     case "page.setMain": return inPage(await targetTab(args), (k, v) => { window[k] = v; return true; }, [args.key, args.value], "MAIN");
@@ -599,7 +609,8 @@ function pageType(field, text, submit, clear) {
   target.focus();
   if (target.isContentEditable || target.getAttribute("role") === "textbox" && !("value" in target)) {
     if (clear) document.execCommand("selectAll", false);
-    document.execCommand("insertText", false, text);
+    if (text) document.execCommand("insertText", false, text);
+    else if (clear) document.execCommand("delete", false);
   } else {
     const proto = target.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
@@ -616,23 +627,216 @@ function pageType(field, text, submit, clear) {
   return {typed: true, field: labelOf(target)[0] || "field"};
 }
 
-function pageScroll(direction, until) {
-  const step = (direction === "up" ? -1 : 1) * window.innerHeight * 0.8;
-  if (direction === "top") { window.scrollTo(0, 0); return {scrolled: true}; }
-  if (direction === "bottom") { window.scrollTo(0, document.body.scrollHeight); return {scrolled: true}; }
-  if (!until) { window.scrollBy(0, step); return {scrolled: true}; }
-  const want = String(until).toLowerCase();
-  const walker = () => {
+// 1.10.0: scrolls what the user is LOOKING at. Gmail, WhatsApp, Docs and most web apps never
+// scroll the window: the mail, the chat or the list is a box inside the page, and
+// window.scrollBy moved nothing while Kayra said "Done". The box is the scrollable ancestor of
+// what sits in the middle of the view (or at the left edge for where = "side"), else the
+// biggest scrollable box, else the page. `moved` is measured, never assumed.
+function pageScroll(direction, until, where, amount) {
+  if (until) {
+    const want = String(until).toLowerCase();
     const it = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let n; while ((n = it.nextNode())) {
       if ((n.textContent || "").toLowerCase().includes(want)) {
         const el = n.parentElement; const r = el.getBoundingClientRect();
-        if (r.height > 0) { el.scrollIntoView({block: "center"}); return true; }
+        if (r.height > 0) { el.scrollIntoView({block: "center"}); return {found: true}; }
       }
     }
-    return false;
+    return {found: false};
+  }
+  const page = document.scrollingElement || document.documentElement;
+  const scrolls = (el) => {
+    if (!el || el === document.body || el === document.documentElement || el === page) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 60 || r.height < 60 || r.bottom <= 0 || r.top >= innerHeight) return false;
+    return /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) && el.scrollHeight > el.clientHeight + 8;
   };
-  return {found: walker()};
+  const above = (el) => {
+    while (el && el !== document.body && el !== document.documentElement) {
+      if (scrolls(el)) return el;
+      el = el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
+    }
+    return null;
+  };
+  const inside = (root) => {
+    if (!root) return null;
+    let best = null, area = 0;
+    for (const el of [root, ...root.querySelectorAll("*")]) {
+      if (!scrolls(el)) continue;
+      const r = el.getBoundingClientRect(); const a = r.width * Math.min(r.height, innerHeight);
+      if (a > area) { best = el; area = a; }
+    }
+    return best;
+  };
+  const at = (fx, fy) => above(document.elementFromPoint(innerWidth * fx, innerHeight * fy));
+  const side = /^(side|sidebar|list|chats|chat list|menu)$/.test(String(where || ""));
+  const pageScrolls = page.scrollHeight > innerHeight + 8;
+  const boxes = [];
+  if (location.hostname === "web.whatsapp.com") {
+    const chats = document.querySelector("#pane-side");
+    const main = document.querySelector("#main");
+    boxes.push(side || !main ? above(chats) || inside(chats) : inside(main));
+  } else if (side) {
+    boxes.push(at(0.1, 0.5));
+  } else {
+    boxes.push(at(0.5, 0.5), at(0.5, 0.3), at(0.65, 0.65));
+  }
+  if (!pageScrolls) boxes.push(inside(document.body));
+  const tried = new Set();
+  const step = (direction === "up" ? -1 : 1) * 0.8 * (Number(amount) || 1);
+  for (const box of [...boxes.filter(Boolean), null]) {
+    if (tried.has(box)) continue;
+    tried.add(box);
+    if (!box && !pageScrolls) break;
+    const get = () => (box ? box.scrollTop : (page.scrollTop || window.scrollY));
+    const full = box ? box.scrollHeight : page.scrollHeight;
+    const view = box ? box.clientHeight : innerHeight;
+    const before = get();
+    const top = direction === "top" ? 0 : direction === "bottom" ? full : before + step * view;
+    (box || window).scrollTo({top, behavior: "instant"});
+    const now = get();
+    if (Math.abs(now - before) > 1)
+      return {scrolled: true, moved: true, inner: !!box, atEnd: now + view >= full - 2, atStart: now <= 1};
+  }
+  // Nothing moved: already at that end, or the app draws on a canvas (Sheets) and has no box.
+  const any = boxes.some(Boolean) || pageScrolls;
+  return {scrolled: any, moved: false, canScroll: any};
+}
+
+// 1.10.0: THE search box of the page in front, for every web app. It is found by what it is
+// (type=search, role=searchbox, inside role=search, named "search"/"q"), not by one site's
+// markup. When the box is hidden behind a magnifier button (YouTube narrow, Drive, Slack),
+// that button is pressed first and the box waited for. Never a password or payment field.
+async function pageSearch(text, submit) {
+  const words = (el) => [el.getAttribute("aria-label"), el.getAttribute("placeholder"), el.getAttribute("name"), el.id,
+                         el.getAttribute("title"), el.getAttribute("data-placeholder"), el.getAttribute("aria-placeholder"),
+                         el.getAttribute("data-tooltip")].filter(Boolean).join(" ").toLowerCase();
+  const shown = (el) => {
+    const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+    return r.width > 20 && r.height > 8 && s.visibility !== "hidden" && s.display !== "none";
+  };
+  const score = (el) => {
+    const type = (el.type || "").toLowerCase();
+    if (["hidden", "submit", "button", "checkbox", "radio", "file", "password"].includes(type)) return 0;
+    const w = words(el);
+    if (/pass(word|code)|\bpin\b|cvv|card number/.test(w)) return 0;
+    let n = 0;
+    if (type === "search" || el.getAttribute("role") === "searchbox") n = 5;
+    else if (el.closest("[role=search], form[action*='search' i], form[role=search]")) n = 4;
+    else if (/\bsearch|\bfind\b/.test(w) || /^(q|query|search_query|k|s)$/.test(el.getAttribute("name") || "")) n = 3;
+    if (!n) return 0;
+    const r = el.getBoundingClientRect();
+    return n + (r.top >= 0 && r.top < innerHeight * 0.45 ? 1 : 0) + (el === document.activeElement ? 1 : 0);
+  };
+  const best = () => Array.from(document.querySelectorAll(
+    "input,textarea,[contenteditable=true],[contenteditable=''],[role=textbox],[role=searchbox],[role=combobox]"))
+    .filter(shown).map((el) => [score(el), el]).filter((p) => p[0] > 0).sort((a, b) => b[0] - a[0]).map((p) => p[1])[0] || null;
+  let box = best(), opened = false;
+  if (!box) {
+    const opener = Array.from(document.querySelectorAll("button,[role=button],a[aria-label],[data-tooltip]")).filter(shown)
+      .find((b) => /^(open |show )?search\b/.test(words(b) || (b.innerText || "").trim().toLowerCase()));
+    if (opener) {
+      opener.click(); opened = true;
+      const deadline = Date.now() + 1500;
+      while (!box && Date.now() < deadline) { await new Promise((r) => setTimeout(r, 80)); box = best(); }
+    }
+  }
+  if (!box) return {searched: false, reason: "no search box"};
+  const r = box.getBoundingClientRect();
+  const opts = {bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+  for (const type of ["mousedown", "mouseup", "click"]) box.dispatchEvent(new MouseEvent(type, opts));
+  // The OLD text is replaced, never added to: the box's own content is selected first (a
+  // Range, so it does not depend on the window having the keyboard focus) and what the box
+  // holds afterwards is read back, so Kayra knows when a page refused the text.
+  const editable = box.isContentEditable || (box.getAttribute("role") === "textbox" && !("value" in box));
+  const valueOf = () => String(editable ? box.innerText || "" : box.value || "").replace(/\s+/g, " ").trim();
+  const put = () => {
+    box.focus();
+    if (editable) {
+      const range = document.createRange(); range.selectNodeContents(box);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      if (valueOf()) document.execCommand("delete", false);
+      if (text) document.execCommand("insertText", false, text);
+    } else {
+      const proto = box.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(box, text);
+      box.dispatchEvent(new Event("input", {bubbles: true}));
+      box.dispatchEvent(new Event("change", {bubbles: true}));
+    }
+  };
+  put();
+  if (valueOf() !== String(text).replace(/\s+/g, " ").trim()) { await new Promise((r) => setTimeout(r, 120)); put(); }
+  const value = valueOf();
+  if (submit) {
+    const enter = {key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true};
+    for (const type of ["keydown", "keypress", "keyup"]) box.dispatchEvent(new KeyboardEvent(type, enter));
+    if (box.form && box.form.requestSubmit) { try { box.form.requestSubmit(); } catch (e) {} }
+  }
+  return {searched: true, opened, value, exact: value === String(text).replace(/\s+/g, " ").trim(),
+          field: words(box).slice(0, 60) || "search"};
+}
+
+// 1.10.0: "close the search" — the search box is emptied, its own Cancel / Clear / Close
+// button pressed, Escape sent, and the focus given back (on WhatsApp: to the message box of
+// the chat that was open), so the app looks the way it did before the search.
+async function pageSearchClose() {
+  const words = (el) => [el.getAttribute("aria-label"), el.getAttribute("placeholder"), el.getAttribute("name"), el.id,
+                         el.getAttribute("title"), el.getAttribute("data-placeholder"), el.getAttribute("aria-placeholder"),
+                         el.getAttribute("data-tooltip")].filter(Boolean).join(" ").toLowerCase();
+  const shown = (el) => {
+    const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+    return r.width > 8 && r.height > 8 && s.visibility !== "hidden" && s.display !== "none";
+  };
+  const isSearch = (el) => {
+    const type = (el.type || "").toLowerCase();
+    if (["hidden", "submit", "button", "checkbox", "radio", "file", "password"].includes(type)) return false;
+    return type === "search" || el.getAttribute("role") === "searchbox" ||
+      !!el.closest("[role=search], form[action*='search' i], form[role=search]") ||
+      /\bsearch|\bfind\b/.test(words(el)) || /^(q|query|search_query|k|s)$/.test(el.getAttribute("name") || "");
+  };
+  const valueOf = (el) => String("value" in el && !el.isContentEditable ? el.value : el.innerText || "").trim();
+  const boxes = Array.from(document.querySelectorAll(
+    "input,textarea,[contenteditable=true],[contenteditable=''],[role=textbox],[role=searchbox],[role=combobox]"))
+    .filter(shown).filter(isSearch);
+  const box = boxes.find((el) => el === document.activeElement) || boxes.find(valueOf) || boxes[0];
+  if (!box) return {closed: false, reason: "no search box"};
+  const had = valueOf(box);
+  const focused = box === document.activeElement;
+  box.focus();
+  if (box.isContentEditable || (box.getAttribute("role") === "textbox" && !("value" in box))) {
+    if (had) {
+      const range = document.createRange(); range.selectNodeContents(box);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      document.execCommand("delete", false);
+    }
+  } else if (had) {
+    const proto = box.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(box, "");
+    box.dispatchEvent(new Event("input", {bubbles: true}));
+    box.dispatchEvent(new Event("change", {bubbles: true}));
+  }
+  const whatsapp = location.hostname === "web.whatsapp.com";
+  let scope = box.closest("[role=search], form") || box;
+  for (let i = 0; i < 4 && scope.parentElement && !scope.matches("[role=search], form"); i++) scope = scope.parentElement;
+  const button = Array.from(scope.querySelectorAll("button,[role=button]")).filter(shown).find((b) => {
+    const w = words(b) || (b.innerText || "").trim().toLowerCase();
+    return /^(cancel|close|clear|exit)( the)? search\b|^(cancel|clear|close)$/.test(w) || (whatsapp && /^back$|chat list/.test(w));
+  });
+  if (button) button.click();
+  const esc = {key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true};
+  box.dispatchEvent(new KeyboardEvent("keydown", esc));
+  box.dispatchEvent(new KeyboardEvent("keyup", esc));
+  // What the box holds a moment later is the truth: a page that refused the script keeps its
+  // text, and Kayra then uses the real keyboard on the (still focused) box.
+  await new Promise((r) => setTimeout(r, 150));
+  const left = box.isConnected ? valueOf(box) : "";
+  if (left) return {closed: false, had, left, button: !!button};
+  box.blur();
+  if (whatsapp) {
+    const composer = document.querySelector("footer [contenteditable=true], #main [contenteditable=true][role=textbox]");
+    if (composer) composer.focus();
+  }
+  return {closed: !!(had || focused || button), had, left: "", button: !!button};
 }
 
 function pageFind(text) {
@@ -661,7 +865,8 @@ function pageChatList(max) {
     const unread = badge ? parseInt((badge.getAttribute("aria-label").match(/\d+/) || ["1"])[0], 10) : 0;
     const when = Array.from(row.querySelectorAll("div, span")).map((e) => (e.childElementCount ? "" : e.textContent.trim()))
       .find((t) => /^(\d{1,2}:\d{2}(\s?[AP]M)?|yesterday|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\/\d{1,2}\/\d{2,4})$/i.test(t)) || "";
-    chats.push({name, preview: preview === name ? "" : preview.slice(0, 160), unread, when});
+    const pinned = !!row.querySelector("[data-icon*='pin' i], [aria-label*='pinned' i]");
+    chats.push({name, preview: preview === name ? "" : preview.slice(0, 160), unread, when, pinned});
     if (chats.length >= max) break;
   }
   return {ready: true, chats};
@@ -698,6 +903,91 @@ function pageChatMessages(limit) {
               text: text.slice(0, 1000), out: !!el.closest(".message-out, [class*='message-out']")});
   }
   return {chat, messages: out.slice(-limit)};
+}
+
+// 1.11.0: WhatsApp's own search, typed AND waited for. The old flow typed and read the list
+// in the same instant, before WhatsApp had filtered it: a chat that was not on screen was
+// "not found" on the first try and found on the second (the audit log, 2026-11-11). The list
+// is read until it has changed and then held still, or WhatsApp says nothing matches.
+// text = "" empties the search and waits for the normal list to come back.
+async function pageChatSearch(text, max, settleMs) {
+  const pane = () => document.querySelector("#pane-side, [aria-label='Chat list'], [aria-label*='Chat list' i], [aria-label*='Search results' i]");
+  const read = () => {
+    const side = pane(); const chats = [];
+    if (!side) return chats;
+    const rows = Array.from(side.querySelectorAll("[role=listitem], [role=row]"))
+      .filter((r) => !r.parentElement.closest("[role=listitem], [role=row]"));
+    for (const row of rows) {
+      const titled = Array.from(row.querySelectorAll("span[title], div[title]")).filter((e) => e.getAttribute("title").trim());
+      if (!titled.length) continue;
+      const name = titled[0].getAttribute("title").trim();
+      if (chats.some((c) => c.name === name)) continue;        // a chat AND a message hit in it: once
+      const badge = row.querySelector("[aria-label*='unread message' i], [aria-label*='unread' i]");
+      chats.push({name, preview: "", when: "", unread: badge ? parseInt((badge.getAttribute("aria-label").match(/\d+/) || ["1"])[0], 10) : 0,
+                  pinned: !!row.querySelector("[data-icon*='pin' i], [aria-label*='pinned' i]")});
+      if (chats.length >= max) break;
+    }
+    return chats;
+  };
+  const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 20 && r.height > 8; };
+  const label = (el) => [el.getAttribute("aria-label"), el.getAttribute("placeholder"), el.getAttribute("title"),
+                         el.getAttribute("data-placeholder"), el.getAttribute("aria-placeholder")].filter(Boolean).join(" ").toLowerCase();
+  const fields = Array.from(document.querySelectorAll("input,[contenteditable=true],[contenteditable=''],[role=textbox],[role=searchbox]"))
+    .filter(shown).filter((el) => !el.closest("#main, footer"));
+  const box = fields.find((el) => /\bsearch/.test(label(el))) || fields.find((el) => el.closest("#side"));
+  if (!pane()) return {ready: false, searched: false, chats: []};
+  if (!box) return {ready: true, searched: false, chats: read(), reason: "no search box"};
+  const editable = box.isContentEditable || !("value" in box);
+  const valueOf = () => String(editable ? box.innerText || "" : box.value || "").replace(/\s+/g, " ").trim();
+  const want = String(text).replace(/\s+/g, " ").trim();
+  const none = () => /no (chats|results|contacts|messages)[^.\n]{0,60}found|no results/i
+    .test(((document.querySelector("#side") || pane()).innerText || "").slice(0, 4000));
+  // What the list SAYS: its names, or "nothing found". A stale "nothing found" from the search
+  // before is the state to move away from, exactly like a stale list.
+  const sig = (list) => (list.length ? list.map((c) => c.name).join("|") : none() ? "<none>" : "");
+  const before = sig(read());
+  const put = () => {
+    box.focus();
+    if (editable) {
+      const range = document.createRange(); range.selectNodeContents(box);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      if (valueOf()) document.execCommand("delete", false);
+      if (want) document.execCommand("insertText", false, want);
+    } else {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(box, want);
+      box.dispatchEvent(new Event("input", {bubbles: true}));
+    }
+  };
+  const same = valueOf() === want;
+  if (!same) { put(); if (valueOf() !== want) { await new Promise((r) => setTimeout(r, 150)); put(); } }
+  const typed = valueOf() === want;
+  const start = Date.now(); const limit = Math.min(Math.max(settleMs || 4000, 500), 8000);
+  let last = null, since = start, chats = read(), empty = false;
+  while (typed && !same && Date.now() - start < limit) {
+    await new Promise((r) => setTimeout(r, 110));
+    chats = read();
+    const now = sig(chats);
+    const words = ((document.querySelector("#side") || pane()).innerText || "").slice(0, 4000);
+    if (/looking for|searching/i.test(words)) { last = null; since = Date.now(); continue; }
+    empty = now === "<none>";
+    if (now !== last) { last = now; since = Date.now(); continue; }
+    const still = Date.now() - since;
+    if (now !== before && still >= 350) break;                    // filtered, and holding still
+    if (now === before && Date.now() - start >= 1600 && still >= 350) break;   // the same list IS the answer
+  }
+  return {ready: true, searched: true, typed, empty, text: valueOf(), chats};
+}
+
+// 1.11.0: "close the chat" — Escape, the way WhatsApp's own shortcut does it.
+async function pageChatClose() {
+  const main = () => document.querySelector("#main");
+  if (!main()) return {closed: false, open: false};
+  const esc = {key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true};
+  const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : main();
+  target.dispatchEvent(new KeyboardEvent("keydown", esc));
+  target.dispatchEvent(new KeyboardEvent("keyup", esc));
+  await new Promise((r) => setTimeout(r, 200));
+  return {closed: !main(), open: !!main()};
 }
 
 function pageChatComposer() {
@@ -960,6 +1250,432 @@ function pageHighlight(text, step, clear) {
   }
   window.__kayraFind = {i: 0, text: String(text)};
   return show(window.__kayraFind);
+}
+
+// ── 1.12.0: Part 6 — forms (D1–D5), video controls (F1), product facts (F3) ──────────────
+//
+// ONE self-contained form function (page functions are serialised alone, so the helpers live
+// inside it). Every field it lists is tagged data-kayra-field=<n>; "fill" and "choose" act on
+// those tags, so what was previewed is exactly what is filled. Password, card, CVV, OTP and
+// PIN fields are never listed as fillable and never filled. Submit never presses a button that
+// pays, buys, orders or checks out (decision D1: Kayra only searches and opens products).
+async function pageForm(op, args) {
+  args = args || {};
+  const norm = (s) => String(s || "").toLowerCase().replace(/\(.*?\)|\*/g, " ").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const visible = (el) => {
+    const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && s.visibility !== "hidden" && s.display !== "none";
+  };
+  const textOf = (id) => { const e = id && document.getElementById(id); return e ? e.innerText || e.textContent : ""; };
+  const question = (el) => {
+    // Google Forms and most form kits: the question's heading sits in the item around the input.
+    const item = el.closest("[role=listitem], fieldset, [role=radiogroup], [role=group], .form-group, .field, .form-field");
+    if (!item) return "";
+    const h = item.querySelector("legend, [role=heading], label, .label, .form-label");
+    return h && !h.contains(el) ? h.innerText || h.textContent : "";
+  };
+  const hintsOf = (el) => {
+    const parts = [];
+    const lb = el.getAttribute("aria-labelledby");
+    if (lb) parts.push(lb.split(/\s+/).map(textOf).join(" "));
+    parts.push(el.getAttribute("aria-label"));
+    if (el.id) { const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`); if (l) parts.push(l.innerText || l.textContent); }
+    const wrap = el.closest("label"); if (wrap && wrap !== el) parts.push(wrap.innerText || wrap.textContent);
+    parts.push(el.placeholder, el.getAttribute("data-placeholder"), el.title, question(el), el.name, el.id);
+    return parts.map(clean).filter(Boolean);
+  };
+  const SENSITIVE = /pass ?(word|code|phrase)|\bcvv\b|\bcvc\b|card ?(number|no)|credit card|debit card|expiry|\botp\b|one time (password|code)|\bpin\b(?! ?code)|security code|\bssn\b|aadhaa?r|\bpan\b(?! ?card holder)/;
+  const sensitive = (el, hints) => (el.type || "").toLowerCase() === "password" ||
+    /^cc-|one-time-code|current-password|new-password/.test(el.getAttribute("autocomplete") || "") ||
+    SENSITIVE.test(norm(hints.join(" ")));
+  const optionLabel = (el) => clean((hintsOf(el)[0]) || el.value);
+  const radioGroupLabel = (r) => {
+    const group = r.closest("[role=radiogroup], fieldset");
+    if (group) {
+      const lb = group.getAttribute("aria-labelledby");
+      const name = clean((lb && lb.split(/\s+/).map(textOf).join(" ")) || group.getAttribute("aria-label") ||
+        ((group.querySelector("legend") || {}).innerText) || question(group));
+      if (name) return name;
+    }
+    return clean(question(r) || r.name);
+  };
+
+  // ── the field list ──
+  const fields = [];
+  const tag = (el, i) => el.setAttribute("data-kayra-field", String(i));
+  document.querySelectorAll("[data-kayra-field]").forEach((el) => el.removeAttribute("data-kayra-field"));
+  const SKIP_TYPES = ["hidden", "submit", "button", "reset", "image", "file", "search", "range", "color"];
+  for (const el of document.querySelectorAll("input, textarea, select")) {
+    const type = el.tagName === "SELECT" ? "select" : el.tagName === "TEXTAREA" ? "textarea" : (el.type || "text").toLowerCase();
+    if (SKIP_TYPES.includes(type) || type === "radio") continue;
+    if (!visible(el) && !(type === "checkbox" && el.closest("label") && visible(el.closest("label")))) continue;
+    if (el.disabled || el.readOnly) continue;
+    const hints = hintsOf(el);
+    const field = {i: fields.length, type, label: hints[0] || "", hints: hints.join(" | ").slice(0, 300),
+                   autocomplete: (el.getAttribute("autocomplete") || "").toLowerCase(), sensitive: sensitive(el, hints),
+                   required: !!(el.required || el.getAttribute("aria-required") === "true")};
+    if (type === "select") {
+      field.options = Array.from(el.options).filter((o) => o.value !== "" || o.index > 0).map((o) => clean(o.text)).slice(0, 60);
+      field.filled = el.selectedIndex > 0 && el.value !== "";
+    } else if (type === "checkbox") {
+      field.filled = el.checked; field.checked = el.checked;
+    } else {
+      field.filled = !!el.value;
+    }
+    tag(el, field.i); fields.push(field);
+  }
+  // Radio buttons are ONE field per group, its options the buttons' labels.
+  const groups = new Map();
+  for (const r of document.querySelectorAll("input[type=radio], [role=radio]")) {
+    const vis = visible(r) || (r.closest("label") && visible(r.closest("label")));
+    if (!vis) continue;
+    const key = r.name || (r.closest("[role=radiogroup], fieldset") || r.parentElement);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  for (const [, radios] of groups) {
+    const label = radioGroupLabel(radios[0]);
+    const field = {i: fields.length, type: "radio", label, hints: label, autocomplete: "", sensitive: false,
+                   options: radios.map((r) => clean(r.getAttribute("aria-label") || r.getAttribute("data-value") || optionLabel(r))),
+                   filled: radios.some((r) => r.checked || r.getAttribute("aria-checked") === "true")};
+    radios.forEach((r) => tag(r, field.i)); fields.push(field);
+  }
+  // ARIA checkboxes and Google Forms' drop-downs (role=listbox, options carry data-value).
+  for (const el of document.querySelectorAll("[role=checkbox]:not(input), [role=switch]:not(input)")) {
+    if (!visible(el)) continue;
+    const label = clean(el.getAttribute("aria-label") || el.innerText || question(el));
+    const on = el.getAttribute("aria-checked") === "true";
+    tag(el, fields.length);
+    fields.push({i: fields.length, type: "checkbox", label, hints: label, autocomplete: "", sensitive: false, filled: on, checked: on});
+  }
+  for (const el of document.querySelectorAll("[role=listbox], [role=combobox]:not(input)")) {
+    if (!visible(el) || el.closest("[data-kayra-field]")) continue;
+    const hints = hintsOf(el);
+    const options = Array.from(el.querySelectorAll("[role=option]")).map((o) => clean(o.getAttribute("data-value") || o.innerText))
+      .filter((o) => o && !/^choose$|^select$/i.test(o));
+    const selected = el.querySelector("[role=option][aria-selected=true]");
+    tag(el, fields.length);
+    fields.push({i: fields.length, type: "listbox", label: hints[0] || "", hints: hints.join(" | ").slice(0, 300), autocomplete: "",
+                 sensitive: false, options: options.slice(0, 60),
+                 filled: !!(selected && clean(selected.getAttribute("data-value") || selected.innerText) && !/^choose$/i.test(clean(selected.innerText)))});
+  }
+  if (op === "list") return {url: location.href, title: document.title, fields: fields.slice(0, args.max || 60)};
+
+  // ── acting on fields ──
+  const byIndex = (i) => Array.from(document.querySelectorAll(`[data-kayra-field="${i}"]`));
+  const rank = (want, have) => {
+    const w = norm(want), h = norm(have);
+    if (!w || !h) return 0;
+    if (w === h) return 4;
+    if (h.startsWith(w) || w.startsWith(h)) return 3;
+    if (h.split(" ").includes(w)) return 2.5;
+    const words = w.split(" ");
+    if (words.every((x) => h.includes(x))) return 2;
+    if (h.includes(w)) return 1.5;
+    return 0;
+  };
+  const best = (want, items, nameOf) => {
+    let top = null, score = 0;
+    for (const it of items) { const s = rank(want, nameOf(it)); if (s > score) { top = it; score = s; } }
+    return top;
+  };
+  const setValue = (el, value) => {
+    el.focus();
+    const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype :
+      el.tagName === "SELECT" ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+    el.dispatchEvent(new Event("input", {bubbles: true}));
+    el.dispatchEvent(new Event("change", {bubbles: true}));
+    el.dispatchEvent(new Event("blur", {bubbles: true}));
+  };
+  const waitFor = async (find, ms) => {
+    const end = Date.now() + (ms || 2000);
+    while (Date.now() < end) { const x = find(); if (x) return x; await new Promise((r) => setTimeout(r, 80)); }
+    return find();
+  };
+  const fillOne = async (field, value) => {
+    const els = byIndex(field.i);
+    if (!els.length) return "gone";
+    if (field.sensitive || els.some((el) => sensitive(el, hintsOf(el)))) return "sensitive";
+    const el = els[0];
+    if (field.type === "select") {
+      const opt = best(value, Array.from(el.options), (o) => o.text) || Array.from(el.options).find((o) => norm(o.value) === norm(value));
+      if (!opt) return "no option";
+      setValue(el, opt.value);
+      return "";
+    }
+    if (field.type === "radio") {
+      const r = best(value, els, (x) => x.getAttribute("aria-label") || x.getAttribute("data-value") || optionLabel(x));
+      if (!r) return "no option";
+      r.click();
+      return (r.checked || r.getAttribute("aria-checked") === "true") ? "" : "not taken";
+    }
+    if (field.type === "checkbox") {
+      const want = !!value && !/^(false|no|off|0)$/i.test(String(value));
+      const on = () => el.checked === true || el.getAttribute("aria-checked") === "true";
+      if (on() !== want) el.click();
+      return on() === want ? "" : "not taken";
+    }
+    if (field.type === "listbox") {
+      el.click();
+      const opt = await waitFor(() => best(value, Array.from(document.querySelectorAll("[role=option]")).filter(visible),
+        (o) => o.getAttribute("data-value") || o.innerText), 2000);
+      if (!opt) { document.body.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", bubbles: true})); return "no option"; }
+      opt.click();
+      return "";
+    }
+    setValue(el, String(value));
+    return norm(el.value) === norm(value) || el.type === "date" ? "" : "not taken";
+  };
+
+  if (op === "fill") {
+    const filled = [], failed = [];
+    for (const item of args.items || []) {
+      const field = fields[item.i];
+      if (!field) { failed.push({i: item.i, reason: "gone"}); continue; }
+      const why = await fillOne(field, item.value);
+      (why ? failed.push({i: item.i, label: field.label, reason: why}) : filled.push({i: item.i, label: field.label}));
+    }
+    return {filled, failed};
+  }
+
+  if (op === "choose") {
+    // "select India in the country dropdown", "choose Male for gender", "tick I agree",
+    // "untick subscribe me", "set the date of birth to 2003-05-04".
+    const kinds = args.kind === "check" ? ["checkbox", "radio"] : args.kind === "date" ? ["date", "text", "datetime-local", "month"] :
+      ["select", "listbox", "radio"];
+    let pool = fields.filter((f) => kinds.includes(f.type) && !f.sensitive);
+    if (args.kind === "check") {
+      // A checkbox is named by its own label; a radio option by the option's label.
+      const boxes = pool.filter((f) => f.type === "checkbox");
+      const box = best(args.field, boxes, (f) => f.label);
+      if (box) {
+        const was = !!box.checked;
+        const want = args.state === null || args.state === undefined ? !was : !!args.state;
+        const why = await fillOne(box, want);
+        return {done: !why, label: box.label, was, now: why ? was : want, reason: why || undefined};
+      }
+      const radio = pool.filter((f) => f.type === "radio").find((f) => best(args.field, f.options.map((o) => ({o})), (x) => x.o));
+      if (radio && args.state !== false) {
+        const opt = best(args.field, radio.options.map((o) => ({o})), (x) => x.o).o;
+        const why = await fillOne(radio, opt);
+        return {done: !why, label: opt, group: radio.label, now: true, reason: why || undefined};
+      }
+      return {done: false, reason: "not found", options: boxes.map((f) => f.label).filter(Boolean).slice(0, 12)};
+    }
+    if (args.field) pool = pool.filter((f) => rank(args.field, f.hints) > 0).sort((a, b) => rank(args.field, b.hints) - rank(args.field, a.hints));
+    let field = pool[0];
+    if (args.kind !== "date" && args.option) {
+      // No field named, or the named one lacks the option: the field that HAS it.
+      const having = pool.find((f) => (f.options || []).some((o) => rank(args.option, o) >= 2));
+      if (having && (!field || !(field.options || []).some((o) => rank(args.option, o) >= 2))) field = having;
+    }
+    if (!field) return {done: false, reason: "field not found", fields: fields.filter((f) => kinds.includes(f.type)).map((f) => f.label).filter(Boolean).slice(0, 12)};
+    const why = await fillOne(field, args.option);
+    return {done: !why, field: field.label, option: args.option, reason: why || undefined, options: why ? (field.options || []).slice(0, 12) : undefined};
+  }
+
+  if (op === "submit") {
+    const named = (el) => clean(el.getAttribute("aria-label") || el.innerText || el.value || el.textContent);
+    const buttons = Array.from(document.querySelectorAll("button, input[type=submit], [role=button]")).filter(visible);
+    const PAYS = /\b(pay|buy|order|checkout|check out|purchase|place order|add to cart|add to bag|add to basket)\b/i;
+    const active = document.activeElement && document.activeElement.form;
+    const form = active || Array.from(document.forms).find((f) => f.querySelector("[data-kayra-field]") && visible(f)) ||
+      Array.from(document.forms).find(visible);
+    let button = buttons.find((b) => /^(submit|send|next|continue|register|sign up|apply|save|done|finish)$/i.test(named(b)) && (!form || form.contains(b))) ||
+      (form && buttons.find((b) => form.contains(b) && ((b.type || "").toLowerCase() === "submit" || (b.tagName === "BUTTON" && !b.getAttribute("type"))))) ||
+      buttons.find((b) => /\bsubmit\b/i.test(named(b)));
+    if (!button && !form) return {submitted: false, reason: "no form"};
+    const label = button ? named(button) : "submit";
+    if (PAYS.test(label)) return {submitted: false, reason: "payment", label};
+    if (form && form.checkValidity && !form.checkValidity()) {
+      // The browser would refuse to send it: say which fields are missing instead of "Submitted".
+      const bad = Array.from(form.elements).filter((el) => el.willValidate && !el.checkValidity());
+      return {submitted: false, reason: "invalid", label,
+              missing: bad.map((el) => clean(hintsOf(el)[0] || el.name || "a field")).slice(0, 6)};
+    }
+    if (args.dry) return {submitted: false, dry: true, label, empty: fields.filter((f) => f.required && !f.filled).map((f) => f.label)};
+    if (button) button.click();
+    else if (form.requestSubmit) form.requestSubmit();
+    return {submitted: true, label};
+  }
+
+  if (op === "file") {
+    // D5: the file input (often hidden behind an "Upload" button). Arming installs ONE trusted-
+    // key hook: the real Space key Kayra presses next gives the page a user activation, and
+    // only inside that handler may input.click() open the file chooser.
+    const inputs = Array.from(document.querySelectorAll("input[type=file]")).filter((el) => !el.disabled);
+    if (!inputs.length) return {found: false};
+    const nameOf = (el) => {
+      const hints = hintsOf(el);
+      const near = el.closest("label, [role=button], button, div");
+      return clean([hints.join(" "), near && near !== el ? (near.innerText || "") : ""].join(" ")).slice(0, 120);
+    };
+    const input = (args.field && best(args.field, inputs, nameOf)) || inputs.find(visible) || inputs[0];
+    document.querySelectorAll("input[data-kayra-file]").forEach((el) => el.removeAttribute("data-kayra-file"));
+    input.setAttribute("data-kayra-file", "1");
+    if (args.arm) {
+      const until = Date.now() + 8000;
+      const hook = (e) => {
+        if (!e.isTrusted || e.key !== " " || Date.now() > until) return;
+        e.preventDefault(); e.stopImmediatePropagation();
+        window.removeEventListener("keydown", hook, true);
+        input.click();
+      };
+      window.addEventListener("keydown", hook, true);
+      setTimeout(() => window.removeEventListener("keydown", hook, true), 8000);
+    }
+    return {found: true, label: nameOf(input), accept: input.accept || "", multiple: !!input.multiple, count: inputs.length,
+            armed: !!args.arm, files: Array.from(input.files || []).map((f) => f.name)};
+  }
+  if (op === "fileState") {
+    const input = document.querySelector("input[data-kayra-file]");
+    return {files: input ? Array.from(input.files || []).map((f) => f.name) : []};
+  }
+  return {error: "unknown op"};
+}
+
+// F1: the video on the page — speed, seek, captions, skip the ad, next, like, subscribe,
+// watch later. The <video> element where the web allows it (speed and seeking work on any
+// site); YouTube's own buttons for the rest, found by class and accessible name.
+async function pageVideo(op, value) {
+  const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+  const area = (el) => { const r = el.getBoundingClientRect(); return r.width * r.height; };
+  const v = Array.from(document.querySelectorAll("video")).filter(visible).sort((a, b) => area(b) - area(a))[0] ||
+    document.querySelector("video");
+  const yt = /(^|\.)youtube\.com$/.test(location.hostname);
+  const first = (sel) => Array.from(document.querySelectorAll(sel)).find(visible) || null;
+  const pressed = (b) => b && (b.getAttribute("aria-pressed") === "true");
+  const ad = !!(yt && document.querySelector(".ad-showing, .ytp-ad-player-overlay, .ytp-ad-player-overlay-layout"));
+  const title = () => {
+    const h = yt && document.querySelector("ytd-watch-metadata h1, h1.ytd-watch-metadata, #title h1");
+    return ((h && h.textContent) || document.title || "").replace(/\s+/g, " ").replace(/ - YouTube$/, "").trim();
+  };
+  const state = () => v ? {video: true, paused: v.paused, time: Math.round(v.currentTime || 0),
+    duration: isFinite(v.duration) ? Math.round(v.duration) : 0, rate: v.playbackRate, muted: v.muted, ad, title: title(),
+    captions: yt ? pressed(first(".ytp-subtitles-button")) : Array.from(v.textTracks || []).some((t) => t.mode === "showing")}
+    : {video: false, title: title()};
+  const wait = async (find, ms) => {
+    const end = Date.now() + (ms || 2500);
+    while (Date.now() < end) { const x = find(); if (x) return x; await new Promise((r) => setTimeout(r, 100)); }
+    return find();
+  };
+  if (op === "state") return state();
+  if (!v && !["like", "subscribe", "watchLater", "next"].includes(op)) return {video: false};
+  switch (op) {
+    case "play": { try { await v.play(); } catch (e) { return {...state(), blocked: true}; } return state(); }
+    case "pause": v.pause(); return state();
+    case "rate": v.playbackRate = Math.min(4, Math.max(0.25, Number(value) || 1)); return state();
+    case "seek": v.currentTime = Math.min(Math.max(0, (v.currentTime || 0) + Number(value || 0)), isFinite(v.duration) ? v.duration - 0.5 : 1e9); return state();
+    case "seekTo": v.currentTime = Math.min(Math.max(0, Number(value || 0)), isFinite(v.duration) ? v.duration - 0.5 : 1e9); return state();
+    case "mute": v.muted = !!value; return state();
+    case "blur": if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); return state();
+    case "skipAd": {
+      const skip = first(".ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, button[id^='skip-button'], .ytp-ad-skip-button-container button");
+      if (skip) { skip.click(); return {skipped: true, ad: true}; }
+      const left = (first(".ytp-preview-ad, .ytp-ad-preview-container, .ytp-preview-ad__text") || {}).textContent || "";
+      return {skipped: false, ad, wait: left.replace(/\s+/g, " ").trim()};
+    }
+    case "captions": {
+      if (yt) {
+        const b = first(".ytp-subtitles-button");
+        if (!b) return {available: false};
+        if (pressed(b) !== !!value) b.click();
+        return {available: true, captions: pressed(b)};
+      }
+      const tracks = Array.from(v.textTracks || []).filter((t) => /captions|subtitles/.test(t.kind));
+      if (!tracks.length) return {available: false};
+      tracks.forEach((t, i) => { t.mode = value && i === 0 ? "showing" : "hidden"; });
+      return {available: true, captions: !!value};
+    }
+    case "next": {
+      const b = yt && first(".ytp-next-button");
+      if (!b) return {next: false};
+      b.click(); return {next: true};
+    }
+    case "like": {
+      const b = yt && first("like-button-view-model button, #segmented-like-button button, ytd-toggle-button-renderer#like-button button, button[aria-label^='like this video' i]");
+      if (!b) return {available: false};
+      const was = pressed(b);
+      if (was !== !!value) b.click();
+      return {available: true, was, liked: pressed(b) || (!was && !!value)};
+    }
+    case "subscribe": {
+      const b = yt && first("#subscribe-button button, ytd-subscribe-button-renderer button, yt-subscribe-button-view-model button");
+      if (!b) return {available: false};
+      const subscribed = /subscribed/i.test((b.getAttribute("aria-label") || "") + " " + (b.textContent || "")) &&
+        !/^subscribe to/i.test(b.getAttribute("aria-label") || "");
+      if (subscribed) return {available: true, already: true, subscribed: true};
+      b.click();
+      return {available: true, subscribed: true};
+    }
+    case "watchLater": {
+      if (!yt) return {available: false};
+      const save = first("button[aria-label='Save to playlist'], button[aria-label^='Save' i]") ||
+        Array.from(document.querySelectorAll("ytd-watch-metadata button, #actions button")).filter(visible)
+          .find((b) => /^save$/i.test((b.textContent || "").trim()));
+      if (!save) return {available: false};
+      save.click();
+      const box = await wait(() => Array.from(document.querySelectorAll("[role=checkbox], tp-yt-paper-checkbox, toggleable-list-item-view-model, yt-list-item-view-model"))
+        .filter(visible).find((el) => /watch later/i.test(el.getAttribute("aria-label") || el.textContent || "")), 3000);
+      if (!box) return {available: false, opened: true};
+      const on = () => box.getAttribute("aria-checked") === "true" || box.getAttribute("aria-pressed") === "true" || box.hasAttribute("checked");
+      const already = on();
+      if (!already) box.click();
+      document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape", code: "Escape", keyCode: 27, bubbles: true}));
+      return {available: true, already, saved: true};
+    }
+  }
+  return {error: "unknown op"};
+}
+
+// F3: the product on a shop page — name, price, rating — from the page's own structured data
+// (schema.org Product), then Amazon's and Flipkart's markup, then the Open Graph tags.
+function pageProduct() {
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const out = {found: false};
+  const take = (node) => {
+    if (!node || typeof node !== "object") return false;
+    if (Array.isArray(node)) return node.some(take);
+    if (node["@graph"]) return take(node["@graph"]);
+    const type = [].concat(node["@type"] || []).join(" ");
+    if (!/\bProduct\b/.test(type)) return false;
+    out.name = clean(node.name);
+    const offer = [].concat(node.offers || [])[0] || {};
+    out.price = String(offer.price || offer.lowPrice || (offer.priceSpecification || {}).price || "");
+    out.currency = offer.priceCurrency || "";
+    out.availability = String(offer.availability || "").replace(/^https?:\/\/schema\.org\//, "");
+    const rating = node.aggregateRating || {};
+    out.rating = String(rating.ratingValue || "");
+    out.ratings = String(rating.reviewCount || rating.ratingCount || "");
+    out.brand = clean((node.brand && (node.brand.name || node.brand)) || "");
+    out.found = !!out.name;
+    return out.found;
+  };
+  for (const s of document.querySelectorAll("script[type='application/ld+json']")) {
+    try { if (take(JSON.parse(s.textContent))) break; } catch (e) {}
+  }
+  const q = (sel) => { const el = document.querySelector(sel); return el ? clean(el.getAttribute("content") || el.textContent) : ""; };
+  const host = location.hostname;
+  if (/(^|\.)amazon\./.test(host)) {
+    out.name = out.name || q("#productTitle");
+    out.price = out.price || q("#corePrice_feature_div .a-price .a-offscreen, #corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #apex_desktop .a-price .a-offscreen, .a-price .a-offscreen");
+    out.rating = out.rating || ((document.querySelector("#acrPopover") || {}).title || "").replace(/ out of.*/, "");
+    out.ratings = out.ratings || q("#acrCustomerReviewText").replace(/ ratings?/i, "");
+    out.availability = out.availability || q("#availability span");
+  } else if (/flipkart\.com$/.test(host)) {
+    out.name = out.name || q("h1 span, h1");
+    out.price = out.price || q("div.Nx9bqj.CxhGGd, div.Nx9bqj, div._30jeq3");
+    out.rating = out.rating || q("div.XQDdHH, div._3LWZlK");
+    out.ratings = out.ratings || q("span.Wphh3N span span, span._2_R_DZ span span").replace(/ ratings?.*/i, "");
+  }
+  out.name = out.name || q("meta[property='og:title']");
+  out.price = out.price || q("meta[property='product:price:amount'], meta[itemprop=price], [itemprop=price]");
+  out.currency = out.currency || q("meta[property='product:price:currency'], meta[itemprop=priceCurrency]");
+  out.found = !!(out.name && (out.price || out.rating));
+  out.url = location.href;
+  return out;
 }
 
 function pageControls(limit) {

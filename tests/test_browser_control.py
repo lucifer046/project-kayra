@@ -24,6 +24,7 @@ import re
 import sys
 import json
 import asyncio
+from time import time as time_now
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import Checker, EnvironmentGuard, describe_host, run  # noqa: E402
@@ -228,7 +229,7 @@ def section_opening():
         with Results([{"url": "https://x.example/", "title": "x"}]) as web:
             r = rig.do("open the pr group chat")
             check("'open … chat' is never sent to a web search",
-                  not web.asked and r.status == Status.NOT_FOUND, (web.asked, r.message))
+                  not web.asked and not r.ok, (web.asked, r.message))
             r = rig.do("open my resume file")
             check("'open … file' is never sent to a web search", not web.asked)
 
@@ -383,8 +384,8 @@ def section_understanding():
     whatsapp = [client("0xw1", "chrome-web.whatsapp.com__-Default", "WhatsApp")]
     with WebRig(Bridge(), hypr=FakeHyprland(whatsapp, active="0xw1")) as rig:
         with Model('{"kind": "automation", "commands": ["browser click on PR and outreach core team"]}') as m:
-            spoken = run_tokens(["open PR and outreach core team chat"])
-            check("'open XYZ chat' with WhatsApp in front: the rules miss, the model clicks the chat",
+            spoken = run_tokens(["open PR and outreach core team"])
+            check("'open XYZ' with WhatsApp in front: the rules miss, the model clicks the chat",
                   ("page.click", {"text": "pr and outreach core team", "nth": 1}) in rig.bridge.calls
                   or any(c == "page.click" and "outreach" in a["text"].lower()
                          for c, a in rig.bridge.calls), (rig.bridge.calls[-3:], spoken))
@@ -428,7 +429,7 @@ def section_understanding():
             linux.CONFIRMATIONS.cancel()
         with Model(""):
             with Results([]):
-                spoken = run_tokens(["open qwerty zxcv chat"])
+                spoken = run_tokens(["open qwerty zxcv"])
             check("model unreachable: the honest original answer stands",
                   "couldn't find" in spoken.lower() or "can't" in spoken.lower(), spoken)
         with Model('{"kind": "none"}') as m:
@@ -571,7 +572,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.9.0")
+        web_macros.BRIDGE = current = Bridge(version="1.12.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1795,7 +1796,11 @@ def section_part_4():
         check("E1: no match is said so", not r.ok and "holiday" in r.message, r.message)
         waits = [a for c, a in rig.bridge.calls if c == "page.docList"]
         check("V9: from 1.8.0 the file list is ONE call that waits inside the browser (waitMs)",
-              all(a.get("waitMs") == 6000 for a in waits) and rig.bridge.doclist_calls == len(waits) == 3, waits)
+              all(a.get("waitMs") == 6000 for a in waits) and rig.bridge.doclist_calls == len(waits) == 4, waits)
+        check("V11: a name Google's search does not find is looked for once more in the recent list",
+              [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")][-2:] ==
+              ["https://docs.google.com/spreadsheets/u/0/?q=holiday", "https://docs.google.com/spreadsheets/u/0/?q="],
+              [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")])
         tabs_open = [a for c, a in rig.bridge.calls if c == "tabs.open"]
         check("V9: a tab already on the Sheets list is reused (search 2); an OPEN sheet is never "
               "navigated away from (search 3 gets a new tab)", len(tabs_open) == 2, tabs_open)
@@ -2309,6 +2314,929 @@ def section_part_5():
           "message open <chat or group>" in interpreter.CATALOG and "message who messaged me" in interpreter.CATALOG)
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   V11 — the fix round: scrolling, search, close search, names          │
+# └────────────────────────────────────────────────────────────────────────┘
+class AppBridge(PageBridge):
+    """PageBridge at 1.10.0: a page that says whether a scroll MOVED, one search box, and a
+    search that can be closed."""
+
+    def __init__(self, url="https://mail.google.com/mail/u/0/#inbox", scroll=None, search=True, open_search="", **kw):
+        super().__init__(version=kw.pop("version", "1.10.0"), url=url, **kw)
+        self.scroll = scroll if scroll is not None else {"scrolled": True, "moved": True, "inner": True}
+        self.search, self.open_search = search, open_search
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "page.scroll":
+            self.calls.append((cmd, args))
+            return dict(self.scroll)
+        if cmd == "page.search":
+            self.calls.append((cmd, args))
+            if self.search:
+                self.open_search = args.get("text", "")
+            return {"searched": bool(self.search)}
+        if cmd == "page.searchClose":
+            self.calls.append((cmd, args))
+            had, self.open_search = self.open_search, ""
+            return {"closed": bool(had), "had": had}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class WhatsApp11(WhatsAppBridge):
+    """WhatsAppBridge at 1.11.0: a search that is waited for and can be closed, a chat that can
+    be closed, and no tab groups. `stuck` = the page refuses to empty its search by script."""
+
+    def __init__(self, stuck=0, **kw):
+        super().__init__(version="1.11.0", **kw)
+        self.stuck = stuck
+
+    def last(self, cmd):
+        return next((a for c, a in reversed(self.calls) if c == cmd), None)
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "tabs.active":
+            return {"id": 5, "title": "WhatsApp", "url": "https://web.whatsapp.com/"}
+        if cmd == "groups.list":
+            return []
+        if cmd == "page.searchClose":
+            self.calls.append((cmd, args))
+            if self.stuck and self.searching:
+                self.stuck -= 1
+                return {"closed": False, "had": self.searching, "left": self.searching}
+            had, self.searching = self.searching, ""
+            return {"closed": bool(had), "had": had, "left": ""}
+        if cmd == "chat.search":
+            self.calls.append((cmd, args))
+            self.searching = args.get("text", "")
+            rows = [c for c in self.chats + self.archive if self.searching.lower() in c["name"].lower()] \
+                if self.searching else self.chats
+            return {"ready": True, "searched": True, "typed": True, "empty": not rows, "chats": [dict(c) for c in rows]}
+        if cmd == "chat.close":
+            self.calls.append((cmd, args))
+            was, self.open_chat = self.open_chat, ""
+            return {"closed": bool(was), "open": False}
+        if cmd == "page.highlight":
+            return {"count": 0}
+        if cmd == "chat.open" and args["name"] in {c["name"] for c in self.chats + self.archive}:
+            self.calls.append((cmd, args))                 # the real app keeps the search open
+            self.open_chat, self.composer = args["name"], ""
+            return {"opened": True, "name": args["name"]}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class YearFiles(WorkspaceBridge):
+    """Google's search finds nothing for a year said the long way; the plain words do."""
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "page.docList":
+            self.calls.append((cmd, args))
+            return [] if "202027" in self.url or "zzz" in self.url else list(self.files)
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_fix_round_v11():
+    check.section("[20] V11 — the reported fixes: scroll, WhatsApp names, search, close search, file names")
+    d = common.direct_tokens
+    nowhere = lambda: {}
+    wa = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+
+    # ── the sentences as they were reported ──
+    for said, key, target in (
+            ("scroll the mail to bottom", "browser.page_scroll", "bottom"),
+            ("scroll the mail", "browser.page_scroll", "down"),
+            ("scroll up a bit", "browser.page_scroll", "up"),
+            ("scroll all the way down", "browser.page_scroll", "bottom"),
+            ("go to the top of the page", "browser.page_scroll", "top"),
+            ("open graphics team group in whatsapp", "message.open", "graphics team"),
+            ("open graphics team group", "browser.group_collapse", "graphics team"),
+            ("open rahul chat", "message.open", "rahul"),
+            ("open the latest chat in whatsapp", "message.open", "recent"),
+            ("read the recent chat", "message.read", "recent"),
+            ("read the latest messages on whatsapp", "message.read", "recent"),
+            ("click on the search button and search for council details", "browser.search_here", "council details"),
+            ("click the search bar and type Rahul Sharma and press enter", "browser.search_here", "Rahul Sharma"),
+            ("search for rahul in the search bar", "browser.search_here", "rahul"),
+            ("close the search bar", "browser.search_close", "search"),
+            ("close the search and go back to my chats", "browser.search_close", "search"),
+            ("open council details 2026-27 sheet", "browser.ws_open", "council details 2026-27")):
+        bare, prefixed = n(said), n("browser " + said)
+        check(f"'{said}' -> {key} {target!r} (bare)", bare is not None and bare.key == key and bare.target == target,
+              bare and (bare.key, bare.target))
+        check("...and the same with the browser prefix", prefixed is not None and prefixed.key == key
+              and prefixed.target == target, prefixed and (prefixed.key, prefixed.target))
+    for said, token in (
+            ("scroll the mail to bottom", "browser scroll the mail to bottom"),
+            ("Scroll the chat up.", "browser Scroll the chat up"),
+            ("open graphics team group in whatsapp", "message open graphics team group in whatsapp"),
+            ("read the recent chat", "message read the recent chat"),
+            ("click on the search button and search for council details",
+             "browser click on the search button and search for council details"),
+            ("close the search bar", "browser close the search bar"),
+            ("open graphics team group", "browser open graphics team group")):
+        check(f"rules first, no model: '{said}'", d(said, nowhere) == [token], d(said, nowhere))
+    a = n("scroll the chat list down a little")
+    check("a place and an amount are kept: the chat LIST, a little",
+          a.parameters == {"direction": "down", "where": "side", "amount": 0.4}, a.parameters)
+    check("'scroll to pricing' is still a scroll TO those words", n("browser scroll to pricing").parameters.get("until") == "pricing")
+    check("'scroll down' / 'scroll up' stay the exact tokens they were", n("scroll down").key == "mouse.scroll_down"
+          and d("scroll down", nowhere) is None)
+    check("a question with 'the end of' in it is not a scroll", n("what's the end of the story") is None
+          and common.scroll_request("scroll through my options and pick one") is None)
+    check("'close chrome' is still the app, 'open google chat' still not a WhatsApp chat",
+          n("close chrome").key == "app.close" and n("open google chat").key != "message.open", n("open google chat"))
+    check("with WhatsApp in front, 'open the budget sheet' is still a Sheet (was sent to a chat)",
+          d("open council details 2026-27 sheet", wa) == ["browser open council details 2026-27 sheet"],
+          d("open council details 2026-27 sheet", wa))
+    check("'open the research tab group' never looks in WhatsApp",
+          n("browser open the research tab group").parameters.get("or_chat") is False)
+    for said, token in (("search for general panchayat", "message search for general panchayat"),
+                        ("search general panchayat group and open it", "message search general panchayat group and open it"),
+                        ("open the first search result not the second one", "message open result 1"),
+                        ("open the second one", "message open result 2"),
+                        ("close this group", "message close this chat"),
+                        ("close the whatsapp search", "browser close the whatsapp search"),
+                        ("delete the text in the search bar", "browser delete the text in the search bar")):
+        check(f"WhatsApp in front: '{said}' -> {token!r}", d(said, wa) == [token], d(said, wa))
+    for token, key, target in (("message search for general panchayat", "message.search", "general panchayat"),
+                               ("search whatsapp for safe house and open it", "message.search", "safe house"),
+                               ("find cultural core team on whatsapp", "message.search", "cultural core team"),
+                               ("message open result 2", "message.open", "#2"),
+                               ("close the chat", "message.close", "current"),
+                               ("close search bar in whatsapp", "browser.search_close", "search"),
+                               ("clear the search text", "browser.search_close", "search")):
+        a = n(token)
+        check(f"'{token}' -> {key} {target!r}", a is not None and a.key == key and a.target == target, a)
+    check("'search … and open it' opens; a plain search only searches",
+          n("message search general panchayat group and open it").parameters == {"open": True}
+          and n("message search for general panchayat").parameters == {"open": False})
+    check("with WhatsApp in front, 'search for cats on youtube' is NOT a chat search; 'close the research group' is still a tab group",
+          not (d("search for cats on youtube", wa) or [""])[0].startswith("message")
+          and d("close the research group", wa) == ["browser close the research group"],
+          d("search for cats on youtube", wa))
+    check("search_close is a rules-first action; the new shapes are in the understanding catalog",
+          "search_close" in common._DIRECT_BROWSER and "browser close the search" in interpreter.CATALOG
+          and "browser scroll the <mail | chat | page> to the <top | bottom>" in interpreter.CATALOG)
+
+    # ── scrolling: what the page reports is what is said ──
+    with WebRig(AppBridge()) as rig:
+        r = rig.do("browser scroll the mail to bottom")
+        check("scroll: the page is asked for the bottom, and 'At the bottom' is said because it MOVED",
+              rig.bridge.last("page.scroll") == {"direction": "bottom", "until": "", "where": "", "amount": 1.0}
+              and r.message == "At the bottom.", (rig.bridge.last("page.scroll"), r.message))
+        rig.bridge.scroll = {"scrolled": True, "moved": False, "canScroll": True}
+        r = rig.do("browser scroll the mail")
+        check("scroll: nothing moved because it is at the end -> said so, never 'Done'",
+              r.message == "It's already at the bottom.", r.message)
+        rig.bridge.scroll = {"scrolled": False, "moved": False, "canScroll": False}
+        before = len(rig.runner.ran)
+        r = rig.do("browser scroll down a bit")
+        keys = [argv for argv, _given in rig.runner.ran[before:] if argv[:1] == ["wtype"]]
+        check("scroll: a canvas app (Sheets) with nothing to scroll gets the real Page Down key",
+              keys == [linux.wtype_argv("pagedown")] and r.ok, (keys, r.message))
+    with WebRig(AppBridge(version="1.9.0")) as rig:
+        r = rig.do("browser scroll the mail to bottom")
+        check("scroll: an older extension is sent only what it knows",
+              rig.bridge.last("page.scroll") == {"direction": "bottom", "until": ""} and r.ok, rig.bridge.last("page.scroll"))
+
+    # ── one search action ──
+    with WebRig(AppBridge(url="https://example.com/shop")) as rig:
+        r = rig.do("browser click on the search button and search for council details")
+        check("search: 'click on the search button and search for X' is ONE search for X, submitted",
+              rig.bridge.last("page.search") == {"text": "council details", "submit": True}
+              and not any(c == "page.click" for c, _a in rig.bridge.calls) and "council details" in r.message,
+              (rig.bridge.calls[-2:], r.message))
+        r = rig.do("browser close the search bar")
+        check("close search: the open search is closed and said so", rig.bridge.open_search == ""
+              and r.message == "Closed the search.", r.message)
+        r = rig.do("browser close the search bar")
+        check("close search: with none open, that is said (no false 'closed')", "no search open" in r.message, r.message)
+    with WebRig(AppBridge(url="https://docs.google.com/spreadsheets/u/0/")) as rig:
+        r = rig.do("browser click on the search button and search for council details")
+        check("search: on the Sheets home list it is Sheets' own search (was Ctrl+F on the page)",
+              rig.bridge.last("tabs.navigate") == {"url": "https://docs.google.com/spreadsheets/u/0/?q=council%20details"}
+              and not any(argv[:1] == ["wtype"] for argv, _g in rig.runner.ran), (rig.bridge.last("tabs.navigate"), r.message))
+    with WebRig(AppBridge(url="https://mail.google.com/mail/u/0/#search/invoices")) as rig:
+        r = rig.do("browser close the search")
+        check("close search: Gmail goes back to the inbox",
+              rig.bridge.last("tabs.navigate") == {"url": "https://mail.google.com/mail/u/0/#inbox"}, r.message)
+
+    # ── WhatsApp ──
+    saved_embed = web_macros.EMBEDDER
+    web_macros.EMBEDDER = False
+    try:
+        chats = [{"name": "Family", "unread": 0, "preview": "", "when": "11:00", "pinned": True},
+                 {"name": "Graphics Team (2026-27)", "unread": 2, "preview": "final poster", "when": "10:40"},
+                 {"name": "Rahul Sharma", "unread": 0, "preview": "ok", "when": "09:02"},
+                 {"name": "Graphics Team (2025-26)", "unread": 0, "preview": "", "when": "1/3/2026"}]
+        with WebRig(WhatsApp11(chats=[dict(c) for c in chats])) as rig, Models("SHOULD NOT BE ASKED") as models:
+            rig.bridge.history["Graphics Team (2026-27)"] = [
+                {"from": "Riya", "text": f"old {i}", "date": TODAY_MARK, "time": "09:00", "out": False} for i in range(5)] + [
+                {"from": "Riya", "text": "Final poster is uploaded", "date": TODAY_MARK, "time": "10:39", "out": False},
+                {"from": "Aman", "text": "Please review by 5", "date": TODAY_MARK, "time": "10:40", "out": False}]
+            r = rig.do("open graphics team group in whatsapp")
+            check("WhatsApp: 'graphics team' opens 'Graphics Team (2026-27)' — the edition with the latest message, no question",
+                  rig.bridge.open_chat == "Graphics Team (2026-27)" and r.ok and "2 unread" in r.message, r.message)
+            rig.bridge.open_chat = ""
+            r = rig.do("browser open graphics team group")
+            check("WhatsApp: 'open graphics team group' with no such TAB group is the WhatsApp group",
+                  rig.bridge.open_chat == "Graphics Team (2026-27)", (rig.bridge.open_chat, r.message))
+            rig.bridge.open_chat = ""
+            r = rig.do("message read the recent chat")
+            check("WhatsApp: 'read the recent chat' with none open opens the newest (not the pinned one) and "
+                  "reads only what is NEW", rig.bridge.open_chat == "Graphics Team (2026-27)"
+                  and r.message.startswith("2 new in Graphics Team (2026-27): Riya: Final poster is uploaded")
+                  and "old 4" not in r.message and models.asked == [], r.message)
+            rig.bridge.open_chat = "Rahul Sharma"
+            rig.bridge.history["Rahul Sharma"] = [{"from": "Rahul Sharma", "text": "ok", "date": TODAY_MARK, "time": "09:02", "out": False}]
+            r = rig.do("message read the recent chat")
+            check("WhatsApp: ...and with a chat open, it is THAT chat's recent messages", r.message == "In Rahul Sharma: Rahul Sharma: ok", r.message)
+            r = rig.do("message open old hostel friends")
+            check("WhatsApp: a chat opened through the search leaves the search CLOSED afterwards",
+                  rig.bridge.open_chat == "Old Hostel Friends" and rig.bridge.searching == ""
+                  and any(c == "page.searchClose" for c, _a in rig.bridge.calls), rig.bridge.searching)
+            r = rig.do("browser search for rahul in the search bar")
+            check("WhatsApp: a search is WhatsApp's own, left open, and the chats it found are said",
+                  rig.bridge.last("chat.search") == {"text": "rahul"} and rig.bridge.searching == "rahul"
+                  and r.message.startswith("I found Rahul Sharma"), r.message)
+            r = rig.do("message search for hostel")
+            check("WhatsApp: searching for something else REPLACES the old text", rig.bridge.searching == "hostel"
+                  and "Old Hostel Friends" in r.message, (rig.bridge.searching, r.message))
+            rig.bridge.open_chat = "Rahul Sharma"
+            r = rig.do("message open result 1")
+            check("WhatsApp: 'open the first one' opens the first chat of the list as shown, and closes the search",
+                  rig.bridge.open_chat == "Old Hostel Friends" and rig.bridge.searching == "", (rig.bridge.open_chat, r.message))
+            rig.do("message search for rahul")
+            r = rig.do("browser close the search bar")
+            check("WhatsApp: 'close the search bar' empties it and the chat that was open is still open",
+                  rig.bridge.searching == "" and rig.bridge.open_chat == "Old Hostel Friends"
+                  and r.message == "Closed the search. You're back in your chats.", r.message)
+            r = rig.do("message search for zzzz")
+            check("WhatsApp: a search with no hit says so and offers the way out", "nothing for zzzz" in r.message
+                  and "close the search" in r.message, r.message)
+            rig.bridge.stuck = 1
+            before = len(rig.runner.ran)
+            r = rig.do("browser close the whatsapp search")
+            keys = [argv for argv, _g in rig.runner.ran[before:] if argv[:1] == ["wtype"]]
+            check("close search: a page that refuses the script gets the REAL keys (select all, delete, Escape), then is checked again",
+                  keys == [linux.wtype_argv("ctrl+a"), linux.wtype_argv("backspace"), linux.wtype_argv("escape")]
+                  and r.ok and rig.bridge.searching == "", (keys, r.message))
+            rig.bridge.searching, rig.bridge.stuck = "rahul", 5
+            r = rig.do("browser close the search")
+            check("close search: if it STILL holds text, that is said — never a false 'closed'", not r.ok, r.message)
+            rig.bridge.searching, rig.bridge.stuck = "", 0
+
+            # ── the audit log of 2026-11-11: a chat that is not on screen ──
+            rig.bridge.archive.append({"name": "General Panchayat", "unread": 0, "preview": "", "when": "2/2/2026"})
+            rig.bridge.calls.clear()
+            r = rig.do("message open general panchayat")
+            check("LOG: a chat that is NOT in the visible list is searched for (waited) and opened",
+                  rig.bridge.open_chat == "General Panchayat" and rig.bridge.last("chat.search") == {"text": "general panchayat"}
+                  and r.ok, r.message)
+            check("LOG: ...and the search is closed afterwards", rig.bridge.searching == ""
+                  and [c for c, _a in rig.bridge.calls].index("page.searchClose") > [c for c, _a in rig.bridge.calls].index("chat.open"))
+            rig.bridge.calls.clear()
+            r = rig.do("message open general punchayat")
+            searches = [a["text"] for c, a in rig.bridge.calls if c == "chat.search"]
+            check("LOG: a misheard name is searched again by its words, and the right chat still opens",
+                  searches == ["general punchayat", "punchayat", "general"] and rig.bridge.open_chat == "General Panchayat", searches)
+            rig.bridge.calls.clear()
+            r = rig.do("message open cultural core team")
+            check("LOG: a chat that does not exist: searched, said so, and the search is NOT left open",
+                  not r.ok and "cultural core team" in r.message and rig.bridge.searching == ""
+                  and any(c == "chat.search" for c, _a in rig.bridge.calls), (r.message, rig.bridge.searching))
+            rig.bridge.calls.clear()
+            with Model('{"kind": "automation", "commands": ["message open cultural core team"]}'):
+                run_tokens(["message open cultural core team"])
+            check("LOG: the model proposing the SAME command does not run it a second time (it ran twice)",
+                  [a["text"] for c, a in rig.bridge.calls if c == "chat.search"].count("cultural core team") == 1,
+                  [a for c, a in rig.bridge.calls if c == "chat.search"])
+            rig.bridge.open_chat = "Rahul Sharma"
+            r = rig.do("message close this chat")
+            check("'close the chat' closes the open conversation", rig.bridge.open_chat == "" and r.message == "Closed the chat.", r.message)
+            r = rig.do("message close this chat")
+            check("...and with none open that is said", "No chat is open" in r.message, r.message)
+        wa_front = [client("0xw1", "chrome-web.whatsapp.com__-Default", "WhatsApp")]
+        with WebRig(WhatsApp11(chats=[dict(c) for c in chats]), hypr=FakeHyprland(wa_front, active="0xw1")) as rig:
+            rig.bridge.open_chat = "Rahul Sharma"
+            r = rig.do("browser close the group")
+            check("LOG: 'close the group' with WhatsApp in front and no tab groups closes the CHAT (was 'no tab groups')",
+                  rig.bridge.open_chat == "" and r.message == "Closed the chat.", r.message)
+        with WebRig(GroupBridge(version="1.10.0")) as rig:
+            r = rig.do("browser open research group")
+            check("a TAB group with that name is still expanded (never WhatsApp)", "Expanded" in r.message
+                  and not any(c.startswith("chat.") for c, _a in rig.bridge.calls), r.message)
+    finally:
+        web_macros.EMBEDDER = saved_embed
+    # ── third pass, the audit log of 2026-11-11 01:19–01:23 ──
+    for said, target, count in (
+            ("open and read the last three latest recent chats of mota panda", "mota panda", 3),   # as it was said
+            ("read the last 3 messages of mota panda", "mota panda", 3),
+            ("read mota panda's last five messages", "mota panda", 5),
+            ("what were the last 2 messages from mom", "mom", 2),
+            ("read the latest messages from rahul", "rahul", 0)):
+        token = d(said, nowhere)
+        a = n(token[0]) if token else None
+        check(f"LOG: '{said}' -> read {target!r}, count {count} (rules first; the classifier answered with its own example)",
+              a is not None and a.key == "message.read" and a.target == target and a.parameters.get("count") == count, (token, a))
+    a = n(d("read the last three messages", wa)[0])
+    check("'read the last three messages' with WhatsApp in front is the OPEN chat, three of them",
+          a.key == "message.read" and a.target == "current" and a.parameters["count"] == 3, a)
+    check("'read my last three emails from ravi' and 'the last two chapters of the book' are not WhatsApp",
+          d("read my last three emails from ravi", nowhere) is None and d("read the last two chapters of the book", nowhere) is None)
+    check("LOG: 'message open' with no name is not a message to someone called 'open'", n("message open") is None
+          and n("message open it") is None, n("message open"))
+    check("'close whatsapp' is the APP, and a failed close is never handed to the model to reinterpret",
+          n("close whatsapp").key == "app.close" and not common._worth_rethinking(
+              n("close whatsapp"), web_macros.ActionResult.not_found("WhatsApp isn't open.")))
+    saved_embed = web_macros.EMBEDDER
+    web_macros.EMBEDDER = False
+    try:
+        with WebRig(WhatsApp11()) as rig, Models("SHOULD NOT BE ASKED") as models:
+            rig.bridge.history["Rahul Sharma"] = [
+                {"from": "Rahul Sharma", "text": f"msg {i}", "date": "1/1/2026", "time": "09:00", "out": False} for i in range(1, 9)]
+            r = rig.do("message read the last three messages of rahul sharma")
+            check("LOG: 'the last three messages of X' opens X and reads exactly the last three, as they are",
+                  rig.bridge.open_chat == "Rahul Sharma" and r.message ==
+                  "The last 3 in Rahul Sharma: Rahul Sharma: msg 6 ... Rahul Sharma: msg 7 ... Rahul Sharma: msg 8"
+                  and models.asked == [], r.message)
+            rig.bridge.archive += [{"name": "PR and Outreach Core Team 2026-27", "unread": 0, "preview": "", "when": "1/1/2026"},
+                                   {"name": "Outreach volunteers", "unread": 0, "preview": "", "when": "1/1/2026"}]
+            rig.bridge.chats = [c for c in rig.bridge.chats if "Outreach" not in c["name"]]
+            r = rig.do("message open public relation and outreach coding")
+            check("LOG: a name heard wrong is not a flat 'not found' when WhatsApp's search showed near chats: they are offered",
+                  r.status == Status.AMBIGUOUS and "PR and Outreach Core Team 2026-27" in r.message
+                  and "Outreach volunteers" in r.message and rig.bridge.searching == "", r.message)
+        with WebRig(WhatsApp11()) as rig:
+            rig.bridge.tabs = [{"id": 1, "title": "Inbox", "url": "https://mail.google.com/"}]
+            r = rig.do("message close this chat")
+            check("'close the chat' never OPENS WhatsApp when it is not open", not r.ok and "isn't open" in r.message
+                  and not any(c in ("tabs.open", "tabs.activate", "chat.close") for c, _a in rig.bridge.calls), (r.message, rig.bridge.calls))
+    finally:
+        web_macros.EMBEDDER = saved_embed
+
+    def close_whatsapp():
+        # The web app runs in "Profile 1": its window class is not the entry's StartupWMClass.
+        window = [client("0xw9", "chrome-web.whatsapp.com__-Profile_1", "WhatsApp")]
+        hypr = FakeHyprland(window, active="0xw9")
+        with WebRig(WhatsApp11(), hypr=hypr) as rig:
+            rig.bridge.open_chat = "Rahul Sharma"
+            before = len(rig.runner.spawned)
+            r = rig.do("open whatsapp")
+            check("LOG: 'open whatsapp' sees the web-app window of ANOTHER profile (it waited 8 s and started a second one)",
+                  r.ok and len(rig.runner.spawned) == before, (r.message, rig.runner.spawned[before:]))
+            r = rig.do("close whatsapp")
+            check("LOG: 'close whatsapp' closes the WhatsApp WINDOW — the chat inside it is not touched",
+                  rig.bridge.open_chat == "Rahul Sharma" and not any(c == "chat.close" for c, _a in rig.bridge.calls)
+                  and "isn't open" not in r.message, (r.message, r.status))
+        with WebRig(WhatsApp11(), hypr=FakeHyprland([client("0xc1", "google-chrome", "WhatsApp - Google Chrome")], active="0xc1")) as rig:
+            rig.bridge.open_chat = "Rahul Sharma"
+            r = rig.do("close whatsapp")
+            check("LOG: with WhatsApp only in a Chrome TAB, 'close whatsapp' closes that tab",
+                  r.ok and ("tabs.close", {"match": "web.whatsapp.com", "all": True}) in rig.bridge.calls
+                  and rig.bridge.open_chat == "Rahul Sharma", (r.message, rig.bridge.calls[-3:]))
+    with_desktop_tree(close_whatsapp)
+    from kayra.automation import semantic_match as S
+    names = ["Family", "Graphics Team (2026-27)", "Rahul", "Graphics Team (2025-26)", "Graphics Design"]
+    check("editions: a year said picks that year", S.match("graphics team 2025", names).best.name == "Graphics Team (2025-26)")
+    check("editions: one word shared by different groups still ASKS", S.match("graphics", names).decision == "ask")
+    check("a year range is one thing however it is said",
+          S.tokens("2026 2027") == S.tokens("2026-27") == S.tokens("twenty twenty six to twenty seven") == ["2026", "27"],
+          S.tokens("twenty twenty six to twenty seven"))
+
+    # ── Workspace file names ──
+    files = [{"id": "p" * 30, "title": "Council Details 2025-26", "url": "https://docs.google.com/spreadsheets/d/" + "p" * 30 + "/edit"},
+             {"id": "q" * 30, "title": "Council Details 2026-27 | Sundarbans House",
+              "url": "https://docs.google.com/spreadsheets/d/" + "q" * 30 + "/edit"},
+             {"id": "r" * 30, "title": "House Council", "url": "https://docs.google.com/spreadsheets/d/" + "r" * 30 + "/edit"}]
+    rank = web_macros.rank_titles
+    for said in ("council details 2026-27", "council details 2026 2027", "council details 2026 to 27",
+                 "council details twenty twenty six twenty seven"):
+        top = rank(said, files)[0]
+        check(f"file names: {said!r} -> the long real title, strongly", top[1]["id"] == "q" * 30 and top[0] >= 80, top)
+    with WebRig(YearFiles(files=files)) as rig, Models("SHOULD NOT BE ASKED") as models:
+        r = rig.do("open council details 2026-27 sheet")
+        check("the reported one: 'open council details 2026-27 sheet' opens '… | Sundarbans House'",
+              rig.bridge.last("tabs.navigate") == {"url": files[1]["url"]} and "Sundarbans" in r.message, r.message)
+        r = rig.do("browser open council details 2026 2027 sheet")
+        searched = [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate") and "?q=" in a["url"]]
+        check("...the year said the long way is searched for as '2026 27'",
+              searched[-1] == "https://docs.google.com/spreadsheets/u/0/?q=council%20details%202026%2027"
+              and rig.bridge.last("tabs.navigate") == {"url": files[1]["url"]}, searched)
+        r = rig.do("browser open zzz council details sheet")
+        check("a name Google's search finds nothing for falls back to the recent list, never a weak guess",
+              not r.ok or "Council" in r.message, r.message)
+        check("...and no name went to a model (D3)", models.asked == [], models.asked)
+    twins = [dict(files[0], title="Budget 2026"), dict(files[1], title="Budget 2025")]
+    with WebRig(WorkspaceBridge(files=twins)) as rig:
+        r = rig.do("open my budget sheet")
+        check("the same name with different years: the one listed first (used last) opens, no question",
+              r.ok and rig.bridge.last("tabs.navigate") == {"url": twins[0]["url"]}, r.message)
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │       PART 6 — FORMS (D1–D5), VIDEO (F1), SITE SEARCH AND SHOPPING      │
+# └────────────────────────────────────────────────────────────────────────┘
+
+FORM_FIELDS = [
+    {"i": 0, "type": "text", "label": "Full name", "hints": "Full name | name", "autocomplete": "", "sensitive": False,
+     "required": True, "filled": False},
+    {"i": 1, "type": "email", "label": "Email address", "hints": "Email address", "autocomplete": "email",
+     "sensitive": False, "required": True, "filled": False},
+    {"i": 2, "type": "tel", "label": "Mobile", "hints": "Mobile", "autocomplete": "", "sensitive": False,
+     "required": False, "filled": False},
+    {"i": 3, "type": "text", "label": "Father's name", "hints": "Father's name", "autocomplete": "",
+     "sensitive": False, "required": True, "filled": False},
+    {"i": 4, "type": "date", "label": "Date of birth", "hints": "Date of birth", "autocomplete": "",
+     "sensitive": False, "required": False, "filled": False},
+    {"i": 5, "type": "select", "label": "Gender", "hints": "Gender", "autocomplete": "", "sensitive": False,
+     "required": False, "filled": False, "options": ["Male", "Female", "Other"]},
+    {"i": 6, "type": "password", "label": "Password", "hints": "Password", "autocomplete": "new-password",
+     "sensitive": True, "required": True, "filled": False},
+    {"i": 7, "type": "text", "label": "City", "hints": "City", "autocomplete": "", "sensitive": False,
+     "required": False, "filled": True},
+    {"i": 8, "type": "checkbox", "label": "I agree to the terms", "hints": "I agree to the terms",
+     "autocomplete": "", "sensitive": False, "required": True, "filled": False},
+    {"i": 9, "type": "text", "label": "Roll number", "hints": "Roll number | roll", "autocomplete": "",
+     "sensitive": False, "required": False, "filled": False},
+]
+
+
+class FormBridge(Bridge):
+    """The extension at 1.12.0 with a form, a video and a product on the active page."""
+
+    def __init__(self, url="https://forms.example/apply", fields=None, video=None, product=None,
+                 submit=None, file_input=True, version="1.12.0"):
+        super().__init__(version=version)
+        self.url, self.fields = url, [dict(f) for f in (FORM_FIELDS if fields is None else fields)]
+        self.video = dict(video or {"video": True, "paused": False, "time": 200, "duration": 765, "rate": 1.0,
+                                    "muted": False, "ad": False, "title": "Attention explained", "captions": False})
+        self.product = product
+        self.submit = submit or {"submitted": True, "label": "Submit"}
+        self.file_input, self.files = file_input, []
+
+    def last(self, cmd):
+        return next((a for c, a in reversed(self.calls) if c == cmd), None)
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "tabs.active":
+            return {"id": 13, "title": "Page", "url": self.url}
+        if cmd == "page.form":
+            self.calls.append((cmd, args))
+            op = args.get("op")
+            if op == "list":
+                return {"url": self.url, "fields": [dict(f) for f in self.fields]}
+            if op == "fill":
+                filled, failed = [], []
+                for item in args["items"]:
+                    f = self.fields[item["i"]]
+                    if f["sensitive"]:
+                        failed.append({"i": item["i"], "reason": "sensitive"})
+                        continue
+                    f["filled"], f["value"] = True, item["value"]
+                    filled.append({"i": item["i"], "label": f["label"]})
+                return {"filled": filled, "failed": failed}
+            if op == "choose":
+                if args.get("kind") == "check":
+                    return {"done": "agree" in args["field"], "label": "I agree to the terms", "was": False,
+                            "now": args.get("state") is not False, "options": ["I agree to the terms"]}
+                if args.get("kind") == "date":
+                    return {"done": True, "field": "Date of birth", "option": args["option"]}
+                field = next((f for f in self.fields if f.get("options") and args["field"] in f["label"].lower()), None)
+                if not field:
+                    return {"done": False, "reason": "field not found", "fields": ["Gender"]}
+                if args["option"].lower() not in [o.lower() for o in field["options"]]:
+                    return {"done": False, "field": field["label"], "reason": "no option", "options": field["options"]}
+                return {"done": True, "field": field["label"], "option": args["option"]}
+            if op == "submit":
+                return dict(self.submit)
+            if op == "file":
+                return {"found": self.file_input, "label": "Upload resume", "armed": bool(args.get("arm"))}
+            if op == "fileState":
+                return {"files": list(self.files)}
+        if cmd == "page.video":
+            self.calls.append((cmd, args))
+            op, value = args.get("op"), args.get("value")
+            v = self.video
+            if not v.get("video"):
+                return {"video": False}
+            if op == "rate":
+                v["rate"] = value
+            elif op == "seek":
+                v["time"] = max(0, v["time"] + value)
+            elif op == "seekTo":
+                v["time"] = value
+            elif op == "pause":
+                v["paused"] = True
+            elif op == "skipAd":
+                return {"skipped": v["ad"] and v.get("skippable", True), "ad": v["ad"], "wait": "Ad · 0:05"}
+            elif op == "captions":
+                v["captions"] = value
+                return {"available": True, "captions": value}
+            elif op == "subscribe":
+                return {"available": True, "subscribed": True}
+            elif op == "like":
+                return {"available": True, "was": False, "liked": True}
+            return dict(v)
+        if cmd == "page.product":
+            self.calls.append((cmd, args))
+            return self.product or {"found": False}
+        if cmd == "page.type":
+            self.calls.append((cmd, args))
+            return {"typed": args.get("field") != "country", "reason": "field not found"}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class TempProfile:
+    """Points the form profile at a temporary file (never the developer's data/profile.json)."""
+
+    def __enter__(self):
+        import tempfile
+        from kayra.automation import form_profile
+        self.dir = tempfile.mkdtemp(prefix="kayra-profile-")
+        self.path = os.path.join(self.dir, "profile.json")
+        self._saved, form_profile._path = form_profile._path, (lambda: self.path)
+        return self
+
+    def __exit__(self, *exc):
+        import shutil
+        from kayra.automation import form_profile
+        form_profile._path = self._saved
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return False
+
+
+class ChooserRunner(RecordingRunner):
+    """wtype recorded; the real Space key makes a file chooser window appear (when `opens`)."""
+
+    def __init__(self, hypr, opens=True):
+        super().__init__(ALL_TOOLS)
+        self.hypr, self.opens = hypr, opens
+
+    def run(self, argv, timeout=4.0, input_text=None, stdin_path=None):
+        if self.opens and argv[:1] == ["wtype"] and argv[-1:] == ["space"]:
+            self.hypr.clients_list.append(client("0xf11e", "xdg-desktop-portal-gtk", "Open Files", pid=900))
+        return super().run(argv, timeout, input_text, stdin_path)
+
+
+def section_part_6():
+    check.section("[21] Part 6 — forms (D1–D5), the video (F1), site search and shopping (F2/F3, D1)")
+    from kayra.automation import form_profile, policy
+    d = common.direct_tokens
+    nowhere = lambda: {}
+    youtube = lambda: {"app": "google-chrome", "tab_url": "https://www.youtube.com/watch?v=x"}
+    amazon = lambda: {"app": "google-chrome", "tab_url": "https://www.amazon.in/s?k=earbuds"}
+
+    # ── parsing: every shape, bare and with the prefix ──
+    table = (
+        ("fill this form with my details", "form_fill", "current"),
+        ("autofill this form", "form_fill", "current"),
+        ("fill in my details", "form_fill", "current"),
+        ("submit this form", "form_submit", "current"),
+        ("select India in the country dropdown", "form_choose", "India"),
+        ("choose male for gender", "form_choose", "male"),
+        ("tick i agree", "form_choose", "i agree"),
+        ("untick subscribe to newsletter", "form_choose", "subscribe to newsletter"),
+        ("check the remember me box", "form_choose", "remember me"),
+        ("set the date of birth to 4 may 2003", "form_choose", "2003-05-04"),
+        ("upload my resume here", "file_upload", "resume"),
+        ("attach my resume", "file_upload", "resume"),
+        ("remember my phone number is 98765 43210", "profile_set", "phone"),
+        ("save CS21B001 as my roll number", "profile_set", "roll_number"),
+        ("what details do you have for forms", "profile_show", "profile"),
+        ("forget my phone number", "profile_forget", "phone"),
+        ("forget my form profile", "profile_clear", "all"),
+        ("skip the ad", "video", "skipAd"),
+        ("speed 1.5", "video", "rate"),
+        ("play at 2x", "video", "rate"),
+        ("normal speed", "video", "rate"),
+        ("turn on captions", "video", "captions"),
+        ("next video", "video", "next"),
+        ("like this video", "video", "like"),
+        ("save this to watch later", "video", "watchLater"),
+        ("make the video full screen", "video", "fullscreen"),
+        ("pause the video", "video", "pause"),
+        ("how much is left in this video", "video", "state"),
+        ("subscribe to this channel", "video_subscribe", "subscribe"),
+        ("search amazon for earbuds under 2000", "site_search", "earbuds"),
+        ("search for wireless mouse on flipkart sorted by price low to high", "site_search", "wireless mouse"),
+        ("look up rust on wikipedia", "site_search", "rust"),
+        ("search github for kokoro onnx", "site_search", "kokoro onnx"),
+        ("images of red pandas", "site_search", "red pandas"),
+        ("add this to cart", "page_click", "add to cart"),
+        ("buy it now", "page_click", "buy now"),
+        ("proceed to checkout", "page_click", "checkout"),
+    )
+    for said, action, target in table:
+        bare, prefixed = n(said), n("browser " + said)
+        check(f"'{said}' -> browser.{action} {target!r}", bare is not None and bare.action == action
+              and bare.target == target and prefixed is not None and prefixed.action == action
+              and prefixed.target == target, (bare, prefixed))
+        check(f"...rules first, no model: '{said}'", d(said, nowhere) == [f"browser {said}"], d(said, nowhere))
+    for token, action, target, params in (
+            ("browser skip 10 seconds", "video", "seek", {"op": "seek", "value": 10}),
+            ("browser skip ten seconds", "video", "seek", {"op": "seek", "value": 10}),
+            ("browser go back 30 seconds", "video", "seek", {"op": "seek", "value": -30}),
+            ("browser rewind", "video", "seek", {"op": "seek", "value": -10}),
+            ("browser go to 2:30", "video", "seekTo", {"op": "seekTo", "value": 150}),
+            ("browser go to 2 minutes", "video", "seekTo", {"op": "seekTo", "value": 120}),
+            ("browser play it at one point five times speed", "video", "rate", {"op": "rate", "value": 1.5}),
+            ("browser speed up the video", "video", "rate", {"op": "rate", "value": "+0.25"}),
+            ("browser unlike this video", "video", "like", {"op": "like", "value": False}),
+            ("browser press tab twice", "page_key", "tab", {"count": 2}),
+            ("browser press enter", "page_key", "enter", {"count": 1}),
+            ("browser sort by price low to high", "shop_refine", "price_asc", {"sort": "price_asc", "lo": 0, "hi": 0}),
+            ("browser show only under 2000", "shop_refine", "price", {"sort": "", "lo": 0, "hi": 2000}),
+            ("browser how much is this", "product_info", "current", {}),
+            ("browser what's the rating", "product_info", "current", {}),
+            ("browser set my date of birth to the fourth of may two thousand three", "form_choose", "2003-05-04",
+             {"field": "date of birth", "kind": "date", "option": "2003-05-04"})):
+        a = n(token)
+        check(f"'{token}' -> browser.{action} {target!r} {params}", a is not None and a.action == action
+              and a.target == target and a.parameters == params, a)
+    a = n("search amazon for the cheapest earbuds between 500 and 1500 in a new tab")
+    check("price range, 'cheapest', and where it opens are all read out of the sentence",
+          a.parameters == {"site": "amazon", "sort": "price_asc", "lo": 500, "hi": 1500, "where": "tab"}
+          and a.target == "earbuds", a)
+    check("'two thousand' and '2k' are prices too", common.price_filter("earbuds under two thousand")[2] == 2000
+          and common.price_filter("earbuds under 2k rupees") == ("earbuds", 0, 2000))
+    # ── context: the same words mean the page only when that page is in front ──
+    for said in ("skip 10 seconds", "go back 30 seconds", "rewind", "go to 2:30"):
+        check(f"'{said}': rules first with a video in front, the model decides elsewhere",
+              d(said, youtube) == [f"browser {said}"] and d(said, nowhere) is None, (d(said, youtube), d(said, nowhere)))
+    for said in ("how much is this", "sort by price low to high", "show me the cheapest ones first"):
+        check(f"'{said}': rules first on a shop, the model decides elsewhere",
+              d(said, amazon) == [f"browser {said}"] and d(said, nowhere) is None, (d(said, amazon), d(said, nowhere)))
+    # ── neighbours that must not move ──
+    for said, key in (("google search cats in a new tab", "browser.search_web"), ("youtube search lofi", "browser.search_youtube"),
+                      ("select all", "keyboard.hotkey"), ("search my drive for budget", "browser.ws_search"),
+                      ("search my bookmarks for rust", "browser.bookmarks_search"),
+                      ("find rahul on whatsapp", "message.search"), ("add a note saying buy milk", "browser.keep_note"),
+                      ("browser fill the email field with ana@x.com", "browser.page_type"),
+                      ("browser type hello into search", "browser.page_type")):
+        a = n(d(said, nowhere)[0] if d(said, nowhere) else said)
+        check(f"unchanged: '{said}' -> {key}", a is not None and a.key == key, a)
+    check("'pick a movie for tonight' and 'check my email' are not form commands",
+          d("pick a movie for tonight", nowhere) is None and (n("pick a movie for tonight") is None
+                                                               or n("pick a movie for tonight").action != "form_choose")
+          and common.part_6_action("check my email", "check my email") is None)
+
+    # ── D1: shopping stops before the cart — refused, not asked ──
+    for token in ("browser add this to cart", "browser buy it now", "browser click on add to cart",
+                  "browser click on proceed to checkout", "browser click on place order", "browser go to cart"):
+        check(f"D1: '{token}' is REFUSED", policy_classify(token) == "DENY", policy_classify(token))
+    check("D1: a click on the same words on the screen (OCR) is refused too",
+          policy.classify_action(policy.Action("mouse", "click_text", target="Add to Cart"))[0] == "DENY")
+    check("D1: 'add to cart' is never accepted from the understanding model",
+          interpreter.validate(["browser click on add to cart"], n, policy.classify_action) == [])
+    for token in ("browser submit this form", "browser subscribe to this channel", "browser forget my form profile"):
+        check(f"'{token}' asks first", policy_classify(token) == "CONFIRM", policy_classify(token))
+    check("the model may never set, forget or submit the user's details, or choose a file",
+          interpreter.validate(["browser remember my email is a@b.com", "browser submit this form",
+                                "browser upload my resume here", "browser forget my phone number",
+                                "browser skip the ad"], n, policy.classify_action) == ["browser skip the ad"])
+    check("the new shapes are in the understanding catalog and every one parses",
+          all(p in interpreter.CATALOG for p in ("browser fill this form with my details", "browser skip the ad",
+                                                 "browser search amazon for <product> under <price>",
+                                                 "browser how much is this"))
+          and all(n(t) is not None for t in ("browser fill this form with my details", "browser tick i agree",
+                                             "browser skip the ad", "browser images of red pandas")))
+
+    # ── the profile: local, 0600, validated, nothing that looks like a card ──
+    with TempProfile() as tp:
+        P = form_profile
+        check("no profile: an empty dict", P.load() == {})
+        check("a spoken email and a spoken phone are stored normalised",
+              P.set_value("email", "ana dot r at gmail dot com")[0] and P.set_value("phone", "98765 43210")[0]
+              and P.load() == {"email": "ana.r@gmail.com", "phone": "9876543210"}, P.load())
+        check("the file is private (0600)", oct(os.stat(tp.path).st_mode & 0o777) == "0o600",
+              oct(os.stat(tp.path).st_mode & 0o777))
+        check("a bad email, a short phone and a card-shaped value are refused",
+              not P.set_value("email", "ana at gmail")[0] and not P.set_value("phone", "12")[0]
+              and not P.set_value("college", "4111 1111 1111 1111")[0])
+        check("dates are read the ways people say them", [P.parse_date(x) for x in (
+            "4 May 2003", "May 4th, 2003", "the fourth of may two thousand three", "04/05/2003", "2003-05-04",
+            "31 feb 2001")] == ["2003-05-04"] * 5 + [""])
+        P.set_value("name", "Ana Rao")
+        P.set_value("dob", "4 may 2003")
+        P.set_value("gender", "female")
+        check("a full name also gives first and last; gender is capitalised",
+              P.load().get("first_name") == "Ana" and P.load().get("last_name") == "Rao"
+              and P.load()["gender"] == "Female", P.load())
+        keys = {f["label"]: P.key_of_field(f) for f in FORM_FIELDS}
+        check("fields map to keys by autocomplete, type and label; someone else's and secret ones never",
+              keys == {"Full name": "name", "Email address": "email", "Mobile": "phone", "Father's name": None,
+                       "Date of birth": "dob", "Gender": "gender", "Password": None, "City": "city",
+                       "I agree to the terms": None, "Roll number": "roll_number"}, keys)
+        check("a text date field gets day/month/year; one that says mm/dd gets that",
+              P.value_for({"type": "text", "hints": "DOB"}, "dob", P.load()) == "04/05/2003"
+              and P.value_for({"type": "text", "hints": "Birthday (mm/dd/yyyy)"}, "dob", P.load()) == "05/04/2003"
+              and P.value_for({"type": "date"}, "dob", P.load()) == "2003-05-04")
+        check("'my email' / 'roll no' name profile keys", P.key_for("my email") == "email" and P.key_for("roll no") == "roll_number"
+              and P.key_for("favourite colour") is None)
+        P.forget("phone")
+        check("one value forgotten", "phone" not in P.load())
+        P.forget()
+        check("everything forgotten removes the file", P.load() == {} and not os.path.exists(tp.path))
+
+    # ── D3: fill this form ──
+    with TempProfile(), WebRig(FormBridge()) as rig:
+        r = rig.do("browser fill this form with my details")
+        check("D3: no saved details: says how to give them, fills nothing", r.status == Status.NOT_FOUND
+              and "remember my email" in r.message and rig.bridge.last("page.form") is None, r.message)
+        for token in ("browser remember my name is Ana Rao", "browser remember my email is ana at x dot com",
+                      "browser remember my phone number is 98765 43210", "browser remember my date of birth is 4 May 2003",
+                      "browser remember my gender is female"):
+            r = rig.do(token)
+        check("profile by voice: the last one is saved and said so", r.ok and "gender" in r.message, r.message)
+        from kayra.automation.policy import recent_audit
+        entry = next(e for e in reversed(recent_audit(40)) if e.get("action") == "browser.profile_set")
+        check("the audit log never holds a profile value", "female" not in str(entry).lower()
+              and "chars>" in str(entry.get("parameters")), entry)
+        r = rig.do("browser what details do you have for forms")
+        check("'what details do you have' names them, without the values",
+              "name" in r.message and "email" in r.message and "ana" not in r.message.lower(), r.message)
+        r = rig.do("browser fill this form with my details")
+        check("D3: asks first, naming the fields it can fill and nothing else",
+              r.status == Status.NEEDS_CONFIRMATION and "5 fields" in r.message
+              and all(w in r.message for w in ("name", "email", "phone number", "date of birth", "gender"))
+              and "roll number" in r.message and "don't have" in r.message
+              and not any(a.get("op") == "fill" for c, a in rig.bridge.calls if c == "page.form"), r.message)
+        pending = linux.CONFIRMATIONS.peek()
+        pending_text = str(pending.parameters if pending else "")
+        check("...the pending action holds field numbers and keys, never a value",
+              "ana@x.com" not in pending_text and "9876543210" not in pending_text and "confirmed" in pending_text,
+              pending_text)
+        ok, said = linux.resolve_confirmation("yes")
+        fill = next(a for c, a in reversed(rig.bridge.calls) if c == "page.form" and a.get("op") == "fill")
+        filled = {item["i"]: item["value"] for item in fill["items"]}
+        check("...on yes: exactly the empty fields Kayra has values for, in their own formats",
+              filled == {0: "Ana Rao", 1: "ana@x.com", 2: "9876543210", 4: "2003-05-04", 5: "Female"}, filled)
+        check("...never the password, the father's name, the consent box or the field already filled",
+              not set(filled) & {3, 6, 7, 8}, filled)
+        check("...and it says it did NOT submit, naming what is still empty",
+              "haven't submitted" in said and "Father's name" in said and "Password" in said, said)
+        check("...no submit was pressed", not any(a.get("op") == "submit" for c, a in rig.bridge.calls if c == "page.form"))
+        rig.bridge.fields = [dict(f, filled=False) for f in FORM_FIELDS]
+        rig.do("browser fill this form with my details")
+        rig.bridge.url = "https://other.example/"
+        ok, said = linux.resolve_confirmation("yes")
+        check("...a page that changed before the yes is not filled", "page changed" in said, said)
+
+    # ── D1/D4: choose, tick, date, submit, keys ──
+    with TempProfile(), WebRig(FormBridge()) as rig:
+        r = rig.do("browser choose male for gender")
+        check("D1: a drop-down option", r.ok and r.message == "Chose male for Gender.", r.message)
+        r = rig.do("browser choose purple for gender")
+        check("D1: a missing option names the real ones", not r.ok and "Male, Female and Other" in r.message, r.message)
+        r = rig.do("browser tick i agree")
+        check("D1: tick", r.ok and r.message.startswith("Ticked I agree"), r.message)
+        r = rig.do("browser set the date of birth to 4 may 2003")
+        check("D1: a date, said back in words", r.ok and "4 May 2003" in r.message
+              and rig.bridge.last("page.form")["option"] == "2003-05-04", r.message)
+        r = rig.do("browser set the country to India")
+        check("'set the country to India' on a drop-down: the text box is not there, so the drop-down is chosen",
+              rig.bridge.last("page.form").get("kind") == "select" and rig.bridge.last("page.form").get("option") == "India", r.message)
+        form_profile.set_value("email", "ana@x.com")
+        rig.do("browser fill the email field with my email")
+        check("'… with my email' types the saved address, not the words",
+              rig.bridge.last("page.type")["text"] == "ana@x.com", rig.bridge.last("page.type"))
+        r = rig.do("browser submit this form")
+        check("D4: submit asks first and presses nothing", r.status == Status.NEEDS_CONFIRMATION
+              and "Submit this form" in r.message and not any(a.get("op") == "submit" for c, a in rig.bridge.calls
+                                                               if c == "page.form"), r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("...on yes it presses the form's own button and says which", said == "Pressed Submit.", said)
+        rig.bridge.submit = {"submitted": False, "reason": "invalid", "label": "Submit", "missing": ["Father's name"]}
+        rig.do("browser submit this form")
+        ok, said = linux.resolve_confirmation("yes")
+        check("D4: a form the browser would refuse is not reported as sent; the missing field is named",
+              said == "I didn't submit it — the form still needs Father's name.", said)
+        rig.bridge.submit = {"submitted": False, "reason": "payment", "label": "Place order"}
+        rig.do("browser submit this form")
+        ok, said = linux.resolve_confirmation("yes")
+        check("D1: a 'submit' that is really Place order is refused", "Place order" in said and "yours to do" in said, said)
+        r = rig.do("browser press tab twice")
+        keys = [a for a in rig.runner.calls if a[:1] == ["wtype"]]
+        check("D2: real keys into the page", r.ok and keys[-2:] == [["wtype", "-k", "Tab"]] * 2 and "2 times" in r.message,
+              (keys[-2:], r.message))
+    with WebRig(FormBridge(version="1.11.0")) as rig:
+        r = rig.do("browser fill this form with my details")
+        check("an extension older than 1.12.0 is updated, never sent page.form",
+              "page.form" not in rig.bridge.cmds(), r.message)
+
+    # ── D5: upload a file ──
+    import tempfile
+    import shutil
+    folder = tempfile.mkdtemp(prefix="kayra-upload-")
+    try:
+        old_path, new_path = os.path.join(folder, "resume_2025.pdf"), os.path.join(folder, "Ana-Resume-2026.pdf")
+        for path, age in ((old_path, 1000), (new_path, 10), (os.path.join(folder, "notes.txt"), 5),
+                          (os.path.join(folder, "resume.sh"), 1)):
+            open(path, "w").close()
+            os.utime(path, (time_now() - age, time_now() - age))
+        saved_roots, web_macros.FILE_ROOTS = web_macros.FILE_ROOTS, [folder]
+        hypr = FakeHyprland()
+        with WebRig(FormBridge(), hypr=hypr, runner=ChooserRunner(hypr)) as rig:
+            r = rig.do("browser upload my resume here")
+            check("D5: the newest matching file is named in the question, nothing uploaded yet",
+                  r.status == Status.NEEDS_CONFIRMATION and "Ana-Resume-2026.pdf" in r.message and "newest of 2" in r.message
+                  and not any(a.get("arm") for c, a in rig.bridge.calls if c == "page.form"), r.message)
+            rig.bridge.files = ["Ana-Resume-2026.pdf"]
+            ok, said = linux.resolve_confirmation("yes")
+            typed = [t for a, t in rig.runner.ran if a == ["wtype", "-"]]
+            keys = [a for a, _ in rig.runner.ran if a[:1] == ["wtype"] and a != ["wtype", "-"]]
+            check("...on yes: the page's input is armed, a REAL Space opens the chooser, the path is typed into it",
+                  rig.bridge.last("page.form") is not None and any(a.get("arm") for c, a in rig.bridge.calls if c == "page.form")
+                  and ["wtype", "-k", "space"] in keys and ["wtype", "-M", "ctrl", "-k", "l", "-m", "ctrl"] in keys
+                  and typed == [new_path] and keys[-1] == ["wtype", "-k", "Return"], (keys, typed))
+            check("...and the file name is read back from the page", said == "Attached Ana-Resume-2026.pdf.", said)
+        hypr = FakeHyprland()
+        with WebRig(FormBridge(), hypr=hypr, runner=ChooserRunner(hypr, opens=False)) as rig:
+            rig.do("browser upload my resume here")
+            ok, said = linux.resolve_confirmation("yes")
+            check("D5: no chooser appeared: nothing is typed anywhere, and it says so",
+                  "nothing was uploaded" in said and not any(a == ["wtype", "-"] for a, _ in rig.runner.ran), said)
+        with WebRig(FormBridge(file_input=False)) as rig:
+            r = rig.do("browser upload my resume here")
+            check("D5: a page with no upload field says so", r.status == Status.NOT_FOUND and "upload" in r.message, r.message)
+            r = rig.do("browser upload my tax return here")
+            check("D5: no such file says so", r.status == Status.NOT_FOUND and "tax return" in r.message, r.message)
+    finally:
+        web_macros.FILE_ROOTS = saved_roots
+        shutil.rmtree(folder, ignore_errors=True)
+
+    # ── F1: the video ──
+    with WebRig(FormBridge(url="https://www.youtube.com/watch?v=x")) as rig:
+        r = rig.do("browser speed 1.5")
+        check("F1: speed", r.message == "Playing at 1.5 times speed.", r.message)
+        r = rig.do("browser speed up the video")
+        check("F1: 'faster' is a quarter step from where it is", rig.bridge.video["rate"] == 1.75, rig.bridge.video)
+        r = rig.do("browser normal speed")
+        check("F1: normal speed", r.message == "Playing at normal speed.", r.message)
+        r = rig.do("browser skip 30 seconds")
+        check("F1: seek ahead, saying where it is now", r.message == "Skipped ahead 30 seconds — now at 3:50.", r.message)
+        r = rig.do("browser go back 2 minutes")
+        check("F1: seek back by minutes", r.message == "Went back 2 minutes — now at 1:50.", r.message)
+        r = rig.do("browser go to 10:05")
+        check("F1: jump to a time", r.message == "Jumped to 10:05.", r.message)
+        r = rig.do("browser skip the ad")
+        check("F1: no ad, said so", r.message == "There's no ad playing.", r.message)
+        rig.bridge.video.update(ad=True, skippable=False)
+        r = rig.do("browser skip the ad")
+        check("F1: an ad that can't be skipped yet says so", not r.ok and "can't be skipped yet" in r.message, r.message)
+        r = rig.do("browser turn on captions")
+        check("F1: captions", r.message == "Captions on.", r.message)
+        r = rig.do("browser how much is left in this video")
+        check("F1: where am I", "Attention explained" in r.message and "of 12:45" in r.message, r.message)
+        rig.do("browser make the video full screen")
+        check("F1: full screen is YouTube's own key, after the page lets go of the keyboard",
+              ["wtype", "-k", "f"] in rig.runner.calls and rig.bridge.last("page.video")["op"] == "blur")
+        r = rig.do("browser subscribe to this channel")
+        check("F1: subscribe asks first", r.status == Status.NEEDS_CONFIRMATION and "Subscribe" in r.message, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("...then subscribes", said == "Subscribed.", said)
+        rig.bridge.video = {"video": False}
+        r = rig.do("browser speed 2")
+        check("F1: no video on the page, said so", r.status == Status.NOT_FOUND and "no video" in r.message, r.message)
+
+    # ── F2/F3: search a site, refine, read a product ──
+    with WebRig(FormBridge(url="https://www.amazon.in/s?k=earbuds&ref=nb")) as rig:
+        r = rig.do("browser search amazon for the cheapest earbuds under 2000")
+        url = (rig.bridge.last("tabs.open") or {}).get("url", "")
+        check("F2: Amazon with a price ceiling (paise) and cheapest first",
+              url == "https://www.amazon.in/s?k=earbuds&s=price-asc-rank&rh=p_36%3A-200000"
+              and r.message == "Searching Amazon for earbuds under 2,000 rupees, cheapest first.", (url, r.message))
+        rig.do("browser search for wireless mouse on flipkart between 500 and 1000")
+        url = (rig.bridge.last("tabs.open") or {}).get("url", "")
+        check("F2: Flipkart with a price range",
+              url.startswith("https://www.flipkart.com/search?q=wireless+mouse&p%5B%5D=facets.price_range.from%3D500"), url)
+        rig.do("browser search github for kokoro onnx")
+        check("F2: any site with a search page", (rig.bridge.last("tabs.open") or {}).get("url") ==
+              "https://github.com/search?q=kokoro+onnx")
+        rig.do("browser images of red pandas")
+        check("F2: images", (rig.bridge.last("tabs.open") or {}).get("url") ==
+              "https://www.google.com/search?tbm=isch&q=red+pandas")
+        r = rig.do("browser sort by price high to low")
+        nav = (rig.bridge.last("tabs.navigate") or {}).get("url", "")
+        check("F3: sort the results in front, keeping the search",
+              nav == "https://www.amazon.in/s?k=earbuds&ref=nb&s=price-desc-rank" and "most expensive first" in r.message,
+              (nav, r.message))
+        r = rig.do("browser how much is this")
+        check("F3: no product on the page says how to get one", r.status == Status.NOT_FOUND and "open the first result" in r.message, r.message)
+        rig.bridge.product = {"found": True, "name": "boAt Airdopes 141", "price": "1299.00", "currency": "INR",
+                              "rating": "4.1 out of 5 stars", "ratings": "2,345", "availability": "InStock"}
+        r = rig.do("browser how much is this")
+        check("F3: name, price in rupees, rating and stock in one sentence",
+              r.message == "boAt Airdopes 141 costs 1,299 rupees. Rated 4.1 out of 5 from 2,345 ratings. In stock.", r.message)
+        r = rig.do("browser add this to cart")
+        check("D1: refused out loud, nothing clicked", r.status == Status.BLOCKED and "for you to do" in r.message
+              and rig.bridge.last("page.click") is None, r.message)
+    with WebRig(FormBridge(url="https://news.example/")) as rig:
+        r = rig.do("browser sort by price low to high")
+        check("F3: sorting is offered only where Kayra can do it honestly", r.status == Status.UNSUPPORTED
+              and "Amazon and Flipkart" in r.message, r.message)
+
+
 def policy_classify(token):
     from kayra.automation.policy import classify_action
     return str(getattr(classify_action(n(token))[0], "name", classify_action(n(token))[0])).upper()
@@ -2333,6 +3261,8 @@ def main():
         section_part_4()
         section_tuning_v9()
         section_part_5()
+        section_fix_round_v11()
+        section_part_6()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

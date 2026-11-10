@@ -15,6 +15,8 @@ order. Newest last.
 | [V8](UPDATE_V8.md) | 2026-11-10 | Google Workspace by voice: Sheets, Docs, Slides, Drive, Gmail, Calendar, Meet, Keep, Forms, Classroom (Part 4) | Feature |
 | [V9](UPDATE_V9.md) | 2026-11-10 | Tuning pass: rules before the classifier, waits inside the browser, relevant text, spoken names, site lookups fixed on live sites | Performance, accuracy, fixes |
 | [V10](UPDATE_V10.md) | 2026-11-10 | WhatsApp by voice, the app in front, and a semantic name matcher (Part 5) | Feature, privacy, fixes |
+| [V11](UPDATE_V11.md) | 2026-11-11 | Fix round: scrolling inside web apps, one search action + "close the search", WhatsApp chats by loose name from anywhere, file names said the short way | Fixes, tuning |
+| [V12](UPDATE_V12.md) | 2026-11-11 | Forms with your saved details, drop-downs, ticks, dates, submit, file upload; video controls; search any site, sort and filter shops, product facts; shopping stops before the cart (Part 6a) | Feature, privacy |
 
 ## Adding an update
 

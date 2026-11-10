@@ -34,6 +34,7 @@ from kayra.automation import browser_bridge
 # the real one reads ~/.config/hypr/xdph.conf and writes under $XDG_RUNTIME_DIR.
 from kayra.automation import share_picker as SHARE_HELPER
 from kayra.automation.policy import Action, ActionResult, Status
+from kayra.automation.semantic_match import year_ranges, edition      # a leaf: no cycle
 
 BRIDGE = browser_bridge            # the test suite replaces this with a fake extension
 SLEEP = time.sleep
@@ -47,7 +48,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 9, 0)
+REQUIRED_VERSION = (1, 12, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -864,25 +865,72 @@ def page_type(field, text, submit=False):
     missing = _need_bridge()
     if missing:
         return missing
+    # Part 6: "fill the email field with my email" — a value from the form profile, by key.
+    mine = re.fullmatch(r"(?:my|the) (.+)", str(text or "").strip().lower())
+    if mine:
+        from kayra.automation import form_profile as P
+        key = P.key_for(mine.group(1))
+        value = P.load().get(key) if key else None
+        if key and not value:
+            return ActionResult.not_found(f"I don't have your {P.spoken(key)} yet. Say \"remember my "
+                                          f"{P.spoken(key)} is …\".")
+        if value:
+            text = value
     result = _call("page.type", field=field, text=text, submit=submit) or {}
     if not result.get("typed"):
         reason = result.get("reason", "")
         if "password" in reason:
             return ActionResult.blocked("That's a password or payment field. I never type into "
                                         "those; please do it yourself.")
+        if not submit and _version() >= (1, 12, 0):
+            # Not a text box: a drop-down ("set the country to India") or a date field.
+            from kayra.automation import form_profile as P
+            kind = "date" if P.parse_date(text) else "select"
+            chosen = form_choose(field, text, kind)
+            if chosen.ok:
+                return chosen
         return ActionResult.not_found(f"I can't find a {field} field here.")
     return ActionResult.success("Searching." if submit else "Typed.")
 
 
-def page_scroll(direction="down", until=None):
+_SCROLL_KEYS = {"up": "pageup", "down": "pagedown", "top": "ctrl+home", "bottom": "ctrl+end"}
+
+
+def page_scroll(direction="down", until=None, where="", amount=1.0):
+    """
+    Scrolls what the user is looking at — the open mail, the chat, the list — not the window
+    (which Gmail, WhatsApp and Docs never scroll). From extension 1.10.0 the page reports
+    whether anything MOVED: "Done" is only said when it did, an end is said as an end, and an
+    app that draws on a canvas (Sheets) gets the real Page Down / Ctrl+End keys instead.
+    """
     missing = _need_bridge()
     if missing:
         return missing
-    result = _call("page.scroll", direction=direction, until=until or "") or {}
     if until:
+        result = _call("page.scroll", direction=direction, until=until) or {}
         return ActionResult.success(f"Here's {until}.") if result.get("found") else \
             ActionResult.not_found(f"I couldn't find {until} on this page.")
-    return ActionResult.success("Done.")
+    if _version() < (1, 10, 0):
+        _call("page.scroll", direction=direction, until="")
+        return ActionResult.success("Done.")
+    result = _call("page.scroll", direction=direction, until="", where=where or "", amount=amount or 1.0) or {}
+    if result.get("moved"):
+        if direction in ("top", "bottom"):
+            return ActionResult.success(f"At the {direction}.")
+        if direction == "down" and result.get("atEnd"):
+            return ActionResult.success("That's the end.")
+        if direction == "up" and result.get("atStart"):
+            return ActionResult.success("That's the top.")
+        return ActionResult.success("Done.")
+    if result.get("canScroll"):
+        return ActionResult.success("It's already at the top." if direction in ("up", "top")
+                                    else "It's already at the bottom.")
+    # Nothing in the page scrolls by script: a canvas editor (Sheets). Its own keys do.
+    L = _L()
+    _focus_chrome()
+    if L.send_keys(_SCROLL_KEYS.get(direction, "pagedown")):
+        return ActionResult.success("Done.")
+    return ActionResult.failure("I couldn't scroll this page.")
 
 
 def page_find(text):
@@ -1376,17 +1424,97 @@ def search_here(query):
                     not target.startswith("https://github.com/search") else label
                 return ActionResult.success(f"Searching {where} for {query}.")
     if _EDITORS.search(host):
-        L = _L()
-        _focus_chrome()
-        L.send_keys("ctrl+f")
-        L.type_text(query)
-        kind = "sheet" if "/spreadsheets/" in url else "document" if "/document/" in url else "file"
-        return ActionResult.success(f"Searching this {kind} for {query}.")
-    typed = (_call("page.type", field="search", text=query, submit=True) or {}) if url.startswith("http") else {}
-    if typed.get("typed"):
-        return ActionResult.success(f"Searching this site for {query}.")
+        if "/d/" in path:
+            L = _L()
+            _focus_chrome()
+            L.send_keys("ctrl+f")
+            L.type_text(query)
+            kind = "sheet" if "/spreadsheets/" in url else "document" if "/document/" in url else "file"
+            return ActionResult.success(f"Searching this {kind} for {query}.")
+        # The Sheets / Docs / Slides / Forms HOME page (a file list, no file open): its own
+        # search address. Ctrl+F there only searched the visible page.
+        section = (path.strip("/").split("/") or [""])[0]
+        kind = {"spreadsheets": "sheet", "document": "doc", "presentation": "slides", "forms": "form"}.get(section)
+        if kind:
+            _call("tabs.navigate", url=_WS_HOME[kind].format(q=quote(query)))
+            return ActionResult.success(f"Searching your {_WS_NOUN[kind]}s for {query}. Say open and a name.")
+    if host == "web.whatsapp.com" and _version() >= (1, 11, 0):
+        return wa_search(query)
+    if url.startswith("http") and _version() >= (1, 10, 0):
+        # ONE search action for every web app: the page's own search box is found (and its
+        # magnifier pressed first when the box is hidden), emptied, typed into and submitted.
+        # Apps that filter as you type are not sent Enter — there it opens the first hit.
+        live = host in _LIVE_SEARCH
+        found = _call("page.search", text=query, submit=not live) or {}
+        if found.get("searched") and found.get("exact") is False:
+            # The page kept its old text (or took none): the real keyboard on the box the
+            # extension left focused — select all, type over it.
+            L = _L()
+            _focus_chrome()
+            L.send_keys("ctrl+a")
+            L.type_text(query)
+            if not live:
+                L.send_keys("enter")
+        if found.get("searched"):
+            where = _LIVE_SEARCH.get(host) or "this site"
+            return ActionResult.success(f"Searching {where} for {query}.")
+    elif url.startswith("http"):
+        typed = _call("page.type", field="search", text=query, submit=True) or {}
+        if typed.get("typed"):
+            return ActionResult.success(f"Searching this site for {query}.")
     return open_in(f"https://www.google.com/search?q={quote_plus(query)}", "tab",
                    f"a Google search for {query}")
+
+
+_LIVE_SEARCH = {"web.whatsapp.com": "WhatsApp", "web.telegram.org": "Telegram", "keep.google.com": "Keep",
+                "contacts.google.com": "your contacts"}
+
+
+def search_close():
+    """
+    "close the search" — the search of the app in front is emptied and closed, and the app
+    is left the way it was before it: WhatsApp back on its chat list with the open chat still
+    open, Gmail back in the inbox, an editor's find bar gone, highlights cleared.
+    """
+    missing = _need_bridge()
+    if missing:
+        return missing
+    if _version() < (1, 10, 0):
+        return page_find_clear()
+    url = (_call("tabs.active") or {}).get("url") or ""
+    host = _host(url)
+    if host == "docs.google.com" and "/d/" in url:
+        _focus_chrome()
+        _L().send_keys("escape")
+        return ActionResult.success("Closed the search.")
+    closed = False
+    if url.startswith("http"):
+        try:
+            result = _call("page.searchClose") or {}
+            closed = bool(result.get("closed"))
+            if result.get("left"):
+                # The page refused the script and still holds the text. The box is focused:
+                # the real keyboard empties it, and the page is asked again whether it is empty.
+                L = _L()
+                _focus_chrome()
+                L.send_keys("ctrl+a")
+                L.send_keys("backspace")
+                L.send_keys("escape")
+                again = _call("page.searchClose") or {}
+                if again.get("left"):
+                    return ActionResult.failure("I couldn't clear the search box. Please press Escape in it.")
+                closed = True
+            _call("page.highlight", clear=True)
+        except browser_bridge.BridgeError:
+            pass
+    if host == "mail.google.com" and "#search/" in url:
+        _call("tabs.navigate", url="https://mail.google.com/mail/u/0/#inbox")
+        return ActionResult.success("Closed the search. You're back in your inbox.")
+    if not closed:
+        return ActionResult.success("There's no search open here.")
+    if host == "web.whatsapp.com":
+        return ActionResult.success("Closed the search. You're back in your chats.")
+    return ActionResult.success("Closed the search.")
 
 
 # G4: "what can I do here?" — a few things worth saying on the site in front.
@@ -1401,8 +1529,10 @@ _HELP = (
                              "read the comments, search for lofi, pause, or skip forward."),
     (r"^docs\.google\.com$", "In Docs and Sheets you can say: search this sheet for a name, read "
                              "this page, summarize this page, or copy the link."),
-    (r"^web\.whatsapp\.com$", "In WhatsApp you can say: message Rahul saying running late, or "
-                              "open a chat by its name."),
+    (r"^web\.whatsapp\.com$", "In WhatsApp you can say: open a chat by its name, read the recent chat, "
+                              "who messaged me, scroll the chat up, search for a name, open the "
+                              "first one, close the search, close the chat, or message Rahul "
+                              "saying running late."),
     (r"(^|\.)google\.[a-z.]+$", "On search results you can say: open the third result, what are the "
                                 "results, or open the first result in a new tab."),
     (r"(^|\.)(amazon\.[a-z.]+|flipkart\.com)$", "Here you can say: search for headphones, open the "
@@ -1503,7 +1633,7 @@ def spoken_numbers(text):
 
 
 def _words(text):
-    return [w for w in re.findall(r"[a-z0-9]+", spoken_numbers(text)) if w not in _NAME_STOP]
+    return year_ranges([w for w in re.findall(r"[a-z0-9]+", spoken_numbers(text)) if w not in _NAME_STOP])
 
 
 def _same_word(a, b):
@@ -1517,14 +1647,16 @@ def _same_word(a, b):
 
 def rank_titles(name, items):
     """
-    [(score, item)] best first. Exact title 100; the whole phrase inside the title 80; every
-    word present 60 (+ shorter titles first); some words: 40 × the share present. Local and
-    deterministic — names never leave the machine.
+    [(score, item)] best first. Exact title 100; a title that STARTS with the phrase 85; the
+    whole phrase inside the title 80; every word present 60; some words: 40 × the share
+    present. Equal scores keep the page's own order, which is most recently opened first —
+    so a short spoken name ("council details") opens the file the user used last, not the
+    one with the shortest title. Local and deterministic — names never leave the machine.
     """
     want = " ".join(_words(name))
     words = want.split()
     ranked = []
-    for item in items:
+    for index, item in enumerate(items):
         title = " ".join(_words(item.get("title", "")))
         if not title or not words:
             continue
@@ -1533,7 +1665,9 @@ def rank_titles(name, items):
                 for w in words]
         if title == want:
             score = 100.0
-        elif want in title:
+        elif title.startswith(want + " "):
+            score = 85.0
+        elif f" {want} " in f" {title} ":
             score = 80.0
         elif all(w in title_words or w in title for w in words):
             score = 60.0
@@ -1542,7 +1676,7 @@ def rank_titles(name, items):
         else:
             score = 40.0 * sum(near) / len(words)
         if score:
-            ranked.append((score - min(len(title), 200) / 1000.0, item))
+            ranked.append((score - min(index, 200) / 1000.0, item))
     ranked.sort(key=lambda pair: -pair[0])
     return ranked
 
@@ -1557,18 +1691,46 @@ def _file_list(url):
     return _ready("page.docList", bool, 6.0, max=40) or []
 
 
+def _find_files(name, kind):
+    """
+    The files matching a spoken name, best first. Google's own search is asked for the words
+    as said; when that finds no good title — a year said another way ("2026 2027" for
+    "2026-27"), a misheard word — it is asked again without the numbers, and last the recent
+    list is matched locally. Only the failure path pays for the extra page loads.
+    """
+    home = _WS_HOME.get(kind, _WS_HOME["file"])
+    words = _words(name)
+    queries = [" ".join(words) or name]      # numbers as digits, a year range as "2026 27"
+    plain = " ".join(w for w in words if not w.isdigit())
+    if plain and plain != " ".join(words):
+        queries.append(plain)
+    if kind in ("sheet", "doc", "slides", "form"):
+        queries.append("")
+    best = []
+    for query in queries:
+        ranked = rank_titles(name, _file_list(home.format(q=quote(query))))
+        if not query:
+            ranked = [pair for pair in ranked if pair[0] >= 40]     # recents: no weak guesses
+        if ranked and ranked[0][0] >= 55:
+            return ranked
+        if ranked and (not best or ranked[0][0] > best[0][0]):
+            best = ranked
+    return best
+
+
 def ws_open(name, kind="sheet"):
     """E1–E4: "open my budget sheet" — the best title match in Sheets/Docs/Slides/Forms/Drive."""
     stop = _bridge_at((1, 7, 0))
     if stop:
         return stop
     noun = _WS_NOUN.get(kind, "file")
-    items = _file_list(_WS_HOME.get(kind, _WS_HOME["file"]).format(q=quote(name)))
-    ranked = rank_titles(name, items)
+    ranked = _find_files(name, kind)
     if not ranked:
         return ActionResult.not_found(f"I don't see a {noun} called {name}. The search is open.")
     best_score, best = ranked[0]
-    close = [item for score, item in ranked[1:4] if best_score - score < 1.0 and best_score < 80]
+    close = [item for score, item in ranked[1:4] if best_score - score < 1.0 and best_score < 86]
+    if close and all(edition(name, item["title"]) for item in [best] + close):
+        close = []       # the same name with different years: the one used last (listed first)
     if close:
         names = ", ".join(_short(i["title"], 40) for i in [best] + close)
         return ActionResult.ambiguous(f"I found {len(close) + 1} {noun}s: {names}. Which one?",
@@ -2483,6 +2645,36 @@ def _wa_ready():
     return listing.get("chats") or [], None
 
 
+def _wa_search(text):
+    """WhatsApp's own search for `text`, typed and waited for inside the page: the chats it
+    shows, or None when the search box could not be used."""
+    try:
+        result = _call("chat.search", timeout=14.0, text=text) or {}
+    except browser_bridge.BridgeError:
+        return None
+    if not result.get("searched") or not result.get("typed"):
+        return None
+    return result.get("chats") or []
+
+
+def _wa_search_close():
+    """Empties and closes WhatsApp's search, whichever extension is connected. True when the
+    search box is known to be empty afterwards."""
+    try:
+        if _version() >= (1, 11, 0):
+            closed = _call("page.searchClose") or {}
+            if closed.get("left"):
+                return bool((_call("chat.search", timeout=8.0, text="", settleMs=1200) or {}).get("typed"))
+            return True
+        if _version() >= (1, 10, 0):
+            _call("page.searchClose")
+            return True
+        _call("page.type", field="search", text="", clear=True)
+        return True
+    except browser_bridge.BridgeError:
+        return False
+
+
 def _wa_find(name):
     """(chat dict, None) | (None, ActionResult). Visible list first, then WhatsApp's own search."""
     from kayra.automation import semantic_match as S
@@ -2495,9 +2687,27 @@ def _wa_find(name):
         return S.match(name, cands, embed=_embedder())
 
     found = decide(chats)
-    searched = False
-    if found.decision != S.PICK:
-        # Not clearly in the visible list: WhatsApp's own search, then match its results.
+    searched, seen = False, []
+    if found.decision != S.PICK and _version() >= (1, 11, 0):
+        # Not clearly on screen (WhatsApp only renders the chats in view): WhatsApp's own
+        # search, WAITED for, then its results are matched. The whole name first; when that
+        # finds nothing — a misheard word, a looser name than the real one — its most
+        # distinctive words one at a time. The search is always closed again afterwards.
+        words = sorted({w for w in S.tokens(name) if len(w) >= 3 and not w.isdigit()}, key=len, reverse=True)
+        queries = [name] + (words[:2] if len(S.tokens(name)) > 1 else [])
+        for query in queries:
+            rows = _wa_search(query)
+            if rows is None:
+                break
+            searched = True
+            seen.extend(r for r in rows if r["name"] not in {s["name"] for s in seen})
+            again = decide(rows)
+            if again.decision == S.PICK or (again.decision == S.ASK and found.decision == S.NONE):
+                found = again
+            if found.decision != S.NONE:
+                break
+    elif found.decision != S.PICK:
+        # An extension before 1.11.0: type, then read (it cannot wait for the results).
         if (_call("page.type", field="search", text=name, clear=True) or {}).get("typed"):
             searched = True
             listing = _ready("chat.list", lambda r: bool((r or {}).get("chats")), 4.0, max=30) or {}
@@ -2505,14 +2715,22 @@ def _wa_find(name):
             if again.decision != S.NONE or found.decision == S.NONE:
                 found = again
     if found.decision == S.PICK:
-        return found.best.data, None
+        return dict(found.best.data, _searched=searched), None
     if searched:
-        # Nothing will be opened: empty WhatsApp's search box again, or every later chat list
+        # Nothing will be opened: close WhatsApp's search again, or every later chat list
         # (who messaged me, the next open) would only see this search's results.
-        _call("page.type", field="search", text="", clear=True)
+        _wa_search_close()
     if found.decision == S.ASK:
         a, b = [c.name for c in found.top(2)]
         return None, ActionResult(Status.AMBIGUOUS, f"Do you mean {a} or {b}?", {"candidates": [a, b]})
+    # Nothing matched well enough to open or to ask about — but WhatsApp's own search DID show
+    # chats for one of the words (a name heard wrong: "public relation and outreach coding").
+    # Offer the closest two instead of a flat "not found".
+    near = sorted(((S.lexical(name, c["name"]), i, c["name"]) for i, c in enumerate(seen)), key=lambda t: (-t[0], t[1]))
+    near = [n for score, _i, n in near if score > 0][:2]
+    if near:
+        return None, ActionResult(Status.AMBIGUOUS, f"I don't see a chat called {name}. The closest I found: "
+                                  f"{' and '.join(near)}. Which one?", {"candidates": near})
     return None, ActionResult.not_found(f"I don't see a chat called {name} in WhatsApp.")
 
 
@@ -2520,12 +2738,87 @@ def _wa_open(chat):
     """Opens `chat` (a chat.list row) and waits until its conversation is the one shown."""
     _call("chat.open", name=chat["name"])
     shown = _ready("chat.messages", lambda r: (r or {}).get("chat") == chat["name"], 4.0, limit=1) or {}
+    if chat.get("_searched"):
+        # The chat came from WhatsApp's search: close it, so the chat list is the normal one
+        # again (the search stayed open and filtered everything the user looked at next).
+        _wa_search_close()
     return shown.get("chat") == chat["name"]
+
+
+def wa_search(query, then_open=False):
+    """'search for general panchayat' in WhatsApp: its own search, left OPEN with the results
+    said, so 'open the first one' / 'close the search' can follow. then_open = open the match."""
+    if then_open:
+        return wa_open(query)
+    chats, problem = _wa_ready()
+    if problem:
+        return problem
+    stop = _outdated((1, 11, 0))
+    if stop:
+        return stop
+    rows = _wa_search(query)
+    if rows is None:
+        return ActionResult.failure("I couldn't use WhatsApp's search box.")
+    if not rows:
+        return ActionResult.success(f"WhatsApp has nothing for {query}. Say close the search, or search for something else.")
+    names = ", ".join(_short(c["name"], 40) for c in rows[:4])
+    more = f", and {len(rows) - 4} more" if len(rows) > 4 else ""
+    return ActionResult.success(f"I found {names}{more}. Say open the first one, or close the search.")
+
+
+def wa_close():
+    """'close the chat' / 'close this group': the open conversation is closed (Escape)."""
+    stop = _bridge_at((1, 11, 0))
+    if stop:
+        return stop
+    # Closing never OPENS WhatsApp: with no WhatsApp tab there is nothing to close.
+    if not any("web.whatsapp.com" in str(t.get("url") or "") for t in (_call("tabs.list") or [])):
+        return ActionResult.not_found("WhatsApp isn't open.")
+    where = {"match": "web.whatsapp.com"}
+    result = _call("chat.close", **where) or {}
+    if not result.get("open") and not result.get("closed"):
+        return ActionResult.success("No chat is open in WhatsApp.")
+    if not result.get("closed"):
+        # The page ignored the scripted key: the real one, on the WhatsApp window.
+        _focus_chrome()
+        _L().send_keys("escape")
+        if (_call("chat.close", **where) or {}).get("open"):
+            return ActionResult.failure("I couldn't close the chat.")
+    return ActionResult.success("Closed the chat.")
+
+
+def _wa_recent(chats):
+    """The chat with the latest message: the first row that is not merely pinned on top."""
+    return next((c for c in chats if c.get("unread") or not c.get("pinned")), chats[0] if chats else None)
+
+
+def group_open(name):
+    """'open the graphics team group': a Chrome TAB group when one has that name, else the
+    WhatsApp group — the word "group" alone does not say which."""
+    if BRIDGE.connected() and _version() >= (1, 5, 0):
+        want = str(name).lower().strip()
+        if any(want and want in g.get("title", "").lower() for g in _groups()):
+            return group_update(name, collapsed=False)
+    return wa_open(name)
 
 
 def wa_open(name):
     """H0.4: "open the PR group" / "open XYZ chat" inside WhatsApp."""
-    chat, problem = _wa_find(name)
+    if name == "recent" or re.fullmatch(r"#-?\d+", name):
+        chats, problem = _wa_ready()
+        if name == "recent":
+            chat = None if problem else _wa_recent(chats)
+        else:
+            # "open the second one": the Nth row of the list AS SHOWN (search results too).
+            nth = int(name[1:])
+            chat = None if problem or not chats or abs(nth) > len(chats) or nth == 0 else \
+                dict(chats[nth - 1 if nth > 0 else nth], _searched=True)
+            if chat is None and not problem:
+                return ActionResult.not_found(f"There are only {len(chats or [])} chats in the list.")
+        if chat is None:
+            return problem or ActionResult.not_found("I don't see any chats in WhatsApp.")
+    else:
+        chat, problem = _wa_find(name)
     if problem:
         return problem
     if not _wa_open(chat):
@@ -2554,13 +2847,22 @@ def _today_marks():
             f"{now.day:02d}/{now.month:02d}/{now.year}", f"{now.month:02d}/{now.day:02d}/{now.year}"}
 
 
-def wa_read(name, today=False):
-    """H0.4: "read the PR group" / "what did they say in the core team today"."""
-    if name in ("", "current", "this", "it"):
-        stop = _bridge_at((1, 9, 0))
-        if stop:
-            return stop
+def wa_read(name, today=False, count=0):
+    """H0.4: "read the PR group" / "what did they say in the core team today". count = "the
+    last three messages of X": exactly that many, read out as they are."""
+    new = 0
+    if name in ("", "current", "this", "it", "recent"):
+        chats, problem = _wa_ready()             # also brings the WhatsApp tab forward
+        if problem:
+            return problem
         data = _call("chat.messages", limit=30) or {}
+        if not data.get("chat") and name == "recent" and chats:
+            # "read the recent chat" with no chat open: the one with the latest message.
+            chat = _wa_recent(chats)
+            if not _wa_open(chat):
+                return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
+            new = int(chat.get("unread") or 0)
+            data = _call("chat.messages", limit=min(max(30, new), 60)) or {}
         if not data.get("chat"):
             return ActionResult.not_found("No chat is open in WhatsApp.")
     else:
@@ -2569,17 +2871,25 @@ def wa_read(name, today=False):
             return problem
         if not _wa_open(chat):
             return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
-        data = _call("chat.messages", limit=30) or {}
+        new = int(chat.get("unread") or 0)
+        data = _call("chat.messages", limit=min(max(30, new), 60)) or {}
     messages = data.get("messages") or []
-    if today:
+    if count:
+        messages, new = messages[-count:], 0     # the number asked for, whatever is unread
+    elif today:
         marks = _today_marks()
         messages = [m for m in messages if m.get("date") in marks]
+    elif 0 < new < len(messages):
+        messages = messages[-new:]               # unread ones only: that is what is new
+    else:
+        new = 0
     title = data.get("chat") or name
     if not messages:
         return ActionResult.success(f"No messages in {title}{' today' if today else ''}.")
     lines = [f"{'You' if m.get('out') else (m.get('from') or 'They')}: {m.get('text')}" for m in messages]
-    if len(lines) <= 4:
-        return ActionResult.success(f"In {title}: " + " ... ".join(_short(l, 200) for l in lines))
+    if len(lines) <= 4 or (count and len(lines) <= 6):
+        lead = f"{new} new in {title}: " if new else f"The last {len(lines)} in {title}: " if count else f"In {title}: "
+        return ActionResult.success(lead + " ... ".join(_short(l, 200) for l in lines))
     spoken = ai.summarize(
         "You are Kayra. Summarize this WhatsApp conversation for the user in two to four spoken "
         "sentences: who said what that matters, any question for the user, any plan or time. "
@@ -2959,3 +3269,510 @@ def _site_key(name):
 def _short(title, limit=48):
     title = re.sub(r"\s+[-–|]\s+(Google Chrome|Gmail|YouTube)$", "", str(title or "")).strip()
     return title if len(title) <= limit else title[: limit - 1].rstrip() + "…"
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │              PART 6 — FORMS (D1–D5), VIDEO (F1), SHOPPING (F2/F3)       │
+# └────────────────────────────────────────────────────────────────────────┘
+# Decision D1 (2026-11-11): shopping is SEARCH AND OPEN only. Adding to a cart, checking out
+# and paying are refused by the policy (`policy._SHOPPING_STOP`), and `form_submit` never
+# presses a button that pays or orders. Decision D2: the form profile holds name, email, phone,
+# postal address, college, roll number, date of birth and gender (`form_profile`).
+
+def _join(items):
+    items = [str(i) for i in items if i]
+    return "" if not items else items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _form(op, **args):
+    return _call("page.form", op=op, **args) or {}
+
+
+def form_fill(confirmed=None, action=None):
+    """D3: "fill this form with my details". Lists the page's fields, matches them to the saved
+    profile LOCALLY, and asks first, naming the fields ("I can fill name, email and phone —
+    fill them?"). On yes the same page is checked and each field is filled; nothing is ever
+    submitted. Values never leave this computer and are never kept in the pending action."""
+    stop = _bridge_at((1, 12, 0))
+    if stop:
+        return stop
+    from kayra.automation import form_profile as P
+    profile = P.load()
+    if not profile:
+        return ActionResult.not_found("I don't have your details yet. Tell me once — for example, "
+                                      "\"remember my email is ana at gmail dot com\" — and I'll use them on forms.")
+    page = _form("list")
+    fields = page.get("fields") or []
+    if confirmed is not None:
+        if page.get("url") != confirmed.get("url"):
+            return ActionResult.failure("The page changed, so I didn't fill anything.")
+        items, labels = [], []
+        for index, key, label in confirmed.get("fields", []):
+            field = next((f for f in fields if f.get("i") == index), None)
+            if not field or field.get("label") != label or field.get("sensitive"):
+                continue
+            value = P.value_for(field, key, profile)
+            if value:
+                items.append({"i": index, "value": value})
+                labels.append(P.spoken(key))
+        if not items:
+            return ActionResult.failure("The form changed, so I didn't fill anything.")
+        done = _form("fill", items=items)
+        filled, failed = done.get("filled") or [], done.get("failed") or []
+        by_index = {i["i"]: k for i, k in zip(items, labels)}
+        said = [by_index.get(f["i"]) for f in filled]
+        message = f"Filled {_join(said)}." if said else "I couldn't fill any field."
+        if failed:
+            message += f" I couldn't fill {_join(by_index.get(f['i']) or f.get('label') for f in failed)}."
+        empty = [f.get("label") for f in (_form("list").get("fields") or [])
+                 if f.get("required") and not f.get("filled") and f.get("label")]
+        if empty:
+            message += f" Still empty: {_join(_short(x, 30) for x in empty[:4])}."
+        message += " I haven't submitted it — say \"submit this form\" when it looks right."
+        return ActionResult.success(message, filled=len(filled)) if filled else ActionResult.failure(message)
+    if not fields:
+        return ActionResult.not_found("I don't see a form on this page.")
+    todo, missing = P.plan(fields, profile)
+    if not todo:
+        if missing:
+            return ActionResult.not_found(f"This form asks for your {_join(P.spoken(k) for k in missing)}, which "
+                                          f"I don't have. Say \"remember my {P.spoken(missing[0])} is …\".")
+        return ActionResult.not_found("None of the empty fields here are ones I have details for.")
+    if action is None:
+        return ActionResult.failure("I need to ask before filling a form.")
+    approved = Action(action.domain, action.action, target=action.target,
+                      parameters={**action.parameters, "confirmed": {
+                          "url": page.get("url"), "fields": [[f["i"], k, f.get("label")] for f, k, _ in todo]}},
+                      raw=action.raw)
+    names = _join(P.spoken(k) for _, k, _ in todo)
+    extra = f" I don't have your {_join(P.spoken(k) for k in missing)}." if missing else ""
+    count = len(todo)
+    return ActionResult(Status.NEEDS_CONFIRMATION,
+                        f"I can fill {count} field{'s' if count != 1 else ''} here: {names}.{extra} Fill them?",
+                        {"confirm": approved})
+
+
+def form_choose(field, option, kind="select", state=None):
+    """D1: pick a drop-down option, tick or untick a box, choose a radio option, set a date."""
+    stop = _bridge_at((1, 12, 0))
+    if stop:
+        return stop
+    if kind == "date":
+        from kayra.automation import form_profile as P
+        iso = P.parse_date(option)
+        if not iso:
+            return ActionResult.failure(f"I didn't catch a date in \"{option}\".")
+        option = iso
+    r = _form("choose", field=field or "", option=option or "", kind=kind, state=state)
+    if kind == "check":
+        if not r.get("done"):
+            choices = r.get("options") or []
+            return ActionResult.not_found(f"I couldn't find a box called {field}." +
+                                          (f" The boxes here are: {_join(choices[:6])}." if choices else ""))
+        label = _short(r.get("label") or field, 40)
+        if r.get("group"):
+            return ActionResult.success(f"Chose {label} for {_short(r['group'], 40)}.")
+        if r.get("was") == r.get("now"):
+            return ActionResult.success(f"{label} is already {'ticked' if r.get('now') else 'unticked'}.")
+        return ActionResult.success(f"{'Ticked' if r.get('now') else 'Unticked'} {label}.")
+    if not r.get("done"):
+        if r.get("reason") == "field not found":
+            others = r.get("fields") or []
+            what = f"a {field} field" if field else "a drop-down"
+            return ActionResult.not_found(f"I couldn't find {what}." +
+                                          (f" The choices here are for: {_join(others[:5])}." if others else ""))
+        choices = r.get("options") or []
+        shown = option if kind != "date" else option
+        return ActionResult.not_found(f"There's no {shown} option in {r.get('field') or field or 'that field'}." +
+                                      (f" The options are: {_join(choices[:8])}." if choices else ""))
+    where = _short(r.get("field") or field, 40)
+    if kind == "date":
+        day = datetime.date.fromisoformat(option)
+        return ActionResult.success(f"Set {where} to {day.day} {day.strftime('%B %Y')}.")
+    return ActionResult.success(f"Chose {option} for {where}." if where else f"Chose {option}.")
+
+
+def form_submit():
+    """D4 (the policy has already asked): presses the form's own Submit / Send / Next button.
+    Never one that pays, buys, orders or checks out (decision D1)."""
+    stop = _bridge_at((1, 12, 0))
+    if stop:
+        return stop
+    r = _form("submit")
+    if r.get("reason") == "payment":
+        return ActionResult.blocked(f"That button is \"{_short(r.get('label'), 30)}\" — paying and ordering are yours to do.")
+    if r.get("reason") == "invalid":
+        missing = [_short(x, 30) for x in r.get("missing") or []]
+        return ActionResult.failure(f"I didn't submit it — the form still needs {_join(missing) or 'some fields'}.")
+    if not r.get("submitted"):
+        return ActionResult.not_found("I don't see a form to submit on this page.")
+    return ActionResult.success(f"Pressed {_short(r.get('label') or 'Submit', 30)}.")
+
+
+_PAGE_KEYS = {"enter": "enter", "return": "enter", "tab": "tab", "shift tab": "shift+tab",
+              "escape": "escape", "esc": "escape", "space": "space", "spacebar": "space",
+              "backspace": "backspace", "delete": "delete", "up": "up", "down": "down",
+              "left": "left", "right": "right", "up arrow": "up", "down arrow": "down",
+              "left arrow": "left", "right arrow": "right", "page up": "pageup", "page down": "pagedown",
+              "home": "home", "end": "end"}
+
+
+def page_key(key, count=1):
+    """D2: real key presses into the page (wtype with Chrome focused) — a page trusts those."""
+    combo = _PAGE_KEYS.get(str(key or "").lower().strip())
+    if not combo:
+        return ActionResult.unsupported(f"I can't press {key} in the page.")
+    L = _L()
+    _focus_chrome()
+    count = max(1, min(int(count or 1), 20))
+    pressed = sum(1 for _ in range(count) if L.send_keys(combo))
+    if not pressed:
+        return ActionResult.unsupported("I can't press keys here — wtype isn't installed.")
+    name = str(key).strip().title() if len(str(key)) > 3 else str(key).upper()
+    return ActionResult.success(f"Pressed {name}" + (f" {pressed} times." if pressed > 1 else "."))
+
+
+# ── D5: upload a file into the page ──
+_UPLOAD_SYNONYMS = {"resume": ("resume", "cv", "curriculum"), "cv": ("resume", "cv", "curriculum"),
+                    "photo": ("photo", "img", "image", "pic"), "picture": ("photo", "img", "image", "pic")}
+_UPLOAD_PREFER = {"resume": (".pdf", ".docx", ".doc"), "cv": (".pdf", ".docx", ".doc"),
+                  "photo": (".jpg", ".jpeg", ".png"), "picture": (".jpg", ".jpeg", ".png")}
+_UPLOAD_STOP = frozenset("my the a an latest newest last recent file document here this page form "
+                         "from in on of to with called named".split())
+_CHOOSER_TITLE = re.compile(r"(?i)\b(?:open|upload|select|choose|attach)\b.*\bfiles?\b|^file upload$|^open$")
+_CHOOSER_CLASS = ("xdg-desktop-portal", "portal", "zenity", "kdialog")
+FILE_ROOTS = None                    # the test suite points this at a temporary folder
+
+
+def _upload_roots():
+    if FILE_ROOTS is not None:
+        return list(FILE_ROOTS)
+    home = os.path.expanduser("~")
+    return [os.path.join(home, d) for d in ("Documents", "Downloads", "Desktop")] + [home]
+
+
+def find_upload(what):
+    """Newest file in the user's folders whose name has every word said (resume -> resume|cv)."""
+    from kayra.automation import linux_system as S
+    low = spoken_numbers(str(what or "").lower())
+    kinds = [ext for word, exts in S._TYPES.items() if re.search(rf"\b{word}s?\b", low) for ext in exts]
+    words = [w for w in re.findall(r"[a-z0-9]{2,}", low) if w not in _UPLOAD_STOP and w not in S._TYPES
+             and w.rstrip("s") not in S._TYPES]
+    prefer = next((exts for w, exts in _UPLOAD_PREFER.items() if w in words), ())
+    alternatives = [_UPLOAD_SYNONYMS.get(w, (w,)) for w in words]
+    hits, seen = [], set()
+    for root in _upload_roots():
+        if not os.path.isdir(root):
+            continue
+        for path in S._walk(root, max_files=20000, max_depth=4 if root == os.path.expanduser("~") else 6):
+            if path in seen:
+                continue
+            seen.add(path)
+            name = os.path.basename(path).lower()
+            if kinds and not name.endswith(tuple(kinds)):
+                continue
+            if not alternatives or not all(any(a in name for a in alts) for alts in alternatives):
+                continue
+            if _EXECUTABLE.search(name):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            hits.append((name.endswith(prefer) if prefer else True, mtime, path))
+    hits.sort(reverse=True)
+    return [p for _, _, p in hits]
+
+
+def _chooser(before):
+    L = _L()
+    for w in L.list_windows():
+        if w.address in before:
+            continue
+        if _CHOOSER_TITLE.search(w.title.strip()) or any(c in w.cls for c in _CHOOSER_CLASS):
+            return w
+    return None
+
+
+def file_upload(what, field="", confirmed_path=None, action=None):
+    """D5: "upload my resume here". Finds the newest matching file, asks naming it, then opens the
+    page's own file chooser with a REAL key press (the page needs a user gesture) and types the
+    path into it (Ctrl+L, path, Enter). Checked by reading the file name back from the page."""
+    stop = _bridge_at((1, 12, 0))
+    if stop:
+        return stop
+    if confirmed_path is None:
+        found = find_upload(what)
+        if not found:
+            return ActionResult.not_found(f"I couldn't find a {what} file in your Documents, Downloads or Desktop.")
+        target = _form("file", field=field or "")
+        if not target.get("found"):
+            return ActionResult.not_found("There's no place to upload a file on this page.")
+        path = found[0]
+        if action is None:
+            return ActionResult.failure("I need to ask before uploading a file.")
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed_path": path}, raw=action.raw)
+        folder = os.path.dirname(path).replace(os.path.expanduser("~"), "home")
+        more = f" (the newest of {len(found)})" if len(found) > 1 else ""
+        return ActionResult(Status.NEEDS_CONFIRMATION,
+                            f"Upload {os.path.basename(path)} from {folder}{more} to this page?",
+                            {"confirm": approved})
+    if not os.path.isfile(confirmed_path):
+        return ActionResult.failure("That file isn't there any more, so I didn't upload anything.")
+    L = _L()
+    before = {w.address for w in L.list_windows()}
+    armed = _form("file", field=field or "", arm=True)
+    if not armed.get("found"):
+        return ActionResult.not_found("There's no place to upload a file on this page any more.")
+    _focus_chrome()
+    L.send_keys("space")                    # the trusted key the page's hook turns into a click
+    chooser = _until(lambda: _chooser(before), 6.0)
+    if chooser is None:
+        return ActionResult.failure("The file chooser didn't open, so nothing was uploaded. "
+                                    "Click the page's upload button and I'll fill in the file.")
+    L.focus_window(chooser)
+    L.send_keys("ctrl+l")
+    L.type_text(confirmed_path)
+    L.send_keys("enter")
+    name = os.path.basename(confirmed_path)
+    done = _until(lambda: name in (_form("fileState").get("files") or []), 6.0)
+    if done:
+        return ActionResult.success(f"Attached {name}.")
+    return ActionResult.success(f"I chose {name} in the file chooser; the page doesn't show it yet.")
+
+
+# ── F1: the video on the page ──
+def _clock(seconds):
+    seconds = int(seconds or 0)
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _speed(rate):
+    rate = float(rate or 1)
+    return "normal speed" if abs(rate - 1) < 1e-6 else f"{rate:g} times speed"
+
+
+def video_control(op, value=None):
+    """F1: speed, seek, captions, skip the ad, next, like, watch later, play/pause, mute,
+    full screen / theatre (YouTube's own keys), and "how long is left"."""
+    stop = _bridge_at((1, 12, 0))
+    if stop:
+        return stop
+    if op in ("fullscreen", "theater", "miniplayer"):
+        state = _call("page.video", op="blur") or {}
+        if not state.get("video"):
+            return ActionResult.not_found("There's no video on this page.")
+        L = _L()
+        _focus_chrome()
+        L.send_keys({"fullscreen": "f", "theater": "t", "miniplayer": "i"}[op])
+        return ActionResult.success({"fullscreen": "Full screen.", "theater": "Theatre mode.",
+                                     "miniplayer": "Mini player."}[op])
+    if op == "rate" and isinstance(value, str):
+        now = float((_call("page.video", op="state") or {}).get("rate") or 1.0)
+        value = max(0.25, min(4.0, now + float(value)))       # "faster" / "slower": a quarter step
+    r = _call("page.video", op=op, value=value) or {}
+    if op == "next":
+        return ActionResult.success("Playing the next video.") if r.get("next") else \
+            ActionResult.not_found("There's no next video here.")
+    if op in ("like", "subscribe", "watchLater"):
+        if not r.get("available"):
+            if r.get("opened"):
+                return ActionResult.failure("I opened Save but couldn't find Watch later.")
+            return ActionResult.unsupported("I can only do that on a YouTube video page.")
+        if op == "like":
+            if value is False:
+                return ActionResult.success("Removed your like." if r.get("was") else "It wasn't liked.")
+            return ActionResult.success("You've already liked it." if r.get("was") else "Liked.")
+        if op == "subscribe":
+            return ActionResult.success("You're already subscribed." if r.get("already") else "Subscribed.")
+        return ActionResult.success("It's already in Watch later." if r.get("already") else "Saved to Watch later.")
+    if r.get("video") is False or not r:
+        return ActionResult.not_found("There's no video on this page.")
+    if op == "skipAd":
+        if r.get("skipped"):
+            return ActionResult.success("Skipped the ad.")
+        if r.get("ad"):
+            wait = r.get("wait") or ""
+            return ActionResult.failure("The ad can't be skipped yet" + (f" — {wait}." if wait else "."))
+        return ActionResult.success("There's no ad playing.")
+    if op == "play" and r.get("blocked"):
+        L = _L()
+        _focus_chrome()
+        L.send_keys("k")                     # YouTube's own play key; a real key is a user gesture
+        return ActionResult.success("Playing.")
+    if op in ("play", "pause"):
+        return ActionResult.success("Paused." if r.get("paused") else "Playing.")
+    if op == "rate":
+        return ActionResult.success(f"Playing at {_speed(r.get('rate'))}.")
+    if op == "seek":
+        secs = abs(int(value or 0))
+        span = f"{secs // 60} minute{'s' if secs // 60 != 1 else ''}" if secs >= 60 and secs % 60 == 0 else f"{secs} seconds"
+        return ActionResult.success(f"{'Skipped ahead' if (value or 0) > 0 else 'Went back'} {span} — now at {_clock(r.get('time'))}.")
+    if op == "seekTo":
+        return ActionResult.success(f"Jumped to {_clock(r.get('time'))}.")
+    if op == "mute":
+        return ActionResult.success("Video muted." if r.get("muted") else "Video unmuted.")
+    if op == "captions":
+        if r.get("available") is False:
+            return ActionResult.not_found("This video has no captions.")
+        return ActionResult.success("Captions on." if r.get("captions") else "Captions off.")
+    # state
+    left = max(0, int(r.get("duration") or 0) - int(r.get("time") or 0))
+    parts = [_short(r.get("title") or "This video", 60) + ":",
+             f"{_clock(r.get('time'))} of {_clock(r.get('duration'))}," if r.get("duration") else "",
+             f"{_clock(left)} left," if r.get("duration") else "",
+             "paused" if r.get("paused") else "playing",
+             f"at {_speed(r.get('rate'))}" if abs(float(r.get("rate") or 1) - 1) > 1e-6 else "",
+             "(an ad is playing)" if r.get("ad") else ""]
+    return ActionResult.success(" ".join(p for p in parts if p).rstrip(",") + ".")
+
+
+# ── F2/F3: search a named site, sort and filter results, read a product ──
+_SORTS = {"amazon": {"price_asc": "price-asc-rank", "price_desc": "price-desc-rank", "rating": "review-rank",
+                     "newest": "date-desc-rank", "popular": "exact-aware-popularity-rank"},
+          "flipkart": {"price_asc": "price_asc", "price_desc": "price_desc", "rating": "popularity",
+                       "newest": "recency_desc", "popular": "popularity"}}
+_SORT_SAID = {"price_asc": "cheapest first", "price_desc": "most expensive first", "rating": "best rated first",
+              "newest": "newest first", "popular": "most popular first"}
+
+
+def _price_said(lo, hi):
+    if lo and hi:
+        return f" between {lo:,} and {hi:,} rupees"
+    if hi:
+        return f" under {hi:,} rupees"
+    if lo:
+        return f" over {lo:,} rupees"
+    return ""
+
+
+def shop_url(site, query, sort="", lo=0, hi=0, base=None):
+    """The results address for Amazon / Flipkart with sort and price, or the site's template."""
+    from urllib.parse import urlencode, parse_qsl, urlunsplit
+    from kayra.automation import sites
+    host = _host(base) if base else ""
+    if site == "amazon" or "amazon." in host:
+        parts = urlsplit(base) if base else urlsplit("https://www.amazon.in/s")
+        q = [(k, v) for k, v in parse_qsl(parts.query) if k not in ("s", "rh", "low-price", "high-price")]
+        if query:
+            q = [(k, v) for k, v in q if k != "k"] + [("k", query)]
+        if sort and sort in _SORTS["amazon"]:
+            q.append(("s", _SORTS["amazon"][sort]))
+        if lo or hi:
+            q.append(("rh", f"p_36:{lo * 100 if lo else ''}-{hi * 100 if hi else ''}"))
+        return urlunsplit((parts.scheme or "https", parts.netloc or "www.amazon.in", "/s", urlencode(q), ""))
+    if site == "flipkart" or "flipkart.com" in host:
+        parts = urlsplit(base) if base else urlsplit("https://www.flipkart.com/search")
+        q = [(k, v) for k, v in parse_qsl(parts.query) if k not in ("sort", "p[]")]
+        if query:
+            q = [(k, v) for k, v in q if k != "q"] + [("q", query)]
+        if sort and sort in _SORTS["flipkart"]:
+            q.append(("sort", _SORTS["flipkart"][sort]))
+        if lo or hi:
+            q.append(("p[]", f"facets.price_range.from={lo or 'Min'}"))
+            q.append(("p[]", f"facets.price_range.to={hi or 'Max'}"))
+        return urlunsplit(("https", "www.flipkart.com", parts.path if base else "/search", urlencode(q), ""))
+    if site == "images":
+        return f"https://www.google.com/search?tbm=isch&q={quote_plus(query)}"
+    return sites.search_url(site, query)
+
+
+def site_search(site, query, sort="", lo=0, hi=0, where=None):
+    """F2: "search Amazon for earbuds under 2000", "search GitHub for kokoro", "images of X"."""
+    from kayra.automation import sites
+    url = shop_url(site, query, sort, int(lo or 0), int(hi or 0))
+    label = "Google Images" if site == "images" else sites.display_name(site)
+    if not url:
+        return ActionResult.unsupported(f"I don't know how to search {label}.")
+    result = open_in(url, where, f"{label} results for {query}")
+    if result.ok:
+        extra = _price_said(int(lo or 0), int(hi or 0)) + (f", {_SORT_SAID[sort]}" if sort in _SORT_SAID else "")
+        result.message = f"Searching {label} for {query}{extra}."
+    return result
+
+
+def shop_refine(sort="", lo=0, hi=0):
+    """F3: "sort by price low to high", "only under 2000" on the Amazon / Flipkart results in front."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    url = (_call("tabs.active") or {}).get("url") or ""
+    host = _host(url)
+    if not ("amazon." in host or host.endswith("flipkart.com")):
+        return ActionResult.unsupported("I can sort and filter Amazon and Flipkart results. Here, say "
+                                        "\"click on sort by\" and the option you want.")
+    target = shop_url("", "", sort, int(lo or 0), int(hi or 0), base=url)
+    _call("tabs.navigate", url=target)
+    said = (_SORT_SAID.get(sort, "") + (_price_said(int(lo or 0), int(hi or 0)) or "")).strip(", ")
+    return ActionResult.success(f"Showing {said or 'the results'}.".replace("Showing  ", "Showing "))
+
+
+def _money(price, currency):
+    text = str(price or "").strip()
+    if not text:
+        return ""
+    if re.search(r"[₹$€£]|rs\.?", text, re.I):
+        return text.replace("₹", "").replace("Rs.", "").strip() + " rupees" if ("₹" in text or "rs" in text.lower()) else text
+    try:
+        amount = float(text.replace(",", ""))
+    except ValueError:
+        return text
+    shown = f"{amount:,.0f}" if amount == int(amount) else f"{amount:,.2f}"
+    return {"INR": f"{shown} rupees", "USD": f"{shown} dollars", "EUR": f"{shown} euros",
+            "GBP": f"{shown} pounds"}.get(str(currency or "").upper(), shown)
+
+
+def product_info():
+    """F3: "how much is this", "what's the rating" — from the shop page's own product data."""
+    stop = _bridge_at((1, 12, 0))
+    if stop:
+        return stop
+    r = _ready("page.product", lambda x: x and x.get("found"), 3.0) or {}
+    if not r.get("found"):
+        return ActionResult.not_found("I don't see a product on this page. Open one first — say \"open the first result\".")
+    parts = [f"{_short(r.get('name'), 80)}"]
+    price = _money(r.get("price"), r.get("currency"))
+    if price:
+        parts[0] += f" costs {price}"
+    parts[0] += "."
+    if r.get("rating"):
+        rating = re.sub(r"[^\d.]", "", str(r["rating"]))[:3] or r["rating"]
+        count = str(r.get("ratings") or "").strip()
+        parts.append(f"Rated {rating} out of 5" + (f" from {count} ratings." if count else "."))
+    availability = str(r.get("availability") or "")
+    if re.search(r"out ?of ?stock|unavailable", availability, re.I):
+        parts.append("It's out of stock.")
+    elif re.search(r"in ?stock", availability, re.I):
+        parts.append("In stock.")
+    return ActionResult.success(" ".join(parts))
+
+
+# ── D3: the form profile by voice ──
+def profile_set(key, value):
+    from kayra.automation import form_profile as P
+    ok, said = P.set_value(key, value)
+    return ActionResult.success(said) if ok else ActionResult.failure(said)
+
+
+def profile_show(read=False):
+    from kayra.automation import form_profile as P
+    profile = P.load()
+    if not profile:
+        return ActionResult.success("I don't have any of your details for forms yet.")
+    if not read:
+        return ActionResult.success(f"For forms I have your {P.describe(profile)}.")
+    lines = [f"{P.spoken(k)}: {profile[k]}" for k in P.FIELDS if profile.get(k)
+             and not (k in ("first_name", "last_name") and profile.get("name"))]
+    return ActionResult.success("; ".join(lines) + ".")
+
+
+def profile_forget(key):
+    from kayra.automation import form_profile as P
+    if key == "all":
+        count = P.forget()
+        return ActionResult.success("Forgot all your form details." if count else "There was nothing saved.")
+    gone = P.forget(key)
+    return ActionResult.success(f"Forgot your {P.spoken(key)}." if gone else f"I didn't have your {P.spoken(key)}.")

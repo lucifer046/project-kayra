@@ -164,7 +164,97 @@ WHATSAPP = """<html><head><title>WhatsApp</title></head><body>
  <footer><div contenteditable="true" role="textbox" aria-label="Type a message">draft text</div></footer>
 </div></body></html>"""
 
+MAILAPP = """<html><body style="margin:0;overflow:hidden;height:100vh">
+<div style="display:flex;height:100vh">
+ <div id="side" style="width:25%;overflow-y:auto"><div style="height:3000px">labels</div></div>
+ <div id="mail" style="flex:1;overflow-y:auto"><div style="height:5000px">a long mail</div></div>
+</div></body></html>"""
+
+SEARCHAPP = """<html><head><title>shop</title></head><body>
+<header><button aria-label="Search" onclick="document.getElementById('box').style.display='block'">o</button>
+<form role="search" onsubmit="document.title='submitted:'+this.q.value;return false">
+ <input id="box" name="q" style="display:none"><button type="button" aria-label="Clear search" onclick="document.title='cleared'">x</button></form></header>
+<input aria-label="Email address"><input type="password" aria-label="Search password">
+</body></html>"""
+
+WA_SEARCH = """<html><head><title>WhatsApp</title></head><body>
+<div id="side"><div><div><button aria-label="Cancel search" onclick="document.title='cancelled'">x</button>
+ <div id="s" contenteditable="true" role="textbox" aria-label="Search input textbox" style="min-height:20px;width:200px"></div></div></div></div>
+<div id="main"><header><span title="Rahul Sharma">Rahul Sharma</span></header>
+ <footer><div id="c" contenteditable="true" role="textbox" aria-label="Type a message" style="min-height:20px;width:200px"></div></footer></div>
+</body></html>"""
+
+
+WA_LIVE = """<html><head><title>WhatsApp</title></head><body>
+<div id="side"><div><div id="s" contenteditable="true" role="textbox" aria-label="Search input textbox"
+  style="min-height:20px;width:200px">old text</div></div>
+ <div id="pane-side" aria-label="Chat list"><div role="grid" id="grid"></div></div></div>
+<div id="main"><header><span title="Family">Family</span></header>
+ <footer><div id="c" contenteditable="true" role="textbox" aria-label="Type a message" style="min-height:20px;width:200px"></div></footer></div>
+<script>
+ const all = ["Family", "Rahul Sharma", "General Panchayat", "Safe House"];
+ const draw = (q) => {
+   const rows = q ? all.filter((n) => n.toLowerCase().includes(q)) : all.slice(0, 2);   // only two are on screen
+   grid.innerHTML = rows.length ? rows.map((n) => '<div role="row"><span title="' + n + '">' + n + '</span></div>').join("")
+     : "<div>No chats, contacts or messages found</div>";
+ };
+ draw(""); let timer;
+ s.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => draw(s.innerText.trim().toLowerCase()), 500); });
+ document.addEventListener("keydown", (e) => { if (e.key === "Escape") { const m = document.getElementById("main"); if (m) m.remove(); } });
+</script></body></html>"""
+
 CAPTCHA = """<html><body><form action="/sorry/validateCaptcha" id="captcha-form"><a href="https://g.example/why">Why did this happen?</a></form></body></html>"""
+
+
+FORM = """<html><head><title>Application</title></head><body><main><form id=f onsubmit="document.title='sent';return false">
+<label for=n>Full name *</label><input id=n name=fullname required>
+<label>Email address <input type=email name=email autocomplete=email required></label>
+<input type=tel aria-label="Mobile number" name=mobile>
+<label for=fa>Father's name</label><input id=fa required>
+<label for=dob>Date of birth</label><input id=dob type=date>
+<label for=g>Gender</label><select id=g><option value="">Choose</option><option value=m>Male</option><option value=f>Female</option><option>Other</option></select>
+<label for=c>Country</label><select id=c><option value="">Select</option><option>India</option><option>Nepal</option></select>
+<fieldset><legend>Year of study</legend>
+ <label><input type=radio name=year value=1> First year</label><label><input type=radio name=year value=2> Second year</label></fieldset>
+<label for=p>Password</label><input id=p type=password>
+<label for=cc>Card number</label><input id=cc>
+<label for=city>City</label><input id=city value="Chennai">
+<label><input type=checkbox id=agree> I agree to the terms</label>
+<div role=listitem><div role=heading id=qh>Hostel</div>
+ <div role=listbox aria-labelledby=qh onclick="document.getElementById('opts').style.display='block'">
+  <div role=option aria-selected=true data-value="">Choose</div>
+  <div id=opts style="display:none"><div role=option data-value="Sundarbans" onclick="this.parentNode.parentNode.setAttribute('data-picked','Sundarbans');document.getElementById('opts').style.display='none';event.stopPropagation()">Sundarbans</div>
+  <div role=option data-value="Godavari" onclick="this.parentNode.parentNode.setAttribute('data-picked','Godavari');event.stopPropagation()">Godavari</div></div>
+ </div></div>
+<div><button type=button onclick="document.getElementById('cv').click()">Upload resume</button><input type=file id=cv style="display:none" accept=".pdf"></div>
+<button type=submit>Submit</button>
+</form></main></body></html>"""
+
+SHOP_FORM = """<html><body><form onsubmit="document.title='ordered';return false"><input aria-label="Address" value="x">
+<button type=submit>Place order</button></form></body></html>"""
+
+VIDEO = """<html><head><title>Attention explained - YouTube</title></head><body>
+<ytd-watch-metadata><h1>Attention explained</h1></ytd-watch-metadata>
+<video id=v width=640 height=360></video>
+<div class="ad-showing"></div>
+<button class="ytp-skip-ad-button" onclick="document.title='skipped'">Skip</button>
+<button class="ytp-subtitles-button" aria-pressed="false" onclick="this.setAttribute('aria-pressed', this.getAttribute('aria-pressed')==='true'?'false':'true')">CC</button>
+<button class="ytp-next-button" onclick="document.title='next'">Next</button>
+<like-button-view-model><button aria-pressed="false" aria-label="like this video along with 10 other people" onclick="this.setAttribute('aria-pressed','true')">Like</button></like-button-view-model>
+<div id="subscribe-button"><button aria-label="Subscribe to Channel" onclick="this.setAttribute('aria-label','Unsubscribe from Channel');this.textContent='Subscribed'">Subscribe</button></div>
+<input id=box>
+</body></html>"""
+
+PRODUCT_LD = """<html><head><title>Earbuds</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"BreadcrumbList"},
+{"@type":"Product","name":"boAt Airdopes 141","brand":{"name":"boAt"},
+ "offers":{"@type":"Offer","price":"1299.00","priceCurrency":"INR","availability":"https://schema.org/InStock"},
+ "aggregateRating":{"ratingValue":"4.1","reviewCount":"2345"}}]}</script></head><body><h1>boAt Airdopes 141</h1></body></html>"""
+
+AMAZON_PRODUCT = """<html><head><meta charset=utf-8></head><body><span id=productTitle> Sony WH-1000XM5 Wireless Headphones </span>
+<div id=corePriceDisplay_desktop_feature_div><span class=a-price><span class=a-offscreen>₹26,990</span></span></div>
+<span id=acrPopover title="4.4 out of 5 stars"></span><span id=acrCustomerReviewText>1,812 ratings</span>
+<div id=availability><span> In stock </span></div></body></html>"""
 
 
 def function(name):
@@ -341,6 +431,74 @@ def main():
         r = at("<html><body>loading…</body></html>", "web.whatsapp.com", "pageChatList", 60)
         check("WhatsApp still loading is 'not ready', not an empty chat list", r == {"ready": False, "chats": []}, r)
 
+        check.section("[8] V11 — scrolling the box the user looks at, one search action, closing it")
+
+        def aat(html, host, name, *args):
+            # An async page function, run as if served from `host`; the promise is awaited.
+            d.get("data:text/html;base64," + base64.b64encode(html.encode()).decode())
+            return d.execute_script(
+                f"return (function(location){{ return (async {function(name)}).apply(null, arguments[1]); }})"
+                f"(arguments[0], arguments[1])", {"hostname": host, "pathname": "/"}, list(args))
+
+        top = lambda el: d.execute_script(f"return document.getElementById('{el}').scrollTop")
+        r = at(MAILAPP, "mail.google.com", "pageScroll", "down", "", "", 1)
+        check("a web app whose window never scrolls: the open MAIL scrolls, and it is reported as moved",
+              r["moved"] and r["inner"] and top("mail") > 100 and top("side") == 0, (r, top("mail")))
+        r = d.execute_script(f"return ({function('pageScroll')})('bottom', '', '', 1)")
+        check("'to the bottom' reaches the end of that box", r["moved"] and r["atEnd"] and top("mail") > 4000, r)
+        r = d.execute_script(f"return ({function('pageScroll')})('bottom', '', '', 1)")
+        check("already at the end: NOT moved (so Kayra never says 'Done' for nothing)",
+              r["moved"] is False and r["canScroll"] is True, r)
+        r = d.execute_script(f"return ({function('pageScroll')})('down', '', 'side', 0.4)")
+        check("where = side scrolls the list on the left, by the smaller amount",
+              r["moved"] and 0 < top("side") < 400, (r, top("side")))
+        r = d.execute_script(f"return ({function('pageScroll')})('top', '', '', 1)")
+        check("'to the top' goes back", r["moved"] and top("mail") == 0, r)
+        r = at(PAGE, "x.example", "pageScroll", "down", "", "", 1)
+        check("an ordinary page still scrolls the window", r["moved"] and r["inner"] is False
+              and d.execute_script("return window.scrollY") > 100, r)
+        r = at("<html><body><p>short</p></body></html>", "x.example", "pageScroll", "down", "", "", 1)
+        check("nothing to scroll is said so (Kayra then uses the real keys)", r["moved"] is False and r["canScroll"] is False, r)
+
+        r = aat(SEARCHAPP, "shop.example", "pageSearch", "council details", True)
+        check("search: a box hidden behind a Search button is opened, typed into and submitted",
+              r["searched"] and r["opened"] and d.title == "submitted:council details", (r, d.title))
+        r = d.execute_script(f"return (async {function('pageSearchClose')})()")
+        check("close search: the box is emptied and its own Clear button pressed",
+              r["closed"] and r["had"] == "council details" and d.title == "cleared"
+              and d.execute_script("return document.getElementById('box').value") == "", (r, d.title))
+        r = aat("<html><body><input type=password aria-label='Search password'><input aria-label='Email'></body></html>",
+                "x.example", "pageSearch", "secret", True)
+        check("search: a password field is never the search box", r["searched"] is False, r)
+        r = aat(WA_SEARCH, "web.whatsapp.com", "pageSearch", "rahul", False)
+        check("WhatsApp: its search box (a contenteditable) takes the text, without Enter",
+              r["searched"] and d.execute_script("return document.getElementById('s').innerText").strip() == "rahul", r)
+        r = d.execute_script("return (function(location){ return (async " + function("pageSearchClose") +
+                             ")(); })({hostname: 'web.whatsapp.com'})")
+        check("WhatsApp: closing the search empties it, presses Cancel, and hands the focus back to the open chat's message box",
+              r["closed"] and r["had"] == "rahul" and d.title == "cancelled"
+              and d.execute_script("return document.getElementById('s').innerText").strip() == ""
+              and d.execute_script("return document.activeElement.id") == "c", (r, d.title))
+        r = d.execute_script(f"return ({function('pageType')})('search', '', false, true)")
+        check("typing an EMPTY text with clear really empties a contenteditable box", r["typed"], r)
+
+        check.section("[9] V12 — WhatsApp's search is WAITED for; the old text is replaced; a chat can be closed")
+        r = aat(WA_LIVE, "web.whatsapp.com", "pageChatSearch", "general panchayat", 60, 4000)
+        check("a chat that is NOT on screen: the search is typed and its results waited for (they arrive 0.5 s later)",
+              r["searched"] and r["typed"] and [c["name"] for c in r["chats"]] == ["General Panchayat"], r)
+        check("...the text that was in the search box was REPLACED, not added to", r["text"] == "general panchayat", r["text"])
+        r = d.execute_script(f"return (async {function('pageChatSearch')})('zzzz', 60, 4000)")
+        check("a search with no hit is reported as empty (not as the old list)", r["empty"] and r["chats"] == [] and r["text"] == "zzzz", r)
+        r = d.execute_script(f"return (async {function('pageSearch')})('safe', false)")
+        check("the generic search replaces the old text too and reads it back", r["searched"] and r["value"] == "safe" and r["exact"], r)
+        r = d.execute_script(f"return (async {function('pageChatSearch')})('', 60, 4000)")
+        check("an empty search empties the box and waits for the normal list to come back",
+              r["text"] == "" and [c["name"] for c in r["chats"]] == ["Family", "Rahul Sharma"], r)
+        r = d.execute_script(f"return (async {function('pageChatClose')})()")
+        check("'close the chat': Escape, and the conversation is gone", r["closed"] and not r["open"], r)
+        r = d.execute_script(f"return (async {function('pageChatClose')})()")
+        check("...with no chat open it says so", r == {"closed": False, "open": False}, r)
+
         r = at(CAPTCHA, "www.google.com", "pageResults", 1, "", path="/sorry/index")
         check("a bot-check page is reported as blocked, never as results", r.get("blocked") and r["count"] == 0, r)
 
@@ -370,6 +528,123 @@ def main():
         d.execute_script("document.getElementById('d').style.display='block'")
         r = call("pageCalendarNext", False)
         check("...a visible one is", r["meet"] == "https://meet.google.com/abc-defg-hij", r)
+
+        check.section("[10] Part 6 — forms (D1–D5), the video (F1), the product (F3)")
+        form = lambda op, args=None: d.execute_script(f"return (async {function('pageForm')})(arguments[0], arguments[1])", op, args or {})
+        d.get("data:text/html;base64," + base64.b64encode(FORM.encode()).decode())
+        listed = form("list")["fields"]
+        by = {f["label"]: f for f in listed}
+        check("every field is listed with its own label (label, wrapping label, aria-label, heading)",
+              {"Full name *", "Email address", "Mobile number", "Father's name", "Date of birth", "Gender", "Country",
+               "Year of study", "City", "I agree to the terms", "Hostel"} <= set(by), sorted(by))
+        check("password and card fields are listed as sensitive, nothing else is",
+              {f["label"] for f in listed if f["sensitive"]} == {"Password", "Card number"},
+              [(f["label"], f["sensitive"]) for f in listed])
+        check("types, options, autocomplete, required and already-filled are read",
+              by["Email address"]["type"] == "email" and by["Email address"]["autocomplete"] == "email"
+              and by["Gender"]["options"] == ["Male", "Female", "Other"] and by["Year of study"]["type"] == "radio"
+              and by["Year of study"]["options"] == ["First year", "Second year"] and by["City"]["filled"]
+              and by["Full name *"]["required"] and by["Hostel"]["type"] == "listbox"
+              and by["Hostel"]["options"] == ["Sundarbans", "Godavari"], by.get("Hostel"))
+        check("the hidden file input is NOT a fillable field", all(f["type"] != "file" for f in listed))
+        items = [{"i": by["Full name *"]["i"], "value": "Ana Rao"}, {"i": by["Email address"]["i"], "value": "ana@x.com"},
+                 {"i": by["Date of birth"]["i"], "value": "2003-05-04"}, {"i": by["Gender"]["i"], "value": "Female"},
+                 {"i": by["Year of study"]["i"], "value": "second year"}, {"i": by["Hostel"]["i"], "value": "Sundarbans"},
+                 {"i": by["Password"]["i"], "value": "hunter2"}]
+        r = form("fill", {"items": items})
+        values = d.execute_script("return [document.getElementById('n').value, document.querySelector('[name=email]').value,"
+                                  "document.getElementById('dob').value, document.getElementById('g').value,"
+                                  "document.querySelector('[name=year]:checked') && document.querySelector('[name=year]:checked').value,"
+                                  "document.querySelector('[role=listbox]').getAttribute('data-picked'), document.getElementById('p').value]")
+        check("fill: text, email, date, select, radio and a Google-Forms drop-down all take their values",
+              values == ["Ana Rao", "ana@x.com", "2003-05-04", "f", "2", "Sundarbans", ""], (values, r))
+        check("...and the password field is refused in the page itself",
+              [f["reason"] for f in r["failed"]] == ["sensitive"] and len(r["filled"]) == 6, r)
+        r = form("choose", {"field": "country", "option": "india", "kind": "select"})
+        check("choose: 'India' in the country drop-down", r["done"] and d.execute_script("return document.getElementById('c').value") == "India", r)
+        r = form("choose", {"field": "country", "option": "mars", "kind": "select"})
+        check("choose: a missing option lists the real ones", not r["done"] and r["options"] == ["India", "Nepal"], r)
+        r = form("choose", {"field": "", "option": "Nepal", "kind": "select"})
+        check("choose: no field said — the drop-down that HAS that option", r["done"] and r["field"] == "Country"
+              and d.execute_script("return document.getElementById('c').value") == "Nepal", r)
+        r = form("choose", {"field": "i agree", "kind": "check", "state": True})
+        check("tick: by its label", r["done"] and r["now"] and d.execute_script("return document.getElementById('agree').checked"), r)
+        r = form("choose", {"field": "i agree", "kind": "check", "state": True})
+        check("...ticking a ticked box leaves it ticked", r["was"] and r["now"] and d.execute_script("return document.getElementById('agree').checked"), r)
+        r = form("choose", {"field": "i agree", "kind": "check", "state": False})
+        check("untick", not r["now"] and not d.execute_script("return document.getElementById('agree').checked"), r)
+        r = form("choose", {"field": "first year", "kind": "check", "state": True})
+        check("'tick first year' picks that radio option", r["done"] and r["group"] == "Year of study"
+              and d.execute_script("return document.querySelector('[name=year]:checked').value") == "1", r)
+        r = form("choose", {"field": "date of birth", "option": "2001-01-31", "kind": "date"})
+        check("a date field", r["done"] and d.execute_script("return document.getElementById('dob').value") == "2001-01-31", r)
+        r = form("file", {"field": "resume"})
+        check("the hidden file input behind 'Upload resume' is found", r["found"] and "resume" in r["label"].lower()
+              and r["accept"] == ".pdf", r)
+        r = form("file", {"arm": True})
+        check("arming installs the key hook without opening anything", r["armed"] and d.title == "Application", r)
+        d.execute_script("document.getElementById('cv').addEventListener('click', () => { document.title = 'chooser'; });"
+                         "window.__typed = 0; document.addEventListener('keypress', () => window.__typed++);")
+        d.execute_script("document.getElementById('box') || document.body.focus()")
+        from selenium.webdriver.common.action_chains import ActionChains
+        d.execute_script("window.dispatchEvent(new KeyboardEvent('keydown', {key: ' ', bubbles: true}))")
+        check("...a SCRIPTED Space does nothing (the hook wants a real key)", d.title == "Application")
+        ActionChains(d).send_keys(" ").perform()
+        check("...a REAL Space opens the file input's chooser, and the Space itself is swallowed",
+              d.title == "chooser" and d.execute_script("return window.__typed") == 0, d.title)
+        d.execute_script("document.title = 'Application'")
+        ActionChains(d).send_keys(" ").perform()
+        check("...the hook fires once only", d.title == "Application", d.title)
+        r = form("submit", {"dry": True})
+        check("submit (dry): the form's own Submit button", r["label"] == "Submit" and d.title == "Application", r)
+        r = form("submit")
+        check("submit with a required field empty: NOT pressed, and the field is named",
+              not r["submitted"] and r["reason"] == "invalid" and r["missing"] == ["Father's name"] and d.title != "sent", r)
+        d.execute_script("document.getElementById('fa').value = 'R. Rao'")
+        r = form("submit")
+        check("...once it is filled, submit presses it", r["submitted"] and d.title == "sent", r)
+        d.get("data:text/html;base64," + base64.b64encode(SHOP_FORM.encode()).decode())
+        r = form("submit")
+        check("D1: a form whose button is 'Place order' is never submitted", not r["submitted"] and r["reason"] == "payment"
+              and d.title != "ordered", r)
+
+        video = lambda op, value=None: d.execute_script(
+            f"return (function(location){{ return (async {function('pageVideo')})(arguments[1], arguments[2]); }})"
+            f"(arguments[0], arguments[1], arguments[2])", {"hostname": "www.youtube.com"}, op, value)
+        d.get("data:text/html;base64," + base64.b64encode(VIDEO.encode()).decode())
+        r = video("state")
+        check("F1: the video, its title and the ad are seen", r["video"] and r["title"] == "Attention explained" and r["ad"], r)
+        check("F1: speed is set on the <video> (clamped to 0.25–4)", video("rate", 1.5)["rate"] == 1.5 and video("rate", 9)["rate"] == 4)
+        check("F1: mute", video("mute", True)["muted"])
+        r = video("skipAd")
+        check("F1: Skip ad presses YouTube's skip button", r["skipped"] and d.title == "skipped", r)
+        r = video("captions", True)
+        check("F1: captions on through the CC button, and asking again leaves them on",
+              r["captions"] and video("captions", True)["captions"], r)
+        check("F1: captions off", video("captions", False)["captions"] is False)
+        check("F1: next video", video("next")["next"] and d.title == "next")
+        r = video("like", True)
+        check("F1: like presses the like button once", r["liked"] and not r["was"] and video("like", True)["was"], r)
+        r = video("subscribe")
+        check("F1: subscribe, and 'already subscribed' after", r["subscribed"] and not r.get("already")
+              and video("subscribe").get("already"), r)
+        d.execute_script("document.getElementById('box').focus()")
+        video("blur")
+        check("F1: before a key shortcut the page lets go of the text box", d.execute_script("return document.activeElement.id") != "box")
+        d.get("data:text/html;base64," + base64.b64encode(PAGE.encode()).decode())
+        check("F1: a page without a video says so", video("rate", 2) == {"video": False})
+
+        d.get("data:text/html;base64," + base64.b64encode(PRODUCT_LD.encode()).decode())
+        r = call("pageProduct")
+        check("F3: the product from schema.org data (inside @graph)", r["found"] and r["name"] == "boAt Airdopes 141"
+              and r["price"] == "1299.00" and r["currency"] == "INR" and r["rating"] == "4.1" and r["ratings"] == "2345"
+              and r["availability"] == "InStock", r)
+        r = at(AMAZON_PRODUCT, "www.amazon.in", "pageProduct", path="/dp/B0")
+        check("F3: Amazon's own markup when there is no structured data", r["found"]
+              and r["name"] == "Sony WH-1000XM5 Wireless Headphones" and r["price"] == "₹26,990"
+              and r["rating"] == "4.4" and r["ratings"] == "1,812" and r["availability"] == "In stock", r)
+        d.get("data:text/html;base64," + base64.b64encode(PAGE.encode()).decode())
+        check("F3: a page that is not a product says so", call("pageProduct")["found"] is False)
     finally:
         d.quit()
     return check.finish()

@@ -102,6 +102,17 @@ anywhere else; one is never needed for an unpacked extension.
 | "tell Rahul I'm running late" | finds and opens the chat, then **asks** naming the real chat ("Send 'I'm running late' to Rahul Sharma?"); on yes it types, reads the text back, sends, and checks it arrived. If you switched chats meanwhile, nothing is sent |
 | "open the PR group on WhatsApp", or with WhatsApp in front "open XYZ chat" / "click on design team 2026" | the chat whose name best matches what you said — loose names, misheard spellings, initials; two close matches → it asks which; a tie → the most recent chat |
 | "who messaged me on WhatsApp" | the chats with unread messages and how many |
+| "open graphics team group in WhatsApp" (from anywhere), "open graphics team group", "open Rahul chat" | opens WhatsApp and the chat. "Graphics team" finds "Graphics Team (2026-27)"; when the same name exists for several years, the one with the latest message opens. "X group" is a Chrome tab group only when one has that name |
+| "read the recent chat", "read the latest messages on WhatsApp" | the open chat's recent messages; with no chat open, the chat with the newest message. Only the unread ones are read when there are unread ones |
+| "scroll the mail", "scroll the mail to the bottom", "scroll the chat up a bit", "scroll the chat list down", "go to the top of the page" | scrolls the mail / chat / list itself (these apps never scroll the window). Says "At the bottom", "It's already at the bottom", or "Done" only when something moved |
+| "click on the search button and search for council details", "search for Rahul in the search bar" | ONE search: finds the app's search box (pressing its magnifier first when hidden), clears it, types, submits. On the Sheets / Docs home list it is Google's own search; in WhatsApp it filters without pressing Enter |
+| "search for general panchayat" (WhatsApp in front), "search WhatsApp for safe house", "… and open it" | WhatsApp's own search, waited for; the chats found are said and the search stays open. "open the first one" / "open the second chat" opens that row and closes the search. A new search replaces the old text |
+| "open general panchayat" when the chat is not on screen | searched for automatically (the whole name, then its words when a word was misheard), opened, and the search is closed again. Not found → said so, search closed |
+| "close the chat", "close this group" (WhatsApp in front) | closes the open conversation |
+| "close WhatsApp" | closes the WhatsApp window (any Chrome profile), or its tab when it is open as a tab — never the chat inside it |
+| "read the last three messages of Mota Panda", "open and read the latest 3 chats from X", "X's last five messages" | opens that chat and reads exactly that many, as they are. "read the last three messages" with a chat open reads that chat |
+| "close the search bar", "close the WhatsApp search", "delete the text in the search bar", "clear the search", "go back to my chats" | empties and closes the search and leaves the app as it was: WhatsApp back on its chat list with your chat still open, Gmail back in the inbox |
+| "open council details 2026-27 sheet" (the file is "Council Details 2026-27 \| Sundarbans House") | the file whose title starts with / contains what you said; "2026 2027", "2026 to 27" and "2026-27" are the same; if Google's search finds nothing it is tried again without the numbers and then in your recent files |
 | "what did they say in the core team today", "read it" (the open chat) | read out when short, summarized by the LOCAL model when long — never by a cloud model; without a local model it reads the latest few |
 | "join my meeting abc-defg-hij", "start a new meeting" | opens Meet and clicks Join now |
 | "mute me", "turn off my camera", "turn on captions", "raise my hand", "leave the call" | clicks Meet's own buttons |
@@ -112,6 +123,17 @@ anywhere else; one is never needed for an unpacked extension.
 | "yes, don't ask again" (to a share question) | shares, and stops asking before sharing until you leave the call |
 | "am I sharing?" | says whether you are, and what |
 | "stop sharing" | clicks Stop presenting and brings notifications back |
+| "remember my email is ana at gmail dot com", "save CS21B001 as my roll number", "what details do you have for forms", "forget my phone number" | your details for forms (Part 6, 1.12.0): name, email, phone, address, college, roll number, date of birth, gender — kept on this computer only (`data/profile.json`, private) |
+| "fill this form with my details" | **asks first**, naming the fields it can fill ("name, email and phone — fill them?"); fills only empty fields; never a password, card, OTP or PIN field, never a field about someone else (father's name, emergency contact); **never submits** |
+| "select India in the country dropdown", "choose male for gender", "tick I agree", "untick subscribe", "set the date of birth to 4 May 2003" | drop-downs (also Google Forms'), radio options, check boxes, date fields; a missing option names the real ones |
+| "submit this form" | **asks first**; a form with an empty required field is not sent — Kayra names the field; a button that pays or orders is never pressed |
+| "upload my resume here", "attach my resume" | **asks first**, naming the newest matching file in Documents / Downloads / Desktop; then opens the page's own file chooser with a real key press and types the path into it |
+| "press tab", "press enter twice" (with "browser") | real key presses into the page |
+| "skip the ad", "speed 1.5", "normal speed", "skip 10 seconds", "go back 30 seconds", "go to 2:30", "turn on captions", "next video", "like this video", "save this to watch later", "make the video full screen", "theater mode", "how much is left" | the video in front; speed and seeking work on any site with a video. "subscribe to this channel" **asks first** |
+| "search Amazon for earbuds under 2000", "search for a wireless mouse on Flipkart sorted by price low to high", "search GitHub for kokoro", "images of red pandas" | the site's own search, with price range and sort for Amazon and Flipkart |
+| "sort by price low to high", "show only under 2000" (Amazon / Flipkart results in front) | the same search, re-sorted or filtered |
+| "how much is this", "what's the rating" (a product page in front) | name, price, rating and stock, from the page's own product data |
+| "add this to cart", "buy it now", "checkout" | **refused** (decision D1, 2026-11-11): Kayra searches and opens products only; the cart and paying are yours |
 
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the
 rest says how to connect it.
@@ -154,7 +176,7 @@ have yet, it sends `runtime.reload` (Chrome re-reads this folder) and says *"I'v
 the Kayra Bridge extension…"* — ask again a few seconds later. You can also say **"browser
 update"**. Only a 1.0.x extension needs the manual **reload arrow** on `chrome://extensions`.
 
-Current version: **1.9.0** (1.9.0: WhatsApp Web — `chat.list`, `chat.open`, `chat.messages`, `chat.composer`; 1.8.0: lists, comments, results, the next event and the transcript wait INSIDE the browser (`waitMs`), and the site lookups were re-checked on live sites — sponsored Amazon results and YouTube ads skipped, Amazon `reviewText`, YouTube Up next cards, Bing organic only, Wikipedia, bot-check pages reported; 1.7.0: Google Workspace — file lists, an in-page read of a Sheet's CSV / a Doc's text fenced to docs.google.com, the Name Box, Calendar's next event; no new permission; 1.6.0: comments, transcript, selection, bookmarks add/remove, history clearing, downloads — adds the `downloads` permission; 1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
+Current version: **1.11.0** (1.11.0: `chat.search` types into WhatsApp's search and WAITS for the results, `chat.close`, `page.search` / `page.searchClose` replace the old text and report what the box holds afterwards; 1.10.0: `page.scroll` scrolls the box the user is looking at and reports whether it moved, `page.search` is one search action for every web app, `page.searchClose` undoes it, `chat.list` rows carry `pinned`; 1.9.0: WhatsApp Web — `chat.list`, `chat.open`, `chat.messages`, `chat.composer`; 1.8.0: lists, comments, results, the next event and the transcript wait INSIDE the browser (`waitMs`), and the site lookups were re-checked on live sites — sponsored Amazon results and YouTube ads skipped, Amazon `reviewText`, YouTube Up next cards, Bing organic only, Wikipedia, bot-check pages reported; 1.7.0: Google Workspace — file lists, an in-page read of a Sheet's CSV / a Doc's text fenced to docs.google.com, the Name Box, Calendar's next event; no new permission; 1.6.0: comments, transcript, selection, bookmarks add/remove, history clearing, downloads — adds the `downloads` permission; 1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
 click matching and `page.waitFor` cheaper; 1.2.2 adds `tabs.close {tabIds}`; 1.3.0 adds
 `tabs.recentlyClosed`, `tabs.restore {sessionId}`, `tabs.muteOthers`, `tabs.discard`,
 `tabs.zoom` and `tabs.reload {hard}` — no new permissions). An older 1.1.0+ extension is
@@ -235,6 +257,14 @@ fakes. If a picker stays open, press Share and tell me what you saw.
   naming the chat Kayra resolved, and re-checks that chat is still the open one before sending.
 - **Clearing history, deleting bookmarks and opening a download always ask**, whatever the
   count, and the "yes" acts on exactly what was named.
+- **Your form details stay on this computer** (decision D2, 2026-11-11). `data/profile.json`
+  is written 0600 and read only to fill a form you asked to fill; the values are matched to
+  fields locally, never sent to a model, never written to the audit log (only their length),
+  and never kept in the pending question — the "yes" carries field numbers and names, and the
+  values are read again at that moment. The understanding model can never set, forget or
+  submit your details or choose a file to upload.
+- **Shopping stops before the cart** (decision D1, 2026-11-11): a click on add to cart, buy
+  now, checkout, place order, pay or the cart itself is refused by the policy, not asked.
 - **Bulk closes ask first.** More than 3 tabs (by site, all but pinned, a group) is a
   question, and the "yes" closes exactly the tabs it listed.
 
@@ -270,6 +300,16 @@ a WebSocket that exchanges a ping every 20 seconds keeps its service worker runn
   more messages", rows that are not buttons) proves "click on more", "all mails", "sent",
   "load more", and opening the first / latest / second / from-Ana / second-unread email, and
   the `page.waitFor` probe. 27 checks.
+- `tests/test_browser_extension.py` [10] (Part 6): a real form (labels, wrapping labels,
+  aria-label, a Google-Forms drop-down, radios, a hidden file input, password and card fields),
+  fill / choose / tick / date / submit, a required field that stops the submit, a "Place
+  order" form never submitted, a SCRIPTED Space ignored and a REAL Space opening the file
+  chooser once; a YouTube-shaped player (speed, mute, skip ad, captions, next, like,
+  subscribe); product facts from schema.org data and from Amazon's markup.
+- `tests/test_browser_control.py` [21] (unit, Part 6): every phrasing bare and prefixed, the
+  context rules (a video / shop in front), D1 refusals, the confirmations, the profile file
+  (0600, validation, dates), fill / choose / submit / keys / upload / video / search / sort /
+  product flows against a fake extension, and that no value reaches the audit log.
 - `tests/test_browser_control.py` (unit): the site registry, every "where", the new-tab merge,
   app/web-app/site/web-result order, the no-extension fallbacks, self-update, and the AI
   understanding layer against a scripted model. 130 checks.

@@ -708,7 +708,14 @@ class CentralizedLLMEngine:
                back to it' after Kayra opened a tab -> 'browser close it' / 'browser go back to
                it'; 'search this sheet for Ravi' / 'search for Ravi here' -> 'browser search for
                ravi here' (a web search for facts stays 'google search ...'); 'what can I do
-               here' -> 'browser what can i do here'; 'click
+               here' -> 'browser what can i do here'; FORMS AND VIDEOS: 'fill this form with
+               my details' / 'select India in the country dropdown' / 'tick I agree' / 'submit
+               this form' / 'upload my resume here' / 'press tab' -> 'browser ' + the same
+               words; with a video in front 'skip 10 seconds' / 'go back 30 seconds' / 'go to
+               2:30' / 'play at 1.5x' / 'skip the ad' -> 'browser ' + the same words; 'search
+               Amazon for earbuds under 2000' -> 'browser search amazon for earbuds under 2000';
+               on a shop page 'how much is this' / 'sort by price low to high' -> 'browser ' +
+               the same words; 'click
                the sign in button' -> 'browser click on sign in'; 'type hello in the search
                box' -> 'browser type hello into search'; 'summarize this page' -> 'browser
                summarize this page'; 'read this article' -> 'browser read this page'; 'open

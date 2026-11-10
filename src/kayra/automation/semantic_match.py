@@ -66,9 +66,34 @@ def _numbers(text):
         return str(text or "").lower()
 
 
+_YEAR = re.compile(r"(?:19|20)\d\d")
+
+
+def year_ranges(words):
+    """['2026', '2027'] -> ['2026', '27']: a year range is one thing however it is said or
+    written ("2026-27", "2026 2027", "2026 to 27"), so both sides are brought to one form."""
+    out = []
+    for word in words:
+        if out and _YEAR.fullmatch(out[-1]) and _YEAR.fullmatch(word) and int(word) == int(out[-1]) + 1:
+            out.append(word[2:])
+        else:
+            out.append(word)
+    return out
+
+
 def tokens(text, keep_stop=False):
     words = re.findall(r"[a-z0-9]+", _numbers(str(text or "").lower()))
-    return words if keep_stop else [w for w in words if w not in _STOP]
+    return year_ranges(words if keep_stop else [w for w in words if w not in _STOP])
+
+
+def edition(query, name):
+    """True when `name` is what was said plus only numbers: "graphics team" for "Graphics Team
+    (2026-27)". Several such names are EDITIONS of one group — the latest one is meant."""
+    q, n = tokens(query), tokens(name)
+    said = [w for w in q if not w.isdigit()]
+    if not said or said != [w for w in n if not w.isdigit()]:
+        return False
+    return all(w in n for w in q if w.isdigit())
 
 
 def _word_hit(spoken, name_words):
@@ -138,6 +163,13 @@ def match(query, candidates, embed=None, aliases=None):
     exact = [c for c in cands if " ".join(tokens(c.name)) == " ".join(tokens(query)) and tokens(query)]
     if len(exact) == 1:                                    # the full name, said as it is written
         return Match(PICK, exact[0], [(1.0, exact[0])], 1.0)
+    if not exact:
+        # The name without its year: "graphics team" for "Graphics Team (2026-27)". With several
+        # editions the one with the latest message is meant (the user's rule), never a question.
+        editions = sorted((c for c in cands if edition(query, c.name)),
+                          key=lambda c: c.recent if c.recent is not None else 1e9)
+        if editions:
+            return Match(PICK, editions[0], [(0.95, c) for c in editions], 0.95)
     vectors = None
     if embed is not None:
         try:

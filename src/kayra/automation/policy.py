@@ -287,6 +287,10 @@ _CONFIRM_ACTIONS = {
     # yes — asserted in tests/test_browser_control.py [19].
     "meet.share",                # your whole screen goes to everyone in the call
     "diagnose.fix", "dev.git_commit", "email.delete", "email.spam",
+    # Part 6 (2026-11-11): a submitted form cannot be taken back; forgetting every saved form
+    # detail at once; a subscription is public. Filling a form and uploading a file ask too,
+    # LATE, naming the fields / the file (the handler resolves them first).
+    "browser.form_submit", "browser.profile_clear", "browser.video_subscribe",
 }
 
 # Actions that must never run from a voice command, whatever the phrasing.
@@ -311,6 +315,17 @@ _RISKY_CLICK = re.compile(
     r"permanently|send|pay|purchase|buy|order|checkout|transfer|confirm|submit|publish|"
     r"post|sign out|log out|logout|shut ?down|restart|reboot|factory|overwrite|replace all|"
     r"revoke|unsubscribe|block|ban|kick)\b", re.IGNORECASE)
+
+
+# Decision D1 (2026-11-11): shopping is SEARCH AND OPEN only. A click on a cart, buy, order,
+# checkout or pay control is refused outright — not confirmed: the user chose that Kayra never
+# does it, so there is nothing to say yes to.
+_SHOPPING_STOP = re.compile(
+    r"\b(add(?: (?:this|it|item))? to (?:the |my )?(?:cart|bag|basket|trolley)|buy (?:it |this )?now|buy (?:this|it)|"
+    r"proceed to (?:checkout|buy|pay)|check ?out|place (?:your |the |an )?order|order now|pay now|make (?:a )?payment|"
+    r"go to (?:the |my )?(?:cart|bag|basket)|view (?:the |my )?(?:cart|bag|basket)|one[- ]click buy)\b", re.IGNORECASE)
+SHOPPING_REFUSAL = ("I only search and open products. Adding to a cart, checking out and paying "
+                    "are for you to do")
 
 
 def classify_action(action: Action):
@@ -342,6 +357,10 @@ def classify_action(action: Action):
 
     if key in _CONFIRM_ACTIONS:
         return Risk.CONFIRM, f"{key} is irreversible or affects the whole session"
+
+    if ((action.domain == "mouse" and action.action.endswith("_text")) or
+            action.key == "browser.page_click") and _SHOPPING_STOP.search(str(action.target or "")):
+        return Risk.DENY, SHOPPING_REFUSAL
 
     # A click is only as safe as the button it lands on. Clicking a word found on screen is
     # confirmed when the word is the kind of button that destroys, spends or sends.

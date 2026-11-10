@@ -381,9 +381,11 @@ most recent message), learn from how the user talks, and reuse what it learned.
 
 ## 7. Open decisions (ask the user when you reach them)
 
-- **D1** Shopping: stop at "add to cart"? (recommended: yes)
-- **D2** Form profile fields to store in `data/profile.json` (name, email, phone, address,
-  college, roll number?) — never passwords/cards.
+- **D1** Shopping: stop at "add to cart"? — **answered 2026-11-11: search and open ONLY** (no
+  add-to-cart, no cart page, no checkout; the policy refuses those clicks).
+- **D2** Form profile fields to store in `data/profile.json` — **answered 2026-11-11: name,
+  email, phone, postal address, college and roll number, date of birth and gender** — never
+  passwords/cards.
 - **D3** May Kayra read Drive/Docs **file names** (in Chrome only, never stored) to search them? — **approved 2026-11-10**: matched locally, never sent to a model.
 - **D4** URLs of the user's IITM portals for the site registry.
 - **D5** Extra permissions: `downloads` (C11) — **approved 2026-11-10**, in 1.6.0; `tabGroups` (B4) — **approved 2026-11-10**, in 1.5.0. `debugger` is NOT to be added.
@@ -435,9 +437,9 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 - [x] A1 [x] A2 [x] A3 [x] A4 [x] A5 [x] A6  *(A6: GitHub "my repos" has no user-free URL — not added)*
 - [x] B1 [x] B2 [x] B3 [x] B4 [x] B5 [x] B6 [x] B7 [x] B8
 - [x] C1 [x] C2 [x] C3 [x] C4 [x] C5 [x] C6 [x] C7 [x] C8 [x] C9 [x] C10 [x] C11
-- [ ] D1 [ ] D2 [ ] D3 [ ] D4 [ ] D5
+- [x] D1 [x] D2 [x] D3 [x] D4 [x] D5  *(D5 not yet tried against the real portal file chooser)*
 - [x] E1 [x] E2 [x] E3 [x] E4 [~] E5 [~] E6 [~] E7 [x] E8  *(E5: no mark-all-read / attach; E6: no "move my 3 pm"; E7: admit only — see §10 Part 4)*
-- [ ] F1 [ ] F2 [ ] F3 [ ] F4 [ ] F5 [ ] F6
+- [x] F1 [x] F2 [~] F3 [ ] F4 [ ] F5 [ ] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b)*
 - [x] G1 [x] G2 [x] G3 [x] G4 [ ] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
 - §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [ ] M2.2 [ ] M2.3 [ ] M3 [ ] M4  *(M1.2: Chrome's tab list opens, the user picks the tab)*
 - [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
@@ -475,9 +477,41 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | **done 2026-11-10** (extension 1.6.0 + `downloads`) |
 | 4 | E1–E8 Google Workspace (needs D3 answered) | **done 2026-11-10** (D3 approved; extension 1.7.0). Left for later: Sheets add-row/sort/chart, Gmail mark-all-read/attach, Calendar move, Meet layout/recording, Drive share |
 | 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | **done 2026-11-10** (extension 1.9.0; not yet tried on a live, logged-in WhatsApp) |
+| 5F | Fix round V11 after live use of Parts 4–5: scrolling inside web apps, one search action + close search, WhatsApp chats by loose name from anywhere, "recent chat", year ranges and recency for file names | **done 2026-11-11** (extension 1.11.0 after the second pass from the audit log; `updates/UPDATE_V11.md`; not yet re-tried on live Gmail / WhatsApp / Sheets) |
 | 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | planned |
-| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
+| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **6a done 2026-11-11** (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`). **6b next**: F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply-to-open-chat + send a file, F6 LinkedIn/Reddit pages, G5 multi-step |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Part 6a — forms, the video, site search and shopping** (done 2026-11-11, extension 1.12.0;
+D1 and D2 answered by the user that day). Detail: `updates/UPDATE_V12.md` and the changelog
+in `docs/platforms/LINUX_AUTOMATION.md`.
+- D1 `form_choose` (drop-down incl. Google Forms, radio, tick/untick, date); D2 `page_key`;
+  D3 `form_profile.py` + `form_fill` (late confirmation naming fields; never submits; values
+  never in the pending action or the audit log); D4 `form_submit` (CONFIRM; invalid form and
+  pay buttons refused); D5 `file_upload` (late confirmation naming the file; trusted-key hook;
+  chooser driven with Ctrl+L).
+- F1 `video` (speed, seek, captions, skip ad, next, like, watch later, full screen, state) and
+  `video_subscribe` (CONFIRM). F2 `site_search` (any site with a search template, Amazon /
+  Flipkart price and sort, images). F3 `shop_refine`, `product_info`; cart / buy / checkout /
+  pay refused by `policy._SHOPPING_STOP` (decision D1).
+- Tests: `test_browser_control.py` [21], `test_browser_extension.py` [10], `test_dmm_browser.py`
+  95/95 on the local model.
+- **Not verified live**: real forms, the real portal file chooser, live YouTube / Amazon /
+  Flipkart pages.
+
+**Part 5F — fix round V11** (done 2026-11-11, extension 1.10.0). Detail: the changelog in
+`docs/platforms/LINUX_AUTOMATION.md` and `updates/UPDATE_V11.md`.
+- `page.scroll` scrolls the box in view and reports `moved`; `common.scroll_request`.
+- `page.search` / `page.searchClose`; `common.search_request`, `browser.search_close`.
+- WhatsApp from anywhere ("… in whatsapp", "X chat", "X group" with a tab-group check), `recent`,
+  unread-only reads, editions (`semantic_match.edition`), `year_ranges`.
+- `rank_titles` by recency + prefix tier, `_find_files` fallbacks.
+- Second pass (audit log, extension 1.11.0): `chat.search` waits for WhatsApp's results (the
+  list was read before it filtered), search by words, search always closed, `search_close`
+  verified with a real-key fallback, `message search` / `open result <n>` / `close this chat`,
+  `_rethink` never re-runs the failed command.
+- Changed on purpose: the same name with different YEARS no longer asks (chats: latest message;
+  files: first listed). Everything else that asked still asks.
 
 **Part 5 — WhatsApp, app context, the semantic matcher** (done 2026-11-10, extension 1.9.0).
 - H0.2 app context: `common.front_site(situation)` — a web-app window's site, or Chrome's tab

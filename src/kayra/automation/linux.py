@@ -230,9 +230,30 @@ def wait_until_gone(address, timeout=None):
         SLEEP(0.1)
 
 
+def _webapp_site(app):
+    """'web.whatsapp.com' for a web-app entry (omarchy-launch-webapp …), else None."""
+    try:
+        url = linux_apps.webapp_url(getattr(app, "entry", None))
+    except Exception:
+        url = None
+    if not url:
+        return None
+    host = re.sub(r"^[a-z]+://", "", url.lower()).split("/")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def _shows_site(window, site):
+    """A Chromium --app window of `site`, whatever profile it runs in. The entry's
+    StartupWMClass names ONE profile ("…__-Default"); a web app launched with another profile
+    has another class ("…__-Profile_1"), so Kayra waited 8 s for a window that was already
+    there and then said "WhatsApp isn't open" (the audit log, 2026-11-11)."""
+    return bool(site) and any(linux_apps.site_of_window_class(c) == site for c in window.classes)
+
+
 def _windows_for(target, strict=True):
     """Windows belonging to an AppTarget. Strict = class identity only (for anything destructive)."""
-    matches = [w for w in list_windows() if w.classes & target.classes]
+    site = _webapp_site(target)
+    matches = [w for w in list_windows() if w.classes & target.classes or _shows_site(w, site)]
     if matches or strict:
         return matches
     needle = target.label.lower()
@@ -353,7 +374,7 @@ def _wait_for_window(app, before, timeout=None):
         for window in list_windows():
             if window.address in before:
                 continue
-            if window.classes & app.classes or not app.classes:
+            if window.classes & app.classes or not app.classes or _shows_site(window, _webapp_site(app)):
                 return window
         SLEEP(0.2)
     return None
@@ -395,6 +416,18 @@ def close_target(name, all_instances=False):
         return ActionResult.not_found(f"I couldn't find {name} open.")
     matches = _windows_for(app, strict=True)
     if not matches:
+        # A web app with no window of its own may be open as a TAB ("close WhatsApp" with
+        # WhatsApp in a Chrome tab): close that tab — never something inside it.
+        site = _webapp_site(app)
+        if site:
+            try:
+                from kayra.automation import web_macros
+                if web_macros.BRIDGE.connected():
+                    closed = (web_macros.BRIDGE.call("tabs.close", match=site, all=True) or {}).get("closed", 0)
+                    if closed:
+                        return ActionResult.success(f"{app.label} is closed.", closed=closed)
+            except Exception:
+                pass
         return ActionResult.not_found(f"{app.label} isn't open.")
     if all_instances:
         for window in matches:
@@ -1302,6 +1335,38 @@ def _browser_in_front():
         return False
 
 
+def _is_open_chat(target, W):
+    """'close the group' with WhatsApp in front and no tab group at all: the open chat."""
+    try:
+        return (str(target).lower() in ("current", "the", "this", "that", "whatsapp")
+                and common.front_site(situation) == "web.whatsapp.com" and not W._groups())
+    except Exception:
+        return False
+
+
+def _page_scroll(params):
+    """A scroll with a direction / place / amount. Into the page when a browser (or Kayra's own
+    window, while the user talks to it) is in front; with real keys when another app is, so
+    "scroll to the bottom" in a terminal or a PDF viewer does not move a hidden Chrome tab."""
+    from kayra.automation import web_macros
+    direction = params.get("direction", "down")
+    front = None
+    try:
+        front = active_window()
+    except Exception:
+        pass
+    elsewhere = front is not None and not front.kayra_owned and not _is_browser_window(front)
+    if params.get("until") or (web_macros.BRIDGE.connected() and not elsewhere):
+        return web_macros.page_scroll(direction, params.get("until"), params.get("where", ""),
+                                      params.get("amount", 1.0))
+    if not elsewhere:
+        return web_macros.page_scroll(direction)             # says how to set the bridge up
+    if direction in ("up", "down"):
+        return mouse_action(f"scroll_{direction}")
+    ok = send_keys("ctrl+home" if direction == "top" else "ctrl+end")
+    return ActionResult.success("Done.") if ok else ActionResult.failure("I couldn't scroll that window.")
+
+
 def mouse_action(verb, target=None):
     # A click or scroll with Chrome in front goes INSIDE the page through the extension: it
     # needs no screenshot, no OCR and no /dev/uinput, and it can click things a screen
@@ -2073,9 +2138,11 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "group_add": lambda: W.group_add(target),
                  "group_rename": lambda: W.group_update(target, title=params.get("title", "")),
                  "group_color": lambda: W.group_update(target, color=params.get("color")),
-                 "group_collapse": lambda: W.group_update(target, collapsed=params.get("collapsed", True)),
+                 "group_collapse": lambda: W.group_open(target) if params.get("or_chat") else
+                 W.group_update(target, collapsed=params.get("collapsed", True)),
                  "group_ungroup": lambda: W.group_ungroup(target),
-                 "group_close": lambda: W.group_close(target, params.get("confirmed_ids"), action),
+                 "group_close": lambda: W.wa_close() if _is_open_chat(target, W) else
+                 W.group_close(target, params.get("confirmed_ids"), action),
                  "tab_detach": lambda: W.tab_detach(params.get("monitor", False)),
                  "windows_merge": lambda: W.windows_merge(),
                  "page_result": lambda: W.page_result(params.get("nth", 1), params.get("new_tab", False)),
@@ -2098,8 +2165,8 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "page_click": lambda: W.page_click(target, params.get("nth", 1)),
                  "page_type": lambda: W.page_type(target, params.get("text", ""),
                                                   params.get("submit", False)),
-                 "page_scroll": lambda: W.page_scroll(params.get("direction", "down"),
-                                                      params.get("until")),
+                 "page_scroll": lambda: _page_scroll(params),
+                 "search_close": lambda: W.search_close(),
                  "page_read": lambda: W.page_read(target), "page_summarize": lambda: W.page_summarize(target),
                  "page_ask": lambda: W.page_ask(params.get("question", "")),
                  "page_comments": lambda: W.page_comments(params.get("summarize", False)),
@@ -2136,7 +2203,25 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "history_open": lambda: W.history_open(target, params.get("days", 7)),
                  "bookmark_open": lambda: W.bookmark_open(target),
                  "bridge_setup": lambda: W.bridge_setup(), "bridge_status": lambda: W.bridge_status(),
-                 "bridge_update": lambda: W.bridge_update()}
+                 "bridge_update": lambda: W.bridge_update(),
+                 # ── Part 6 ──
+                 "form_fill": lambda: W.form_fill(params.get("confirmed"), action),
+                 "form_choose": lambda: W.form_choose(params.get("field", ""), params.get("option", target),
+                                                      params.get("kind", "select"), params.get("state")),
+                 "form_submit": lambda: W.form_submit(),
+                 "page_key": lambda: W.page_key(target, params.get("count", 1)),
+                 "file_upload": lambda: W.file_upload(target, params.get("field", ""),
+                                                      params.get("confirmed_path"), action),
+                 "video": lambda: W.video_control(params.get("op", target), params.get("value")),
+                 "video_subscribe": lambda: W.video_control("subscribe"),
+                 "site_search": lambda: W.site_search(params.get("site", ""), target, params.get("sort", ""),
+                                                      params.get("lo", 0), params.get("hi", 0), params.get("where")),
+                 "shop_refine": lambda: W.shop_refine(params.get("sort", ""), params.get("lo", 0), params.get("hi", 0)),
+                 "product_info": lambda: W.product_info(),
+                 "profile_set": lambda: W.profile_set(target, params.get("text", "")),
+                 "profile_show": lambda: W.profile_show(params.get("read", False)),
+                 "profile_forget": lambda: W.profile_forget(target),
+                 "profile_clear": lambda: W.profile_forget("all")}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
@@ -2177,10 +2262,14 @@ def _dispatch_extended(domain, verb, target, params, action):
     if domain == "message":
         if verb == "open":
             return W.wa_open(target)
+        if verb == "search":
+            return W.wa_search(target, bool(params.get("open")))
+        if verb == "close":
+            return W.wa_close()
         if verb == "unread":
             return W.wa_unread()
         if verb == "read":
-            return W.wa_read(target, bool(params.get("today")))
+            return W.wa_read(target, bool(params.get("today")), int(params.get("count") or 0))
         return W.message_send(target, params.get("text", ""), params.get("confirmed_chat"), action)
     if domain == "diagnose":
         if verb == "fix":
