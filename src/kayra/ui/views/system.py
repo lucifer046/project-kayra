@@ -30,13 +30,12 @@ No subprocess is ever spawned on the refresh path.
 """
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy, QGridLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout
 
-from kayra.ui.theme import Font, Color, Space, Motion, VERDICT_COLORS, VERDICT_LABELS
+from kayra.ui.theme import Font, Color, Space, Motion, VERDICT_LABELS
 from kayra.ui.components.primitives import (
-    Card, Caption, Secondary, StatusPill, SectionLabel, Meter, StatRow, EmptyState,
-    Disclosure, ActionStatus,
-    Divider, GhostButton, _label,
+    Card, Caption, Secondary, StatusPill, SectionLabel, Meter, StatRow, Disclosure,
+    ActionStatus, _label,
 )
 from kayra.ui.views.base import View
 

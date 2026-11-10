@@ -15,17 +15,15 @@ font dependency would have to ship with the app and a raster set would need a co
 eight primitives drawn with QPainter are sharp at any scale factor and cost nothing.
 """
 
-import math
 
 from PySide6.QtCore import (Qt, Signal, QSize, QRect, QRectF, QPointF,
                             QPropertyAnimation, QEasingCurve)
 from PySide6.QtGui import QPainter, QColor, QPen, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QButtonGroup, QLabel, QSizePolicy,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QButtonGroup,
 )
 
-from kayra.ui.theme import (Color, Font, Space, Size, Motion, STATE_LABELS, STATE_COLORS,
-                            repolish, glyph_dpr)
+from kayra.ui.theme import (Color, Space, Size, Motion, STATE_LABELS, repolish, glyph_dpr)
 from kayra.ui.components.primitives import Caption, Divider, _label
 from kayra.ui.components.orb import OrbBadge
 

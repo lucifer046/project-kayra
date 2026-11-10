@@ -6,6 +6,7 @@ r"""
 Runs Kayra's test suites by CATEGORY and prints one table.
 
     .venv\Scripts\python tests\run_all.py                 # unit — safe, the default
+    .venv/bin/python tests/run_all.py                      # (Linux spelling of the same)
     .venv\Scripts\python tests\run_all.py --integration    # + needs network or hardware
     .venv\Scripts\python tests\run_all.py --hardware       # + camera / microphone / GPU
     .venv\Scripts\python tests\run_all.py --all            # everything except manual
@@ -58,10 +59,19 @@ PROJECT_ROOT = os.path.dirname(TESTS_DIR)
 SUITES = [
     # ── UNIT: deterministic, hardware-free, safe to run at any time ──
     dict(file="test_automation.py", category="unit", feature="Automation pipeline",
-         needs="none", writes="temp dir only", seconds=6,
+         needs="none", writes="temp dir only", seconds=6, platforms=("win32",),
          note="normalizer, policy, resolver, planner, audit; --live adds read-only Win32"),
     dict(file="test_target_resolution.py", category="unit", feature="Target resolution",
-         needs="none", writes="nothing", seconds=3),
+         needs="none", writes="nothing", seconds=3, platforms=("win32",)),
+    dict(file="test_assistant_automation.py", category="unit", feature="Assistant automation",
+         needs="none", writes="temp dir only", seconds=3,
+         note="diagnostics, Chrome bridge (real socket), web, screen AI, workflows, system"),
+    dict(file="test_browser_control.py", category="unit", feature="Browser control (round 5)",
+         needs="none", writes="nothing", seconds=2,
+         note="site registry, open anything/anywhere, web apps, extension versions; fake extension"),
+    dict(file="test_linux_automation.py", category="unit", feature="Linux automation",
+         needs="none", writes="nothing", seconds=2,
+         note="fake Hyprland + recording runner; argv/dispatch level, launches nothing"),
     dict(file="test_voice_control.py", category="unit", feature="Local control vocabulary",
          needs="none", writes="nothing", seconds=5,
          note="includes the shutdown ORDER against a stubbed backend"),
@@ -102,6 +112,9 @@ SUITES = [
     dict(file="test_ui.py", category="unit", feature="Desktop interface",
          needs="none", writes="nothing", seconds=25,
          note="Qt offscreen, backend fully stubbed, five synthetic machines"),
+    dict(file="test_platforms.py", category="unit", feature="Platform abstraction layer",
+         needs="none", writes="nothing", seconds=1,
+         note="OS/distro/session detection, fake Hyprland socket, recording pointer"),
     dict(file="test_hardware_profile.py", category="unit", feature="Hardware / OS detection",
          needs="none", writes="nothing", seconds=4,
          note="seven synthetic machines; reads this host for consistency only"),
@@ -120,6 +133,9 @@ SUITES = [
     dict(file="test_stt_lifecycle.py", category="integration", feature="STT session lifecycle",
          needs="Chrome or Edge", writes="nothing", seconds=60,
          note="run it with your OWN browser open — that is the interesting case"),
+    dict(file="test_browser_extension.py", category="integration", feature="Chrome extension page functions",
+         needs="Google Chrome", writes="nothing", seconds=15,
+         note="headless throwaway Chrome; never your profile"),
     dict(file="test_dmm_matrix.py", category="integration", feature="DMM intent boundaries",
          needs="a model provider", writes="nothing", seconds=180,
          note="follows local-first routing, so a local server changes what it measures"),
@@ -171,6 +187,12 @@ def run_suite(entry, python_exe, extra_args=()):
     path = os.path.join(TESTS_DIR, entry["file"])
     if not os.path.exists(path):
         return dict(entry, status="MISSING", passed=0, failed=0, skipped=0, seconds=0.0)
+    # A suite that exercises a Windows-only subsystem (desktop automation) is reported as
+    # not applicable elsewhere — never as a failure, and never silently omitted.
+    allowed = entry.get("platforms")
+    if allowed and not any(sys.platform.startswith(p) for p in allowed):
+        return dict(entry, status="n/a:" + "/".join(allowed), passed=0, failed=0,
+                    skipped=1, seconds=0.0, output="")
     started = time.time()
     try:
         proc = subprocess.run([python_exe, path, *extra_args], cwd=PROJECT_ROOT,
@@ -241,6 +263,9 @@ def main():
                         help="unit + integration + hardware (never manual)")
     parser.add_argument("--only", default="",
                         help="run only suites whose filename or feature contains this")
+    parser.add_argument("--python", metavar="PATH", default=None,
+                        help="run the suites under this interpreter instead of .venv "
+                             "(the Python-version matrix: one venv per version)")
     parser.add_argument("--list", action="store_true", help="print the inventory and exit")
     parser.add_argument("--markdown", action="store_true",
                         help="with --list, print the regression matrix as a Markdown table")
@@ -267,7 +292,11 @@ def main():
         print("Nothing selected.")
         return 1
 
-    python_exe = interpreter()
+    python_exe = args.python or interpreter()
+    if args.python:
+        # Tells the one suite that asserts "I am the project .venv" that this run is a
+        # deliberate matrix run on another interpreter.
+        os.environ["KAYRA_TEST_INTERPRETER"] = args.python
     print(f"Interpreter : {python_exe}")
     print(f"Categories  : {', '.join(sorted(categories))}")
     print(f"Suites      : {len(selected)}")
@@ -284,7 +313,8 @@ def main():
 
     totals = print_table(results)
 
-    broken = [r for r in results if r["status"] not in ("ok",)]
+    broken = [r for r in results
+              if r["status"] != "ok" and not r["status"].startswith("n/a")]
     if broken:
         print("\nSuites that did not exit cleanly:")
         for row in broken:

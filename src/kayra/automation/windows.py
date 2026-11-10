@@ -116,6 +116,19 @@ from kayra.automation.policy import (Action, ActionResult, Status, Risk, classif
                                 is_protected_path, read_confirmation_reply)
 from kayra.automation import targets as targets
 
+# The platform-neutral half of the pipeline: the normalizer, the planner, the timer service,
+# the filesystem handlers and the safe terminal. They lived in this file until the Linux port,
+# and are re-exported here under their original names so every caller and test keeps working.
+from kayra.automation.common import (
+    TimerService, parse_duration, _humanize_duration, _writable_base, CreateFolder,
+    CreateFile, RenamePath, CopyPath, MovePath, DeletePath, SearchFiles, RunShellCommand,
+    _env_int, SCREENSHOT_KEEP, SHELL_TIMEOUT_SECONDS, prune_screenshots, _EXACT_TOKENS,
+    _PREFIX_TOKENS,
+    HOTKEY_MAP, _power_refusal_sentence, _assistant_alias, ASSISTANT_LABEL, _SYSTEM_VERBS,
+    normalize_command, _build_action, _CONCURRENT_SAFE, plan_actions, _CONFIRM_PROMPTS,
+    _confirm_prompt)
+from kayra.automation import common as _common
+
 # Runtime state is optional here: the automation layer works standalone (the diagnostic block
 # at the bottom runs without main.py), but when the assistant is live it must publish
 # AUTOMATING so the proactive agent knows not to speak.
@@ -233,7 +246,7 @@ def OpenApp(app):
     distinct ways it launched the wrong thing, both reproduced on this machine:
 
       * a STALE index entry — `youtube` was cached as a Brave PWA AppsFolder id that no longer
-        exists. `explorer shell:appsFolder\<dead id>` does not fail; it opens a plain FILE
+        exists. `explorer shell:appsFolder\\<dead id>` does not fail; it opens a plain FILE
         EXPLORER WINDOW. That is the reported bug, exactly.
       * a FUZZY hit — `github` is absent from the index, difflib matched "git gui", and Git
         GUI launched.
@@ -1057,95 +1070,9 @@ def SystemInfo(query):
 # │                     TIMER & REMINDER ENGINE                             │
 # └────────────────────────────────────────────────────────────────────────┘
 
-class TimerService:
-    """
-    One bounded, cancellable timer service for the whole process.
-
-    The old `SetTimer` started a fresh `threading.Thread` per timer that slept for the whole
-    duration. That meant: a thread per timer for up to an hour each, no way to cancel one, no
-    way to list them, and nothing that stopped them at shutdown — a two-hour timer kept a
-    thread alive and fired a PowerShell message box after the assistant had exited.
-
-    This uses `threading.Timer`, which is still a thread per pending timer but a cancellable
-    one, and adds an explicit registry with a hard cap so a stuck loop cannot create thousands.
-    `shutdown()` cancels every outstanding timer, so nothing survives the process.
-    """
-
-    MAX_ACTIVE = 16
-
-    def __init__(self):
-        try:
-            self.MAX_ACTIVE = max(1, min(128, int(
-                str(os.environ.get("AUTOMATION_MAX_TIMERS", "")).strip())))
-        except (TypeError, ValueError):
-            pass
-        self._lock = threading.RLock()
-        self._timers = {}                 # id -> {"timer", "label", "due", "seconds"}
-        self._next_id = 1
-
-    def add(self, seconds, label, on_fire=None):
-        """Arms a timer. Returns (id, error_message). `id` is None when it was refused."""
-        if seconds <= 0:
-            return None, "That duration doesn't make sense."
-        with self._lock:
-            if len(self._timers) >= self.MAX_ACTIVE:
-                return None, f"I already have {len(self._timers)} timers running."
-            timer_id = self._next_id
-            self._next_id += 1
-
-            def _fire():
-                with self._lock:
-                    self._timers.pop(timer_id, None)
-                print_success(f"Timer complete: {label}")
-                if on_fire:
-                    try:
-                        on_fire(label)
-                    except Exception:
-                        pass
-                else:
-                    _timer_toast(label)
-
-            handle = threading.Timer(seconds, _fire)
-            handle.daemon = True
-            handle.name = f"kayra-timer-{timer_id}"
-            handle.start()
-            self._timers[timer_id] = {"timer": handle, "label": label,
-                                      "due": time.time() + seconds, "seconds": seconds}
-            return timer_id, None
-
-    def cancel(self, timer_id=None):
-        """Cancels one timer, or the most recent when no id is given. Returns its label."""
-        with self._lock:
-            if not self._timers:
-                return None
-            if timer_id is None:
-                timer_id = max(self._timers)
-            entry = self._timers.pop(timer_id, None)
-        if entry is None:
-            return None
-        entry["timer"].cancel()
-        return entry["label"]
-
-    def list(self):
-        with self._lock:
-            now = time.time()
-            return [{"id": tid, "label": e["label"], "remaining": max(0.0, e["due"] - now)}
-                    for tid, e in sorted(self._timers.items())]
-
-    def shutdown(self):
-        """Cancels everything. Called from the assistant's shutdown path."""
-        with self._lock:
-            entries = list(self._timers.values())
-            self._timers.clear()
-        for entry in entries:
-            try:
-                entry["timer"].cancel()
-            except Exception:
-                pass
-        return len(entries)
 
 
-TIMERS = TimerService()
+TIMERS = TimerService(notify=lambda label: _timer_toast(label))
 
 
 def _timer_toast(label):
@@ -1162,36 +1089,6 @@ def _timer_toast(label):
         pass
 
 
-def parse_duration(text):
-    """
-    Parses '5 minutes', 'an hour and 30 minutes', '90 sec' into seconds. Returns None if it
-    cannot. Sums every unit it finds, so compound durations work.
-    """
-    if not text:
-        return None
-    lowered = str(text).lower()
-    total = 0
-    found = False
-    for value, unit in re.findall(r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
-                                  lowered):
-        amount = int(value)
-        if unit.startswith(("hour", "hr", "h")):
-            total += amount * 3600
-        elif unit.startswith(("min", "m")):
-            total += amount * 60
-        else:
-            total += amount
-        found = True
-    if not found:
-        # "an hour", "half an hour"
-        if "half an hour" in lowered or "half hour" in lowered:
-            return 1800
-        if re.search(r"\ban hour\b", lowered):
-            return 3600
-        if re.search(r"\ba minute\b", lowered):
-            return 60
-        return None
-    return total or None
 
 
 def SetTimer(command):
@@ -1212,16 +1109,6 @@ def SetTimer(command):
     return True
 
 
-def _humanize_duration(seconds):
-    seconds = int(seconds)
-    if seconds >= 3600:
-        hours, rest = divmod(seconds, 3600)
-        minutes = rest // 60
-        return f"{hours} hour{'s' if hours != 1 else ''}" + (f" {minutes} minutes" if minutes else "")
-    if seconds >= 60:
-        minutes, rest = divmod(seconds, 60)
-        return f"{minutes} minute{'s' if minutes != 1 else ''}" + (f" {rest} seconds" if rest else "")
-    return f"{seconds} second{'s' if seconds != 1 else ''}"
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1493,261 +1380,28 @@ def OpenPath(target, kind="any"):
         return ActionResult.failure(f"I couldn't open {target}.", error=str(e))
 
 
-def _writable_base(name):
-    """
-    Resolves the parent directory for a new file/folder.
-
-    A bare name means the Desktop — that is what "make a folder called notes" means to a
-    person. An explicit path is honoured as given.
-    """
-    raw = str(name).strip().strip('"')
-    if os.path.isabs(raw) or "\\" in raw or "/" in raw:
-        expanded = os.path.expandvars(os.path.expanduser(raw))
-        return os.path.dirname(expanded) or os.getcwd(), os.path.basename(expanded)
-    home = os.path.expanduser("~")
-    desktop = next((p for p in (os.path.join(home, "OneDrive", "Desktop"),
-                                os.path.join(home, "Desktop")) if os.path.isdir(p)), home)
-    return desktop, raw
 
 
-def CreateFolder(name):
-    parent, leaf = _writable_base(name)
-    if not leaf:
-        return ActionResult.failure("What should I call it?")
-    path = os.path.join(parent, leaf)
-    try:
-        if os.path.exists(path):
-            return ActionResult.failure(f"{leaf} already exists.")
-        os.makedirs(path)
-        return (ActionResult.success(f"Created {leaf}.", path=path) if os.path.isdir(path)
-                else ActionResult.failure(f"I couldn't create {leaf}."))
-    except Exception as e:
-        return ActionResult.failure(f"I couldn't create {leaf}.", error=str(e))
 
 
-def CreateFile(name, content=""):
-    parent, leaf = _writable_base(name)
-    if not leaf:
-        return ActionResult.failure("What should I call it?")
-    path = os.path.join(parent, leaf)
-    try:
-        if os.path.exists(path):
-            return ActionResult.failure(f"{leaf} already exists.")
-        os.makedirs(parent, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(content or "")
-        return (ActionResult.success(f"Created {leaf}.", path=path) if os.path.isfile(path)
-                else ActionResult.failure(f"I couldn't create {leaf}."))
-    except Exception as e:
-        return ActionResult.failure(f"I couldn't create {leaf}.", error=str(e))
 
 
-def RenamePath(source, new_name):
-    resolution = targets.resolve_path(source)
-    if not resolution.ok:
-        return ActionResult.not_found(f"I couldn't find {source}.")
-    path = resolution.target
-    destination = os.path.join(os.path.dirname(path), str(new_name).strip())
-    try:
-        if os.path.exists(destination):
-            return ActionResult.failure("Something with that name already exists.")
-        os.rename(path, destination)
-        return (ActionResult.success("Renamed.", path=destination)
-                if os.path.exists(destination) else ActionResult.failure("The rename failed."))
-    except Exception as e:
-        return ActionResult.failure("The rename failed.", error=str(e))
 
 
-def CopyPath(source, destination):
-    resolution = targets.resolve_path(source)
-    if not resolution.ok:
-        return ActionResult.not_found(f"I couldn't find {source}.")
-    src = resolution.target
-    dst_resolution = targets.resolve_path(destination, kind="folder")
-    dst = (dst_resolution.target if dst_resolution.ok
-           else os.path.expandvars(os.path.expanduser(str(destination))))
-    try:
-        final = os.path.join(dst, os.path.basename(src)) if os.path.isdir(dst) else dst
-        if os.path.isdir(src):
-            shutil.copytree(src, final)
-        else:
-            os.makedirs(os.path.dirname(final), exist_ok=True)
-            shutil.copy2(src, final)
-        return (ActionResult.success("Copied.", path=final) if os.path.exists(final)
-                else ActionResult.failure("The copy failed."))
-    except Exception as e:
-        return ActionResult.failure("The copy failed.", error=str(e))
 
 
-def MovePath(source, destination):
-    resolution = targets.resolve_path(source)
-    if not resolution.ok:
-        return ActionResult.not_found(f"I couldn't find {source}.")
-    src = resolution.target
-    dst_resolution = targets.resolve_path(destination, kind="folder")
-    dst = (dst_resolution.target if dst_resolution.ok
-           else os.path.expandvars(os.path.expanduser(str(destination))))
-    try:
-        final = os.path.join(dst, os.path.basename(src)) if os.path.isdir(dst) else dst
-        if os.path.exists(final):
-            return ActionResult.failure("Something with that name is already there.")
-        shutil.move(src, final)
-        return (ActionResult.success("Moved.", path=final) if os.path.exists(final)
-                else ActionResult.failure("The move failed."))
-    except Exception as e:
-        return ActionResult.failure("The move failed.", error=str(e))
 
 
-def DeletePath(target):
-    """
-    Deletes a file or folder. CONFIRM-gated by policy — never reached without approval.
-
-    Sends to the Recycle Bin when send2trash is available, because a recoverable delete is
-    strictly better and costs nothing. Refuses a protected system location regardless.
-    """
-    resolution = targets.resolve_path(target)
-    if not resolution.ok:
-        return ActionResult.not_found(f"I couldn't find {target}.")
-    path = resolution.target
-
-    if is_protected_path(path):
-        return ActionResult.blocked("That's a protected system location. I won't delete it.")
-
-    try:
-        try:
-            from send2trash import send2trash
-            send2trash(path)
-            recycled = True
-        except Exception:
-            recycled = False
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
-        if os.path.exists(path):
-            return ActionResult.failure("I couldn't delete it.")
-        return ActionResult.success(
-            "Moved to the Recycle Bin." if recycled else "Deleted.", path=path)
-    except Exception as e:
-        return ActionResult.failure("I couldn't delete it.", error=str(e))
 
 
-def SearchFiles(query, root=None, limit=20):
-    """
-    Finds files by name under one folder.
-
-    Bounded on purpose: one root, `os.scandir`, a depth cap and a result cap. A full-disk walk
-    is unbounded work that would block a spoken command for minutes.
-    """
-    base = root or os.path.join(os.path.expanduser("~"))
-    needle = str(query).strip().lower()
-    if not needle:
-        return ActionResult.failure("Search for what?")
-    matches = []
-    max_depth = 4
-
-    def _walk(directory, depth):
-        if depth > max_depth or len(matches) >= limit:
-            return
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if len(matches) >= limit:
-                        return
-                    if entry.name.startswith((".", "$")):
-                        continue
-                    if needle in entry.name.lower():
-                        matches.append(entry.path)
-                    if entry.is_dir(follow_symlinks=False):
-                        _walk(entry.path, depth + 1)
-        except (PermissionError, OSError):
-            return
-
-    _walk(base, 0)
-    if not matches:
-        return ActionResult.not_found(f"I couldn't find anything called {query}.")
-    for path in matches[:10]:
-        print_info(path)
-    noun = "match" if len(matches) == 1 else "matches"
-    return ActionResult.success(f"Found {len(matches)} {noun}.", matches=matches)
 
 
-# ── Safe terminal ─────────────────────────────────────────────────────────
-def RunShellCommand(command, timeout=None):
-    """
-    Runs a terminal command that the POLICY has already approved.
-
-    Called only after `classify_shell` returned ALLOW, or CONFIRM plus an explicit yes. The
-    command is split into an argument vector and run with `shell=False`, so the user's words
-    can never become shell syntax — no chaining, no redirection, no substitution.
-
-    This function does not decide whether the command is safe. That decision belongs to
-    `automation_policy` and is made before we get here; duplicating it would create two places
-    that can disagree.
-    """
-    try:
-        argv = shlex.split(str(command), posix=False)
-    except ValueError:
-        return ActionResult.failure("I couldn't parse that command.")
-    if not argv:
-        return ActionResult.failure("There was no command to run.")
-
-    try:
-        completed = subprocess.run(argv, capture_output=True, text=True, shell=False,
-                                   timeout=timeout if timeout is not None else SHELL_TIMEOUT_SECONDS)
-    except FileNotFoundError:
-        return ActionResult.not_found(f"I couldn't find {argv[0]}.")
-    except subprocess.TimeoutExpired:
-        return ActionResult.failure("That command took too long, so I stopped it.")
-    except Exception as e:
-        return ActionResult.failure("The command didn't run.", error=str(e))
-
-    output = (completed.stdout or completed.stderr or "").strip()
-    if output:
-        print_info(output[:2000])
-    if completed.returncode == 0:
-        return ActionResult.success("Done.", returncode=0, output_chars=len(output))
-    return ActionResult.failure(f"That finished with an error.", returncode=completed.returncode)
 
 
-# ── Screenshot retention ──────────────────────────────────────────────────
-def _env_int(name, default, minimum=1, maximum=100000):
-    try:
-        return max(minimum, min(maximum, int(str(os.environ.get(name, "")).strip())))
-    except (TypeError, ValueError):
-        return default
 
 
-SCREENSHOT_KEEP = _env_int("AUTOMATION_SCREENSHOT_KEEP", 30, 1, 1000)
-# Bounded so an approved-but-hung command can never block the assistant indefinitely.
-SHELL_TIMEOUT_SECONDS = _env_int("AUTOMATION_SHELL_TIMEOUT_SECONDS", 20, 1, 600)
 
 
-def prune_screenshots(folder=None, keep=SCREENSHOT_KEEP):
-    """
-    Keeps the newest `keep` Kayra screenshots and deletes the rest.
-
-    Retention policy, as required of every collection Kayra writes: a screenshot key pressed
-    a few times a day is an unbounded pile of PNGs on the user's Desktop within a year. Only
-    files matching Kayra's own naming prefix are ever touched.
-    """
-    try:
-        folder = folder or _screenshot_folder()
-        entries = [os.path.join(folder, f) for f in os.listdir(folder)
-                   if f.startswith("KAYRA_Screenshot_") and f.endswith(".png")]
-        if len(entries) <= keep:
-            return 0
-        entries.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        removed = 0
-        for path in entries[keep:]:
-            try:
-                os.remove(path)
-                removed += 1
-            except OSError:
-                continue
-        return removed
-    except Exception:
-        return 0
 
 
 def _screenshot_folder():
@@ -1769,414 +1423,27 @@ def _screenshot_folder():
 # Pure string/dict work: no window enumeration, no process lookup, no model call. Measured at
 # a few microseconds, which is what lets it sit on the hot path of every command.
 
-# Exact-match tokens -> (domain, action). Checked BEFORE any prefix rule, which is what keeps
-# "close window" and "close tab" from being swallowed by the generic "close " prefix. The old
-# router relied on if/elif ordering for this; a dict cannot be reordered by accident.
-_EXACT_TOKENS = {
-    # window
-    "close window": ("window", "close"), "minimize": ("window", "minimize"),
-    # The BROAD close, and the only one. It exists as its own token precisely so that the
-    # ordinary "close X" can never widen into it by accident: nothing infers this, the user
-    # has to say it, and the policy layer confirms it.
-    "close everything": ("window", "close_all"),
-    "close all windows": ("window", "close_all"),
-    "close all": ("window", "close_all"),
-    "minimize all": ("window", "minimize_all"), "show desktop": ("window", "minimize_all"),
-    "maximize": ("window", "maximize"), "restore": ("window", "restore"),
-    "snap left": ("window", "snap_left"), "snap right": ("window", "snap_right"),
-    "switch window": ("window", "alt_tab"), "alt tab": ("window", "alt_tab"),
-    "task view": ("window", "task_view"), "action center": ("window", "action_center"),
-    "notification": ("window", "action_center"), "emoji": ("window", "emoji"),
-    # browser
-    "close tab": ("browser", "close_tab"), "new tab": ("browser", "new_tab"),
-    "next tab": ("browser", "next_tab"), "previous tab": ("browser", "previous_tab"),
-    "reopen tab": ("browser", "reopen_tab"), "duplicate tab": ("browser", "duplicate_tab"),
-    "go back": ("browser", "back"), "go forward": ("browser", "forward"),
-    "refresh": ("browser", "refresh"), "reload": ("browser", "refresh"),
-    # media
-    "pause": ("media", "pause"), "resume": ("media", "resume"),
-    "next track": ("media", "next"), "previous track": ("media", "previous"),
-    "stop media": ("media", "stop"), "play pause": ("media", "pause"),
-    # clipboard
-    "copy": ("clipboard", "copy"), "copy that": ("clipboard", "copy"),
-    "paste": ("clipboard", "paste"), "paste that": ("clipboard", "paste"),
-    "cut": ("clipboard", "cut"), "clear clipboard": ("clipboard", "clear"),
-    "read clipboard": ("clipboard", "read"),
-    # information
-    "battery": ("info", "battery"), "cpu": ("info", "cpu"), "ram": ("info", "ram"),
-    "memory": ("info", "ram"), "disk": ("info", "disk"), "storage": ("info", "disk"),
-    "uptime": ("info", "uptime"), "ip address": ("info", "network"),
-    # screen
-    "screenshot": ("screen", "screenshot"), "take screenshot": ("screen", "screenshot"),
-    # keyboard shortcuts
-    "undo": ("keyboard", "hotkey"), "redo": ("keyboard", "hotkey"),
-    "select all": ("keyboard", "hotkey"), "save": ("keyboard", "hotkey"),
-    "save file": ("keyboard", "hotkey"), "find": ("keyboard", "hotkey"),
-    "search": ("keyboard", "hotkey"), "print": ("keyboard", "hotkey"),
-    "fullscreen": ("keyboard", "hotkey"), "zoom in": ("keyboard", "hotkey"),
-    "zoom out": ("keyboard", "hotkey"), "reset zoom": ("keyboard", "hotkey"),
-    "task manager": ("keyboard", "hotkey"), "run dialog": ("keyboard", "hotkey"),
-    "enter": ("keyboard", "hotkey"), "escape": ("keyboard", "hotkey"),
-    # mouse
-    "click": ("mouse", "click"), "mouse click": ("mouse", "click"),
-    "double click": ("mouse", "double_click"), "right click": ("mouse", "right_click"),
-    "scroll up": ("mouse", "scroll_up"), "scroll down": ("mouse", "scroll_down"),
-    # timers
-    "cancel timer": ("timer", "cancel"), "list timers": ("timer", "list"),
-    # wifi
-    "wifi on": ("system", "wifi_on"), "wifi off": ("system", "wifi_off"),
-}
-
-# Prefix tokens -> (domain, action). Ordered longest-first at build time so a longer literal
-# can never be shadowed by a shorter one that happens to be its prefix.
-_PREFIX_TOKENS = [
-    ("open folder ", ("file", "open_folder")),
-    ("open file ", ("file", "open_file")),
-    ("create folder ", ("file", "create_folder")),
-    ("create file ", ("file", "create_file")),
-    ("delete file ", ("file", "delete")),
-    ("delete folder ", ("file", "delete")),
-    ("rename ", ("file", "rename")),
-    ("find file ", ("file", "search")),
-    ("search files ", ("file", "search")),
-    ("restart app ", ("app", "restart")),
-    ("focus ", ("window", "focus")),
-    ("switch to ", ("window", "focus")),
-    ("google search ", ("browser", "search_web")),
-    ("web search ", ("browser", "search_web")),
-    ("youtube search ", ("browser", "search_youtube")),
-    ("copy text ", ("clipboard", "set")),
-    ("terminal ", ("shell", "run")),
-    ("run command ", ("shell", "run")),
-    ("set timer ", ("timer", "add")),
-    ("timer ", ("timer", "add")),
-    ("reminder ", ("timer", "reminder")),
-    ("remind ", ("timer", "reminder")),
-    ("content ", ("app", "content")),
-    ("system ", ("system", "raw")),
-    ("write ", ("keyboard", "type")),
-    ("type ", ("keyboard", "type")),
-    ("close all ", ("app", "close_all")),
-    ("close ", ("app", "close")),
-    ("open ", ("app", "open")),
-    ("play ", ("media", "play")),
-]
-_PREFIX_TOKENS.sort(key=lambda item: len(item[0]), reverse=True)
-
-# Hotkey names -> key combination. Single source of truth, shared with HotkeyShortcut.
-HOTKEY_MAP = {
-    "undo": "ctrl+z", "redo": "ctrl+y", "select all": "ctrl+a", "save": "ctrl+s",
-    "save file": "ctrl+s", "find": "ctrl+f", "search": "ctrl+f", "cut": "ctrl+x",
-    "copy": "ctrl+c", "paste": "ctrl+v", "new tab": "ctrl+t", "close tab": "ctrl+w",
-    "refresh": "ctrl+r", "reload": "ctrl+r", "fullscreen": "f11", "print": "ctrl+p",
-    "zoom in": "ctrl+plus", "zoom out": "ctrl+minus", "reset zoom": "ctrl+0",
-    "task manager": "ctrl+shift+escape", "run dialog": "win+r",
-    "enter": "enter", "escape": "esc", "tab": "tab",
-}
-
-# "system X" sub-verbs. Shutdown/restart/sign-out become their own actions so the policy layer
-# can see them; previously they were a substring test inside ExecuteCommand and executed
-# instantly with no confirmation whatsoever.
-def _power_refusal_sentence(action):
-    """
-    What the user hears when a power request could not be targeted. "" for anything else.
-
-    Two situations, two different sentences, because they are different mistakes:
-
-      AMBIGUOUS — nothing in the sentence named a target. Ask which, naming both, so the
-                  answer is a choice rather than a yes/no about the wrong thing.
-      KAYRA     — the sentence named Kayra and reached the automation layer anyway, which
-                  means the transcript missed the local control vocabulary. Say what was
-                  understood and how to phrase it, rather than acting on a near-miss.
-    """
-    if action.domain != "system":
-        return ""
-    verb = action.parameters.get("verb") or action.action
-    word = {"shutdown": "shut down", "restart": "restart",
-            "sign_out": "sign out of", "sleep": "put to sleep"}.get(verb, "power off")
-
-    if action.action == "power_ambiguous":
-        return (f"Do you mean {word} {ASSISTANT_LABEL}, or {word} the computer? "
-                "They are different things, so please say which.")
-    if action.action == "power_kayra":
-        return (f"That sounded like you meant {ASSISTANT_LABEL} rather than the computer, "
-                f"and I did not hear it clearly enough to be sure. "
-                f"Say \"{word} {ASSISTANT_LABEL}\" and I will confirm it with you.")
-    return ""
 
 
-def _assistant_alias():
-    """
-    The name the user calls the assistant, lower-cased. "kayra" when it cannot be read.
-
-    Read lazily and defensively: this module must import without `.env`, and a configuration
-    failure must never widen the power-target gate.
-    """
-    try:
-        from kayra.core.config import assistant_name
-        return (assistant_name() or "kayra").strip().lower()
-    except Exception:
-        return "kayra"
 
 
-ASSISTANT_LABEL = "Kayra"
 
 
-# ORDER MATTERS: the first needle found in the payload wins, so the most specific phrasings
-# come first. "turn off screen" must beat "turn off the computer" for a payload containing
-# both, and neither may be beaten by a bare verb.
-#
-# These find the VERB. They do NOT decide the TARGET — `resolve_power_target` does, and for
-# everything in `policy.POWER_VERBS` the normalizer refuses to build an action without an
-# explicit one. See the power-target gate in `normalize_command`.
-_SYSTEM_VERBS = (
-    # Explicit computer-power phrasings, first so a bare verb cannot shadow them.
-    # TURNING THE DISPLAY OFF IS NOT SUSPENDING THE MACHINE, and mapping it to "sleep" was a
-    # pre-existing mislabel: the sleep branch calls `SetSuspendState`, so "turn off screen"
-    # suspended the whole session. It is its own verb now, it blanks the monitor, and it is
-    # therefore NOT a power action and needs no target — nothing is lost by getting it wrong.
-    ("turn off screen", "screen_off"), ("turn off the screen", "screen_off"),
-    ("turn off the display", "screen_off"), ("blank the screen", "screen_off"),
-    ("turn off the computer", "shutdown"), ("turn off my computer", "shutdown"),
-    ("turn off the pc", "shutdown"), ("turn off my pc", "shutdown"),
-    ("turn off the laptop", "shutdown"), ("turn off my laptop", "shutdown"),
-    ("power down the computer", "shutdown"), ("power down my computer", "shutdown"),
-    ("sign out", "sign_out"), ("log out", "sign_out"), ("logout", "sign_out"),
-    ("shutdown", "shutdown"), ("shut down", "shutdown"), ("power off", "shutdown"),
-    ("restart", "restart"), ("reboot", "restart"),
-    ("lock", "lock"),
-    ("sleep", "sleep"),
-    ("mute", "volume"), ("volume", "volume"), ("brightness", "brightness"),
-)
 
 
-def normalize_command(command, context=None):
-    """
-    DMM token -> structured `Action`.
-
-    Contextual references ("it", "this", "that") are resolved HERE, against the bounded
-    automation context, and only when the context actually holds a fresh referent. When it
-    does not, the action keeps the pronoun and carries a low confidence, which the policy
-    layer turns into a confirmation rather than a guess.
-    """
-    raw = (command or "").strip()
-    lowered = raw.lower()
-    if not lowered:
-        return None
-
-    # 1. Exact tokens first — this is what prevents prefix shadowing structurally.
-    if lowered in _EXACT_TOKENS:
-        domain, action = _EXACT_TOKENS[lowered]
-        parameters = {}
-        if domain == "keyboard" and action == "hotkey":
-            parameters["keys"] = HOTKEY_MAP.get(lowered, lowered)
-            parameters["name"] = lowered
-        return Action(domain, action, target="current", parameters=parameters, raw=raw)
-
-    # 2. Prefix tokens, longest first.
-    for prefix, (domain, action) in _PREFIX_TOKENS:
-        if lowered.startswith(prefix):
-            payload = raw[len(prefix):].strip()
-            return _build_action(domain, action, payload, raw, context)
-
-    # 3. Keyword fallbacks for phrasings the DMM emits without a canonical prefix.
-    for keyword, (domain, action) in (
-            ("screenshot", ("screen", "screenshot")),
-            ("screen capture", ("screen", "screenshot")),
-            ("wifi", ("system", "wifi_toggle")),
-            ("wi-fi", ("system", "wifi_toggle"))):
-        if keyword in lowered:
-            return Action(domain, action, target=lowered, raw=raw)
-
-    if lowered in HOTKEY_MAP:
-        return Action("keyboard", "hotkey", target="current",
-                      parameters={"keys": HOTKEY_MAP[lowered], "name": lowered}, raw=raw)
-
-    return None
 
 
-def _build_action(domain, action, payload, raw, context):
-    """Builds the action for a prefix token, resolving pronouns and sub-verbs."""
-    parameters = {}
-    confidence = 1.0
-    target = payload
 
-    # ── Contextual reference resolution ──
-    if payload and payload.lower().strip(" .?!") in targets.CURRENT_TARGET_WORDS:
-        # "close it" is UNTYPED: the thing the user opened a moment ago might have been a
-        # site, an app or a file, and the untyped resolver returns whichever was established
-        # most recently. Only the file domain pins a kind, because "delete it" reaching for a
-        # browser tab would be nonsense.
-        kind = "file" if domain == "file" else None
-        referent = context.resolve_referent(kind) if context else None
-        if referent:
-            target = referent
-            parameters["resolved_from"] = payload
-        else:
-            # No fresh referent. Keep the pronoun and drop confidence — the policy layer will
-            # ask rather than let a `close` act on a guess.
-            confidence = 0.3
 
-    if domain == "keyboard" and action == "type":
-        return Action(domain, action, target="current",
-                      parameters={"text": payload}, raw=raw)
 
-    if domain == "shell":
-        return Action("shell", "run", target=payload,
-                      parameters={"command": payload}, raw=raw)
-
-    if domain == "timer":
-        seconds = parse_duration(payload)
-        return Action("timer", action, target=payload,
-                      parameters={"seconds": seconds, "label": payload},
-                      confidence=1.0 if seconds else 0.4, raw=raw)
-
-    if domain == "system" and action == "raw":
-        lowered_payload = (payload or "").lower()
-        for needle, verb in _SYSTEM_VERBS:
-            if needle not in lowered_payload:
-                continue
-
-            # ── THE POWER-TARGET GATE ──
-            # `needle in payload` is a SUBSTRING test, and for the power verbs a substring
-            # test was the whole of the safety logic. "system shutdown the engine car" — a
-            # malformed transcript of a request about KAYRA's engine — matched "shutdown" and
-            # became `Action("system", "shutdown")`, one reflexive "yes" away from ending the
-            # user's Windows session.
-            #
-            # The substring match is kept, because it is a fine way to find the VERB. What it
-            # may no longer do is decide the TARGET. Nothing infers a computer shutdown any
-            # more; the user has to name one.
-            if verb in policy.POWER_VERBS:
-                target_kind = policy.resolve_power_target(payload, _assistant_alias())
-                if target_kind == policy.TARGET_KAYRA:
-                    # A lifecycle request that reached the automation layer only because the
-                    # transcript missed the local control vocabulary. Hand it back; never
-                    # touch the machine for it.
-                    return Action("system", "power_kayra", target=payload,
-                                  parameters={"command": payload, "verb": verb,
-                                              "power_target": target_kind},
-                                  confidence=0.9, raw=raw)
-                if target_kind != policy.TARGET_COMPUTER:
-                    return Action("system", "power_ambiguous", target=payload,
-                                  parameters={"command": payload, "verb": verb,
-                                              "power_target": target_kind},
-                                  confidence=0.2, raw=raw)
-                return Action("system", verb, target=payload,
-                              parameters={"command": payload,
-                                          "power_target": target_kind}, raw=raw)
-
-            return Action("system", verb, target=payload,
-                          parameters={"command": payload}, raw=raw)
-        # NO VERB MATCHED, but the payload may still be a power request phrased in a way the
-        # needle table does not carry — "turn off the engine", "power down". A bare "turn off"
-        # is deliberately NOT a needle above, because "turn off wifi" and "turn off the
-        # camera" are ordinary requests that must keep working; it becomes a power verb only
-        # when the sentence also NAMES a target, which is the same evidence the gate wants.
-        if any(word in lowered_payload for word in ("turn off", "power down", "turn it off")):
-            target_kind = policy.resolve_power_target(payload, _assistant_alias())
-            if target_kind == policy.TARGET_KAYRA:
-                return Action("system", "power_kayra", target=payload,
-                              parameters={"command": payload, "verb": "shutdown",
-                                          "power_target": target_kind},
-                              confidence=0.9, raw=raw)
-            if target_kind == policy.TARGET_COMPUTER:
-                return Action("system", "shutdown", target=payload,
-                              parameters={"command": payload,
-                                          "power_target": target_kind}, raw=raw)
-
-        return Action("system", "raw", target=payload,
-                      parameters={"command": payload}, confidence=0.6, raw=raw)
-
-    if domain == "app" and action == "open":
-        # TYPE THE TARGET HERE, not three layers down. "open X" is an application launch only
-        # when X is an application; when X is an address or a web service it is a browser
-        # navigation, and the two must not share an execution path. Two dictionary lookups,
-        # measured in microseconds — there is no reason to defer this decision.
-        if targets.is_explicit_url(target):
-            return Action("browser", "open_url", target=target,
-                          parameters={"url": targets.normalize_url(target)}, raw=raw)
-        if not targets.canonical_app(target):
-            url = targets.website_url(target)
-            if url:
-                return Action("browser", "open_url", target=target,
-                              parameters={"url": url, "site": targets.canonical_website(target)},
-                              confidence=confidence, raw=raw)
-
-    if domain == "app" and action == "close_all":
-        # "close all chrome windows" -> the application is "chrome". The trailing noun is
-        # grammar, not part of the target.
-        target = re.sub(r"\s+(windows|window|tabs|tab|instances)$", "", target or "",
-                        flags=re.I).strip()
-        if not target or target in ("windows", "window"):
-            return Action("window", "close_all", target="all", raw=raw)
-        return Action("app", "close_all", target=target, raw=raw)
-
-    if domain == "app" and action == "close":
-        # "close this"/"close it" with no referent means the foreground WINDOW, which is both
-        # the safest reading and what a person actually means standing at their desk.
-        if confidence < 1.0 and (payload or "").lower().strip(" .?!") in targets.CURRENT_TARGET_WORDS:
-            return Action("window", "close", target="current", raw=raw)
-
-    if domain == "file" and action == "open_file":
-        # "open file explorer" is an APPLICATION, not a file called "explorer". The prefix
-        # table is longest-first, so `open file ` legitimately wins the literal match — what
-        # disambiguates is the target: a curated application name with no file extension was
-        # never a filename. Without this, "open file explorer" reached the filesystem
-        # resolver, missed, and reported that it could not find a file.
-        if targets.canonical_app(target) and not os.path.splitext(str(target))[1]:
-            return Action("app", "open", target=target, raw=raw)
-
-    if domain == "file" and action in ("create_file", "create_folder", "rename", "delete"):
-        if action == "rename" and " to " in payload.lower():
-            source, _, new_name = payload.rpartition(" to ")
-            return Action(domain, action, target=source.strip(),
-                          parameters={"new_name": new_name.strip()}, raw=raw)
-        if action == "delete":
-            parameters["bulk"] = bool(re.search(r"[*?]|\ball\b|\beverything\b", payload.lower()))
-
-    return Action(domain, action, target=target, parameters=parameters,
-                  confidence=confidence, raw=raw)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                          ACTION PLANNER                                │
 # └────────────────────────────────────────────────────────────────────────┘
 
-# Domains that only READ. Two of these can genuinely run at the same time because neither
-# touches the screen, the keyboard, or the foreground window.
-_CONCURRENT_SAFE = frozenset({"info"})
 
 
-def plan_actions(actions):
-    """
-    Orders actions into execution groups.
-
-    Every group is executed in order; the actions inside one group run concurrently.
-
-    The rule is deliberately conservative: only pure reads share a group. Everything else
-    contends for exactly one resource — the foreground window and the keyboard focus — and
-    running two of those at once is a race with a visible, wrong outcome.
-
-    This is a correctness fix, not a tuning choice. The old router built every command as an
-    `asyncio.to_thread` task and fired them all through one `asyncio.gather`, so
-    "open chrome and maximize the window" raced the maximize against the launch, and
-    "open chrome, open youtube" sent both keystroke sequences into whatever had focus at that
-    instant.
-    """
-    groups = []
-    batch = []
-    for action in actions:
-        if action.domain in _CONCURRENT_SAFE:
-            batch.append(action)
-            continue
-        if batch:
-            groups.append(batch)
-            batch = []
-        groups.append([action])
-    if batch:
-        groups.append(batch)
-    return groups
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -2186,29 +1453,8 @@ def plan_actions(actions):
 CONFIRMATIONS = ConfirmationManager()
 CONTEXT = AutomationContext()
 
-_CONFIRM_PROMPTS = {
-    # These are reached ONLY once `resolve_power_target` has returned COMPUTER, so the
-    # wording can be specific about the target. It has to be: a prompt that says "your
-    # computer" about a request that never named one is how a reflexive "yes" ends a session.
-    "system.shutdown": "This will shut down your COMPUTER, not Kayra. Should I go ahead?",
-    "system.restart": "This will restart your COMPUTER, not Kayra. Should I go ahead?",
-    "system.sign_out": "This will sign you out. Should I go ahead?",
-    "system.sleep": "This will put the computer to sleep. Should I go ahead?",
-    "system.wifi_off": "This will turn off Wi-Fi. Should I go ahead?",
-    "file.delete": "That will delete it. Should I go ahead?",
-    "app.kill": "That will force-close it and you may lose unsaved work. Should I go ahead?",
-    "window.close_all": "That will close every open window. Should I go ahead?",
-}
 
 
-def _confirm_prompt(action, reason):
-    prompt = _CONFIRM_PROMPTS.get(action.key)
-    if prompt:
-        return prompt
-    if action.domain == "shell":
-        return f"I can run that, but {reason}. Should I?"
-    what = action.target or action.action.replace("_", " ")
-    return f"Just to check — you want me to {action.action.replace('_', ' ')} {what}?"
 
 
 def execute_action(action, skip_policy=False):

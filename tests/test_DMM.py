@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(project_root, "src"))
 
 from kayra.intelligence.llm_engine import CentralizedLLMEngine
 from kayra.input.speech_to_text import SpeechToTextEngine, format_query, translate_query
-from kayra.utils import print_system, print_info, print_success, print_error, console
+from kayra.utils import print_system, print_info, print_success, console
 
 def get_hybrid_input(stt_engine):
     """

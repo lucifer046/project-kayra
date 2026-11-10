@@ -39,7 +39,7 @@ class StageTimer:
         with self._lock:
             self._marks.append((name, elapsed))
         if not quiet:
-            safe_print(f"[dim]\[TIMING][/dim] [text]{name}[/text] [dim]+{elapsed:.2f}s[/dim]")
+            safe_print(f"[dim]\\[TIMING][/dim] [text]{name}[/text] [dim]+{elapsed:.2f}s[/dim]")
         return elapsed
 
     def elapsed(self) -> float:

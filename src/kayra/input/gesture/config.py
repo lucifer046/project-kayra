@@ -129,7 +129,7 @@ class GestureConfig:
     target_fps: int = 30
     preview_fps: int = 15
     mirror: bool = True
-    # AUTO | MSMF | DSHOW. Which OpenCV capture backend to ask for.
+    # AUTO | MSMF | DSHOW (Windows) | V4L2 | GSTREAMER (Linux). Which OpenCV capture backend.
     #
     # AUTO (`CAP_ANY`) is the default because it was MEASURED to be the best here, and because
     # capture-backend behaviour is machine-specific enough that hardcoding one is a liability.

@@ -274,9 +274,10 @@ def prefers_reduced_motion():
     True when the platform asks for reduced motion.
 
     Qt has no cross-platform accessor for this, so the answer is read from the two places
-    that DO carry it on Windows: the `KAYRA_REDUCED_MOTION` override (which is also how the
+    that DO carry it: the `KAYRA_REDUCED_MOTION` override (which is also how the
     test suite asserts the behaviour without touching the machine's settings), and the
-    system's own animation preference through `SystemParametersInfoW`.
+    platform's own animation preference (`kayra.platforms`: SystemParametersInfoW on
+    Windows, Hyprland's `animations:enabled` on Omarchy).
 
     Anything unreadable returns False — a machine that cannot be asked has not asked for
     reduced motion, and defaulting to "off" would silently strip the design from every user
@@ -290,13 +291,6 @@ def prefers_reduced_motion():
     if override in ("0", "false", "no", "off"):
         return False
 
-    try:
-        import ctypes
-
-        SPI_GETCLIENTAREAANIMATION = 0x1042
-        enabled = ctypes.c_int(1)
-        ok = ctypes.windll.user32.SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(enabled), 0)
-        return bool(ok) and enabled.value == 0
-    except Exception:
-        return False
+    # Windows' "Show animations" setting, or Hyprland's `animations:enabled` on Omarchy.
+    from kayra import platforms
+    return bool(platforms.prefers_reduced_motion())

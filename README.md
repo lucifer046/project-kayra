@@ -1,6 +1,6 @@
 # Kayra - Desktop Assistant
 
-Kayra is a Jarvis-inspired desktop assistant for Windows. You speak or type; it works out what
+Kayra is a personal desktop assistant for Windows and Linux. You speak or type; it works out what
 you meant, and then either answers you, searches the live web, writes a research report, or
 takes hold of your machine and does the thing.
 
@@ -103,15 +103,39 @@ a local LLM server and it never touches the network.
 
 |                   |                                                                                                    |
 | ----------------- | -------------------------------------------------------------------------------------------------- |
-| **OS**      | Windows 10/11. Conversation and speech work elsewhere;**desktop automation is Windows-only** |
-| **Python**  | 3.10+ (3.11 is what this is developed and verified against; 3.12 works but is unverified)          |
-| **Browser** | Chrome**or** Edge. Edge ships with Windows 11, so you probably already qualify               |
+| **OS**      | Windows 10/11, or Linux x86_64 (Omarchy/Arch first — see [Linux and Omarchy](#linux-and-omarchy)). Desktop automation on both (Linux via Hyprland) |
+| **Python**  | 3.10 – 3.14 (3.11 recommended; 3.14 verified on Omarchy). 3.15 is not supported yet |
+| **Browser** | Windows: Chrome **or** Edge (Edge ships with Windows 11). Linux: **Google Chrome** |
 | **Audio**   | A working output device, and a microphone for voice input                                          |
 | **Disk**    | ~2 GB for dependencies, ~120 MB for the speech model, ~1.4 GB more if you enable GPU speech        |
 | **GPU**     | Optional. NVIDIA only, and read [Speech device](#speech-device-cpu-or-gpu) before you bother       |
 
 You do **not** need the CUDA Toolkit, and you do **not** need to activate the virtual
 environment by hand.
+
+### Linux and Omarchy
+
+Kayra runs on Linux with the same two commands (`python3 setup.py`, then `python3 run.py`).
+Conversation, search, research, memory, speech in/out (CUDA included), the desktop UI,
+proactive presence and hand gestures work, and so does **desktop automation** — apps,
+windows, workspaces, keys, media, volume, brightness, Wi-Fi/Bluetooth, screenshots and power,
+through Hyprland and standard Wayland tools
+([`docs/platforms/LINUX_AUTOMATION.md`](docs/platforms/LINUX_AUTOMATION.md)). It goes further
+towards a true personal assistant: "diagnose my computer" (AI-summarized, with a report and
+offered fixes), "what's on my screen?" (local vision model), modes like "work mode", plans
+("get me ready for my presentation"), automations ("when the download finishes, shut down"),
+a morning briefing, and voice control inside your own Chrome — tabs, clicks, Gmail,
+Calendar, WhatsApp and Google Meet — through the Kayra Bridge extension
+([`docs/platforms/CHROME_BRIDGE.md`](docs/platforms/CHROME_BRIDGE.md)). On
+Omarchy: `yay -S google-chrome` for voice input (the default Chromium cannot transcribe), and
+optionally a udev rule for gesture clicks. Details:
+[`docs/platforms/LINUX.md`](docs/platforms/LINUX.md) and
+[`docs/platforms/OMARCHY.md`](docs/platforms/OMARCHY.md).
+
+Commands in this README use the Windows spelling; on Linux read `.venv\Scripts\python.exe`
+as `.venv/bin/python` and `python` as `python3`.
+
+Developers and AI agents: start at [`AGENTS.md`](AGENTS.md) and [`docs/`](docs/README.md).
 
 ---
 
@@ -828,8 +852,8 @@ Deep detail - including what was tried and rejected, and why - lives in
 
 Stated plainly. Several are deliberate trade-offs rather than defects.
 
-- **Windows only** for automation. Conversation and speech work elsewhere; window management,
-  app control and hotkeys do not.
+- **Window management on Linux needs Hyprland.** Other Linux sessions get apps, media and
+  system control but not focus/close/workspaces. macOS has no automation backend.
 - **Background browser tabs are invisible.** Windows exposes one handle per browser window and
   its title reflects only the active tab, so "close YouTube" cannot find a YouTube tab that is
   not in front. Kayra reports that rather than closing something else.

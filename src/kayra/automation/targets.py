@@ -229,53 +229,14 @@ CURRENT_TARGET_WORDS = frozenset({
 # Adding a service is one line. Keep it to services a person actually names out loud; this is
 # an alias table, not an attempt to mirror the web.
 
-WEBSITE_REGISTRY = {
-    "youtube":       {"url": "https://www.youtube.com/",
-                      "aliases": ("yt", "you tube"), "titles": ("youtube", "youtu.be")},
-    "youtube music": {"url": "https://music.youtube.com/",
-                      "aliases": ("yt music",), "titles": ("youtube music",)},
-    "google":        {"url": "https://www.google.com/",
-                      "aliases": (), "titles": ("google search",)},
-    "gmail":         {"url": "https://mail.google.com/",
-                      "aliases": ("google mail", "my mail", "my email", "email", "mail"),
-                      "titles": ("gmail", "google mail", "inbox")},
-    "github":        {"url": "https://github.com/",
-                      "aliases": ("git hub",), "titles": ("github",)},
-    "chatgpt":       {"url": "https://chatgpt.com/",
-                      "aliases": ("chat gpt", "openai", "open ai"),
-                      "titles": ("chatgpt", "chat.openai")},
-    "claude":        {"url": "https://claude.ai/",
-                      "aliases": ("claude ai",), "titles": ("claude",)},
-    "linkedin":      {"url": "https://www.linkedin.com/",
-                      "aliases": ("linked in",), "titles": ("linkedin",)},
-    "twitter":       {"url": "https://x.com/",
-                      "aliases": ("tweeter",), "titles": ("twitter", "x.com")},
-    "reddit":        {"url": "https://www.reddit.com/", "aliases": (), "titles": ("reddit",)},
-    "netflix":       {"url": "https://www.netflix.com/", "aliases": (), "titles": ("netflix",)},
-    "instagram":     {"url": "https://www.instagram.com/",
-                      "aliases": ("insta", "ig"), "titles": ("instagram",)},
-    "facebook":      {"url": "https://www.facebook.com/",
-                      "aliases": ("fb",), "titles": ("facebook",)},
-    "amazon":        {"url": "https://www.amazon.in/", "aliases": (), "titles": ("amazon",)},
-    "wikipedia":     {"url": "https://www.wikipedia.org/",
-                      "aliases": ("wiki",), "titles": ("wikipedia",)},
-    "stackoverflow": {"url": "https://stackoverflow.com/",
-                      "aliases": ("stack overflow",),
-                      "titles": ("stack overflow", "stackoverflow")},
-    "twitch":        {"url": "https://www.twitch.tv/", "aliases": (), "titles": ("twitch",)},
-    "maps":          {"url": "https://www.google.com/maps",
-                      "aliases": ("google maps",), "titles": ("google maps",)},
-    "translate":     {"url": "https://translate.google.com/",
-                      "aliases": ("google translate",), "titles": ("google translate",)},
-    "drive":         {"url": "https://drive.google.com/",
-                      "aliases": ("google drive",), "titles": ("google drive", "drive.google")},
-    "docs":          {"url": "https://docs.google.com/",
-                      "aliases": ("google docs",), "titles": ("google docs", "docs.google")},
-    "whatsapp web":  {"url": "https://web.whatsapp.com/",
-                      "aliases": ("web whatsapp",), "titles": ("whatsapp",)},
-    "spotify web":   {"url": "https://open.spotify.com/",
-                      "aliases": ("web spotify",), "titles": ("spotify",)},
-}
+# Since round 5 (2026-11-10) the table itself lives in `automation/sites.py` (~190 services,
+# with a category and a search template each). This is the same three-field view it has
+# always been, so every caller and the pinned tests read it unchanged.
+from kayra.automation.sites import SITES as _SITES  # noqa: E402
+
+WEBSITE_REGISTRY = {name: {"url": spec["url"], "aliases": spec["aliases"],
+                           "titles": spec["titles"]}
+                    for name, spec in _SITES.items()}
 
 # Backward-compatible view: canonical site -> title fragments. `looks_like_site` and
 # `site_fragments` have always read this, and `tests/test_automation.py` pins its behaviour
@@ -298,7 +259,7 @@ for _site, _spec in WEBSITE_REGISTRY.items():
 # Words stripped before a website lookup. Small and safe: "open the youtube website" is one
 # request, and mangling a real service name into a different one is the failure mode here.
 _WEB_FILLERS = {"the", "a", "an", "my", "up", "please", "website", "site", "page",
-                "just", "now"}
+                "just", "now", "web", "app", "dot", "com", "homepage", "home"}
 
 _DOMAIN_RE = re.compile(
     r"\.(com|org|net|in|io|ai|co|dev|me|xyz|gov|edu|info|app|tech|site|online|live|pro|cc|tv|gg|us|uk|eu)"
@@ -419,6 +380,14 @@ def canonical_website(name):
     filtered = " ".join(w for w in cleaned.split() if w not in _WEB_FILLERS)
     if filtered and filtered in _WEB_ALIAS_TO_CANONICAL:
         return _WEB_ALIAS_TO_CANONICAL[filtered]
+    # GRAMMAR, never spelling: "google sheet" / "google sheets", "my doc" / "docs". Only the
+    # LAST word changes number, and only by a plain "s" — "youtub" still resolves to nothing.
+    for form in (cleaned, filtered):
+        if not form:
+            continue
+        variant = form[:-1] if form.endswith("s") and not form.endswith("ss") else form + "s"
+        if variant in _WEB_ALIAS_TO_CANONICAL:
+            return _WEB_ALIAS_TO_CANONICAL[variant]
     # "youtube.com" / "github.com" — the host stem, only when the name really is host-shaped.
     if "." in cleaned:
         stem = cleaned.split(".")[0]
@@ -475,7 +444,7 @@ def _app_index():
     AppOpener's cached Start-Menu index, as a plain dict. Read at most once per TTL.
 
     Entries whose value is falsy are dropped: that value is what AppOpener interpolates into
-    `explorer shell:appsFolder\<id>`, and an empty id makes explorer open a FILE EXPLORER
+    `explorer shell:appsFolder\\<id>`, and an empty id makes explorer open a FILE EXPLORER
     WINDOW rather than failing. An unlaunchable entry is not an installed application.
     """
     now = time.time()

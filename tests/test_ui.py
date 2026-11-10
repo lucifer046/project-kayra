@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt, QObject, Signal, QSize, QPoint, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication
 
-from kayra.utils import print_banner, print_system, print_info, print_success, print_error
+from kayra.utils import print_banner, print_system, print_success, print_error
 
 PASSED = 0
 FAILED = 0
@@ -574,7 +574,7 @@ def section_components(app):
     print_system("\n[2] Components")
     from kayra.ui.components.orb import AssistantOrb, OrbBadge
     from kayra.ui.components.primitives import (
-        Card, StatusPill, Toggle, Meter, StatRow, EmptyState)
+        StatusPill, Toggle, Meter)
     from kayra.ui.components.navigation import Sidebar
     from kayra.ui.components.chat_items import MessageRow, AutomationTrace, ThinkingRow
 
@@ -1299,7 +1299,7 @@ def section_refinement(app):
         StatusPill,
     )
     from kayra.ui.views.automation import (
-        Pipeline, STAGES, humanise_action, humanise_command, collapse_audit,
+        Pipeline, humanise_action, humanise_command, collapse_audit,
     )
     from kayra.ui.theme import Color, Size
 
@@ -1525,9 +1525,8 @@ def section_interaction(app):
     print_system("\n[10] Chat scrolling, listening control, ambient lifecycle")
 
     from kayra.ui.views.chat import ChatView
-    from kayra.ui.views.home import HomeView
     from kayra.ui.application import KayraWindow, AmbientAssistant
-    from kayra.ui.components.primitives import ActionStatus, OutlineButton
+    from kayra.ui.components.primitives import ActionStatus
     from kayra.ui.views.automation import AutomationView
 
     # ── CHAT AUTO-SCROLL ──────────────────────────────────────────────
@@ -1791,7 +1790,7 @@ def section_interaction(app):
           ambient.bridge is bridge and window.bridge is bridge)
 
     # ── AMBIENT DRAG vs CLICK ─────────────────────────────────────────
-    from PySide6.QtCore import QPoint, QPointF, QEvent
+    from PySide6.QtCore import QPointF, QEvent
     from PySide6.QtGui import QMouseEvent
 
     def press(x, y):
@@ -2725,7 +2724,6 @@ def section_gesture(app):
     """
     print_system("\n[17] Hand gesture control")
 
-    from kayra.ui.views.home import HomeView
     from kayra.ui.views.settings import SettingsView
     from kayra.ui.components.camera_preview import CameraPreview
 

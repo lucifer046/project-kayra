@@ -66,7 +66,7 @@ from PySide6.QtGui import QPainter, QColor, QPen, QFont
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QFrame, QSizePolicy,
                                QGraphicsDropShadowEffect)
 
-from kayra.ui.theme import Color, Font, Space, Size, Radius, Motion, Elevation
+from kayra.ui.theme import Color, Font, Space, Size, Motion, Elevation
 from kayra.ui.components.primitives import _icon_glyph
 
 

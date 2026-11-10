@@ -83,9 +83,15 @@ def section_launcher():
     check("running_inside_venv is decided by sys.prefix, not an env var",
           "sys.prefix" in io.open(os.path.join(PROJECT_ROOT, "run.py"),
                                   encoding="utf-8").read())
-    check("this suite is itself running in the venv",
-          run["running_inside_venv"]() is True,
-          f"(sys.prefix={sys.prefix})")
+    if os.environ.get("KAYRA_TEST_INTERPRETER"):
+        # `run_all.py --python` (the Python-version matrix) deliberately runs the suites under a
+        # DIFFERENT venv, so "this is the project .venv" is false by construction there.
+        skip("this suite is itself running in the venv",
+             f"matrix run under {os.environ['KAYRA_TEST_INTERPRETER']}")
+    else:
+        check("this suite is itself running in the venv",
+              run["running_inside_venv"]() is True,
+              f"(sys.prefix={sys.prefix})")
 
     # A relaunch loop guard must exist: one relaunch is legitimate, forever is the worst form
     # of the duplicate instance the lock exists to prevent.

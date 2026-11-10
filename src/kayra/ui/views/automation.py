@@ -32,8 +32,8 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy
 
 from kayra.ui.theme import Color, Space, Motion, Font
 from kayra.ui.components.primitives import (
-    Card, Caption, Secondary, StatusPill, SectionLabel, EmptyState, Divider,
-    ListRow, ActionStatus, _label,
+    Card, Caption, Secondary, StatusPill, EmptyState, ListRow, ActionStatus,
+    _label,
 )
 from kayra.ui.views.base import View
 

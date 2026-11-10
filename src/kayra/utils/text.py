@@ -204,8 +204,8 @@ def _strip_unspeakable(text: str) -> str:
     Drops characters with no spoken form, using Unicode CATEGORY rather than a character
     allow-list.
 
-    A regex allow-list such as `[^\w\s.,!?]` looks equivalent but silently destroys
-    non-Latin text: Python's `\w` excludes combining marks (category Mn), so Devanagari
+    A regex allow-list such as `[^\\w\\s.,!?]` looks equivalent but silently destroys
+    non-Latin text: Python's `\\w` excludes combining marks (category Mn), so Devanagari
     vowel signs are stripped and "यह ठीक है" degrades to broken consonants. Keeping
     every letter, digit and mark avoids that entire class of bug.
     """

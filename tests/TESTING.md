@@ -9,6 +9,38 @@ Kayra's tests are **standalone scripts**, not a pytest suite. Each one is run di
 by category and totals them. There is no `pytest` dependency and no `conftest.py` — the shared
 scaffolding lives in `tests/_harness.py`.
 
+## Linux and the Python-version matrix (added 2026-11-09)
+
+Commands below use the Windows spelling. On Linux use `.venv/bin/python tests/run_all.py`
+(and `/` paths); everything else is the same. Platform behaviour of the runner:
+
+- `test_automation.py` and `test_target_resolution.py` exercise the Win32 automation hands and
+  are reported as **`n/a:win32`** off Windows — never as failures, never omitted.
+  `test_voice_turn.py`'s power-boundary section runs everywhere, against whichever backend
+  `automation.load_backend()` picks.
+- `test_linux_automation.py` (273 checks) covers the Linux hands and the shared pipeline with a
+  FAKE compositor and a RECORDING process runner: argv/dispatch-level assertions for apps,
+  closing, workspaces (first empty workspace), keys, media, volume, battery sysfs parsing,
+  device answers, settings screens, OCR clicking (synthetic tesseract TSV, fake pointer),
+  undo, and the harmful-command matrix (services, packages, kill, `rm -rf ~`, …). It launches
+  nothing, clicks nothing and changes no setting. Runs on every OS.
+- `test_assistant_automation.py` (326 checks) covers round 3 (assistant features): every new phrasing and confirmation,
+  the Chrome bridge over REAL sockets on a free port (Origin check, frames, port release), the
+  web flows against a fake extension, diagnostics/screen AI with fake probes and models,
+  scenes/plans/triggers in a temp data folder, system controls at the argv level, the wake
+  word and the bar status file.
+- `test_browser_extension.py` (integration; needs Chrome) runs the extension's in-page code in
+  a throwaway headless Chrome — never your profile, including a Gmail-shaped page (24 checks).
+- `test_platforms.py` covers the platform layer (OS/distro/session detection, a fake Hyprland
+  socket, reveal vectors, mimeapps parsing, the Linux pointer injector with recording
+  transports). It runs on every OS.
+- `test_hardware_profile.py` serves its synthetic Windows machines on Linux through a stub
+  `winreg`, so the registry logic is tested on both.
+- Run the unit tier under another interpreter with `--python PATH` (one venv per version; see
+  `docs/development/DEVELOPMENT.md`). That sets `KAYRA_TEST_INTERPRETER`, which makes
+  `test_environment.py` skip its "I am the project .venv" check.
+- Headless Linux / CI: set `QT_QPA_PLATFORM=offscreen` for `test_ui.py`.
+
 ---
 
 ## 1. Prerequisites

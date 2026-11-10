@@ -94,6 +94,23 @@ def section_ordering(monkey):
     check("the backendless browser is still offered LAST, not dropped", order[-1] == "brave",
           "so a machine with only that browser gets a specific error, not 'no browser found'")
 
+    # OMARCHY: Chromium is the distribution's default browser, and a distribution Chromium
+    # has no verified speech backend. On Linux it must not outrank an installed Chrome (it
+    # would pass the probe, be cached as verified, and transcribe nothing). Windows keeps
+    # promoting an unknown default, exactly as before.
+    monkey(installed=(spec("chromium", default=True), spec("chrome")), verified=None)
+    order = [b.key for b in browsers.candidates()]
+    if sys.platform.startswith("win"):
+        check("Windows: an unknown-backend default is still promoted",
+              order[0] == "chromium", f"order={order}")
+    else:
+        check("Linux: Chrome outranks an unknown-backend default (Omarchy's Chromium)",
+              order[0] == "chrome", f"order={order}")
+    monkey(installed=(spec("chromium", default=True),), verified=None)
+    order = [b.key for b in browsers.candidates()]
+    check("an unknown default is still tried when nothing better is installed",
+          order == ["chromium"], f"order={order}")
+
     # A default browser that DOES work must win — honouring the default is the point.
     monkey(installed=(spec("edge", default=True), spec("chrome")), verified=None)
     order = [b.key for b in browsers.candidates()]
@@ -259,8 +276,15 @@ def section_engine():
         edge_opts = eng2._chrome_options(spec("edge"))
         check("Brave options carry binary_location",
               brave_opts.binary_location.endswith("brave.exe"))
-        check("Chrome options do not force a binary_location",
-              not chrome_opts.binary_location)
+        if sys.platform.startswith("win"):
+            check("Chrome options do not force a binary_location",
+                  not chrome_opts.binary_location)
+        else:
+            # Linux points ChromeDriver at the discovered executable (`google-chrome-stable`
+            # is not on ChromeDriver's default search path everywhere).
+            check("Linux: Chrome options carry the discovered binary",
+                  chrome_opts.binary_location == spec("chrome").binary,
+                  chrome_opts.binary_location)
         check("Edge options are EdgeOptions",
               type(edge_opts).__module__.endswith("edge.options"))
         check("headless is set for every family",

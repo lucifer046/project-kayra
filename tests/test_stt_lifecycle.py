@@ -38,7 +38,7 @@ except ImportError:
     print_error("psutil is required for this diagnostic (pip install psutil).")
     sys.exit(1)
 
-from kayra.input.speech_to_text import SpeechToTextEngine, SttState, get_shared_engine
+from kayra.input.speech_to_text import SttState, get_shared_engine
 
 CYCLES = int(sys.argv[1]) if len(sys.argv) > 1 else 15
 FAILURES = []

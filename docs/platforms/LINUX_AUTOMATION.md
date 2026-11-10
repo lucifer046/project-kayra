@@ -1,0 +1,480 @@
+# Desktop automation on Linux (Hyprland / Omarchy)
+
+Kayra's "hands" now run on Linux. Same voice commands, same safety rules, same confirmations
+as Windows — different mechanism underneath.
+
+```
+"close chrome"
+   │  DMM token
+   ▼
+automation/common.py      normalize_command() → Action{app.close, target=chrome}
+automation/policy.py      classify_action()   → ALLOW / CONFIRM / DENY
+automation/linux.py       _dispatch()         → close_target()
+   │                         linux_apps.resolve("chrome") → classes {google-chrome}
+   │                         Hyprland clients → 1 match (or the focused one, or ASK)
+   ▼
+Hyprland IPC              hl.dsp.window.close({ window = "address:0x…" })  → verified gone
+```
+
+## Layout
+
+| Module | Role |
+|---|---|
+| `automation/common.py` | **Shared by both OSes.** Normalizer, power-target gate, planner, `AutomationRuntime` (policy → dispatch → record, confirmations, context, timers), filesystem handlers, safe terminal. |
+| `automation/policy.py` | Unchanged contract; the shell policy now also denies `sudo`/`su`/`doas`/`pkexec`, POSIX shells, `shred`/`wipefs`/`parted`, and confirms `systemctl poweroff`/`reboot`. |
+| `automation/linux_apps.py` | XDG desktop-entry index (incl. Flatpak exports) + curated alias table. Exact identities only — **no fuzzy matching**, the rule that ended "open GitHub → Git GUI" on Windows. |
+| `automation/linux.py` | The Linux handlers and `_dispatch`. Every process start goes through one injectable `Runner`; every compositor call through `platforms.hyprland`. |
+| `automation/windows.py` | The Win32 hands. Now imports the shared pipeline from `common.py` under the original names; behaviour unchanged. |
+| `automation/__init__.py` | `load_backend()` — the one place that picks the hands for this OS. `app.bootstrap()` calls it. |
+| `platforms/hyprland.py` | IPC client. `dispatch(lua, legacy)` speaks **both** syntaxes (see below). |
+| `platforms/linux.py` | `automation_support()` — the readiness probe the System screen and setup use; `battery_status()` from sysfs. |
+| `automation/ai.py` | The two model calls automation makes *after* deciding: `summarize()` (bounded, with a deterministic fallback) and `see()` (vision: local LM Studio first, then Gemini, then Groq). |
+| `automation/diagnostics.py` | "Diagnose my computer": read-only probes → findings → AI summary → Markdown report → offered fixes; the background health watch. |
+| `automation/browser_bridge.py` + `extension/kayra-bridge/` | The Chrome extension and its local WebSocket server — see [CHROME_BRIDGE.md](CHROME_BRIDGE.md). |
+| `automation/web_macros.py` | Tabs, page clicks/typing/reading, Gmail, Calendar, WhatsApp Web, Google Meet. |
+| `automation/screen_ai.py` | "What's on my screen?", explain an error, read aloud, copy screen text, screen recording, vision-located clicks. |
+| `automation/workflows.py` | Scenes (modes), saved layouts, the AI planner, triggers, the watcher thread, the briefing, "what did you just do?", call detection. |
+| `automation/linux_system.py` | Audio/mic devices, per-app volume, Bluetooth devices, Wi-Fi, updates and installs, display/input/theme, processes, Docker, git, notifications, window layouts, files. |
+| `automation/status_file.py` + `extension/omarchy-kayra-widget/` | Kayra's state for the Omarchy bar pill. |
+
+## What works, and how
+
+| Say | Mechanism |
+|---|---|
+| "open Chrome / files / terminal / calculator / btop" | desktop entry via `uwsm-app -- id.desktop` (`gtk-launch` fallback); focuses an already-running window instead of starting a second copy; waits for the window to appear |
+| "close Spotify", "close this window", "close all Chrome windows" | Hyprland `window.close` on an exact address, verified gone. Several matches and none focused → asks |
+| "close YouTube" | focuses the browser window showing it, Ctrl+W (the tab, not the window) |
+| "switch to VS Code" | Hyprland focus, most recently used window on a tie |
+| "open control panel", "open settings" | Omarchy's Setup menu (`omarchy-menu toggle setup`); GNOME/KDE settings elsewhere |
+| "open wifi / bluetooth / sound / power / display settings" | the matching Omarchy bar panel (`omarchy-shell shell toggle omarchy.network` …) |
+| "open the system menu", "keyboard shortcuts", "theme settings" | `omarchy-menu toggle root` / `omarchy-menu-keybindings` / `omarchy-menu toggle style` |
+| "maximize", "fullscreen", "snap left", "minimize", "show desktop" | fullscreen-maximized / fullscreen / swap / special:minimized / the first empty workspace |
+| "go to workspace 3", "move this window to workspace 2" | `hl.dsp.focus` / `hl.dsp.window.move` |
+| "open an empty workspace", "move this window to an empty workspace" | the **lowest-numbered** workspace with no window on it — windows on 1, 2, 4, 6 → **3**, never 5 |
+| "make this window float", "pin window", "center window" | float toggle / pin / center |
+| "type hello world", "undo", "new tab", "refresh" | `wtype` (text over **stdin**, never as an argument) |
+| "pause", "next track", "what's playing?" | `playerctl`, else MPRIS over `gdbus` (Kayra's own speech browser excluded by PID) |
+| "volume 40", "increase volume by 20", "mute" | `wpctl` (PipeWire), capped at 100 %; `pamixer` fallback |
+| "brightness 60", "dim the screen" | `brightnessctl` (never below 5 % by voice) |
+| "wifi off" (confirms), "bluetooth on" | `nmcli`, `bluetoothctl` |
+| "do not disturb on", "night light on" | `omarchy-toggle-notification-silencing` / `makoctl`; `omarchy-toggle-nightlight` / `hyprsunset` |
+| "take a screenshot", "screenshot a region" | `grim` (+ `slurp`) → `~/Pictures/Screenshots`, also copied to the clipboard; Kayra keeps its own last 30 |
+| "copy text …", "read clipboard" | `wl-copy` / `wl-paste` |
+| "lock", "turn off the screen" | `omarchy-system-lock` / `loginctl`; DPMS only when input is configured to wake it, otherwise lock (a blank screen with no way back is worse than a lock) |
+| "shut down the computer" (confirms), "restart the computer" (confirms) | `systemctl poweroff` / `reboot` — only after the power-target gate named the COMPUTER and the user said yes |
+| "set a timer for 5 minutes" | shared timer service → `notify-send` + chime |
+| "play lo-fi beats", "google search …" | first YouTube result / search page via `xdg-open` |
+| "click", "double click", "right click", "scroll down" | uinput (needs `/dev/uinput` access, see below) |
+| "click on Save", "double click on report.pdf", "right click on Downloads" | screenshot of the focused monitor → `tesseract` OCR → exact words → pointer moved there → click (see **Clicking**) |
+| "click at 400 300", "move mouse to center / top right / Save" | coordinates on the focused monitor (logical pixels); `move` never clicks |
+| "how's my battery?", "is it charging?" | kernel sysfs: percent, **charging / discharging / plugged in but idle / full**, watts, time to full or empty, health vs design capacity, cycles |
+| "how hot is my CPU?" | `psutil` sensors (+ `nvidia-smi` for the GPU); warns when running hot |
+| "which Wi-Fi am I on?", "what Bluetooth devices are connected?" | `nmcli` (no rescan), `bluetoothctl devices Connected` |
+| "screen resolution", "device info", "CPU / RAM / disk / uptime / IP" | Hyprland monitors; `core.hardware` + `psutil` |
+| "switch to performance / balanced / power saver mode" | `powerprofilesctl` (undoable) |
+| "undo what you just did", "put it back" | Kayra's own **undo stack** (see **Undo**) — a bare "undo" is still Ctrl+Z |
+
+## Everything you can say (round 3)
+
+Grouped like the brainstorm. Phrasings are examples — the classifier maps natural wording to
+these. **🔒 = asks for your yes first.**
+
+**A. Diagnostics and health**
+| Say | What happens |
+|---|---|
+| "diagnose my computer" | CPU, memory, temperatures/throttling, every disk, battery wear, failed services, crashes this week, actionable kernel errors, network quality, uptime, pending updates → spoken in 2–4 sentences by the AI → full report in `Reports/diagnosis_*.md` |
+| "why is my laptop slow / fan loud / battery draining / internet slow", "is my computer secure", "what crashed" | the matching slice of the diagnosis |
+| "fix it" 🔒 | applies every fix the diagnosis offered: close a runaway app, balanced/power-saver profile, restart a failed *user* service, clear the thumbnail cache, empty Trash, trim the package cache in a terminal (you type the password) |
+| *(background)* | full disk, CPU ≥ 97 °C for 3 minutes, lost network, a user service failing — spoken once per 2 h. `KAYRA_HEALTH_WATCH=0` turns it off |
+
+**B. Apps, windows, workspaces**
+| Say | What happens |
+|---|---|
+| "Chrome on the left and VS Code on the right" | both opened if needed, placed side by side on the first empty workspace |
+| "what's open?", "where is Chrome?" | windows grouped by workspace |
+| "move all browsers to workspace 2", "group my windows", "move this to the other screen", "make it bigger/smaller" | as said (resize is undoable) |
+| "close everything except VS Code" 🔒 | closes the rest, never Kayra |
+| "work mode", "study / focus / gaming / movie / presentation / night / battery saver mode" | built-in scenes (apps on workspaces + DND, volume, brightness, power profile) |
+| "save this layout as study", "what modes do I have", "delete study mode" | your own scenes, in `data/scenes.json` |
+| "remember my setup", "restore my setup", "restore my last session" | the layout is also saved automatically as *last session* when Kayra shuts down |
+
+**C. Browser and web** — see [CHROME_BRIDGE.md](CHROME_BRIDGE.md): tabs (incl. background),
+click by name, type, scroll, read, summarize, history, bookmarks, form fill (never passwords).
+
+**D. Screen understanding**
+| Say | What happens |
+|---|---|
+| "what's on my screen?", "explain this error" | screenshot of the focused monitor → local vision model (`google/gemma-4-e4b` here, ~12 s) → spoken answer. No vision model → OCR text to the text model → OCR text |
+| "read this to me", "copy the text on screen" | OCR, Kayra's own window text removed |
+| "click the second Save", "click the blue button" | OCR with ordinals; falls back to the vision model to locate a button without readable text |
+| "record my screen", "stop recording" | Omarchy's recorder, saved to Videos |
+
+**E. Files**
+| Say | What happens |
+|---|---|
+| "find the PDF I downloaded yesterday", "find my resume" | name/type/date search of home (bounded), opens the folder |
+| "what did I work on today?" | the desktop's recently-used list |
+| "organize my downloads" 🔒 | sorts loose files into Images/Documents/Videos/…; never touches unfinished downloads, never deletes |
+| "find duplicate files", "what's taking up space?" | content-hash duplicates (nothing deleted); biggest home folders |
+| "summarize resume.pdf", "what does the contract say about notice period" | PDF/DOCX/text → AI summary |
+| "convert report.docx to pdf", "compress this video", "resize photo.jpg by 50%" | LibreOffice / ffmpeg (in a terminal) / ImageMagick |
+| "back up my documents" 🔒 | rsync to a plugged-in drive, or `~/Backups` |
+
+**F. Communication and assistant**
+| Say | What happens |
+|---|---|
+| "read my notifications", "what did I miss?", "clear notifications" | Kayra keeps the last 50 desktop notifications **in memory only** (never on disk) |
+| "check / read my email", "draft…", "send it" 🔒, "what's on my calendar", "add … to my calendar" 🔒, "tell Rahul I'm late" 🔒 | through Chrome — see CHROME_BRIDGE.md |
+| "remind me at 9 pm to call mom", "wake me at 7", "set a timer for 20 minutes" | **spoken** when due, plus a notification and a chime |
+| "good morning / brief me" | time, weather, calendar and unread mail (when Chrome is connected), battery, crashes in the last day, disk warnings, scheduled automations — phrased by the AI in Kayra's own calm, precise voice |
+
+**G. Media and audio**
+| Say | What happens |
+|---|---|
+| "switch to my headphones / the speakers", "what audio devices do I have" | default output switched (undoable) |
+| "mute my mic", "mic volume 70" | default input |
+| "lower Chrome's volume", "mute Discord" | per-app stream volume |
+| "connect my earbuds", "disconnect the mouse", "earbuds battery" | paired Bluetooth devices by name |
+| "set a sleep timer for 30 minutes" | pauses the music when it fires |
+
+**H. System**
+| Say | What happens |
+|---|---|
+| "check for updates" | repo + AUR counts |
+| "update my system" 🔒 | `omarchy-update` in a terminal; **refused on battery below 40 %** |
+| "install VLC" 🔒, "uninstall VLC" 🔒 | `yay` in a terminal (you confirm with your password); core packages can never be removed |
+| "connect to Wi-Fi Home", "forget the Cafe network" 🔒, "share the Wi-Fi password" | `nmcli` / Omarchy's Wi-Fi QR |
+| "set refresh rate to 60", "scale the screen up", "rotate the screen" | `hyprctl keyword monitor` (undoable) |
+| "toggle the touchpad", "switch keyboard layout", "keyboard backlight on" | Omarchy tools |
+| "next theme", "switch to Catppuccin", "dark mode", "next wallpaper" | Omarchy themes (undoable) |
+| "what's using my CPU / memory?", "close the app using the most memory" 🔒 | grouped per app; closing goes through the window |
+| "shut down the computer in 30 minutes" 🔒, "hibernate the computer" 🔒 | a cancellable timer ("cancel timer") |
+
+**I. Developer**
+| Say | What happens |
+|---|---|
+| "git status", "what branch am I on", "commit with message fix login" 🔒 | the repo of the focused terminal, else `KAYRA_DEV_PROJECT`, else Kayra's own |
+| "run my tests", "start the dev server" | detected command (run_all.py / npm / cargo / pytest / manage.py) in a terminal |
+| "explain the error in my terminal" | screen explain |
+| "docker status", "restart the db container" 🔒 | Docker |
+
+**J. Plans and automations**
+| Say | What happens |
+|---|---|
+| "get me ready for my presentation" | the AI writes a plan from a fixed catalog; each step is validated (no shell, no power, nothing denied), spoken, then run through the policy. A step that needs a yes pauses the plan; "no" drops the rest |
+| "when the download finishes, shut down the computer" | 🔒 confirmed when created; when it fires Kayra warns and waits one minute ("cancel timer" stops it) |
+| "when my battery hits 20%, switch to power saver", "when it's charged, remind me to unplug", "when I plug in…", "when I'm back online…", "every day at 9, work mode", "at 6 pm remind me…", "in 10 minutes…" | stored in `data/triggers.json`, checked every 20 s |
+| "list my automations", "cancel the download automation", "cancel all automations" | as said |
+| "what did you just do?", "why didn't you do that?" | from the audit log |
+
+**K. Presence**
+| | |
+|---|---|
+| Speaking unprompted | reminders and warnings speak at once; everything else waits (up to a minute) until Kayra is idle, **you're not on a call** (another app recording the mic; Kayra's own speech browser excluded) and not in standby — otherwise it's dropped |
+| Wake word | `KAYRA_WAKE_WORD=on`: only speech naming Kayra is acted on, except follow-ups within 20 s of a reply |
+| Bar widget | `python3 scripts/install_omarchy_widget.py` adds a Kayra pill (listening / thinking / speaking / paused / standby / off) to the Omarchy bar; click to bring Kayra up or start it. `--remove` takes it out |
+| Spoken progress | "Running a full diagnosis…", "Setting up work mode.", "Here's the plan: …" |
+
+## Hyprland 0.55+: Lua dispatch
+
+Hyprland now configures itself in Lua, and `dispatch` on the socket evaluates a Lua
+expression (`dispatch hl.dsp.window.close({ window = "address:0x…" })`). The classic form
+(`dispatch closewindow address:0x…`) is answered with an **error string**, not a refused
+connection — so a client that treats "got a reply" as success silently does nothing. That had
+already broken gesture pointer movement (`movecursor`) on this machine.
+
+`hyprland.dispatch(lua, legacy)` tries the Lua form, falls back to the legacy one, counts only
+a literal `ok` as success, and remembers which syntax the compositor speaks so a 30 Hz caller
+pays for one attempt, not two.
+
+## Clicking on what you can see
+
+"click on Save" works like a person would: look at the screen, find the word, click it.
+
+1. `grim -o <focused monitor>` takes a screenshot (a temp file, deleted right after).
+2. `tesseract --psm 11 tsv` reads every word with its box and confidence.
+3. The **whole phrase** must appear on one line, word for word (no partial or fuzzy matches),
+   with OCR confidence ≥ 50.
+4. Matches **inside Kayra's own window are ignored** — its chat shows the very words you said.
+5. One match → click it. Several → the one in the focused window; still several → Kayra asks.
+6. Image pixels are converted to layout coordinates (`monitor.x + px / scale`), the pointer is
+   moved with Hyprland, and the button is pressed through uinput.
+
+**Risky buttons ask first.** If the words sound like they delete, send, pay, publish, sign out
+or shut down (`Delete`, `Send`, `Pay`, `Confirm`, `Submit`, `Uninstall`…), the click is
+CONFIRM-gated like any other destructive action.
+
+**Clicks need `/dev/uinput`.** Wayland lets no ordinary program press mouse buttons; the kernel's
+virtual-input device is the honest way, and it is root-only by default. Without it Kayra still
+**moves the pointer to the target** and tells you clicking needs access. One-time fix (the same
+rule hand-gesture clicks use):
+
+```bash
+sudo modprobe uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/60-kayra-uinput.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=uinput
+```
+
+## Undo
+
+Every **reversible** action records how to put things back, newest first: volume (exact
+previous level and mute state), brightness, Wi-Fi, Bluetooth, do-not-disturb, night light,
+power profile, workspace switches, moving a window to a workspace, minimize, maximize,
+fullscreen, float and pin. "undo what you just did" / "revert that" / "put it back" pops the
+newest one.
+
+- Bounded to the last **10** actions and **5 minutes** — an undo for something long ago is a
+  surprise.
+- Irreversible actions (closing, deleting, typing, clicking) record **nothing**, so Kayra never
+  pretends it can bring them back; it says "There's nothing recent of mine to undo."
+- A bare "undo" is still Ctrl+Z in the app you're using; only "undo *what you did*" phrasing
+  reaches Kayra's own undo.
+
+## Device questions
+
+Read-only, always allowed, answered from the machine itself:
+
+| Ask | Example answer |
+|---|---|
+| battery | "Battery is at 73 percent and charging at 48 watts, about 23 minutes until full. Its health is 85 percent of the original capacity." |
+| battery, unplugged | "Battery is at 40 percent and running on battery, drawing 10 watts, about 2 hours left." |
+| battery, plugged in but idle | "Battery is at 80 percent, plugged in but idle, not charging." |
+| temperature | "Right now the processor is at 93 degrees and the graphics card is at 52 degrees. That's running hot." |
+| Wi-Fi | "You're connected to Home_5G, signal 58 percent." |
+| Bluetooth | "Connected: realme Buds T310." |
+| displays | "1 display: eDP-2 at 2880 by 1800, 120 hertz, scale 2.25." |
+| device info | "This computer is running Omarchy, with an AMD Ryzen 9 8945HS…, a NVIDIA GeForce RTX 4060 Laptop GPU, 15 gigabytes of memory. …" |
+
+Battery details come from `platforms.linux.battery_status()` (kernel `power_supply` class,
+both energy- and charge-reporting batteries; peripheral batteries such as a mouse are skipped).
+
+## Safety
+
+- **Every gate is shared code.** Power-target gate, confirmations, shell policy and the
+  "one intent, one target" close rule live in `common.py` / `policy.py`. The test suite
+  asserts a denied or unconfirmed action leaves the process log **empty**.
+- **Kayra is never a target.** The UI window (class `kayra`, our PID) and the speech browser's
+  PIDs are excluded from every window and media resolution.
+- **No shell, no name-kill.** Argument vectors, `shell=False`, no `os.system`, no
+  `pkill`/`killall`. Closing is `window.close` — what the X button does.
+
+### Commands Kayra refuses (spoken "terminal …" / "run command …")
+
+The shell policy (`automation/policy.py::classify_shell`) parses the command and judges what it
+would actually do. On top of the original rules (no chaining/redirection, no nested shells,
+protected system paths, no fork bombs, no raw disk writes), this round added:
+
+| Refused outright (DENY) | Why |
+|---|---|
+| `systemctl`/`service` **stop, disable, mask, kill, isolate**, rescue/emergency targets — any service | switching off services is how a voice command takes the network, sound, login or display down |
+| `loginctl terminate-*/kill-*` | ends your session |
+| `kill`, `pkill`, `killall`, `xkill`, `skill` | ending processes by number or name can crash the system; closing goes through the window |
+| removing a **critical package** (`linux*`, `systemd`, `glibc`, `pacman`, `hyprland`, `mesa`, `nvidia*`, `pipewire`, `networkmanager`, `omarchy*`, …) or any forced removal (`-Rdd`, `--nodeps`) | leaves the machine unbootable |
+| `chmod`/`chown -R` on a system path or your home folder | locks you out |
+| `rm -rf ~`, `$HOME`, `~/`, `~/../../etc`, `/usr`, … | your home folder is protected as a target; `~` paths are judged by where they really point |
+| `sudo`, `su`, `doas`, `pkexec`, `run0`; `bash`/`sh`/`zsh`/`fish -c` | privilege escalation and nested shells defeat every other check |
+| `mount`, `umount`, `swapoff`, `modprobe`, `rmmod`, `sysctl`, `init`/`telinit`, `kexec`, `fsck`, `mkfs.*`, `dd`, `wipefs`, `parted`, bootloader tools, `iptables`/`nft`/`ufw`, `passwd`/`useradd`/`usermod`, `chroot`, `stress` | can crash, hang, brick or weaken the system in one line |
+
+| Asks first (CONFIRM) | |
+|---|---|
+| starting/restarting any service (critical ones say so) | `systemctl restart NetworkManager` |
+| installing or removing ordinary software | `pacman -Syu`, `yay -R vlc`, `pip install …` |
+| inline code | `python -c …`, `node -e …` (running your own `python train.py` is allowed) |
+| git commands that change or discard work | `git clean -fdx`, `git reset --hard` |
+| anything that can cut the network | `nmcli networking off`, `ip link set … down`, `rfkill block all` |
+| power | `systemctl poweroff`, `reboot`, `shutdown` |
+
+Allowed without asking: read-only queries — `systemctl status`, `df`, `free`, `uname`,
+`nmcli device status`, `ip addr`, `pip list`, `pacman -Qi`, `git status/log/diff`, …
+- **Honest failure.** A missing tool returns *"I can't … here. Install X."*, never a fake
+  "Done."
+
+## Tests
+
+`tests/test_assistant_automation.py` — 326 checks, ~1 s: every new phrasing, every new confirmation (and that
+nothing runs before the yes), the Chrome bridge over real sockets, every web flow against a
+fake extension, diagnostics with fake probes and models, screen AI, scenes/plans/triggers
+(including the one-minute shutdown grace), every system control at the argv level, files in a
+temp folder, the wake word and the status file. `tests/test_browser_extension.py`
+(integration) runs the extension's page code in a real headless Chrome.
+
+`tests/test_linux_automation.py` — 273 checks, under 1 s, hardware-free: a fake compositor and a
+recording runner, so assertions are about the exact argv / dispatch that would have reached
+the machine. `test_voice_turn.py`'s power-boundary section now runs on Linux too.
+
+## Status of the 60 brainstormed items
+
+Implemented, with these gaps stated plainly:
+
+| Item | Not done yet |
+|---|---|
+| 29 "write a summary of my week" | no weekly activity report; `content …` and the briefing exist |
+| 37 smarter music | "play something calm", sleep timer and now-playing work; "like this song" and "what was the last song" do not |
+| 54 follow-ups | "make it full screen / move it to workspace 3" act on the focused window (which is the one just opened), not on a remembered window address |
+| 56 learns routines | uses the proactive agent's existing habit suggestions; nothing new was added |
+
+And the ones that depend on something outside Kayra:
+
+| Item | Status |
+|---|---|
+| 14–18, 30–32, 34 (Chrome, Gmail, Calendar, WhatsApp, Meet) | Built and unit-tested; the extension's page code passes in real Chrome. **Needs the one-time extension load** ("browser set up"). Meet screen-share key presses are not yet verified in a live call. |
+| 19, 22 (vision) | Verified live with the local `google/gemma-4-e4b` (~12 s). Vision-located clicks need a model good at coordinates — treat as experimental. |
+| Real mouse clicks (22 and every "click on …") | Need `/dev/uinput` access (one-time udev rule above). Browser clicks go through the extension and do **not** need it. |
+| 59 (bar widget) | Shipped in `extension/omarchy-kayra-widget`; installed by **you** with `scripts/install_omarchy_widget.py` (it edits `~/.config/omarchy/shell.json`, with a backup). Not yet seen running in the bar. |
+| 31 email | Through Gmail in your Chrome, not an email API — no account tokens are stored anywhere. |
+| Windows | The new families are Linux-only for now; on Windows they answer "I don't know how to do that yet." |
+
+## Changelog
+
+### 2026-11-10 — the understanding layer: a model works out what you meant
+
+**Why:** everything after the DMM was rules (tables and patterns). Fast and exact for what
+they know, but "open PR and outreach core team chat" with WhatsApp in front, or "make this tab
+quiet", fell through to *"I couldn't find an app…"*.
+
+**What changed**
+- `automation/interpreter.py` (new): one bounded model call, given what the user said, what
+  the rules tried, what is on screen and the catalog of commands. It answers automation
+  commands, *chat*, *ask one question*, or *none*. Its commands are parsed and judged by the
+  policy like spoken ones; power, shell, plans, triggers and file delete/move/rename are never
+  accepted from it.
+- `automation/common.py`: `AutomationRuntime` asks it only when a token is unparseable, only a
+  guess, or ran and found nothing; `take_chat_handoff()`; unknown names go rules → model →
+  web result.
+- `automation/linux.py`: `situation()` (app / web app in front, Chrome's active tab).
+- `app.py`: a request the model judged to be conversation is answered by the Chatbot.
+- `automation/ai.py`: `complete()` returns the reply verbatim; the goal planner uses it too
+  (a ```json reply used to be stripped to nothing).
+- Verified live with the local model: WhatsApp chat → `browser click on PR and outreach core
+  team` (7.2 s), "make this tab quiet" → `browser mute this tab` (3.8 s), "what's a good name
+  for my cat" → chat (1.9 s).
+- **Speed (same day):** the first version took ~4 s warm (7.2 s cold). Measured: prompt size
+  barely mattered (865 vs 59 tokens: 4.0 vs 3.7 s); ~140 of ~160 output tokens were the
+  model's hidden THINKING. `ai.fast()` calls the local model with thinking off, temperature 0
+  and a 200-token cap, plus worked examples in the prompt: **12/12 correct, median 0.51 s,
+  worst 0.78 s**. Unknown reply shapes are read as chat.
+- Tests: `tests/test_browser_control.py` section 8 (scripted fake model): 130 checks.
+
+### 2026-11-10 — round 5, part 1: open anything, anywhere, the way you say it
+
+Plan: `docs/roadmap/BROWSER_CONTROL_PLAN.md` (items A1–A6, G3, H0.1).
+
+**What was wrong:** "open new tab and open Google Sheet in that tab" answered *"I couldn't find
+an app called google sheet"*: 23 known sites, exact aliases only, no web fallback, no "this
+tab", and the two tokens raced.
+
+**What changed**
+- `automation/sites.py` (new): ~190 sites with aliases, title fragments, a category and a
+  search template. `targets.WEBSITE_REGISTRY` is a view over it. Lookups now accept grammar
+  (singular/plural, "the … website/app", "my …") but never misspellings; folder names
+  (documents, photos) are never sites.
+- `automation/common.py`: `_split_where` ("in this tab", "in a new window", "in incognito",
+  "next to this tab", "in the browser"); `merge_tab_steps` turns `new tab` + `open X` into one
+  open; `browser open …`, `browser update`; "open the article I read …" goes to history.
+- `automation/linux.py`: "open X" → installed app → Omarchy web app → known site → top web
+  result (DuckDuckGo text API, 6 s cap) → web search, said honestly; a known app that is not
+  installed opens its web version (as on Windows); web-app windows (`chrome-…__-Default`) are
+  browser surfaces, so clicks there go into the page; incognito/new window without the
+  extension starts Chrome with `--incognito` / `--new-window`.
+- `automation/linux_apps.py`: `webapp_for_url`, `webapp_url`, `is_app_window_class`,
+  `site_of_window_class`.
+- `automation/web_macros.py`: `open_in`, `open_site`, `web_worthy`, `bridge_update`,
+  `_outdated` / self-update, `_wait_for`.
+- Extension 1.2.0: `tabs.open {where: tab|window|incognito|next}` (never into an `--app`
+  window), `page.waitFor {text|selector|urlIncludes|titleIncludes, timeoutMs}`.
+- `intelligence/llm_engine.py`: preamble lines for sites with a location (history untouched).
+- Tests: `tests/test_browser_control.py` (new, 107 at Part 1; 130 with the understanding layer), `test_browser_extension.py` +3,
+  `test_linux_automation.py` "open spotify" now expects the web player.
+
+### 2026-11-10 — round 4: browser control that actually works in Gmail
+
+**What was wrong** (from `logs/automation.log` and your real Gmail's control names, read
+through the extension without clicking anything):
+1. "open the first / latest email" was classified as *read the inbox aloud*; there was no way
+   to open one email, and Gmail's rows are not buttons, so no generic click could open them.
+2. "click on more / load more / all mails / sent" went to the **screen** clicker (OCR + mouse),
+   which cannot click without `/dev/uinput` — not to the extension inside Chrome.
+3. The extension's matching missed "More" → **More labels**, "all mails" → **All Mail** (plural),
+   and "load more" → **Show more messages**.
+
+**What changed**
+- Extension 1.1.0: tiered click matching (exact, plurals/synonyms, prefix, all-words, contains,
+  visible-text fallback), more clickable roles, `gmail.open` (first / Nth / latest-by-date /
+  oldest / last / unread / from / about), `runtime.reload`.
+- `automation/common.py`: `email open …`, `email read <one email>` (opens and reads that
+  message), `email read my emails` (inbox), Gmail folders, reply/forward/archive/delete/back/
+  unread/star/spam; "open the first email" as a plain `open …` is caught and routed to email.
+- `automation/linux.py`: any `click on …` / `scroll` with Chrome in front and the extension
+  connected goes into the page; the screen clicker is only used outside the browser.
+- `automation/web_macros.py`: `email_open`, `email_folder` (by URL), `email_action`, single-email
+  reading, and a clear "reload the extension" message when Chrome runs an older version.
+- `automation/policy.py`: deleting an email and reporting spam ask first.
+- `intelligence/llm_engine.py`: preamble lines for the Gmail phrasings.
+
+**Screen (non-browser) clicking** is unchanged and, as agreed, left for later: it needs the
+`/dev/uinput` rule to press the button at all.
+
+
+### 2026-11-10 — round 3: assistant features
+
+**Added** `automation/ai.py`, `diagnostics.py`, `browser_bridge.py`, `web_macros.py`,
+`screen_ai.py`, `workflows.py`, `linux_system.py`, `status_file.py`; the Chrome extension
+(`extension/kayra-bridge`) and the Omarchy bar widget (`extension/omarchy-kayra-widget`,
+`scripts/install_omarchy_widget.py`); `tests/test_assistant_automation.py`, `tests/test_browser_extension.py`.
+
+**Changed**
+- `automation/common.py`: new token families (`browser`, `meet`, `email`, `calendar`,
+  `message`, `diagnose`, `screen`, `scene`, `plan`, `trigger`, `files`, `git`, `click on …`)
+  parsed into structured actions; ~120 new "system …" phrasings, all matched before the power
+  needles; clock-time reminders (`parse_clock_reminder`); `AutomationRuntime.run_steps` with
+  plan pause/resume across a confirmation; the announcer (`set_announcer` / `announce`).
+- `automation/policy.py`: confirmations for update/install/uninstall, forgetting Wi-Fi,
+  closing many windows, closing the biggest app, other tabs, sending email/messages, calendar
+  events, screen sharing, diagnosis fixes, git commits, Docker stop/restart, bulk file moves;
+  the risky-click rule now covers browser clicks.
+- `automation/linux.py`: dispatch for all of the above; scheduled/hibernate power; per-app
+  volume; spoken timers; `start_services()` (bridge, watcher, notification log, status file)
+  and their teardown, which also saves the *last session* layout.
+- `intelligence/llm_engine.py`: the new tokens in `funcs` and a D3 preamble section (the
+  few-shot history is untouched).
+- `app.py`: `speak_unprompted()` (holds lines during turns, calls and standby) wired into the
+  automation services; the optional wake word.
+- `core/voice_control.py`: `passes_wake_word()`.
+
+**Verified live on the reference laptop:** full diagnosis in 16.5 s with an AI summary and
+report; morning briefing with real weather; local vision describing the screen; earbuds
+battery (90 %), audio devices, mic level, git status, workspaces, a real desktop notification
+captured and read back; bridge port opening and closing cleanly.
+
+
+### 2026-11-10 — round 2: safety hardening, device awareness, clicking, undo
+
+**What changed**
+- `automation/policy.py`: critical-service, package, permission, kernel/boot/firewall and
+  process-kill rules (tables above); home-folder protection; inline-code confirmation;
+  risky-button rule for text clicks (`_RISKY_CLICK`).
+- `platforms/linux.py`: `battery_status()` reads the kernel's `power_supply` class.
+- `automation/common.py`: device questions phrased as "system …" become read-only `info`
+  actions; new verbs `undo`, `power_profile`; "move/send … to an empty workspace" moves;
+  new prefixes `click on`, `click the`, `click at`, `double click on`, `right click on`,
+  `move mouse to`.
+- `automation/linux.py`: battery/temperature/Wi-Fi/Bluetooth/display/summary answers,
+  `powerprofilesctl`, `first_empty_workspace()`, settings screens, OCR clicking
+  (`ocr_words`, `find_text`, `click_on_text`, `click_at`), the undo stack
+  (`remember_undo`, `undo_last`).
+- `automation/linux_apps.py`: `SETTINGS_PANELS` / `settings_panel()`.
+- `intelligence/llm_engine.py`: preamble examples for the new phrasings (preamble only; the
+  few-shot history is untouched).
+
+**How it works now** — see the sections above. Verified live on the reference laptop: battery
+"73 percent and charging at 48 watts, about 23 minutes until full, health 85 percent"; first
+empty workspace 5 with windows on 1–4 and 6; Wi-Fi name and signal; volume 40 → 35 → undo → 40.
+
+**Not yet verified** — real mouse clicks on this machine (`/dev/uinput` is root-only until
+the udev rule above is installed); the DMM matrix with the new preamble lines.
+
+### 2026-11-09 — round 1: the Linux port
+
+Shared pipeline extracted to `automation/common.py`; Linux hands (`automation/linux.py`,
+`automation/linux_apps.py`); Hyprland Lua dispatch; System screen findings; 143-check suite.

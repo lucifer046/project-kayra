@@ -1081,3 +1081,32 @@ def control_kinds():
 def phrases_for(kind):
     """Every phrase that classifies to `kind`. Diagnostics and tests only."""
     return tuple(sorted(p for p, k in _KIND_BY_PHRASE.items() if k == kind))
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                     OPTIONAL WAKE WORD                               │
+# └────────────────────────────────────────────────────────────────────────┘
+# OFF by default. With KAYRA_WAKE_WORD=on, an utterance is acted on only when it names the
+# assistant ("Kayra, open Chrome"), or arrives within CONVERSATION_WINDOW_S of Kayra's last
+# reply — a follow-up in an ongoing exchange does not need the name again. Control phrases
+# (stop, wake up, ...) are matched before this gate and are never affected by it. Pure and
+# stateless: the caller passes the facts in.
+
+CONVERSATION_WINDOW_S = 20.0
+WAKE_NAMES = ("kayra", "kaira", "keira")
+
+
+def wake_word_enabled(environ=None):
+    import os
+    environ = os.environ if environ is None else environ
+    return str(environ.get("KAYRA_WAKE_WORD", "off")).strip().lower() in ("1", "on", "true", "yes")
+
+
+def passes_wake_word(text, seconds_since_reply, enabled, names=WAKE_NAMES):
+    """True when the utterance should be acted on."""
+    if not enabled:
+        return True
+    if seconds_since_reply is not None and seconds_since_reply <= CONVERSATION_WINDOW_S:
+        return True
+    words = re.findall(r"[a-z]+", str(text or "").lower())
+    return any(name in words for name in names)

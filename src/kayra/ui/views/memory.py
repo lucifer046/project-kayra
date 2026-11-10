@@ -27,17 +27,14 @@ Removing an item rewrites the store through the same atomic helpers the backend 
 pretends to delete something it merely hides.
 """
 
-import json
-import os
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy
 
-from kayra.ui.theme import Color, Space
+from kayra.ui.theme import Space
 from kayra.ui.components.primitives import (
     ListRow, CardAction,
-    Card, Caption, Secondary, StatusPill, GhostButton, DangerButton, EmptyState,
-    Divider, SectionLabel, _label,
+    Card, Caption, Secondary, StatusPill, GhostButton, EmptyState, _label,
 )
 from kayra.ui.views.base import View
 

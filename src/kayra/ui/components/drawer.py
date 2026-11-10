@@ -27,8 +27,7 @@ highlighted. The window owns routing; this emits `navigate(key)` and forgets.
 """
 
 from PySide6.QtCore import (Qt, Signal, QPropertyAnimation, QEasingCurve, QRect,
-                            QParallelAnimationGroup, QSequentialAnimationGroup,
-                            QPauseAnimation, Property)
+                            QParallelAnimationGroup, Property)
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QButtonGroup,
                                QGraphicsDropShadowEffect, QGraphicsOpacityEffect)

@@ -9,7 +9,6 @@ It features a dual-tier memory system comprising:
 - A persistent long-term memory database backed by transactional, corruption-resistant storage.
 """
 
-import os
 
 # Robust imports supporting relative paths across all execution contexts
 # Fallbacks are configured to handle standalone execution vs imported module contexts cleanly.
@@ -17,8 +16,8 @@ from kayra.core.config import assistant_name as get_assistant_name
 from kayra.intelligence.llm_engine import CentralizedLLMEngine
 
 from kayra.utils import (
-    print_banner, print_info, print_success, print_warning, print_error, print_system,
-    console, answer_modifier, real_time_info, SentenceStreamer
+    print_banner, print_success, print_error, print_system, console, answer_modifier,
+    real_time_info, SentenceStreamer
 )
 from kayra.memory.conversation import load_conversation_memory, save_conversation_memory
 

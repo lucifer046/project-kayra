@@ -46,6 +46,7 @@ second `VideoCapture`: most webcams are exclusive-access devices, so a second op
 fails outright or (worse, on some UVC drivers) succeeds and halves the frame rate of both.
 """
 
+import sys
 import threading
 import time
 
@@ -445,8 +446,16 @@ def _backend_flag(cv2, name):
     user a default, never the camera.
     """
     name = (name or "AUTO").strip().upper()
-    if name == "DSHOW":
+    windows = sys.platform.startswith("win")
+    # DSHOW / MSMF exist only on Windows and V4L2 / GSTREAMER only on Linux. A name for the
+    # other OS (a `.env` copied between machines) degrades to AUTO instead of an unopenable
+    # camera — the OpenCV constants exist everywhere, the backends do not.
+    if name == "DSHOW" and windows:
         return getattr(cv2, "CAP_DSHOW", 0)
-    if name == "MSMF":
+    if name == "MSMF" and windows:
         return getattr(cv2, "CAP_MSMF", 0)
+    if name == "V4L2" and not windows:
+        return getattr(cv2, "CAP_V4L2", 0)
+    if name == "GSTREAMER" and not windows:
+        return getattr(cv2, "CAP_GSTREAMER", 0)
     return getattr(cv2, "CAP_ANY", 0)

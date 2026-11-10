@@ -42,8 +42,9 @@ import os
 
 import hashlib
 import subprocess
-import sys
 
+from kayra import platforms
+from kayra.platforms import windows as _platform_windows
 from kayra.core.logbus import Subsystem, info, warning, error, debug
 from kayra.core.paths import conversation_paths
 from kayra.memory.conversation import load_conversation_memory, save_conversation_memory
@@ -249,7 +250,7 @@ def clear_all_memories():
 
 def open_memory_location():
     """
-    Reveals the memory file in Windows File Explorer. Returns (ok, detail).
+    Reveals the memory file in the platform's file manager. Returns (ok, detail).
 
     THE COMMAND IS AN ARGUMENT VECTOR, NEVER A STRING. `explorer.exe /select,<path>` is
     launched with `shell=False` and a list, so the path — which is data, even though it comes
@@ -277,17 +278,18 @@ def open_memory_location():
         error(Subsystem.MEMORY, f"Memory folder unavailable: {parent} ({exc})")
         return False, f"{parent}: {exc}"
 
-    if not sys.platform.startswith("win"):
-        # Kayra is a Windows assistant; this is here so the function is testable and honest
-        # rather than silently doing nothing on another platform.
-        warning(Subsystem.MEMORY, f"File Explorer is Windows-only. Memory store: {path}")
+    # The vector is the platform's: Explorer on Windows, the freedesktop FileManager1 call or
+    # `xdg-open` on Linux. None means this OS has no opener, which is reported, not faked.
+    command = platforms.reveal_command(path)
+    label = platforms.file_manager_label()
+    if not command:
+        warning(Subsystem.MEMORY, f"No file manager available. Memory store: {path}")
         return False, "not supported on this platform"
 
-    command = explorer_command(path)
     try:
         subprocess.Popen(command, shell=False)
     except Exception as exc:
-        error(Subsystem.MEMORY, f"Could not open File Explorer: {type(exc).__name__}: {exc}")
+        error(Subsystem.MEMORY, f"Could not open {label}: {type(exc).__name__}: {exc}")
         info(Subsystem.MEMORY, f"Memory store: {path}", correlate=False)
         return False, f"{path}: {exc}"
 
@@ -297,17 +299,11 @@ def open_memory_location():
 
 def explorer_command(path):
     """
-    The exact argument vector used to reveal `path`. Separated so it can be asserted on
-    without launching anything — a test that had to spawn Explorer to check the command shape
-    would be a test nobody runs.
+    The exact Windows Explorer vector used to reveal `path`. Separated so it can be asserted
+    on without launching anything — a test that had to spawn Explorer to check the command
+    shape would be a test nobody runs. Lives in the platform layer; kept here by name.
     """
-    path = os.path.abspath(path)
-    if os.path.exists(path) and os.path.isfile(path):
-        # One argument, exactly: Explorer's /select takes the path joined to the switch by a
-        # comma, and passing them as two arguments opens the wrong thing.
-        return ["explorer.exe", f"/select,{path}"]
-    target = path if os.path.isdir(path) else os.path.dirname(path)
-    return ["explorer.exe", target]
+    return _platform_windows.reveal_command(path)
 
 
 def describe_store():

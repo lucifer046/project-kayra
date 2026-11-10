@@ -294,6 +294,9 @@ def _is_system_drive(mountpoint):
     the system is on `C:` — a hardcoded drive letter would be right here by luck and wrong
     for anyone who moved theirs.
     """
+    if os.name != "nt":
+        # POSIX has one tree; the OS lives on whatever is mounted at /.
+        return os.path.abspath(mountpoint) == os.sep
     try:
         system_root = os.environ.get("SystemDrive") or os.path.splitdrive(sys.executable)[0]
         if not system_root:
@@ -308,7 +311,7 @@ def system_drive():
     The mount point of the drive the OS is on, for anything that needs "the" disk.
 
     `live_metrics` used `os.path.abspath(os.sep)`, which resolves against the CURRENT WORKING
-    DIRECTORY's drive — so running Kayra from `D:\` reported D:'s usage as the system disk.
+    DIRECTORY's drive — so running Kayra from `D:\\` reported D:'s usage as the system disk.
     """
     root = os.environ.get("SystemDrive")
     if root:
@@ -466,16 +469,30 @@ def _compatibility_findings(profile):
 
     is_windows = profile["os_name"] == "Windows"
     product, version = os_summary()
+    # Supported means an automation backend exists for it: Win32 on Windows, Hyprland on
+    # Linux. Any other Linux session gets applications, media and system control but no
+    # window management, which is LIMITED and said in plain words.
+    os_verdict, os_advice = READY, ""
+    if not is_windows:
+        from kayra import platforms
+        info = platforms.current()
+        if not info.is_linux:
+            os_verdict = LIMITED
+            os_advice = "Voice and conversation work; desktop control has no backend for this OS yet."
+        elif not info.is_hyprland:
+            os_verdict = LIMITED
+            os_advice = ("Apps, media and system control work. Window management needs a "
+                         "Hyprland session (Omarchy).")
     out.append(Finding(
         "Operating system",
-        READY if is_windows else LIMITED,
+        os_verdict,
         # The CORRECTED product name, never `platform.release()`. That value is "10" on a
         # Windows 11 machine, and this finding used to fall back to it whenever the edition
         # string was unavailable — which is how a Windows 11 laptop was told it ran Windows 10.
         product,
-        version or "Kayra's automation layer is built on Win32 APIs.",
-        "" if is_windows else
-        "Voice and conversation work, but window and application control are Windows-only."))
+        version or ("Desktop control through Win32." if is_windows else
+                    "Desktop control through Hyprland IPC and Wayland tools."),
+        os_advice))
 
     arch = (profile["architecture"] or "").lower()
     known_64 = arch in ("amd64", "x86_64", "arm64")
@@ -645,22 +662,24 @@ def _readiness_findings():
 
     # Proactive service.
     enabled = env_bool("PROACTIVE_AGENT_ENABLED", True)
-    try:
-        import pygetwindow                              # noqa: F401
-        has_context = True
-    except Exception:
-        has_context = False
+    from kayra import platforms
+    has_context, context_detail = platforms.active_window_support()
     if not enabled:
         verdict, summary, advice = LIMITED, "Disabled", "Enable it in Settings if you want it."
     elif has_context:
         verdict, summary, advice = READY, "Enabled with full signals", ""
     else:
         verdict, summary = GOOD, "Enabled, reduced signals"
-        advice = "pygetwindow is unavailable, so suggestions use time and habits only."
+        advice = (f"The active-window signal is unavailable ({context_detail}), so "
+                  "suggestions use time and habits only.")
     out.append(Finding("Proactive agent", verdict, summary,
                        "Suggests things unprompted, using local scoring only.", advice))
 
-    # Automation dependencies.
+    # Automation dependencies. Linux is judged by the tools `automation.linux` drives (never
+    # by the Windows package list, which nobody should install there).
+    if not platforms.current().is_windows:
+        out.append(_linux_automation_finding(platforms.automation_support()))
+        return _append_memory_finding(out)
     missing = []
     for module, label in (("win32gui", "pywin32"), ("pyautogui", "pyautogui"),
                           ("keyboard", "keyboard"), ("AppOpener", "AppOpener")):
@@ -677,8 +696,29 @@ def _readiness_findings():
         verdict, summary, advice = LIMITED, "Some components missing", f"Install: {', '.join(missing)}"
     out.append(Finding("Desktop automation", verdict, summary,
                        "Window, application, media and keyboard control.", advice))
+    return _append_memory_finding(out)
 
-    # Memory store.
+
+def _linux_automation_finding(support):
+    purpose = "Window, application, media, keyboard and system control."
+    if not support or "a desktop automation backend" in support.get("missing_core", ()):
+        return Finding("Desktop automation", NOT_AVAILABLE, "No backend for this OS",
+                       purpose, "Conversation, search, research, speech and gestures work.")
+    core, extras = support.get("missing_core", []), support.get("missing_extras", [])
+    if not support.get("compositor"):
+        return Finding("Desktop automation", LIMITED, "No window management",
+                       purpose, "Window control uses Hyprland's IPC; run Kayra in a Hyprland "
+                                "session for focus, close, workspaces and layout.")
+    if core:
+        return Finding("Desktop automation", LIMITED, f"Missing {', '.join(core)}", purpose,
+                       "Install wtype, wireplumber and uwsm (all in Omarchy by default).")
+    if extras:
+        return Finding("Desktop automation", GOOD, "Hyprland control ready",
+                       purpose, f"Optional and missing: {', '.join(extras)}.")
+    return Finding("Desktop automation", READY, "Hyprland control ready", purpose, "")
+
+
+def _append_memory_finding(out):
     try:
         from kayra.core.paths import data_dir
         writable = os.access(data_dir(), os.W_OK)

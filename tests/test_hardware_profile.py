@@ -44,6 +44,7 @@ import re
 import ast
 import sys
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _harness import (Checker, EnvironmentGuard, MACHINES, MACHINES_BY_LETTER,
@@ -75,6 +76,17 @@ class FakeRegistry:
     def __enter__(self):
         machine = self.machine
         self._values = hardware._reg_values
+
+        # Off Windows there is no `winreg` at all, so the registry code path would never run.
+        # A stand-in module makes the SAME parsing code serve the synthetic machine on Linux,
+        # which is what lets a Linux developer run the Windows hardware checks.
+        self._stub_winreg = hardware.winreg is None
+        if self._stub_winreg:
+            def _missing(*a, **k):
+                raise OSError("no registry on this platform")
+            hardware.winreg = types.SimpleNamespace(
+                HKEY_LOCAL_MACHINE=0x80000002, HKEY_CURRENT_USER=0x80000001,
+                OpenKey=_missing, EnumKey=_missing, QueryValueEx=_missing)
 
         adapters = {}
         for index, (vendor, name, vram) in enumerate(machine.adapters):
@@ -139,6 +151,8 @@ class FakeRegistry:
     def __exit__(self, *exc):
         hardware._reg_values = self._values
         hardware.winreg.OpenKey, hardware.winreg.EnumKey = self._enum
+        if self._stub_winreg:
+            hardware.winreg = None
         hardware.reset_cache()
         return False
 
@@ -153,7 +167,7 @@ def section_real_machine():
     facts = hardware.os_info()
     check("os_info returns an OSInfo", isinstance(facts, hardware.OSInfo))
     check("the OS has a product name", bool(facts.display_name))
-    check("the source is declared", facts.source in ("registry", "platform"))
+    check("the source is declared", facts.source in ("registry", "platform", "os-release"))
     print_info(f"      OS   {facts.display_name}  |  {facts.version_text or 'no version'}")
 
     if sys.platform.startswith("win"):
@@ -172,6 +186,14 @@ def section_real_machine():
                   "windows 10" not in facts.display_name.lower(), facts.display_name)
         check("the build text carries the revision when there is one",
               facts.revision is None or "." in facts.build_text, facts.build_text)
+
+    if sys.platform.startswith("linux"):
+        check("Linux is read from os-release, not from platform",
+              facts.source == "os-release", facts.source)
+        check("the Linux product is the distribution, not the kernel",
+              facts.display_name.lower() != "linux" or not os.path.exists("/etc/os-release"),
+              facts.display_name)
+        check("the kernel release is recorded", bool(facts.kernel_version))
 
     cpu = hardware.cpu_info()
     check("cpu_info returns a CPUInfo", isinstance(cpu, hardware.CPUInfo))
@@ -281,12 +303,17 @@ def section_os_detection():
     class _Blank:
         def __enter__(self_inner):
             self_inner.original = hardware._reg_values
+            self_inner.stubbed = hardware.winreg is None
+            if self_inner.stubbed:            # exercise the registry path on Linux too
+                hardware.winreg = types.SimpleNamespace(HKEY_LOCAL_MACHINE=0x80000002)
             hardware._reg_values = lambda *a, **k: {}
             hardware.reset_cache()
             return self_inner
 
         def __exit__(self_inner, *exc):
             hardware._reg_values = self_inner.original
+            if self_inner.stubbed:
+                hardware.winreg = None
             hardware.reset_cache()
             return False
 
@@ -598,8 +625,12 @@ def section_no_hardcoding():
     imports = {alias.name.split(".")[0] for node in ast.walk(tree)
                if isinstance(node, ast.Import) for alias in node.names}
     check("hardware imports no subprocess module", "subprocess" not in imports)
-    check("hardware is a leaf: it imports nothing from kayra except lazily",
+    # `kayra.platforms` is the one permitted import: it is itself a stdlib-only leaf BELOW
+    # core, so depending on it keeps `core` a leaf.
+    check("hardware is a leaf: it imports nothing from kayra except the platform layer",
           all(not (node.module or "").startswith("kayra")
+              or (node.module or "").startswith("kayra.platforms")
+              or (node.module == "kayra" and all(a.name == "platforms" for a in node.names))
               for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)))
 
 

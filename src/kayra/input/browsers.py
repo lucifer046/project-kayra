@@ -53,8 +53,10 @@ works; capability decides where it does not.
 
 import os
 import json
+import shutil
 import functools
 
+from kayra import platforms
 from kayra.core.paths import data_path
 from kayra.core.logbus import Subsystem, info, warning
 
@@ -116,6 +118,34 @@ _CANDIDATE_PATHS = {
     ],
 }
 
+# Linux: executable names on PATH, in preference order per family. Arch/Omarchy package names
+# first (`google-chrome-stable`, `brave`, `vivaldi-stable`), then the Debian/Fedora spellings.
+# NOTE for speech: Google Chrome (AUR `google-chrome`) is verified to transcribe on Linux.
+# Distribution Chromium builds are not entitled to Google's speech service; on the reference
+# Omarchy host Arch's Chromium started a session without an error but produced no transcripts.
+# It stays "unknown" (probed, never trusted), and Chrome is preferred whenever it is installed.
+_LINUX_COMMANDS = {
+    "chrome": ["google-chrome-stable", "google-chrome"],
+    "edge": ["microsoft-edge-stable", "microsoft-edge"],
+    "brave": ["brave", "brave-browser", "brave-browser-stable"],
+    "chromium": ["chromium", "chromium-browser"],
+    "opera": ["opera"],
+    "vivaldi": ["vivaldi-stable", "vivaldi"],
+}
+
+# Linux: a family from the default handler's desktop id (`google-chrome.desktop`).
+_DESKTOP_HINTS = (
+    ("google-chrome", "chrome"),
+    ("com.google.chrome", "chrome"),
+    ("microsoft-edge", "edge"),
+    ("brave", "brave"),
+    ("com.brave.browser", "brave"),
+    ("chromium", "chromium"),
+    ("org.chromium.chromium", "chromium"),
+    ("opera", "opera"),
+    ("vivaldi", "vivaldi"),
+)
+
 # Substrings identifying a family from the registry ProgId of the default browser. Brave's
 # ProgId carries a per-installation suffix (BraveHTML.FE6EYDMJR34A7AVVYBFC4QRSMI), so matching
 # is by prefix rather than equality.
@@ -168,26 +198,33 @@ def default_browser_key():
     """
     The family key of the user's default browser, or None.
 
-    Read from the per-user UrlAssociations UserChoice, which is what Windows Settings actually
-    writes. This is a READ of a registry value the user set; nothing here modifies it.
+    The platform layer reads what the user set — the registry UserChoice ProgId on Windows,
+    the https handler in `mimeapps.list` on Linux — and this maps it to a family. A READ of a
+    preference; nothing here modifies it.
     """
-    try:
-        import winreg
-    except ImportError:
+    hint = platforms.default_browser_hint()
+    if not hint:
         return None
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"SOFTWARE\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice")
-        with key:
-            prog_id, _ = winreg.QueryValueEx(key, "ProgId")
-    except (OSError, FileNotFoundError):
-        return None
-
-    lowered = (prog_id or "").lower()
-    for hint, family in _PROGID_HINTS:
-        if lowered.startswith(hint):
+    lowered = hint.lower()
+    table = _PROGID_HINTS if platforms.is_windows() else _DESKTOP_HINTS
+    for prefix, family in table:
+        if lowered.startswith(prefix):
             return family
+    return None
+
+
+def _installed_binary(key):
+    """The executable for a family on this OS, or None."""
+    if platforms.is_windows():
+        for raw in _CANDIDATE_PATHS.get(key, ()):
+            path = _expand(raw)
+            if path and os.path.isfile(path):
+                return path
+        return None
+    for command in _LINUX_COMMANDS.get(key, ()):
+        path = shutil.which(command)
+        if path:
+            return path
     return None
 
 
@@ -201,12 +238,10 @@ def discover_browsers():
     """
     default_key = default_browser_key()
     found = []
-    for key, paths in _CANDIDATE_PATHS.items():
-        for raw in paths:
-            path = _expand(raw)
-            if path and os.path.isfile(path):
-                found.append(BrowserSpec(key, path, is_default=(key == default_key)))
-                break
+    for key in _FAMILIES:
+        path = _installed_binary(key)
+        if path:
+            found.append(BrowserSpec(key, path, is_default=(key == default_key)))
     found.sort(key=lambda spec: not spec.is_default)
     return tuple(found)
 
@@ -293,9 +328,19 @@ def candidates(preference=None):
 
     add(by_key.get(previously_working()))
 
+    # LINUX: the default is promoted only when its backend is KNOWN (google/vendor), or when
+    # nothing with a known backend is installed. Omarchy ships Chromium as the default
+    # browser; a distribution Chromium starts a recognition session without an error and then
+    # transcribes nothing, so promoting it would pass the probe, be cached as "verified", and
+    # leave Kayra deaf with Google Chrome sitting unused. Windows keeps its historical order.
+    known_backend = any(spec.recognition in ("google", "vendor") for spec in installed)
     for spec in installed:
-        if spec.is_default and spec.recognition != "none":
-            add(spec)
+        if not spec.is_default or spec.recognition == "none":
+            continue
+        if (not platforms.is_windows() and spec.recognition == "unknown"
+                and known_backend):
+            continue
+        add(spec)
 
     for tier in ("google", "vendor", "unknown"):
         for spec in installed:

@@ -1090,10 +1090,13 @@ def section_short_answers():
 
 def section_power_boundary():
     check.section("[10] Kayra shutdown vs computer shutdown")
-    from kayra.automation import windows as auto
+    # The backend for THIS OS — automation.windows or automation.linux. Both share the one
+    # normalizer and power-target gate in automation.common, so the boundary is checked
+    # everywhere rather than skipped off Windows.
+    from kayra.automation import load_backend
+    auto = load_backend()
     from kayra.automation.policy import (classify_action, Risk, POWER_VERBS,
-                                         resolve_power_target, TARGET_COMPUTER,
-                                         TARGET_KAYRA, TARGET_AMBIGUOUS)
+                                         resolve_power_target, TARGET_AMBIGUOUS)
 
     # THE REPORTED FAILURE. "Shutdown the engine car." — a malformed transcript of a request
     # about KAYRA — reached `system.shutdown` through a substring test and produced

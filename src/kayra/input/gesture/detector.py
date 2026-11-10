@@ -109,20 +109,28 @@ class HandDetector:
 
             delegate = probe_accelerators(self.config.gpu)
             try:
-                self._hands = mp.solutions.hands.Hands(
-                    static_image_mode=False,
-                    max_num_hands=self.max_hands,
-                    model_complexity=self.config.model_complexity,
-                    min_detection_confidence=self.config.detection_confidence,
-                    min_tracking_confidence=self.config.tracking_confidence,
-                )
+                if hasattr(mp, "solutions"):
+                    self._hands = mp.solutions.hands.Hands(
+                        static_image_mode=False,
+                        max_num_hands=self.max_hands,
+                        model_complexity=self.config.model_complexity,
+                        min_detection_confidence=self.config.detection_confidence,
+                        min_tracking_confidence=self.config.tracking_confidence,
+                    )
+                    graph = f"complexity={self.config.model_complexity}"
+                else:
+                    # MediaPipe >= 0.10.30 removed `mp.solutions`, and those are the only
+                    # wheels published for Python 3.13+. Same model family through the
+                    # Tasks API; see `_TasksHands`.
+                    self._hands = _TasksHands(mp, self.max_hands, self.config)
+                    graph = "tasks HandLandmarker"
             except Exception as exc:
                 self.error_detail = f"{type(exc).__name__}: {exc}"
                 return False, self.error_detail
 
             self.delegate = delegate
             self.backend = (f"mediapipe {getattr(mp, '__version__', '?')} "
-                            f"complexity={self.config.model_complexity} {delegate}")
+                            f"{graph} {delegate}")
             self.ready = True
             self._extractor.reset()
             info(Subsystem.GESTURE, f"Detector: {self.backend}")
@@ -228,6 +236,68 @@ class HandDetector:
             "hands_seen": self.hands_seen,
             "error": self.error_detail,
         }
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                   TASKS API ADAPTER (MediaPipe >= 0.10.30)               │
+# └────────────────────────────────────────────────────────────────────────┘
+# `mp.solutions.hands` was removed upstream. Its replacement, `HandLandmarker`, runs the same
+# palm-detector + landmark model pair but (a) needs the model bundle as a FILE, which the pip
+# wheel no longer ships, and (b) returns a differently-shaped result. This adapter presents
+# the legacy `process()` contract so everything downstream of the detector is untouched.
+
+HAND_MODEL_FILE = "hand_landmarker.task"
+HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                  "hand_landmarker/float16/latest/hand_landmarker.task")
+
+
+def hand_model_path():
+    from kayra.core.paths import model_path
+    return model_path(HAND_MODEL_FILE)
+
+
+class _TasksHands:
+    """`HandLandmarker` in VIDEO mode behind the legacy `Hands.process()` interface."""
+
+    def __init__(self, mp, max_hands, config):
+        import os
+        path = hand_model_path()
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"{HAND_MODEL_FILE} is missing from models/ — run `python setup.py` "
+                f"(MediaPipe {getattr(mp, '__version__', '?')} needs the model as a file)")
+        from mediapipe.tasks.python import vision
+        from mediapipe.tasks.python.core.base_options import BaseOptions
+        options = vision.HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=path),
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=max_hands,
+            min_hand_detection_confidence=config.detection_confidence,
+            min_hand_presence_confidence=config.detection_confidence,
+            min_tracking_confidence=config.tracking_confidence,
+        )
+        self._mp = mp
+        self._landmarker = vision.HandLandmarker.create_from_options(options)
+        self._last_ts = 0
+
+    def process(self, rgb_frame):
+        from types import SimpleNamespace
+        image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb_frame)
+        # VIDEO mode requires strictly increasing timestamps.
+        ts = max(int(time.monotonic() * 1000), self._last_ts + 1)
+        self._last_ts = ts
+        result = self._landmarker.detect_for_video(image, ts)
+        hands = [SimpleNamespace(landmark=list(points))
+                 for points in (getattr(result, "hand_landmarks", None) or [])]
+        handedness = [SimpleNamespace(classification=[SimpleNamespace(
+                          label=getattr(cats[0], "category_name", ""),
+                          score=getattr(cats[0], "score", 0.0))] if cats else [])
+                      for cats in (getattr(result, "handedness", None) or [])]
+        return SimpleNamespace(multi_hand_landmarks=hands or None,
+                               multi_handedness=handedness or None)
+
+    def close(self):
+        self._landmarker.close()
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

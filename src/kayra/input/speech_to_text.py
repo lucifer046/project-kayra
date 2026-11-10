@@ -28,9 +28,9 @@ recovered in place when it dies, and torn down by PID (never by process name) on
 """
 
 import os
+import sys
 import re
 import time
-import urllib.parse
 import atexit
 import threading
 import mtranslate as mt
@@ -50,7 +50,7 @@ except ImportError:
 from kayra.core.config import env
 from kayra.core.paths import data_path
 from kayra.input import browsers
-from kayra.core.logbus import Subsystem, info, warning, error
+from kayra.core.logbus import Subsystem, info, warning, error, debug
 from kayra.utils import print_warning, print_error, print_success, print_banner, console, now_ms
 
 
@@ -1167,7 +1167,10 @@ class SpeechToTextEngine:
         # A Chromium derivative is launched by pointing ChromeDriver at its executable. Without
         # this, ChromeDriver silently starts Chrome instead — which would "work" while quietly
         # ignoring the browser the user actually asked for.
-        if spec is not None and spec.needs_binary_location():
+        if spec is not None and (spec.needs_binary_location()
+                                 or (not sys.platform.startswith("win") and spec.binary)):
+            # On Linux Chrome is pointed at explicitly too: the binary is
+            # `google-chrome-stable`, which ChromeDriver's default search does not always find.
             chrome_options.binary_location = spec.binary
 
         return chrome_options
@@ -1243,12 +1246,45 @@ class SpeechToTextEngine:
             time.sleep(0.1)
         return True, "no error"
 
+    @staticmethod
+    def _matching_driver(spec):
+        """
+        A Selenium `Service` pinned to a driver that matches `spec`'s browser, or None.
+
+        LINUX ONLY, and for one concrete trap: Arch/Omarchy's `chromedriver` package belongs to
+        `chromium` and lives on PATH. Selenium Manager prefers a driver found on PATH even when
+        its major version does not match, so Google Chrome 157 was driven by ChromeDriver 155,
+        the session failed to start, and Kayra fell back to Chromium — which ships no speech
+        backend on Arch. Asking Selenium Manager with `--skip-driver-in-path` resolves (and
+        caches) the driver for the browser actually being launched. Windows is unchanged.
+        """
+        if sys.platform.startswith("win") or spec is None or not spec.binary:
+            return None
+        try:
+            from selenium.webdriver.common.selenium_manager import SeleniumManager
+            browser = "MicrosoftEdge" if spec.driver == "edge" else "chrome"
+            paths = SeleniumManager().binary_paths(
+                ["--browser", browser, "--browser-path", spec.binary, "--skip-driver-in-path"])
+            driver_path = paths.get("driver_path")
+        except Exception as exc:
+            debug(Subsystem.STT, f"Selenium Manager could not resolve a driver: {exc}")
+            return None
+        if not driver_path:
+            return None
+        if spec.driver == "edge":
+            from selenium.webdriver.edge.service import Service as EdgeService
+            return EdgeService(executable_path=driver_path)
+        from selenium.webdriver.chrome.service import Service as ChromeService
+        return ChromeService(executable_path=driver_path)
+
     def _launch(self, spec, page_url):
         """Builds one browser session and starts recognition in it. Raises on failure."""
+        service = self._matching_driver(spec)
+        extra = {"service": service} if service is not None else {}
         if spec is not None and spec.driver == "edge":
-            self.driver = webdriver.Edge(options=self._chrome_options(spec))
+            self.driver = webdriver.Edge(options=self._chrome_options(spec), **extra)
         else:
-            self.driver = webdriver.Chrome(options=self._chrome_options(spec))
+            self.driver = webdriver.Chrome(options=self._chrome_options(spec), **extra)
 
         # Bound every HTTP command so a dead driver fails fast instead of hanging.
         try:

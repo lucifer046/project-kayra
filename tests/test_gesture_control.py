@@ -60,7 +60,7 @@ from kayra.utils import print_banner, print_info, print_success, print_error, pr
 # The synthetic hands live in the state-machine suite; there is one fixture set, not two.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_gesture_state import (hand, pinch_hand, fist_hand, INDEX_ONLY,
-                                TWO_FINGER, ASPECT)
+                                TWO_FINGER)
 from test_camera_runtime import install_fake_cv2, restore_cv2, wait_for
 
 FAILURES = []
@@ -286,25 +286,49 @@ def section_config():
 def section_ownership():
     print_system("\n[2] Single ownership, by AST")
 
-    capture_sites, graph_sites = [], []
+    # A hand graph is built by EITHER `mp.solutions.hands.Hands(...)` (MediaPipe <= 0.10.21) or
+    # the Tasks adapter `_TasksHands(...)`, which calls `HandLandmarker.create_from_options`
+    # (0.10.30+, the only releases for Python 3.13+). The invariant is not "one call
+    # expression" but "one place decides which graph exists": every construction must live in
+    # detector.py, and the public entry to it must be `HandDetector.start` alone.
+    capture_sites, graph_sites, graph_owners = [], [], set()
     for path in gesture_sources():
-        for node in ast.walk(parse(path)):
+        tree = parse(path)
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             name = ast.unparse(node.func)
             if name.endswith("VideoCapture"):
                 capture_sites.append(f"{os.path.basename(path)}:{node.lineno}")
-            if "solutions.hands.Hands" in name or name.endswith("Hands"):
+            if ("solutions.hands.Hands" in name or name.endswith("Hands")
+                    or name.endswith("HandLandmarker.create_from_options")):
                 graph_sites.append(f"{os.path.basename(path)}:{node.lineno}")
+                owner, cursor = None, node
+                while cursor in parents:
+                    cursor = parents[cursor]
+                    if isinstance(cursor, (ast.FunctionDef, ast.ClassDef)) and owner is None:
+                        owner = cursor.name
+                    if isinstance(cursor, ast.ClassDef):
+                        owner = f"{cursor.name}.{owner}" if owner != cursor.name else owner
+                        break
+                graph_owners.add(owner)
 
     check("there is exactly ONE VideoCapture call site in the package",
           len(capture_sites) == 1, str(capture_sites))
     check("...and it is in camera.py",
           capture_sites and capture_sites[0].startswith("camera.py"), str(capture_sites))
-    check("there is exactly ONE hand-graph construction site",
-          len(graph_sites) == 1, str(graph_sites))
-    check("...and it is in detector.py",
-          graph_sites and graph_sites[0].startswith("detector.py"), str(graph_sites))
+    check("every hand-graph construction is in detector.py",
+          graph_sites and all(site.startswith("detector.py") for site in graph_sites),
+          str(graph_sites))
+    check("...and only HandDetector.start and the Tasks adapter build one",
+          graph_owners <= {"HandDetector.start", "_TasksHands.__init__"}
+          and "HandDetector.start" in graph_owners, str(sorted(map(str, graph_owners))))
+    check("there is exactly ONE hand-graph decision point (HandDetector.start)",
+          sum(1 for site in graph_sites) <= 3, str(graph_sites))
 
     # The whole application, not just this package.
     all_sources = sorted(glob.glob(os.path.join(project_root, "src", "kayra", "**", "*.py"),

@@ -560,7 +560,7 @@ def main(argv=None):
             from kayra.ui.application import main as ui_main
         except ImportError as exc:
             info(f"Desktop interface unavailable ({exc}). Starting in console mode.")
-            hint("Install it with:  .venv\\Scripts\\python.exe -m pip install PySide6-Essentials")
+            hint(f"Install it with:  {venv_python()} -m pip install PySide6-Essentials")
             from kayra.app import main as app_main
             return app_main()
         return ui_main(argv)

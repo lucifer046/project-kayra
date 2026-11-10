@@ -124,6 +124,7 @@ Automation = None
 pending_confirmation = None
 resolve_confirmation = None
 shutdown_automation = None
+take_chat_handoff = None
 is_interrupt_phrase = None
 create_default_agent = None
 
@@ -158,6 +159,53 @@ def boot_announcement():
     tier = "Cloud" if getattr(engine, "is_online", False) else "Local"
     return (f"{assistant_name} is now online. "
             f"{tier} intelligence services are active and I'm ready.")
+
+
+def speak_unprompted(text, urgent=False):
+    """
+    How background automation talks: reminders, triggers, health alerts, progress lines.
+
+    URGENT lines (a reminder the user set, "Running a full diagnosis…", a scheduled shutdown
+    warning) speak at once. Everything else waits — up to a minute — for a moment when Kayra
+    is not mid-turn, the user is not on a call, and Kayra is not in standby; after that it is
+    dropped rather than spoken at a bad time. Runs on its own short-lived thread so the
+    watcher and timers never block on audio.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return
+    logbus.info(Subsystem.AUTO, f"Kayra: \"{text[:160]}\"", correlate=False)
+
+    def deliver():
+        if not urgent:
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                snap = RUNTIME.snapshot()
+                busy = snap.get("busy") or snap.get("sleeping")
+                in_call = False
+                if not busy:
+                    try:
+                        from kayra.automation import workflows
+                        in_call = workflows.in_call()
+                    except Exception:
+                        in_call = False
+                if not busy and not in_call:
+                    break
+                time.sleep(3)
+            else:
+                return
+        if TTS_ENABLED and tts_engine is not None:
+            try:
+                tts_engine.begin_background_utterance()
+                tts_engine.speak(text)
+            except Exception:
+                pass
+        try:
+            RUNTIME.emit("assistant_announcement", text=text)
+        except Exception:
+            pass
+
+    threading.Thread(target=deliver, name="kayra-announce", daemon=True).start()
 
 
 def speak_boot_announcement():
@@ -529,7 +577,7 @@ def bootstrap():
     global _BOOTSTRAPPED, BOOT, env_vars, assistant_name
     global engine, emotion_engine, EMOTION_ENABLED
     global Chatbot, RealTimeSearchEngine, DeepResearchEngine, Automation
-    global pending_confirmation, resolve_confirmation, shutdown_automation
+    global pending_confirmation, resolve_confirmation, shutdown_automation, take_chat_handoff
     global is_interrupt_phrase, create_default_agent, PROACTIVE_AVAILABLE, proactive_agent
 
     if _BOOTSTRAPPED:
@@ -587,18 +635,35 @@ def bootstrap():
             print_error("Deep Research Engine is offline.")
 
     try:
-        from kayra.automation.windows import (Automation as _Automation,
-                                              pending_confirmation as _pending,
-                                              resolve_confirmation as _resolve,
-                                              shutdown_automation as _shutdown_auto)
-        Automation, pending_confirmation = _Automation, _pending
-        resolve_confirmation, shutdown_automation = _resolve, _shutdown_auto
-    except ImportError as e:
+        # The hands for THIS operating system: `automation.windows` (Win32) or
+        # `automation.linux` (Hyprland/Wayland). Both expose the same four entry points and
+        # share one normalizer and one policy (`automation.common`).
+        from kayra.automation import load_backend as _load_automation
+        _hands = _load_automation()
+        Automation, pending_confirmation = _hands.Automation, _hands.pending_confirmation
+        resolve_confirmation = _hands.resolve_confirmation
+        shutdown_automation = _hands.shutdown_automation
+        # The understanding layer may decide an "automation" request was conversation.
+        take_chat_handoff = getattr(_hands, "take_chat_handoff", lambda: False)
+        # Linux: the Chrome bridge, the trigger/health watcher and the notification log.
+        # They speak through `speak_unprompted`, never through a turn.
+        if hasattr(_hands, "start_services"):
+            try:
+                started = _hands.start_services(speak_unprompted)
+                logbus.info(Subsystem.AUTO, "Services: " + ", ".join(
+                    f"{k} {'on' if v else 'off'}" for k, v in started.items()), correlate=False)
+            except Exception as exc:
+                logbus.warning(Subsystem.AUTO, f"Automation services did not start: {exc}")
+    except Exception as e:
+        # `Exception`, not just ImportError: a desktop library that cannot reach a display
+        # fails with its own error type. Isolating that HERE is what keeps conversation,
+        # search and speech working when desktop control cannot start.
         print_error(f"Automation Engine is offline: {e}")
 
         async def Automation(cmds):
             print_error("Automation Engine is offline.")
-            return ""
+            # Spoken, so a user who asks to open an app hears why nothing happened.
+            return "Desktop control isn't available right now."
 
         def pending_confirmation():
             return None
@@ -608,6 +673,9 @@ def bootstrap():
 
         def shutdown_automation():
             return 0
+
+        def take_chat_handoff():
+            return False
 
     try:
         from kayra.intelligence.emotion_engine import EmotionEngine
@@ -1754,6 +1822,18 @@ def Listen():
                 print_warning(f"[ECHO REJECTED] Ignoring own voice picked up by mic: '{user_input}'")
                 continue
 
+            # ── Optional wake word (KAYRA_WAKE_WORD=on) ──
+            # Off by default. When on, room talk that never names Kayra is ignored, except as
+            # a follow-up within a few seconds of Kayra's last reply.
+            from kayra.core import voice_control as _vc
+            if _vc.wake_word_enabled():
+                names = _vc.WAKE_NAMES + (str(assistant_name or "").lower(),)
+                since = RUNTIME.snapshot().get("seconds_since_turn_end")
+                if not _vc.passes_wake_word(user_input, since, True, names):
+                    logbus.debug(Subsystem.VOICE, f"Wake word not heard; ignoring '{user_input}'")
+                    logbus.end_turn()
+                    continue
+
             return user_input
 
     return console.input("\n[bold cyan]User >[/bold cyan] ").strip()
@@ -2087,7 +2167,7 @@ async def Execute_Task(intent_array, original_query, mood=None):
         #
         #    The local control interpreter normally catches "exit" / "turn off Kayra" before
         #    the classifier ever sees them, so this branch is the fallback for the phrasings
-        #    only the DMM recognises ("that's all", "bye jarvis"). Both routes converge on the
+        #    only the DMM recognises ("that's all", "bye kayra"). Both routes converge on the
         #    same `request_shutdown`, which speaks the farewell itself.
         if task_lower == "exit":
             print_system(f"Initiating shutdown sequence for {assistant_name}. Goodbye!")
@@ -2208,6 +2288,15 @@ async def Execute_Task(intent_array, original_query, mood=None):
                 (pending_confirmation() or "") if pending_confirmation else "")
         if spoken and isinstance(spoken, str):
             _say(spoken)
+        # The DMM sent it to automation, but the understanding layer judged it to be a
+        # question or conversation ("what's a good name for my cat"): answer it as chat.
+        if take_chat_handoff and take_chat_handoff():
+            set_state(STATE_SPEAKING)
+            _voice_flow("Speaking")
+            answer = await asyncio.to_thread(Chatbot, original_query,
+                                             tts_engine if TTS_ENABLED else None, mood)
+            if isinstance(answer, str):
+                _announce_reply(answer)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

@@ -32,14 +32,13 @@ reorder it, does not duplicate it, and does not try to clean up first.
 """
 
 import sys
-import os
 
-from PySide6.QtCore import Qt, QTimer, QSize, QThread, QMetaObject
+from PySide6.QtCore import Qt, QTimer, QThread, QMetaObject
 from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QAction, QGuiApplication,
                            QCursor)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QSystemTrayIcon, QMenu, QSizePolicy, QLabel,
+    QSystemTrayIcon, QMenu,
 )
 
 from kayra.ui import theme
@@ -47,8 +46,8 @@ from kayra.ui.theme import Color, Space, Size, Motion
 from kayra.ui.bridge import KayraBridge
 from kayra.ui.controls import KayraControls
 from kayra.ui.components.navigation import Sidebar
-from kayra.ui.components.orb import AssistantOrb, OrbBadge
-from kayra.ui.components.primitives import Caption, GhostButton, _label
+from kayra.ui.components.orb import AssistantOrb
+from kayra.ui.components.primitives import Caption, _label
 from kayra.ui.components.backdrop import AmbientBackdrop, prefers_reduced_motion
 from kayra.ui.components.navigation import _motion_allowed
 from kayra.ui.components.dock import FloatingDock
@@ -122,6 +121,10 @@ class AmbientAssistant(QWidget):
         super().__init__(parent)
         self.bridge = bridge
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        # Never shown on Windows (frameless tool window). On Wayland compositors the title is
+        # the only thing that tells this panel apart from the dashboard — both carry the app-id
+        # `kayra` — so a tiling compositor (Hyprland/Omarchy) can be told to float just this.
+        self.setWindowTitle("Kayra Ambient")
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFixedSize(Size.ambient_width, Size.ambient_height)
 
@@ -964,6 +967,76 @@ def _build_tray(app, window, ambient, bridge):
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
+# │                   POSIX SIGNALS UNDER THE QT EVENT LOOP                │
+# └────────────────────────────────────────────────────────────────────────┘
+
+def _install_signal_bridge(app, bridge):
+    """
+    Routes SIGTERM / SIGINT / SIGHUP to the authoritative shutdown while Qt owns the thread.
+
+    WHY THIS EXISTS. `app.bootstrap()` installs Kayra's signal handlers, but in the desktop
+    front end it runs on the session's worker thread, where `signal.signal` is not allowed —
+    so in the UI nothing was registered, and a SIGTERM took the default action: the Python
+    process vanished and its headless-browser tree was orphaned. On Linux that is the ordinary
+    way a session logout, `systemctl --user stop` or `kill` asks an application to quit.
+
+    THE MECHANISM, AND WHY IT DOES NOT POLL. A Python-level handler only runs when the
+    interpreter regains control, and inside `app.exec()` it does not until some Qt callback
+    fires. `signal.set_wakeup_fd` makes the C-level handler write a byte to a socket; a
+    `QSocketNotifier` on the other end wakes the event loop, the slot runs Python, and the
+    pending handler executes. No timer — this codebase does not poll for events it can be told
+    about.
+
+    The handler does exactly what the tray's Quit does: `bridge.shutdown(hard=True)`, on the
+    GUI thread. Windows is unchanged (console control events are a different mechanism and the
+    existing behaviour there was not part of this change).
+    """
+    if sys.platform.startswith("win"):
+        return None
+    import signal
+    import socket
+    from PySide6.QtCore import QSocketNotifier
+
+    reader, writer = socket.socketpair()
+    reader.setblocking(False)
+    writer.setblocking(False)
+    try:
+        signal.set_wakeup_fd(writer.fileno())
+    except (ValueError, OSError):
+        reader.close()
+        writer.close()
+        return None
+
+    requested = {"done": False}
+
+    def on_signal(signum, _frame):
+        if requested["done"]:
+            return
+        requested["done"] = True
+        bridge.shutdown(hard=True)
+        app.quit()          # only reached if the backend never booted; see quit_kayra
+
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            signal.signal(number, on_signal)
+
+    notifier = QSocketNotifier(reader.fileno(), QSocketNotifier.Read, app)
+
+    def drain():
+        try:
+            while reader.recv(64):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+
+    notifier.activated.connect(drain)
+    # Kept alive by the application object for the life of the process.
+    app._kayra_signal_bridge = (notifier, reader, writer)
+    return notifier
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
 # │                            ENTRY POINT                                 │
 # └────────────────────────────────────────────────────────────────────────┘
 
@@ -979,6 +1052,9 @@ def main(argv=None):
     app = QApplication(argv)
     app.setApplicationName("Kayra")
     app.setOrganizationName("Kayra")
+    # The Wayland app-id (and X11 WM_CLASS). Without it Hyprland sees a generic `python3`
+    # window, and Omarchy users cannot write a window rule for Kayra. Ignored on Windows.
+    app.setDesktopFileName("kayra")
     # Closing the last window must not end the process: the tray keeps the assistant alive.
     app.setQuitOnLastWindowClosed(False)
 
@@ -997,6 +1073,8 @@ def main(argv=None):
 
     if QSystemTrayIcon.isSystemTrayAvailable():
         _build_tray(app, window, ambient, bridge)
+
+    _install_signal_bridge(app, bridge)
 
     # PRESENTATION COMES OFF THE SCREEN LAST, not first.
     #

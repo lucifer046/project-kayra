@@ -209,7 +209,7 @@ COMPUTER_TARGET_WORDS = frozenset({
 # to touch the machine.
 KAYRA_TARGET_WORDS = frozenset({
     "kayra", "engine", "assistant", "yourself", "you", "program", "app", "application",
-    "jarvis", "bot",
+    "bot",
 })
 
 # Verbs whose blast radius is the whole session. These are the ones that need a target.
@@ -276,6 +276,12 @@ _CONFIRM_ACTIONS = {
     "window.close_all",          # the whole desktop at once — the one close with a blast
                                  # radius wider than the thing the user named
     "screen.brightness_set",     # can render the display unreadable at 0
+    # Round 3 (2026-11-10): things that spend, send, publish, remove or close a lot.
+    "system.update_system", "system.install", "system.uninstall", "system.wifi_forget",
+    "system.close_except", "system.close_hog",
+    "browser.tabs_close_others", "email.send", "message.send", "calendar.add",
+    "meet.share",                # your whole screen goes to everyone in the call
+    "diagnose.fix", "dev.git_commit", "email.delete", "email.spam",
 }
 
 # Actions that must never run from a voice command, whatever the phrasing.
@@ -293,6 +299,13 @@ _DENY_ACTIONS = {
     # not be touched for it under any circumstances.
     "system.power_kayra",
 }
+
+
+_RISKY_CLICK = re.compile(
+    r"\b(delete|remove|uninstall|erase|format|wipe|reset|discard|clear all|empty trash|"
+    r"permanently|send|pay|purchase|buy|order|checkout|transfer|confirm|submit|publish|"
+    r"post|sign out|log out|logout|shut ?down|restart|reboot|factory|overwrite|replace all|"
+    r"revoke|unsubscribe|block|ban|kick)\b", re.IGNORECASE)
 
 
 def classify_action(action: Action):
@@ -325,8 +338,18 @@ def classify_action(action: Action):
     if key in _CONFIRM_ACTIONS:
         return Risk.CONFIRM, f"{key} is irreversible or affects the whole session"
 
+    # A click is only as safe as the button it lands on. Clicking a word found on screen is
+    # confirmed when the word is the kind of button that destroys, spends or sends.
+    if ((action.domain == "mouse" and action.action.endswith("_text")) or
+            action.key == "browser.page_click") and _RISKY_CLICK.search(str(action.target or "")):
+        return Risk.CONFIRM, "that button sounds like it deletes, sends or pays for something"
+
+    if action.key == "system.docker" and re.search(r"\b(stop|restart|start)\b",
+                                                   str(action.target or "").lower()):
+        return Risk.CONFIRM, "that changes a running container"
+
     # A bulk filesystem operation is confirmed even though the single-item version is not.
-    if action.domain == "file" and action.parameters.get("bulk"):
+    if action.domain in ("file", "files") and action.parameters.get("bulk"):
         return Risk.CONFIRM, "affects many files at once"
 
     # The normalizer sets a low confidence when it had to guess. Guessing is fine for opening
@@ -368,6 +391,21 @@ _DENY_EXECUTABLES = {
     "rundll32",           # arbitrary DLL entry point execution
     "mshta", "regsvr32", "certutil",   # classic download-and-execute proxies
     "powershell", "pwsh", "cmd", "wscript", "cscript",
+    # POSIX equivalents. A nested shell defeats the metacharacter check exactly as cmd does,
+    # and privilege escalation turns every "confirm" below into a root-level action.
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "nu",
+    "sudo", "su", "doas", "pkexec", "run0",
+    "shred", "wipefs", "parted", "sgdisk", "gdisk", "mkswap", "cryptsetup",
+    "crontab", "chattr", "visudo",
+    # Things that can crash, hang or brick a Linux machine in one line, or quietly weaken it.
+    "init", "telinit", "kexec", "sysctl", "modprobe", "rmmod", "insmod", "mount", "umount",
+    "swapoff", "swapon", "losetup", "fsck", "e2fsck", "tune2fs", "resize2fs", "mdadm",
+    "lvremove", "vgremove", "pvremove", "zpool", "btrfs",
+    "grub-install", "grub-mkconfig", "mkinitcpio", "dracut", "bootctl", "efibootmgr",
+    "limine-install", "limine-update", "limine-snapper-restore", "snapper",
+    "iptables", "ip6tables", "nft", "ufw", "firewall-cmd", "setenforce", "aa-disable",
+    "passwd", "chpasswd", "chsh", "useradd", "userdel", "usermod", "groupadd", "groupdel",
+    "gpasswd", "chroot", "nsenter", "unshare", "stress", "stress-ng",
     # ^ a nested shell defeats every check below, so the *interpreters* themselves are denied
     #   as a shell target. Kayra's own internal handlers still call PowerShell directly where
     #   there is no API alternative; that is trusted, first-party, fixed-argument code — this
@@ -377,7 +415,43 @@ _DENY_EXECUTABLES = {
 # Process-termination utilities. Denied outright as shell commands: closing an application has
 # a first-class, target-resolved handler that operates on a specific window or PID, and a
 # name-wide sweep is precisely the failure mode that would kill the user's browser session.
-_DENY_PROCESS_KILLERS = {"taskkill", "tskill", "pskill", "killall", "pkill"}
+_DENY_PROCESS_KILLERS = {"taskkill", "tskill", "pskill", "killall", "pkill", "kill",
+                         "killall5", "xkill", "skill", "snice"}
+
+# ── Linux service and package safety ──────────────────────────────────────
+# A voice command must never be able to switch off the parts of the system that keep it
+# running, reachable or safe. "stop", "disable", "mask" and "kill" of ANY system service are
+# refused outright; a critical one cannot even be restarted without a confirmation.
+CRITICAL_SERVICES = frozenset({
+    "systemd", "dbus", "dbus-broker", "networkmanager", "network", "systemd-networkd",
+    "systemd-resolved", "systemd-logind", "systemd-udevd", "udev", "systemd-journald",
+    "systemd-timesyncd", "polkit", "sshd", "ssh", "sddm", "gdm", "lightdm", "greetd",
+    "display-manager", "getty", "user", "pipewire", "pipewire-pulse", "wireplumber",
+    "bluetooth", "iwd", "wpa_supplicant", "firewalld", "ufw", "nftables", "iptables",
+    "apparmor", "auditd", "cups", "power-profiles-daemon", "upower", "tlp", "thermald",
+    "fstrim", "snapper-timeline", "snapper-cleanup", "docker", "containerd", "libvirtd",
+    "hyprland", "uwsm", "xdg-desktop-portal", "xdg-desktop-portal-hyprland", "hypridle",
+    "omarchy", "elephant", "walker", "mako", "swayosd",
+})
+_SERVICE_TOOLS = {"systemctl", "service", "sv", "rc-service", "launchctl"}
+_SERVICE_READ_ONLY = {"status", "is-active", "is-enabled", "is-failed", "list-units",
+                      "list-unit-files", "list-timers", "list-sockets", "list-dependencies",
+                      "show", "cat", "help", "--version", "-h", "--help"}
+_SERVICE_FORBIDDEN = {"stop", "disable", "mask", "kill", "isolate", "daemon-reexec",
+                      "set-default", "rescue", "emergency", "default", "switch-root",
+                      "clean", "freeze", "set-property", "revert", "edit", "link", "unmask",
+                      "preset-all", "reset-failed"}
+# Packages whose removal leaves the machine unbootable or without a desktop.
+CRITICAL_PACKAGES_PREFIXES = ("linux", "systemd", "glibc", "bash", "coreutils", "pacman",
+                              "sudo", "base", "filesystem", "grub", "limine", "mkinitcpio",
+                              "hyprland", "uwsm", "mesa", "nvidia", "networkmanager",
+                              "pipewire", "wireplumber", "wayland", "dbus", "util-linux",
+                              "shadow", "pam", "openssl", "python", "omarchy", "sddm",
+                              "xdg-desktop-portal", "polkit", "iwd", "firmware")
+_PACKAGE_READ_ONLY = {"--version", "-v", "list", "show", "search", "info", "freeze",
+                      "-q", "-qi", "-qs", "-ss", "-si", "-qe", "outdated", "-qu", "ls"}
+_PACKAGE_TOOLS = {"pacman", "yay", "paru", "pamac", "apt", "apt-get", "dnf", "zypper",
+                  "flatpak", "snap", "pip", "pip3", "npm", "pipx"}
 
 # Destructive verbs paired with a scope test below.
 _DELETE_EXECUTABLES = {"del", "erase", "rd", "rmdir", "rm", "remove-item", "ri"}
@@ -420,7 +494,99 @@ _ALLOW_EXECUTABLES = {
     "echo", "whoami", "hostname", "date", "time", "ver", "cd", "pwd",
     "ipconfig", "ping", "tracert", "nslookup", "systeminfo", "tasklist",
     "git", "python", "pip", "node", "npm", "where", "which", "dir", "ls", "type", "cat",
+    # Linux read-only utilities.
+    "uname", "df", "free", "uptime", "lsblk", "nproc", "id", "lscpu", "sensors",
+    "nvidia-smi", "lsusb", "lspci",
 }
+
+
+_INTERPRETERS = {"python", "python3", "node", "pip", "pip3", "npm", "perl", "ruby", "lua"}
+# Running a script FILE the user named is their own code; text after -c/-e/-m is arbitrary
+# code typed by voice, which is how `python -c "...rmtree(...)"` would get past every check.
+_INLINE_CODE_FLAGS = {"-c", "-e", "-m", "--eval", "-p", "--print", "-x", "--exec"}
+_GIT_READ_ONLY = {"status", "log", "diff", "show", "branch", "remote", "--version", "blame",
+                  "shortlog", "describe", "tag"}
+
+
+def _service_name(token):
+    name = token.lower().strip()
+    for suffix in (".service", ".socket", ".timer", ".target", ".path", ".mount"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.split("@", 1)[0]
+
+
+def _classify_admin(stem, args, lowered_args):
+    """Service control, package removal, permission sweeps, network kill-switches. Or None."""
+    if stem in _SERVICE_TOOLS:
+        verbs = [a for a in lowered_args if not a.startswith("-")]
+        if not verbs or verbs[0] in _SERVICE_READ_ONLY:
+            return Risk.ALLOW, ""
+        # `service NAME stop` puts the verb second.
+        verb = verbs[0] if stem == "systemctl" else (verbs[1] if len(verbs) > 1 else verbs[0])
+        units = verbs[1:] if stem == "systemctl" else verbs[:1]
+        if verb in ("poweroff", "reboot", "halt", "suspend", "hibernate", "hybrid-sleep",
+                    "kexec"):
+            return None                      # the shutdown rule below confirms these
+        if verb in _SERVICE_FORBIDDEN:
+            return Risk.DENY, "I won't stop, disable or mask system services by voice"
+        if any(_service_name(u) in CRITICAL_SERVICES for u in units):
+            return Risk.CONFIRM, "that is a critical system service"
+        return Risk.CONFIRM, "this changes a system service"
+    if stem == "loginctl" and lowered_args and lowered_args[0] in (
+            "terminate-session", "terminate-user", "kill-session", "kill-user",
+            "disable-linger"):
+        return Risk.DENY, "that would end a login session"
+
+    if stem in _PACKAGE_TOOLS:
+        if not lowered_args or lowered_args[0] in _PACKAGE_READ_ONLY:
+            return Risk.ALLOW, ""
+        removing = any(a in ("remove", "uninstall", "purge", "autoremove", "erase", "-r",
+                             "--remove") or re.fullmatch(r"-r[a-z]*", a)
+                       for a in lowered_args)
+        nodeps = any(a in ("--nodeps", "-dd", "--force", "--overwrite") or
+                     re.fullmatch(r"-r\w*dd\w*", a) for a in lowered_args)
+        if removing:
+            if nodeps:
+                return Risk.DENY, "a forced removal can break the whole system"
+            names = [a for a in lowered_args if not a.startswith("-")
+                     and a not in ("remove", "uninstall", "purge", "autoremove", "erase")]
+            if any(n.startswith(CRITICAL_PACKAGES_PREFIXES) for n in names):
+                return Risk.DENY, "removing that package could leave the system unbootable"
+            return Risk.CONFIRM, "this uninstalls software"
+        return Risk.CONFIRM, "this installs or changes software"
+
+    if stem in ("chmod", "chown", "chgrp", "setfacl"):
+        recursive = any(a in ("-r", "--recursive") or re.fullmatch(r"-\w*r\w*", a)
+                        for a in lowered_args)
+        targets_ = [a for a in args if not a.startswith("-")][1:]
+        if any(_is_protected_path(t) for t in targets_) or (recursive and any(
+                _is_home(t) for t in targets_)):
+            return Risk.DENY, "changing permissions there can lock you out of the system"
+        return Risk.CONFIRM, "this changes file permissions"
+
+    if stem in ("nmcli", "ip", "rfkill", "iw", "ifconfig"):
+        text = " ".join(lowered_args)
+        if re.search(r"\b(networking off|radio all off|down|block all|del|delete|flush)\b",
+                     text):
+            return Risk.CONFIRM, "this can cut off your network connection"
+        if stem in ("nmcli", "ip") and lowered_args and lowered_args[0] in (
+                "device", "dev", "addr", "address", "link", "route", "-br", "general",
+                "connection", "con", "c", "d", "a", "r", "l") and not re.search(
+                r"\b(add|modify|set|up|connect|disconnect)\b", text):
+            return Risk.ALLOW, ""
+        return Risk.CONFIRM, "this changes network settings"
+    return None
+
+
+def _is_home(token):
+    try:
+        expanded = os.path.normpath(os.path.expanduser(os.path.expandvars(
+            str(token).strip().strip('"').strip("'"))))
+        return expanded.rstrip("/\\") == os.path.normpath(os.path.expanduser("~"))
+    except (TypeError, ValueError):
+        return False
 
 
 def _stem(executable: str) -> str:
@@ -447,6 +613,14 @@ def _is_protected_path(token: str) -> bool:
     raw = (token or "").strip().strip('"').strip("'")
     if not raw:
         return False
+    # "~", "$HOME" and "/home/<you>" are the user's whole life. Protected as a TARGET (a file
+    # inside is fine). And a "~/" path is judged by where it really points — "~/../../etc".
+    if _is_home(raw):
+        return True
+    if raw.startswith(("~", "$")):
+        expanded = os.path.expanduser(os.path.expandvars(raw))
+        if expanded != raw:
+            raw = expanded
     lowered = raw.lower()
 
     if any(env in lowered for env in _PROTECTED_ENV):
@@ -547,13 +721,24 @@ def classify_shell(command):
     lowered_args = [a.lower().strip('"') for a in args]
 
     # 3. Executables with no legitimate voice-driven use, including nested interpreters.
-    if stem in _DENY_EXECUTABLES:
+    #    `mkfs.ext4`, `mkfs.btrfs`... are the same formatter under a dotted name.
+    if stem in _DENY_EXECUTABLES or stem.startswith(("mkfs.", "mke2fs", "fdisk", "sfdisk",
+                                                       "cfdisk", "wipefs")):
         return Risk.DENY, f"'{stem}' can damage the system and is not allowed this way"
 
     # 4. Process termination never goes through the shell — it has a resolved-target handler.
     if stem in _DENY_PROCESS_KILLERS:
+        if stem in ("kill", "skill", "snice", "killall5"):
+            return Risk.DENY, ("ending a process by number can crash the system; "
+                               "ask me to close the app instead")
         return Risk.DENY, ("closing programs by name can kill unrelated windows; "
                            "ask me to close the specific app instead")
+
+    # 4b. Services, packages, permissions and the network — the Linux ways to break a machine
+    #     without deleting anything.
+    verdict = _classify_admin(stem, args, lowered_args)
+    if verdict is not None:
+        return verdict
 
     # 5. Destructive filesystem operations, judged by SCOPE.
     if stem in _DELETE_EXECUTABLES:
@@ -574,14 +759,23 @@ def classify_shell(command):
 
     # 6. Shutdown / restart through the shell still needs the same confirmation as the
     #    first-class action, otherwise the policy is trivially bypassed by phrasing.
-    if stem == "shutdown":
+    if stem in ("shutdown", "poweroff", "reboot", "halt") or (
+            stem in ("systemctl", "loginctl") and any(
+                a in ("poweroff", "reboot", "halt", "suspend", "hibernate", "kill-session",
+                      "terminate-session", "kexec") for a in lowered_args)):
         return Risk.CONFIRM, "this shuts down or restarts the computer"
 
     # 7. Anything that writes to a raw device.
     if re.search(r"\\\\\.\\physicaldrive|of=/dev/|\\\\\.\\[a-z]:", lowered_text):
         return Risk.DENY, "raw disk access is not permitted"
 
-    # 8. Known-safe read-only utilities run directly.
+    # 8. Known-safe read-only utilities run directly. Interpreters and git are only "safe" for
+    #    a version query or a read-only subcommand: `python -c "...rmtree(...)"` and
+    #    `git clean -fdx` are arbitrary code and data loss behind a friendly name.
+    if stem in _INTERPRETERS and any(a in _INLINE_CODE_FLAGS for a in lowered_args):
+        return Risk.CONFIRM, f"'{stem}' with inline code can do anything"
+    if stem == "git" and (not lowered_args or lowered_args[0] not in _GIT_READ_ONLY):
+        return Risk.CONFIRM, "that git command can change or discard your work"
     if stem in _ALLOW_EXECUTABLES:
         return Risk.ALLOW, ""
 
