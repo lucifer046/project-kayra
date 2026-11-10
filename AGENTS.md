@@ -17,10 +17,10 @@ this repository. Read this first; follow the links when you need depth.
 
 ## Pending work
 
-[`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) — a full
-browser-control round (open anything with app → website → search fallback, tabs, pages,
-Google Workspace, big sites, forms), planned with acceptance criteria and tests. Implement it,
-or a phase of it, only when the user asks. The user also asked that every round proactively
+[`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) — the
+browser-control round, built **one part per session** (§10 has the part table). Part 1 (open
+anything, anywhere) and 1b (the AI understanding layer) are done; Part 2 (tabs and windows) is
+next. Do the next part only when the user asks. The user also asked that every round proactively
 add the obvious neighbouring features and list them for veto.
 
 ## What Kayra is
@@ -61,6 +61,7 @@ src/kayra/
   automation/       desktop control — common (shared pipeline), policy, targets,
                     windows (Win32 hands), linux + linux_apps (Hyprland hands),
                     linux_system, web_macros + browser_bridge (Chrome extension),
+                    sites (website table), interpreter (AI understanding layer),
                     diagnostics, screen_ai, workflows, ai, status_file
   extension/        kayra-bridge (Chrome MV3), omarchy-kayra-widget (bar pill)
   services/         chatbot, real_time_search, deep_research, proactive_agent
@@ -116,7 +117,13 @@ Shutdown is `app.request_shutdown()`, always. Full detail: `docs/architecture/EX
     cross-thread traffic goes through `ui/bridge.py` signals. `ui/session.py` contains no Qt.
 11. **Report capability honestly.** Unknown is `None`/"unavailable", never a plausible default
     (no fake 1920×1080, no "GPU" when the session runs on CPU, no "Windows 10" from a stale key).
-12. **Tier-1 tests must not read or write the host's state** (`.env`, memory store, battery,
+12. **Models propose, rules and policy decide.** The understanding layer
+    (`automation/interpreter.py`) and the planner may suggest commands; every one is parsed by
+    `normalize_command` and judged by `classify_action`. Never let a model's output skip that,
+    and never accept power, shell or file-deletion commands from a model. Test rigs switch
+    `interpreter.ACTIVE` off and stub `web_macros.TOP_RESULTS` — no suite may reach a model or
+    the network.
+13. **Tier-1 tests must not read or write the host's state** (`.env`, memory store, battery,
     real pointer). Use `tests/_harness.py` (`EnvironmentGuard`, `HostPin`, `TemporaryProject`,
     `RecordingInstaller`, recording injectors).
 

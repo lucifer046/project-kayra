@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Part 1 of 7 done (2026-11-10).** See §10 for the parts and what is
-> next. Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Part 1 of 7 done, plus the AI understanding layer (2026-11-10).**
+> See §10 for the parts and what is next (Part 2). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -442,12 +442,18 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 
 ## 9. Known state at the time of writing
 
-- Rounds 1–4 were committed in `1261170` (feature/linux-desktop-automation).
+- Rounds 1–4 were committed in `1261170` (feature/linux-desktop-automation); Part 1 in
+  `2a8e51b`; the understanding layer in `677eba3`, made fast in `c0ee678`.
 - Extension in the repo is **1.2.0** (Part 1). From 1.1.0 on it updates itself: when Kayra
   needs a newer command it sends `runtime.reload` and says so; only a 1.0.x extension still
   needs the manual reload on chrome://extensions.
-- Unit tier after Part 1: 4506 checks green (new suite `tests/test_browser_control.py`, 107);
-  extension integration suite: 27 checks green.
+- Unit tier: 4529 checks green (`tests/test_browser_control.py`: 130); extension integration
+  suite: 27 checks green.
+- Local model in LM Studio: `google/gemma-4-e4b` (thinking model) + `nomic-embed-text`. The
+  understanding layer calls it with thinking OFF: median 0.51 s, worst 0.78 s, 12/12 correct
+  on the live check. §7a's Qwen3.5-9B is still only a recommendation, not installed.
+- Not yet verified end to end by voice in the user's real Chrome (the user's Chrome was on
+  extension 1.0.0, which needs one manual reload before self-updating works).
 - Screen (non-browser) clicking needs `/dev/uinput` and is deliberately deferred by the user.
 
 ## 10. Implementation parts (one per session)
@@ -459,6 +465,7 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | Part | Items | Status |
 |---|---|---|
 | 1 | Tuning pass; A1–A6, G3 (`page.waitFor`), H0.1, `browser update` + self-updating extension | **done 2026-11-10** |
+| 1b | The understanding layer (`automation/interpreter.py`), requested by the user | **done 2026-11-10** |
 | 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | next |
 | 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | |
 | 4 | E1–E8 Google Workspace (needs D3 answered) | |
@@ -466,12 +473,29 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
 
-**Added after Part 1, at the user's request — the understanding layer**
-(`automation/interpreter.py`): when the rules fail, a model reads the request with the screen
-context and proposes commands / chat / one question. It already covers much of H0.2 ("open X"
-inside the app in front) without hard-coding; Part 5 still adds the WhatsApp site functions and
-the semantic matcher. Every later part should add its new command shapes to
-`interpreter.CATALOG` (the test asserts every catalog example parses).
+**Part 1b — the understanding layer** (`automation/interpreter.py`). The user asked that
+Kayra not be only hard-coded rules: "it should ask AI whether this is automation or chat, like
+proper human-alike intelligence."
+- **How it works.** The DMM (a model) still makes the first call: chat, web question or task.
+  The rule parser then handles everything it knows in microseconds. Only when the rules cannot
+  parse a token, are only guessing (`browser <anything>` read as a click), or ran and found
+  NOTHING, `AutomationRuntime` asks a model what the user meant — with what was said, what the
+  rules tried, the screen context (`linux.situation()`: app / web app in front, Chrome's active
+  tab) and `interpreter.CATALOG`. It answers commands / chat (answered by the Chatbot via
+  `take_chat_handoff()`) / one clarifying question / none. Unknown names go rules → model →
+  web result.
+- **Safety.** The model proposes, never authorises: every command is parsed and judged by the
+  same policy; power, shell, plans, triggers and file delete/move/rename are never accepted
+  from it; its own proposals are never re-interpreted (one call per request).
+- **Speed.** First version ~4 s warm / 7.2 s cold. ~85 % of gemma-4-e4b's output was hidden
+  thinking (prompt size barely mattered). `ai.fast()` calls the local model with
+  `reasoning_effort: none`, temperature 0, 200-token cap, plus worked examples in the prompt:
+  12/12 correct, median 0.51 s, worst 0.78 s. Requests the rules handle never call a model.
+- **Covers part of H0.2** ("open X" inside the app in front) without hard-coding. Part 5 still
+  adds WhatsApp site functions and the semantic matcher (loose names like "core team").
+- **Rule for every later part:** add new command shapes to `interpreter.CATALOG` and, where a
+  phrasing is easy to get wrong, a worked example to `_SYSTEM` (the tests assert both parse).
+- `AUTOMATION_AI_INTERPRETER=off` in `.env` disables it.
 
 **Tuning applied in Part 1** (found while reading rounds 1–4):
 - `REQUIRED_VERSION` was declared but never checked, so an old extension silently ignored new

@@ -384,7 +384,7 @@ tab", and the two tokens raced.
 - Extension 1.2.0: `tabs.open {where: tab|window|incognito|next}` (never into an `--app`
   window), `page.waitFor {text|selector|urlIncludes|titleIncludes, timeoutMs}`.
 - `intelligence/llm_engine.py`: preamble lines for sites with a location (history untouched).
-- Tests: `tests/test_browser_control.py` (new, 107), `test_browser_extension.py` +3,
+- Tests: `tests/test_browser_control.py` (new, 107 at Part 1; 130 with the understanding layer), `test_browser_extension.py` +3,
   `test_linux_automation.py` "open spotify" now expects the web player.
 
 ### 2026-11-10 — round 4: browser control that actually works in Gmail

@@ -68,6 +68,15 @@ anywhere else; one is never needed for an unpacked extension.
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the
 rest says how to connect it.
 
+## When Kayra doesn't understand the words
+
+If a request matches none of Kayra's rules ("open PR and outreach core team chat" with
+WhatsApp in front, "make this tab quiet", "hit the like button"), a local model is asked what
+you meant, given what's on your screen. It answers in about half a second and turns the request
+into one of the commands above. It can also decide it was a question (answered as chat) or ask
+you one short question. It never sends, deletes or shuts down anything without the usual
+confirmation, and it can't propose power, terminal or file-deletion commands at all.
+
 ## How clicks are matched
 
 The extension looks at what a screen reader would announce for every visible control (its
@@ -165,4 +174,5 @@ a WebSocket that exchanges a ping every 20 seconds keeps its service worker runn
   "load more", and opening the first / latest / second / from-Ana / second-unread email, and
   the `page.waitFor` probe. 27 checks.
 - `tests/test_browser_control.py` (unit): the site registry, every "where", the new-tab merge,
-  app/web-app/site/web-result order, the no-extension fallbacks, self-update. 107 checks.
+  app/web-app/site/web-result order, the no-extension fallbacks, self-update, and the AI
+  understanding layer against a scripted model. 130 checks.
