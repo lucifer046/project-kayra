@@ -817,6 +817,13 @@ def normalize_command(command, context=None):
         return Action("browser", "page_result", target=str(hit[0]),
                       parameters={"nth": hit[0], "new_tab": hit[1]}, raw=raw)
 
+    # 1a'. Part 3 phrasings the DMM may send without the `browser` prefix: they are about
+    # the page in front, never an app ("translate this page", "bookmark this page").
+    if _BARE_PAGE.match(lowered):
+        found = part_3_action(lowered, raw, raw)
+        if found is not None:
+            return found
+
     # 1b. A request to share the screen, however it arrived ("share screen", "click on share
     # screen", "start screen sharing"): ONE meet.share, never a click or a new meeting (M0.1).
     if _BARE_SHARE.match(lowered):
@@ -1021,6 +1028,14 @@ def _share_action(request, raw):
     return Action("meet", "share", target=surface, parameters=params, raw=raw)
 
 
+_BARE_PAGE = re.compile(
+    r"^(?:translate (?:this|the) (?:page|site|article)|bookmark (?:this|the current) (?:page|tab|site)|"
+    r"(?:read|show|summari[sz]e) (?:me )?(?:the )?(?:top |latest )?(?:comments|reviews)|"
+    r"(?:summari[sz]e|what is|what's) (?:this|the) (?:youtube )?video|what (?:does|do) (?:this|the) page say|"
+    r"what can i (?:do|say) here|(?:clear|delete) (?:my )?(?:browsing )?history|"
+    r"open (?:my |the )?(?:last|latest) download|what did i (?:just )?download|explain (?:the |this )?(?:selected|highlighted))")
+
+
 # A DMM token that is a share request but arrived without the `meet` prefix — "share screen",
 # "click on share screen", "start screen sharing", "present now" (M0.1). Only phrasings that
 # name a SCREEN surface or presenting are taken; "click on share" on a video page stays a click.
@@ -1098,6 +1113,10 @@ def _web_action(kind, payload, raw):
         m = re.fullmatch(r"copy (?:the |this )?(?:page'?s? |tab'?s? )?(link|url|address|title)(?: of (?:this|the) (?:page|tab))?", low)
         if m:
             return Action("browser", "page_copy", target="title" if m.group(1) == "title" else "link", raw=raw)
+        # ── Part 3 ──
+        found = part_3_action(low, raw, text)
+        if found is not None:
+            return found
         # ── Part 2c ──
         found = _part_2c_action(low, raw)
         if found is not None:
@@ -1258,6 +1277,121 @@ def _web_action(kind, payload, raw):
             who, body = (m.group(1), m.group(2)) if m else (text, "")
         return Action("message", "send", target=_strip(who, "to"),
                       parameters={"text": body.strip(), "app": "whatsapp"}, raw=raw)
+    return None
+
+
+# ── Part 3 (BROWSER_CONTROL_PLAN C5, C6, C8–C11, G1, G2, G4) ──
+LANGUAGES = {"english": "en", "hindi": "hi", "spanish": "es", "french": "fr", "german": "de",
+             "tamil": "ta", "telugu": "te", "bengali": "bn", "bangla": "bn", "marathi": "mr",
+             "gujarati": "gu", "kannada": "kn", "malayalam": "ml", "punjabi": "pa", "urdu": "ur",
+             "japanese": "ja", "chinese": "zh-CN", "korean": "ko", "arabic": "ar",
+             "russian": "ru", "portuguese": "pt", "italian": "it", "nepali": "ne",
+             "odia": "or", "sanskrit": "sa", "indonesian": "id", "turkish": "tr", "dutch": "nl"}
+_PAGE = r"(?:this|the) (?:page|article|site|website|post|doc|document)"
+_IT = r"(?:it|that|that tab|this one|that one|that page)"
+
+
+def part_3_action(low, raw, text=None):
+    """The Part 3 shapes (questions, comments, video, translate, bookmarks, history,
+    downloads, "it", search here, what can I do here), or None."""
+    text = text if text is not None else raw
+    low = low.strip(" .?!")
+    # C5 — a question about the page.
+    m = re.fullmatch(r"what (?:does|do) " + _PAGE + r" (?:say|tell me|mention) (?:about|on|regarding) (.+)", low) \
+        or re.fullmatch(r"(?:ask|question) " + _PAGE + r"[:,]? (.+)", low) \
+        or re.fullmatch(r"according to " + _PAGE + r",? (.+)", low) \
+        or re.fullmatch(r"(?:does|did) " + _PAGE + r" (?:say|mention|talk about) (.+)", low)
+    if m:
+        return Action("browser", "page_ask", target="current", parameters={"question": low}, raw=raw)
+    # C6 — comments, reviews, a video.
+    m = re.fullmatch(r"(read|show|list|summari[sz]e|what are|what do people say in|what are people saying in)"
+                     r"(?: me)?(?: the)?(?: top| best| latest| first)? (comments|reviews|replies|feedback)"
+                     r"(?: (?:on|of|under|for|about) (?:this|the) (?:video|page|post|product|article|item))?", low) \
+        or re.fullmatch(r"what (?:do|are) (?:people|users|buyers|viewers) (?:say(?:ing)?|think(?:ing)?)"
+                        r"(?: about (?:this|it|the (?:video|product|post)))?", low)
+    if m:
+        verb = m.group(1) if m.lastindex else "what do"
+        return Action("browser", "page_comments", target="current",
+                      parameters={"summarize": not str(verb).startswith(("read", "show", "list"))}, raw=raw)
+    if re.fullmatch(r"(?:summari[sz]e|tldr|recap|give me the gist of|what is|what's|explain) (?:this|the|that) "
+                    r"(?:youtube )?video(?: about| for me)?|what is (?:this|the) video about", low):
+        return Action("browser", "video_summary", target="current", raw=raw)
+    # C8 — translate, explain the selection.
+    m = re.fullmatch(r"translate (?:this|the) (?:page|site|website|article|tab)(?: (?:to|into|in) (\w+))?", low)
+    if m:
+        return Action("browser", "page_translate", target=(m.group(1) or "english"), raw=raw)
+    m = re.fullmatch(r"translate (?:the |this |my )?(?:selected|highlighted|selection)(?: text| words| part)?"
+                     r"(?: (?:to|into|in) (\w+))?", low)
+    if m:
+        return Action("browser", "selection_translate", target=(m.group(1) or "english"), raw=raw)
+    if re.fullmatch(r"(?:explain|what does|what do|simplify|define) (?:the |this |my )?(?:selected|highlighted|selection)"
+                    r"(?: text| words| part| line)?(?: mean)?(?: to me| for me)?|explain what i (?:selected|highlighted)", low):
+        return Action("browser", "selection_explain", target="current", raw=raw)
+    # C9 — bookmarks.
+    m = re.fullmatch(r"(?:bookmark|save) (?:this|the current) (?:page|tab|site|article)(?: as a bookmark)?"
+                     r"(?: (?:in|into|under|to) (?:the |my )?(.+?)(?: folder)?)?|add (?:this|the) (?:page|tab|site) "
+                     r"to (?:my )?bookmarks(?: (?:in|under|into) (?:the |my )?(.+?)(?: folder)?)?|bookmark (?:this|it)", low)
+    if m:
+        folder = (m.group(1) or m.group(2) or "") if m.lastindex else ""
+        return Action("browser", "bookmark_add", target="current", parameters={"folder": folder}, raw=raw)
+    m = re.fullmatch(r"(?:delete|remove) (?:the |my |this )?bookmarks? (?:for |called |named |of )?(.+)", low)
+    if m:
+        return Action("browser", "bookmark_delete", target=m.group(1), raw=raw)
+    m = re.fullmatch(r"(?:search|find|look for|look in|search in) (?:in )?(?:my )?bookmarks (?:for |about )?(.+)|"
+                     r"(?:what|which|show me|list) (?:my )?bookmarks (?:do i have )?(?:for|about|on) (.+)", low)
+    if m:
+        return Action("browser", "bookmarks_search", target=(m.group(1) or m.group(2)), raw=raw)
+    # C10 — history.
+    m = re.fullmatch(r"(?:clear|delete|erase|wipe|remove) (?:my |the )?(?:browsing |browser |search )?history"
+                     r"(?: (?:from|for|of))? ?(today|the last hour|the past hour|last hour|this hour|the last 15 minutes)?|"
+                     r"(?:clear|delete|erase|wipe) (today'?s|the last hour'?s|this hour'?s) (?:browsing )?history|"
+                     r"(?:clear|delete|erase|wipe|remove) (?:the |my )?(last hour|past hour|last 15 minutes|today) of "
+                     r"(?:my )?(?:browsing |browser )?history", low)
+    if m:
+        span = (m.group(1) or m.group(2) or m.group(3) or "today").replace("'s", "")
+        span = "15m" if "15" in span else ("hour" if "hour" in span else "today")
+        return Action("browser", "history_clear", target=span, raw=raw)
+    m = re.fullmatch(r"(?:what (?:sites |pages )?did i (?:visit|browse|open|look at|read)|show (?:me )?my (?:recent |browsing )?history|"
+                     r"what (?:sites|pages) did i (?:visit|open))(?: (today|yesterday|this week))?", low)
+    if m:
+        return Action("browser", "history_list", target=m.group(1) or "today",
+                      parameters={"days": {"yesterday": 2, "this week": 7}.get(m.group(1) or "", 1)}, raw=raw)
+    # C11 — downloads.
+    if re.fullmatch(r"(?:what did i (?:just )?download|(?:show|list|read) (?:me )?(?:my |the )?(?:recent |last )?downloads|"
+                    r"what'?s downloading|is (?:my|the) download (?:done|finished|complete)|(?:how is|how's) (?:my|the) download(?: going)?)", low):
+        return Action("browser", "downloads_list", target="recent", raw=raw)
+    if re.fullmatch(r"open (?:my |the )?(?:last|latest|most recent|recent|newest) (?:download|downloaded file|file i downloaded)|"
+                    r"open (?:what|the file) i (?:just )?downloaded", low):
+        return Action("browser", "download_open", target="latest", raw=raw)
+    if re.fullmatch(r"(?:show|reveal|open) (?:my |the )?(?:last |latest )?download(?:ed file)? in (?:the |its )?folder|"
+                    r"show (?:it|that) in (?:the |its )?folder|(?:open|show) (?:my |the )?downloads? folder", low):
+        return Action("browser", "download_show", target="latest", raw=raw)
+    m = re.fullmatch(r"(pause|resume|continue|cancel|stop) (?:the |my |this )?(?:current )?download(?:ing)?", low)
+    if m:
+        verb = {"continue": "resume", "stop": "cancel"}.get(m.group(1), m.group(1))
+        return Action("browser", "download_control", target=verb, raw=raw)
+    # G1 — "it": the tab Kayra last opened or switched to.
+    m = re.fullmatch(r"(close|switch (?:back )?to|go (?:back )?to|bring (?:back|up)|show me|read|summari[sz]e) " + _IT, low)
+    if m:
+        verb = m.group(1)
+        action = ("tab_close" if verb == "close" else "page_read" if verb == "read"
+                  else "page_summarize" if verb.startswith("summari") else "tab_switch")
+        return Action("browser", action, target="it", raw=raw)
+    # G2 — search where you are.
+    m = re.fullmatch(r"search (?:for )?(.+?) (?:here|on this (?:site|page|website)|in this (?:sheet|spreadsheet|doc|document|"
+                     r"site|page|tab|inbox|mail|drive|channel|repo|repository))", low) \
+        or re.fullmatch(r"search (?:this|the) (?:sheet|spreadsheet|doc|document|site|website|page|inbox|mail|drive|channel|"
+                        r"repo|repository|tab)? ?for (.+)", low) \
+        or re.fullmatch(r"search (?:for )?(.+)", low)
+    if m:
+        query = m.group(1)
+        found = re.search(re.escape(query), text, re.I)
+        return Action("browser", "search_here", target=found.group(0) if found else query, raw=raw)
+    # G4 — what can I do here?
+    if re.fullmatch(r"what (?:can|could) i (?:do|say|ask(?: you)?) (?:here|on this (?:page|site|website)|with this (?:page|site))|"
+                    r"what (?:can|could) you do (?:here|on this (?:page|site))|help(?: me)? (?:here|with this (?:page|site))|"
+                    r"what are my options here", low):
+        return Action("browser", "page_help", target="current", raw=raw)
     return None
 
 

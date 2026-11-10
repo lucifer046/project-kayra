@@ -330,8 +330,8 @@ def section_extension_versions():
     for needle in ('case "page.waitFor"', 'where === "incognito"', 'where === "next"',
                    'windowTypes: ["normal"]'):
         check(f"background.js handles {needle}", needle in source)
-    check("no new permission was added (no downloads/debugger yet)",
-          not set(manifest["permissions"]) & {"debugger", "downloads", "nativeMessaging"})
+    check("never debugger or native messaging (downloads was approved for 1.6.0, D5)",
+          not set(manifest["permissions"]) & {"debugger", "nativeMessaging", "cookies"})
 
 
 def section_app_windows():
@@ -571,7 +571,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.5.0")
+        web_macros.BRIDGE = current = Bridge(version="1.6.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1202,7 +1202,7 @@ def section_audit_log():
 class GroupBridge(TabBridge):
     """TabBridge at 1.5.0, with five YouTube tabs, tab groups, windows and a result list."""
 
-    def __init__(self, version="1.5.0"):
+    def __init__(self, version="1.6.0"):
         super().__init__(version=version)
         for i, title in enumerate(("Lecture 4 - YouTube", "Lecture 5 - YouTube", "Lecture 6 - YouTube")):
             self.tabs.append({"id": 30 + i, "title": title, "url": f"https://www.youtube.com/watch?v=l{i}",
@@ -1409,10 +1409,261 @@ def section_part_2c():
         check("C4: next with nothing highlighted is said so", not r.ok, r.message)
 
     manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
-    check("extension 1.5.0 asks for tabGroups and nothing else new",
-          manifest["version"] == "1.5.0" and web_macros.REQUIRED_VERSION == (1, 5, 0)
-          and "tabGroups" in manifest["permissions"] and "debugger" not in manifest["permissions"]
-          and "downloads" not in manifest["permissions"])
+    check("the extension has tabGroups (1.5.0+) and never debugger",
+          "tabGroups" in manifest["permissions"] and "debugger" not in manifest["permissions"])
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │  PART 3 — questions, comments, video, translate, bookmarks, history,   │
+# │           downloads, "it", search here, what can I do here (§10)       │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class PageBridge(GroupBridge):
+    """GroupBridge at 1.6.0 with an active page of a chosen address, bookmarks, history and
+    downloads."""
+
+    def __init__(self, version="1.6.0", url="https://docs.google.com/", comments=None,
+                 transcript="", selection="", downloads=None):
+        super().__init__(version=version)
+        self.url, self.selection = url, selection
+        next(t for t in self.tabs if t["id"] == 13)["url"] = url
+        self.comment_list = ["Great explanation of attention.", "The audio is a bit low.",
+                             "Helped me pass my exam."] if comments is None else comments
+        self.transcript, self.transcript_calls = transcript, 0
+        self.bookmarks = [{"id": "b1", "title": "The Rust Book", "url": "https://doc.rust-lang.org/book/"},
+                          {"id": "b2", "title": "Rust by Example", "url": "https://doc.rust-lang.org/rbe/"}]
+        self.download_list = downloads if downloads is not None else [
+            {"id": 1, "filename": "/home/u/Downloads/report.pdf", "state": "complete", "exists": True,
+             "danger": "safe"},
+            {"id": 2, "filename": "/home/u/Downloads/old.zip", "state": "complete", "exists": True,
+             "danger": "safe"}]
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "tabs.active":
+            tab = dict(next(t for t in self.tabs if t["id"] == 13))
+            tab["url"] = self.url
+            return tab
+        if cmd == "page.text" and "tabId" not in args:
+            self.calls.append((cmd, args))
+            return {"title": "Pricing - Acme", "url": self.url,
+                    "text": "Acme costs 10 dollars a month for teams. " * 5}
+        if cmd.startswith(("page.comments", "page.transcript", "page.selection", "bookmarks.",
+                           "history.", "downloads.", "page.type")):
+            self.calls.append((cmd, args))
+            if cmd == "page.comments":
+                return {"kind": "comments", "comments": list(self.comment_list)}
+            if cmd == "page.transcript":
+                if "youtube" not in self.url:
+                    return {"supported": False}
+                self.transcript_calls += 1
+                ready = self.transcript_calls > 2         # the panel loads a moment later
+                return {"supported": True, "title": "Attention explained",
+                        "description": "A talk.", "text": self.transcript if ready else ""}
+            if cmd == "page.selection":
+                return self.selection
+            if cmd == "bookmarks.add":
+                return {"added": True, "title": "Pricing - Acme", "folder": args.get("folder", "")}
+            if cmd == "bookmarks.find":
+                want = args.get("text", "").lower()
+                return [b for b in self.bookmarks if want in b["title"].lower()]
+            if cmd == "bookmarks.remove":
+                self.bookmarks = [b for b in self.bookmarks if b["id"] not in args["ids"]]
+                return {"removed": len(args["ids"])}
+            if cmd == "history.deleteRange":
+                return {"deleted": True}
+            if cmd == "history.search":
+                return [{"title": "Rust lifetimes", "url": "https://x"}, {"title": "Docs", "url": "https://y"}]
+            if cmd == "downloads.list":
+                return [dict(d) for d in self.download_list]
+            if cmd == "page.type":
+                return {"typed": True}
+            return {"ok": True}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_part_3():
+    check.section("[16] Part 3 — ask the page, comments, video, translate, bookmarks, history, "
+                  "downloads, 'it', search here, what can I do here")
+    table = (
+        ("browser what does this page say about pricing", "page_ask", "current"),
+        ("browser read the comments", "page_comments", "current"),
+        ("browser summarize the reviews", "page_comments", "current"),
+        ("browser what do people say about this", "page_comments", "current"),
+        ("browser summarize this video", "video_summary", "current"),
+        ("summarize this video", "video_summary", "current"),
+        ("browser translate this page to hindi", "page_translate", "hindi"),
+        ("translate this page", "page_translate", "english"),
+        ("browser explain the selected text", "selection_explain", "current"),
+        ("browser translate the selected text to french", "selection_translate", "french"),
+        ("browser bookmark this page", "bookmark_add", "current"),
+        ("bookmark this page", "bookmark_add", "current"),
+        ("browser bookmark this page in the work folder", "bookmark_add", "current"),
+        ("browser search my bookmarks for rust", "bookmarks_search", "rust"),
+        ("browser delete the bookmark for rust", "bookmark_delete", "rust"),
+        ("browser clear today's history", "history_clear", "today"),
+        ("browser clear the last hour of history", "history_clear", "hour"),
+        ("browser what did i visit today", "history_list", "today"),
+        ("browser what did i download", "downloads_list", "recent"),
+        ("browser open my last download", "download_open", "latest"),
+        ("browser show it in folder", "download_show", "latest"),
+        ("browser pause the download", "download_control", "pause"),
+        ("browser cancel the download", "download_control", "cancel"),
+        ("browser close it", "tab_close", "it"),
+        ("browser go back to it", "tab_switch", "it"),
+        ("browser search for ravi here", "search_here", "ravi"),
+        ("browser search this sheet for ravi", "search_here", "ravi"),
+        ("browser what can i do here", "page_help", "current"),
+        ("what can i do here", "page_help", "current"),
+        # unchanged neighbours
+        ("browser open my bookmark for rust", "bookmark_open", "rust"),
+        ("browser summarize this page", "page_summarize", "current"),
+        ("browser find the tab about rust", "tab_find", "rust"),
+    )
+    for token, action, target in table:
+        a = n(token)
+        check(f"'{token}' -> browser.{action} {target!r}",
+              a is not None and a.domain == "browser" and a.action == action and a.target == target,
+              f"{a.key if a else None} {a.target if a else ''}")
+    check("'bookmark this page' no longer tries to OPEN a bookmark called 'this page'",
+          n("browser bookmark this page").action == "bookmark_add")
+    check("'browser delete my browsing history' clears TODAY, never all time",
+          n("browser delete my browsing history").target == "today")
+    check("the new shapes are in the understanding catalog",
+          all(p in interpreter.CATALOG for p in ("browser summarize this video", "browser close it",
+                                                 "browser open my last download",
+                                                 "browser what can i do here")))
+
+    with WebRig(PageBridge()) as rig, Models("Acme costs 10 dollars a month for teams.") as models:
+        r = rig.do("browser what does this page say about pricing")
+        check("C5: the answer comes from the page's text",
+              r.ok and "10 dollars" in r.message and "Acme costs" in str(models.asked[-1]), r.message)
+        r = rig.do("browser read the comments")
+        check("C6: the top comments are read out", "Great explanation" in r.message, r.message)
+        rig.do("browser summarize the reviews")
+        check("C6: 'summarize' asks a model about the comments", "audio is a bit low" in str(models.asked[-1]))
+        r = rig.do("browser translate this page to hindi")
+        nav = rig.bridge.last("tabs.navigate") or {}
+        check("C8: the page opens through Google Translate in Hindi, this tab",
+              "translate.google.com/translate?sl=auto&tl=hi&u=https%3A%2F%2Fdocs.google.com%2F" in nav.get("url", "")
+              and "Hindi" in r.message, (nav, r.message))
+        r = rig.do("browser translate this page to klingon")
+        check("...an unknown language is said so", not r.ok and "klingon" in r.message, r.message)
+        r = rig.do("browser explain the selected text")
+        check("C8: no selection is said so", not r.ok and "selected" in r.message, r.message)
+        r = rig.do("browser bookmark this page in the work folder")
+        check("C9: bookmark into a folder", rig.bridge.last("bookmarks.add") == {"folder": "work"}
+              and "in work" in r.message, r.message)
+        r = rig.do("browser delete the bookmark for rust")
+        check("C9: deleting ALWAYS asks, naming the bookmarks", r.status == Status.NEEDS_CONFIRMATION
+              and "The Rust Book" in r.message and rig.bridge.last("bookmarks.remove") is None, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("...'yes' removes exactly those", rig.bridge.last("bookmarks.remove") == {"ids": ["b1", "b2"]}
+              and "Removed 2" in said, said)
+        r = rig.do("browser clear today's history")
+        check("C10: clearing history ALWAYS asks", r.status == Status.NEEDS_CONFIRMATION
+              and "can't be undone" in r.message and rig.bridge.last("history.deleteRange") is None, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        start = (rig.bridge.last("history.deleteRange") or {}).get("startTime", 0)
+        import datetime as _dt
+        midnight = _dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        check("...from midnight today, nothing older", start == int(midnight.timestamp() * 1000), start)
+        r = rig.do("browser what did i download")
+        check("C11: downloads are listed by file name", "report.pdf" in r.message, r.message)
+        r = rig.do("browser open my last download")
+        check("C11: opening a download ALWAYS asks, naming it", r.status == Status.NEEDS_CONFIRMATION
+              and "report.pdf" in r.message, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("...then opens that file", ["xdg-open", "/home/u/Downloads/report.pdf"] in rig.runner.spawned,
+              rig.runner.spawned)
+        r = rig.do("browser show it in folder")
+        check("C11: show in folder", rig.bridge.last("downloads.show") == {"id": 1}, r.message)
+        r = rig.do("browser pause the download")
+        check("C11: nothing downloading is said so", not r.ok and "Nothing" in r.message, r.message)
+        r = rig.do("browser what can i do here")
+        check("G4: Docs gets Docs hints", "Docs and Sheets" in r.message, r.message)
+
+    exe = [{"id": 5, "filename": "/home/u/Downloads/install.sh", "state": "complete", "exists": True,
+            "danger": "safe"}]
+    with WebRig(PageBridge(downloads=exe)) as rig:
+        r = rig.do("browser open my last download")
+        check("C11: a program is never opened, not even after a yes", r.status == Status.BLOCKED
+              and not rig.runner.spawned, r.message)
+    busy = [{"id": 7, "filename": "/d/big.iso", "state": "in_progress", "paused": False, "bytes": 50, "total": 200}]
+    with WebRig(PageBridge(downloads=busy)) as rig:
+        r = rig.do("browser what did i download")
+        check("C11: an active download says its progress", "25 percent" in r.message, r.message)
+        r = rig.do("browser pause the download")
+        check("C11: pause the one downloading", rig.bridge.last("downloads.pause") == {"id": 7}
+              and "Paused big.iso" in r.message, r.message)
+
+    with WebRig(PageBridge(url="https://www.youtube.com/watch?v=1", transcript="Attention lets a model "
+                           "look at every word.")) as rig, Models("A short talk on attention.") as models:
+        r = rig.do("browser summarize this video")
+        check("C6: the YouTube transcript is opened, waited for (not slept) and summarized",
+              r.message == "A short talk on attention." and "look at every word" in str(models.asked[-1])
+              and rig.bridge.transcript_calls >= 3, (r.message, rig.bridge.transcript_calls))
+        r = rig.do("browser search for lofi here")
+        check("G2: on YouTube, search YouTube", rig.bridge.last("tabs.navigate") ==
+              {"url": "https://www.youtube.com/results?search_query=lofi"} and "YouTube" in r.message, r.message)
+    with WebRig(PageBridge(url="https://www.youtube.com/watch?v=1", transcript="")) as rig, \
+            Models("Going by the description, it's a talk.") as models:
+        r = rig.do("browser summarize this video")
+        check("C6: no transcript -> the description, said so by the model prompt",
+              "No transcript" in str(models.asked[-1]), str(models.asked[-1])[:200])
+
+    for url, expected in (
+            ("https://mail.google.com/mail/u/0/#inbox", "https://mail.google.com/mail/u/0/#search/ravi%20kumar"),
+            ("https://github.com/rust-lang/rust/issues", "https://github.com/rust-lang/rust/search?q=ravi+kumar"),
+            ("https://www.amazon.in/dp/B0", "https://amazon.in/s?k=ravi+kumar"),
+            ("https://drive.google.com/drive/my-drive", "https://drive.google.com/drive/search?q=ravi+kumar")):
+        with WebRig(PageBridge(url=url)) as rig:
+            rig.do("browser search for ravi kumar here")
+            check(f"G2: search on {url.split('/')[2]} uses its own search",
+                  rig.bridge.last("tabs.navigate") == {"url": expected}, rig.bridge.last("tabs.navigate"))
+    with WebRig(PageBridge(url="https://docs.google.com/spreadsheets/d/x/edit")) as rig:
+        r = rig.do("browser search this sheet for ravi")
+        keys = [(argv, given) for argv, given in rig.runner.ran if argv[:1] == ["wtype"]]
+        check("G2: in a Sheet, the sheet's own find (Ctrl+F), then the name typed",
+              len(keys) == 2 and keys[0][0] == linux.wtype_argv("ctrl+f")
+              and keys[1] == (["wtype", "-"], "ravi") and "this sheet" in r.message, (keys, r.message))
+    with WebRig(PageBridge(url="https://example.com/blog")) as rig:
+        r = rig.do("browser search for ravi here")
+        check("G2: any other site: its own search box", rig.bridge.last("page.type") ==
+              {"field": "search", "text": "ravi", "submit": True}, r.message)
+
+    # G1 — "it" is the tab Kayra last opened or switched to.
+    with WebRig(PageBridge()) as rig:
+        saved_clock = web_macros.CLOCK
+        now = [1000.0]
+        web_macros.CLOCK = lambda: now[0]
+        try:
+            web_macros.LAST_TAB.update(id=None, title="", at=0.0)
+            r = rig.do("browser close it")
+            check("G1: 'close it' with nothing remembered asks for a name", not r.ok and "which tab" in r.message,
+                  r.message)
+            rig.do("browser switch to the github tab")
+            rig.do("browser switch to the third tab")      # by position: not remembered as "it"
+            r = rig.do("browser go back to it")
+            check("G1: 'go back to it' returns to the tab Kayra switched to by name",
+                  rig.bridge.last("tabs.activate") == {"tabId": 15}, (rig.bridge.last("tabs.activate"), r.message))
+            r = rig.do("browser close it")
+            check("G1: 'close it' closes THAT tab", rig.bridge.last("tabs.close") == {"tabIds": [15]}
+                  and "GitHub" in r.message, r.message)
+            rig.do("browser switch to the github tab")
+            now[0] += 3600
+            r = rig.do("browser close it")
+            check("G1: an hour later 'it' has expired", not r.ok, r.message)
+        finally:
+            web_macros.CLOCK = saved_clock
+            web_macros.LAST_TAB.update(id=None, title="", at=0.0)
+
+    with WebRig(PageBridge(version="1.5.0")) as rig:
+        r = rig.do("browser read the comments")
+        check("an extension older than 1.6.0 is never sent a 1.6.0 command",
+              rig.bridge.last("page.comments") is None and not r.ok, r.message)
+    manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
+    check("extension 1.6.0 adds downloads and still no debugger",
+          manifest["version"] == "1.6.0" and web_macros.REQUIRED_VERSION == (1, 6, 0)
+          and "downloads" in manifest["permissions"] and "debugger" not in manifest["permissions"])
 
 
 def main():
@@ -1430,6 +1681,7 @@ def main():
         section_tabs_by_position()
         section_part_2b()
         section_part_2c()
+        section_part_3()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

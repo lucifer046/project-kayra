@@ -81,6 +81,17 @@ INSIDE THE BROWSER PAGE (also inside web apps like WhatsApp, YouTube, X):
   browser ungroup the <name> group | browser close the <name> group |
   browser move this tab to a new window | browser move this tab to the other screen |
   browser merge my chrome windows |
+  browser what does this page say about <topic> | browser read the comments |
+  browser summarize the reviews | browser summarize this video |
+  browser translate this page to <language> | browser explain the selected text |
+  browser translate the selected text to <language> | browser bookmark this page |
+  browser bookmark this page in <folder> | browser search my bookmarks for <text> |
+  browser delete the bookmark for <name> | browser clear today's history |
+  browser clear the last hour of history | browser what did i visit today |
+  browser what did i download | browser open my last download | browser show it in folder |
+  browser pause the download | browser resume the download | browser cancel the download |
+  browser close it | browser go back to it | browser search for <text> here |
+  browser what can i do here |
   browser open the page i read yesterday about <topic> | browser bookmark <name>
 EMAIL (Gmail): email check | email open latest | email open the email from <name> |
   email read latest | email read this | email go to sent | email reply | email archive |

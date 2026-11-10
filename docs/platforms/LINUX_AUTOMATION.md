@@ -327,6 +327,27 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-10 — round 5, part 3: about the page, bookmarks, history, downloads, "it"
+
+- **C5** `page_ask`: a question answered from the page text by the model ("the page doesn't
+  say" otherwise). **C6** `page.comments` (site table + marked-up reviews; YouTube is scrolled
+  to and polled), `page.transcript` (presses "...more" and "Show transcript", polled with
+  `_until`, falls back to the description). **C8** Google Translate for the page, the model for a
+  selection (`page.selection`). **C9** bookmark add (folder by name, created if missing), search,
+  delete (always asks; exact ids). **C10** history clear (today / hour / 15 min; always asks),
+  "what did I visit". **C11** downloads: list with progress, open (asks; Kayra runs xdg-open,
+  never a program or a flagged file), show in folder, pause / resume / cancel.
+- **G1** `web_macros.LAST_TAB`: the tab Kayra last opened or switched to by name — "close it",
+  "go back to it", "read it", "summarize it"; 10 minutes, and only while it is still open.
+- **G2** `search_here`: the site in front's own search (Gmail, YouTube, Drive, GitHub repo,
+  Amazon, Flipkart, Wikipedia, Reddit, Stack Overflow, Google results), Ctrl+F in Docs/Sheets,
+  the page's search box, else Google. "browser search for X" now goes here.
+- **G4** `page_help`: per-site hints.
+- Extension 1.6.0 (+ `downloads`). Fixed: "bookmark this page" tried to OPEN a bookmark
+  called "this page". DMM preamble: a question about the page is not a word find; downloads
+  are not closed tabs (both misread by the live local model before the fix).
+- Tests: `test_browser_control.py` [16], `test_browser_extension.py` [4].
+
 ### 2026-11-10 — round 5, part 2c: the rest of tabs and windows, results, find
 
 - **B2** "close all YouTube tabs", "close all but pinned": more than 3 tabs asks first. New in

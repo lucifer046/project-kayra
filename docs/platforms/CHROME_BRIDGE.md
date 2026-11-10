@@ -50,6 +50,16 @@ anywhere else; one is never needed for an unpacked extension.
 | "move this tab to a new window", "… to the other screen", "merge my Chrome windows" | the tab gets its own window (moved to the other monitor with Hyprland); every tab back in one window |
 | "open the third result", "play the second video", "open the last result in a new tab", "what are the results" | the result list of Google, YouTube, Amazon, Flipkart, GitHub, Reddit, DuckDuckGo, Bing; on other pages the Nth content link |
 | "find pricing on this page", "next match", "previous match", "clear highlights" | highlights every match, scrolls to the first, steps through them |
+| "what does this page say about pricing", "does this page mention refunds" | answered from the page's own text (a model reads it; "the page doesn't say" when it doesn't) |
+| "read the comments", "summarize the reviews", "what are people saying about this" | YouTube, Reddit, Amazon, Flipkart, Hacker News, GitHub, or any page that marks up reviews |
+| "summarize this video" | YouTube: opens the transcript, waits for it, summarizes; no transcript → the description, said so |
+| "translate this page to Hindi", "translate the selected text to French", "explain the selected text" | the page through Google Translate in this tab; a selection through the model |
+| "bookmark this page (in the work folder)", "search my bookmarks for rust", "delete the bookmark for X" | deleting **always asks**, naming the bookmarks, and removes exactly those |
+| "clear today's history", "clear the last hour of history", "what did I visit today" | clearing **always asks**; only today / the last hour / 15 minutes, never all time |
+| "what did I download", "open my last download", "show it in folder", "pause / resume / cancel the download" | opening **always asks**; a program (.sh, .AppImage, .exe, …) or a file Chrome flagged is never opened |
+| "close it", "go back to it", "read it" | "it" = the tab Kayra last opened or switched to by name (10 minutes) |
+| "search for Ravi here", "search this sheet for Ravi" | searches INSIDE what's in front: Gmail, YouTube, Drive, GitHub (this repo), Amazon, Flipkart, Wikipedia, Reddit, Stack Overflow, Google; Docs/Sheets use their own Find; any other site its search box; else Google |
+| "what can I do here?" | a few things worth saying on the site in front |
 | "mute everything except this tab", "unmute all other tabs" | every other tab |
 | "what did I just close?" | the last few closed tabs and windows |
 | "reopen the YouTube tab I closed" | that tab, not just the last one closed |
@@ -129,7 +139,7 @@ have yet, it sends `runtime.reload` (Chrome re-reads this folder) and says *"I'v
 the Kayra Bridge extension…"* — ask again a few seconds later. You can also say **"browser
 update"**. Only a 1.0.x extension needs the manual **reload arrow** on `chrome://extensions`.
 
-Current version: **1.5.0** (1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
+Current version: **1.6.0** (1.6.0: comments, transcript, selection, bookmarks add/remove, history clearing, downloads — adds the `downloads` permission; 1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
 click matching and `page.waitFor` cheaper; 1.2.2 adds `tabs.close {tabIds}`; 1.3.0 adds
 `tabs.recentlyClosed`, `tabs.restore {sessionId}`, `tabs.muteOthers`, `tabs.discard`,
 `tabs.zoom` and `tabs.reload {hard}` — no new permissions). An older 1.1.0+ extension is
@@ -195,8 +205,12 @@ fakes. If a picker stays open, press Share and tell me what you saw.
   your screen and closing other tabs.
 - **Minimal permissions.** tabs, scripting, history, bookmarks, sessions, alarms, storage,
   tabGroups (1.5.0, approved by the user 2026-11-10: it only creates, names, colours and
-  collapses groups — no page data; Chrome shows no prompt for it). No cookies, downloads,
-  debugger or native messaging.
+  collapses groups — no page data; Chrome shows no prompt for it), downloads (1.6.0, approved
+  by the user 2026-11-10: list, show in folder, pause / resume / cancel; Kayra opens a
+  finished file itself with xdg-open, after a yes, and never a program). No cookies,
+  debugger or native messaging (`downloads.open` is not requested either).
+- **Clearing history, deleting bookmarks and opening a download always ask**, whatever the
+  count, and the "yes" acts on exactly what was named.
 - **Bulk closes ask first.** More than 3 tabs (by site, all but pinned, a group) is a
   question, and the "yes" closes exactly the tabs it listed.
 

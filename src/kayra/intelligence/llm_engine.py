@@ -677,7 +677,24 @@ class CentralizedLLMEngine:
                my college tabs'; 'make the research group blue' / 'collapse the research group'
                / 'rename this group to thesis' / 'ungroup the research group' -> 'browser ' +
                the same words; 'move this tab to a new window' -> 'browser move this tab to a
-               new window'; 'merge my Chrome windows' -> 'browser merge my chrome windows'; 'click
+               new window'; 'merge my Chrome windows' -> 'browser merge my chrome windows';
+               ABOUT THE PAGE IN FRONT: a QUESTION about the page is answered from it, never a
+               word search: 'what does this page say about pricing' -> 'browser what does this
+               page say about pricing' (NOT 'browser find pricing on this page', which only
+               highlights a word); 'read the comments' / 'what are people saying
+               about this' / 'summarize the reviews' -> 'browser ' + the same words; 'summarize
+               this video' -> 'browser summarize this video'; 'translate this page to Hindi' ->
+               'browser translate this page to hindi'; 'explain the selected text' -> 'browser
+               explain the selected text'; 'bookmark this page' -> 'browser bookmark this page';
+               'delete the bookmark for X' -> 'browser delete the bookmark for x'; 'clear today's
+               history' -> 'browser clear today's history'; DOWNLOADS are files, not closed
+               tabs: 'what did I download' -> 'browser what did i download' (NOT 'what did i
+               just close'); 'open my last download' / 'pause the download' -> 'browser ' + the
+               same words; 'close it' / 'go
+               back to it' after Kayra opened a tab -> 'browser close it' / 'browser go back to
+               it'; 'search this sheet for Ravi' / 'search for Ravi here' -> 'browser search for
+               ravi here' (a web search for facts stays 'google search ...'); 'what can I do
+               here' -> 'browser what can i do here'; 'click
                the sign in button' -> 'browser click on sign in'; 'type hello in the search
                box' -> 'browser type hello into search'; 'summarize this page' -> 'browser
                summarize this page'; 'read this article' -> 'browser read this page'; 'open

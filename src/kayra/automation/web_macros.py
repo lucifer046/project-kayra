@@ -23,7 +23,7 @@ import os
 import re
 import time
 import datetime
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlsplit
 
 from kayra.automation import ai
 from kayra.automation import browser_bridge
@@ -44,7 +44,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 5, 0)
+REQUIRED_VERSION = (1, 6, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -458,6 +458,13 @@ def tab_switch(name):
     missing = _need_bridge()
     if missing:
         return missing
+    if name == "it":
+        tab = _referent_tab()
+        if tab is None:
+            return _no_referent()
+        _call("tabs.activate", tabId=tab["id"])
+        _focus_chrome()
+        return ActionResult.success(f"Here's {_short(tab.get('title') or 'that tab')}.")
     if is_position(name):
         tab, problem = _tab_at(name)
         if tab is None:
@@ -469,6 +476,7 @@ def tab_switch(name):
         tab = _call("tabs.activate", match=_site_key(name))
     except browser_bridge.BridgeError:
         return ActionResult.not_found(f"I don't see a {name} tab.")
+    remember_tab(tab)
     _focus_chrome()
     return ActionResult.success(f"Here's {_short(tab.get('title') or name)}.")
 
@@ -477,6 +485,13 @@ def tab_close(name, all_tabs=False, confirmed_ids=None, action=None):
     missing = _need_bridge()
     if missing:
         return missing
+    if name == "it":
+        tab = _referent_tab()
+        if tab is None:
+            return _no_referent()
+        LAST_TAB["id"] = None
+        result = _close_ids([tab["id"]])
+        return ActionResult.success(f"Closed {_short(tab.get('title') or 'that tab')}.") if result.ok else result
     if is_position(name):
         tab, problem = _tab_at(name)
         if tab is None:
@@ -878,11 +893,20 @@ def _page_text(max_chars=15000):
     return _call("page.text", max=max_chars, timeout=15.0) or {}
 
 
-def page_read():
+def _page_of(target):
+    """page.text of the active tab, or of the remembered tab for "it" (G1)."""
+    if target == "it":
+        tab = _referent_tab()
+        if tab is not None:
+            return _call("page.text", tabId=tab["id"], max=15000, timeout=15.0) or {}
+    return _page_text()
+
+
+def page_read(target="current"):
     missing = _need_bridge()
     if missing:
         return missing
-    page = _page_text(4000)
+    page = _page_of(target) if target == "it" else _page_text(4000)
     text = " ".join((page.get("text") or "").split())
     if not text:
         return ActionResult.not_found("This page has no readable text.")
@@ -891,11 +915,11 @@ def page_read():
     return ActionResult.success(cut)
 
 
-def page_summarize():
+def page_summarize(target="current"):
     missing = _need_bridge()
     if missing:
         return missing
-    page = _page_text()
+    page = _page_of(target)
     text = page.get("text") or ""
     if len(text.strip()) < 80:
         return ActionResult.not_found("There isn't enough text on this page to summarize.")
@@ -931,6 +955,413 @@ def bookmark_open(query):
         return ActionResult.not_found(f"I don't have a bookmark for {query}.")
     _call("tabs.open", url=items[0]["url"])
     return ActionResult.success(f"Opening {_short(items[0].get('title') or query)}.")
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 3 — questions, comments, video, translate, bookmarks, history,  │
+# │            downloads, "it", search here, what can I do here            │
+# └────────────────────────────────────────────────────────────────────────┘
+
+# G1: the tab Kayra last opened or switched to, so "close it" / "go back to it" / "read it"
+# mean THAT tab even after the user moved on. Bounded: one tab, ten minutes.
+LAST_TAB = {"id": None, "title": "", "at": 0.0}
+LAST_TAB_TTL_S = 600.0
+CLOCK = time.monotonic          # replaced by the test rigs
+
+
+def remember_tab(tab):
+    if isinstance(tab, dict) and tab.get("id") is not None:
+        LAST_TAB.update(id=tab["id"], title=tab.get("title") or "", at=CLOCK())
+
+
+def _referent_tab():
+    """The remembered tab if it is fresh and still open, else None."""
+    if LAST_TAB["id"] is None or CLOCK() - LAST_TAB["at"] > LAST_TAB_TTL_S:
+        return None
+    return next((t for t in (_call("tabs.list") or []) if t.get("id") == LAST_TAB["id"]), None)
+
+
+def _no_referent():
+    return ActionResult.not_found("I'm not sure which tab you mean. Say its name, like close the "
+                                  "YouTube tab.")
+
+
+def page_ask(question):
+    """C5: "what does this page say about pricing" — answered from the page's own text."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    page = _page_text(15000)
+    text = page.get("text") or ""
+    if len(text.strip()) < 40:
+        return ActionResult.not_found("This page has no readable text to answer from.")
+    answer = ai.summarize(
+        "You are Kayra. Answer the user's question using ONLY the web page below, in one to "
+        "three spoken sentences. If the page does not say, answer exactly: The page doesn't say.",
+        f"Question: {question}\n\nTitle: {page.get('title')}\nURL: {page.get('url')}\n\n{text[:12000]}",
+        fallback="")
+    if not answer:
+        return ActionResult.failure("I couldn't reach a model to answer that. Say \"find <word> on "
+                                    "this page\" to look for it yourself.")
+    return ActionResult.success(answer)
+
+
+def page_comments(summarize=False):
+    """C6: "read the comments" / "summarize the reviews" — YouTube, Reddit, Amazon, Flipkart,
+    Hacker News, GitHub, or any page that marks up its reviews."""
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    # YouTube loads comments only once scrolled to: the first call scrolls, then poll.
+    found = _until(lambda: (lambda r: r if r.get("comments") else None)(
+        _call("page.comments", max=12) or {}), 4.0) or {}
+    comments, kind = found.get("comments") or [], found.get("kind", "comments")
+    if not comments:
+        return ActionResult.not_found(f"I don't see any {kind} on this page.")
+    if summarize and len(comments) >= 2:
+        spoken = ai.summarize(
+            f"You are Kayra. Summarize what these {kind} say, in two to four spoken sentences: "
+            "the overall feeling, what people agree on, and any common complaint. No quotes.",
+            "\n".join(f"- {c}" for c in comments),
+            fallback="")
+        if spoken:
+            return ActionResult.success(spoken)
+    top = " ... ".join(_short(c, 160) for c in comments[:3])
+    return ActionResult.success(f"The top {kind}: {top}")
+
+
+def video_summary():
+    """C6: "summarize this video" — the YouTube transcript, else the title and description."""
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    first = _call("page.transcript", open=True) or {}
+    if not first.get("supported"):
+        return page_summarize()                  # not YouTube: the page itself
+    data = _until(lambda: (lambda r: r if r.get("text") else None)(
+        _call("page.transcript") or {}), 5.0) or (_call("page.transcript") or {})
+    text, title = data.get("text") or "", data.get("title") or "this video"
+    source = f"Transcript:\n{text[:14000]}" if text else \
+        f"(No transcript is available.) Description:\n{data.get('description', '')}"
+    spoken = ai.summarize(
+        "You are Kayra. Summarize this YouTube video for the user in three to five spoken "
+        "sentences: what it covers and the main takeaways. If you only have the description, "
+        "say that you're going by the description. No markdown.",
+        f"Title: {title}\n{source}",
+        fallback=f"This is {title}. I couldn't reach a model to summarize it.")
+    return ActionResult.success(spoken)
+
+
+def page_translate(language="english"):
+    """C8: the whole page through Google Translate, in this tab."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    from kayra.automation.common import LANGUAGES
+    code = LANGUAGES.get(str(language).lower().strip())
+    if code is None:
+        return ActionResult.not_found(f"I don't know the language {language}.")
+    tab = _call("tabs.active") or {}
+    url = tab.get("url") or ""
+    if not url.startswith("http"):
+        return ActionResult.not_found("This tab isn't a web page I can translate.")
+    _call("tabs.navigate", url=f"https://translate.google.com/translate?sl=auto&tl={code}&u={quote(url, safe='')}")
+    return ActionResult.success(f"Here's the page in {language.capitalize()}.")
+
+
+def _selection():
+    return str(_call("page.selection") or "").strip()
+
+
+def selection_explain():
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    picked = _selection()
+    if not picked:
+        return ActionResult.not_found("Nothing is selected. Highlight some text first.")
+    spoken = ai.summarize("You are Kayra. Explain the selected text simply, in two or three spoken "
+                          "sentences, as if to a curious friend. No markdown.", picked[:4000],
+                          fallback="")
+    return ActionResult.success(spoken) if spoken else \
+        ActionResult.failure("I couldn't reach a model to explain it.")
+
+
+def selection_translate(language="english"):
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    picked = _selection()
+    if not picked:
+        return ActionResult.not_found("Nothing is selected. Highlight some text first.")
+    spoken = ai.summarize(f"Translate the user's text into {language}. Reply with the translation "
+                          "only.", picked[:3000], fallback="", max_chars=1200)
+    return ActionResult.success(spoken) if spoken else \
+        ActionResult.failure("I couldn't reach a model to translate it.")
+
+
+def bookmark_add(folder=""):
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    result = _call("bookmarks.add", folder=folder or "") or {}
+    title = _short(result.get("title") or "this page")
+    if result.get("already"):
+        return ActionResult.success(f"{title} is already bookmarked.")
+    return ActionResult.success(f"Bookmarked {title}" + (f" in {folder}." if folder else "."))
+
+
+def bookmarks_search(query):
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    items = _call("bookmarks.find", text=query, max=5) or []
+    if not items:
+        return ActionResult.not_found(f"No bookmarks match {query}.")
+    names = ", ".join(_short(b.get("title") or b.get("url"), 50) for b in items)
+    return ActionResult.success(f"I found {len(items)}: {names}. Say open my bookmark for one of them.")
+
+
+def bookmark_delete(query, confirmed_ids=None, action=None):
+    """C9: always asks, naming what will go; "yes" removes exactly the bookmarks it named."""
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    if confirmed_ids is not None:
+        removed = (_call("bookmarks.remove", ids=list(confirmed_ids)) or {}).get("removed", 0)
+        return ActionResult.success(f"Removed {removed} bookmark{'s' if removed != 1 else ''}.")
+    items = _call("bookmarks.find", text=query, max=5) or []
+    if not items:
+        return ActionResult.not_found(f"No bookmarks match {query}.")
+    if action is None:
+        return ActionResult.failure("I need to ask before removing bookmarks.")
+    approved = Action(action.domain, action.action, target=action.target,
+                      parameters={**action.parameters, "confirmed_ids": [b["id"] for b in items]},
+                      raw=action.raw)
+    names = ", ".join(_short(b.get("title") or b.get("url"), 40) for b in items)
+    return ActionResult(Status.NEEDS_CONFIRMATION,
+                        f"Remove {len(items)} bookmark{'s' if len(items) != 1 else ''}: {names}?",
+                        {"confirm": approved})
+
+
+_SPANS = {"today": "today's history", "hour": "the last hour of history",
+          "15m": "the last 15 minutes of history"}
+
+
+def _span_start(span):
+    now = datetime.datetime.now()
+    if span == "hour":
+        return now - datetime.timedelta(hours=1)
+    if span == "15m":
+        return now - datetime.timedelta(minutes=15)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def history_clear(span="today", confirmed=False, action=None):
+    """C10: always asks first. Only today / the last hour / 15 minutes — never all time."""
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    what = _SPANS.get(span, _SPANS["today"])
+    if not confirmed:
+        if action is None:
+            return ActionResult.failure("I need to ask before clearing history.")
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed": True}, raw=action.raw)
+        return ActionResult(Status.NEEDS_CONFIRMATION,
+                            f"Clear {what} in Chrome? That can't be undone.", {"confirm": approved})
+    start = int(_span_start(span).timestamp() * 1000)
+    _call("history.deleteRange", startTime=start)
+    return ActionResult.success(f"Cleared {what}.")
+
+
+def history_list(days=1):
+    missing = _need_bridge()
+    if missing:
+        return missing
+    items = _call("history.search", text="", days=days, max=8) or []
+    if not items:
+        return ActionResult.success("Nothing in your history for that time.")
+    names = ", ".join(_short(h.get("title") or h.get("url"), 40) for h in items[:6])
+    return ActionResult.success(f"Recently: {names}.")
+
+
+def _downloads(n=5):
+    return _call("downloads.list", max=n) or []
+
+
+def _file_name(path):
+    return os.path.basename(str(path or "")) or "the file"
+
+
+def downloads_list():
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    items = _downloads(5)
+    if not items:
+        return ActionResult.success("Chrome has no downloads.")
+    parts = []
+    for d in items[:4]:
+        name = _file_name(d.get("filename"))
+        if d.get("state") == "in_progress":
+            total, got = d.get("total") or 0, d.get("bytes") or 0
+            pct = f", {round(100 * got / total)} percent" if total else ""
+            parts.append(f"{name} ({'paused' if d.get('paused') else 'downloading'}{pct})")
+        elif d.get("state") == "interrupted":
+            parts.append(f"{name} (failed)")
+        else:
+            parts.append(name)
+    return ActionResult.success("Your downloads: " + ", ".join(parts) + ".")
+
+
+# A downloaded file Kayra will not open for you: it would RUN something.
+_EXECUTABLE = re.compile(r"\.(?:sh|run|bin|appimage|exe|msi|bat|cmd|com|deb|rpm|desktop|jar|py|pl|"
+                         r"apk|pkg(?:\.tar\.\w+)?|zst)$", re.I)
+
+
+def download_open(confirmed_id=None, action=None):
+    """C11: opens the newest finished download — always asks, never an executable."""
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    done = [d for d in _downloads(10) if d.get("state") == "complete" and d.get("exists") is not False]
+    if confirmed_id is not None:
+        done = [d for d in done if d.get("id") == confirmed_id]
+    if not done:
+        return ActionResult.not_found("I don't see a finished download to open.")
+    item, name = done[0], _file_name(done[0].get("filename"))
+    if _EXECUTABLE.search(name) or item.get("danger") not in (None, "safe", "accepted"):
+        return ActionResult.blocked(f"{name} is a program or was flagged by Chrome, so I won't open "
+                                    "it. Open it yourself if you trust it.")
+    if confirmed_id is None:
+        if action is None:
+            return ActionResult.failure("I need to ask before opening a downloaded file.")
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed_id": item["id"]}, raw=action.raw)
+        return ActionResult(Status.NEEDS_CONFIRMATION, f"Open {name}?", {"confirm": approved})
+    L = _L()
+    if L._have("xdg-open") and L.RUNNER.spawn(["xdg-open", item["filename"]]):
+        return ActionResult.success(f"Opening {name}.")
+    return ActionResult.failure(f"I couldn't open {name}.")
+
+
+def download_show():
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    items = _downloads(1)
+    if not items:
+        return ActionResult.not_found("Chrome has no downloads.")
+    _call("downloads.show", id=items[0]["id"])
+    return ActionResult.success(f"Here's {_file_name(items[0].get('filename'))} in its folder.")
+
+
+def download_control(verb):
+    stop = _bridge_at((1, 6, 0))
+    if stop:
+        return stop
+    active = [d for d in _downloads(10) if d.get("state") == "in_progress"]
+    if verb == "resume":
+        active = [d for d in active if d.get("paused")] or active
+    elif verb == "pause":
+        active = [d for d in active if not d.get("paused")]
+    if not active:
+        return ActionResult.not_found("Nothing is downloading." if verb != "resume" else
+                                      "No download is paused.")
+    item = active[0]
+    _call(f"downloads.{verb}", id=item["id"])
+    name = _file_name(item.get("filename"))
+    return ActionResult.success({"pause": f"Paused {name}.", "resume": f"Resumed {name}.",
+                                 "cancel": f"Cancelled {name}."}[verb])
+
+
+# G2: search INSIDE what is in front. Each site's own search address; the editors use their
+# own find (Ctrl+F); any page with a search box gets typed into; otherwise Google.
+_SITE_SEARCH = (
+    (r"(^|\.)youtube\.com$", "YouTube", lambda host, path, q: f"https://www.youtube.com/results?search_query={quote_plus(q)}"),
+    (r"^mail\.google\.com$", "your mail", lambda host, path, q: f"https://mail.google.com/mail/u/0/#search/{quote(q)}"),
+    (r"^drive\.google\.com$", "Drive", lambda host, path, q: f"https://drive.google.com/drive/search?q={quote_plus(q)}"),
+    (r"^github\.com$", "GitHub", lambda host, path, q: (
+        f"https://github.com/{'/'.join(path.strip('/').split('/')[:2])}/search?q={quote_plus(q)}"
+        if len(path.strip("/").split("/")) >= 2 and path.strip("/").split("/")[0] not in ("search", "settings")
+        else f"https://github.com/search?q={quote_plus(q)}")),
+    (r"(^|\.)amazon\.[a-z.]+$", "Amazon", lambda host, path, q: f"https://{host}/s?k={quote_plus(q)}"),
+    (r"(^|\.)flipkart\.com$", "Flipkart", lambda host, path, q: f"https://www.flipkart.com/search?q={quote_plus(q)}"),
+    (r"(^|\.)wikipedia\.org$", "Wikipedia", lambda host, path, q: f"https://{host}/w/index.php?search={quote_plus(q)}"),
+    (r"(^|\.)reddit\.com$", "Reddit", lambda host, path, q: f"https://www.reddit.com/search/?q={quote_plus(q)}"),
+    (r"(^|\.)stackoverflow\.com$", "Stack Overflow", lambda host, path, q: f"https://stackoverflow.com/search?q={quote_plus(q)}"),
+    (r"(^|\.)google\.[a-z.]+$", "Google", lambda host, path, q: f"https://www.google.com/search?q={quote_plus(q)}"
+     if path.startswith("/search") else None),
+)
+_EDITORS = re.compile(r"^docs\.google\.com$")
+
+
+def search_here(query):
+    """G2: "search for Ravi" — in the sheet, doc, inbox, video site or shop in front."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tab = _call("tabs.active") or {}
+    url = tab.get("url") or ""
+    host, path = _host(url), urlsplit(url).path or "/"
+    for pattern, label, build in _SITE_SEARCH:
+        if re.search(pattern, host):
+            target = build(host, path, query)
+            if target:
+                _call("tabs.navigate", url=target)
+                where = "this repo" if label == "GitHub" and "/search?q=" in target and \
+                    not target.startswith("https://github.com/search") else label
+                return ActionResult.success(f"Searching {where} for {query}.")
+    if _EDITORS.search(host):
+        L = _L()
+        _focus_chrome()
+        L.send_keys("ctrl+f")
+        L.type_text(query)
+        kind = "sheet" if "/spreadsheets/" in url else "document" if "/document/" in url else "file"
+        return ActionResult.success(f"Searching this {kind} for {query}.")
+    typed = (_call("page.type", field="search", text=query, submit=True) or {}) if url.startswith("http") else {}
+    if typed.get("typed"):
+        return ActionResult.success(f"Searching this site for {query}.")
+    return open_in(f"https://www.google.com/search?q={quote_plus(query)}", "tab",
+                   f"a Google search for {query}")
+
+
+# G4: "what can I do here?" — a few things worth saying on the site in front.
+_HELP = (
+    (r"^mail\.google\.com$", "In Gmail you can say: open my latest email, read this email, reply, "
+                             "archive, go to Sent, search for invoices, or draft an email to someone."),
+    (r"^calendar\.google\.com$", "In Calendar you can say: what's on my calendar today, or add "
+                                 "standup tomorrow at 10am."),
+    (r"^meet\.google\.com$", "In a call you can say: mute me, turn off my camera, share the LM "
+                             "Studio window, stop sharing, raise my hand, or leave the call."),
+    (r"(^|\.)youtube\.com$", "On YouTube you can say: play the second video, summarize this video, "
+                             "read the comments, search for lofi, pause, or skip forward."),
+    (r"^docs\.google\.com$", "In Docs and Sheets you can say: search this sheet for a name, read "
+                             "this page, summarize this page, or copy the link."),
+    (r"^web\.whatsapp\.com$", "In WhatsApp you can say: message Rahul saying running late, or "
+                              "open a chat by its name."),
+    (r"(^|\.)google\.[a-z.]+$", "On search results you can say: open the third result, what are the "
+                                "results, or open the first result in a new tab."),
+    (r"(^|\.)(amazon\.[a-z.]+|flipkart\.com)$", "Here you can say: search for headphones, open the "
+                                                "second product, or summarize the reviews."),
+    (r"^github\.com$", "On GitHub you can say: search this repo for a word, read this page, or "
+                       "open the first result."),
+)
+
+
+def page_help():
+    missing = _need_bridge()
+    if missing:
+        return missing
+    host = _host((_call("tabs.active") or {}).get("url"))
+    for pattern, hint in _HELP:
+        if re.search(pattern, host):
+            return ActionResult.success(hint)
+    return ActionResult.success("On any page you can say: summarize this page, what does this page "
+                                "say about something, find a word on this page, open the third "
+                                "result, bookmark this page, translate this page, or what can I "
+                                "click.")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -981,6 +1412,7 @@ def open_in(url, where=None, name=None):
     _focus_chrome()
     spoken = f"Opened {label} {said}." if where in _WHERE_SAID and where != "tab" else \
         f"Opening {label}."
+    remember_tab(tab)
     return ActionResult.success(spoken, url=url, tab=tab.get("id"))
 
 

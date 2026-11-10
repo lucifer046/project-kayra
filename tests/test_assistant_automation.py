@@ -172,7 +172,7 @@ def section_parsing():
         "browser close other tabs": ("browser.tabs_close_others", None),
         "browser click on the second reply button": ("browser.page_click", "reply"),
         "browser type hello world into search": ("browser.page_type", "search"),
-        "browser search for shoes": ("browser.page_type", "search"),
+        "browser search for shoes": ("browser.search_here", "shoes"),     # Part 3, G2
         "browser scroll until you see pricing": ("browser.page_scroll", "pricing"),
         "browser summarize this page": ("browser.page_summarize", None),
         "browser read this page": ("browser.page_read", None),
@@ -403,8 +403,9 @@ def section_bridge():
     derived = "".join(chr(ord("a") + int(c, 16)) for c in hashlib.sha256(der).hexdigest()[:32])
     check("the manifest key really produces EXTENSION_ID", derived == browser_bridge.EXTENSION_ID,
           derived)
-    check("the extension never asks for cookies, downloads or debugger access",
-          not ({"cookies", "debugger", "downloads", "nativeMessaging"} & set(manifest["permissions"])))
+    check("the extension never asks for cookies, debugger or native messaging access "
+          "(downloads was approved for 1.6.0, plan decision D5)",
+          not ({"cookies", "debugger", "nativeMessaging"} & set(manifest["permissions"])))
     js = open(os.path.join(browser_bridge.extension_dir(), "background.js")).read()
     check("the extension only connects to 127.0.0.1", "ws://127.0.0.1" in js and "fetch(" not in js)
     check("the extension refuses password fields itself", "password" in js and "never types" in js)

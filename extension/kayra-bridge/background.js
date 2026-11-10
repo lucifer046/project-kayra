@@ -275,6 +275,54 @@ async function run(cmd, args) {
     case "page.results": return inPage(await targetTab(args), pageResults, [args.nth || 0, args.kind || ""]);
     case "page.highlight": return inPage(await targetTab(args), pageHighlight, [args.text || "", args.step || 0, !!args.clear]);
 
+    // ── 1.6.0: comments/reviews (C6), transcript (C6), selection (C8), bookmarks (C9),
+    //    history (C10), downloads (C11) ──
+    case "page.comments": return inPage(await targetTab(args), pageComments, [args.max || 12]);
+    case "page.transcript": return inPage(await targetTab(args), pageTranscript, [!!args.open]);
+    case "page.selection": return inPage(await targetTab(args), () => String(window.getSelection() || "").slice(0, 6000), []);
+    case "bookmarks.add": {
+      const t = await targetTab(args);
+      let parentId;
+      if (args.folder) {
+        const want = String(args.folder).toLowerCase();
+        const folders = [];
+        const walk = (nodes) => nodes.forEach((n) => {
+          if (!n.url && (n.title || "").toLowerCase() === want) folders.push(n);
+          if (n.children) walk(n.children);
+        });
+        walk(await chrome.bookmarks.getTree());
+        if (folders.length) parentId = folders[0].id;
+        else parentId = (await chrome.bookmarks.create({title: args.folder})).id;
+      }
+      const existing = (await chrome.bookmarks.search({url: t.url})) || [];
+      if (existing.length && !args.folder) return {added: false, already: true, title: existing[0].title};
+      const b = await chrome.bookmarks.create(Object.assign({title: t.title, url: t.url}, parentId ? {parentId} : {}));
+      return {added: true, title: b.title, folder: args.folder || ""};
+    }
+    case "bookmarks.remove": {
+      // Exact ids only: Kayra asks the user first and passes what it listed.
+      for (const id of args.ids || []) await chrome.bookmarks.remove(String(id));
+      return {removed: (args.ids || []).length};
+    }
+    case "bookmarks.find": {
+      const items = await chrome.bookmarks.search(args.text || "");
+      return items.filter((b) => b.url).slice(0, args.max || 10).map((b) => ({id: b.id, title: b.title, url: b.url}));
+    }
+    case "history.deleteRange": {
+      await chrome.history.deleteRange({startTime: args.startTime, endTime: args.endTime || Date.now()});
+      return {deleted: true};
+    }
+    case "downloads.list": {
+      const items = await chrome.downloads.search({orderBy: ["-startTime"], limit: Math.min(args.max || 5, 20)});
+      return items.map((d) => ({id: d.id, filename: d.filename, url: d.finalUrl || d.url, state: d.state,
+                               paused: d.paused, exists: d.exists, bytes: d.bytesReceived, total: d.totalBytes,
+                               mime: d.mime, danger: d.danger}));
+    }
+    case "downloads.show": { chrome.downloads.show(args.id); return {shown: true}; }
+    case "downloads.pause": { await chrome.downloads.pause(args.id); return {paused: true}; }
+    case "downloads.resume": { await chrome.downloads.resume(args.id); return {resumed: true}; }
+    case "downloads.cancel": { await chrome.downloads.cancel(args.id); return {cancelled: true}; }
+
     case "page.text": return inPage(await targetTab(args), pageText, [args.max || 15000]);
     case "page.click": return inPage(await targetTab(args), pageClick, [args.text, args.nth || 1]);
     case "gmail.open": return inPage(await targetTab(args), gmailOpen, [args.which || "first", args.nth || 1, args.query || ""]);
@@ -551,6 +599,63 @@ function pageFind(text) {
   let count = 0, at = body.indexOf(want);
   while (want && at !== -1) { count++; at = body.indexOf(want, at + want.length); }
   return {count};
+}
+
+// C6: comments or reviews, site-aware, the visible ones in page order. On YouTube the comments
+// load only once scrolled to, so the section is scrolled into view and an empty list means
+// "not loaded yet" (Kayra polls again).
+function pageComments(max) {
+  const host = location.hostname;
+  let selector = "[itemprop=reviewBody], [data-hook=review-body], .comment-body, .comment p, " +
+                 "[class*=comment-content], [class*=review-text], [class*=reviewText]";
+  let kind = "comments";
+  if (/youtube\.com$/.test(host)) {
+    const section = document.querySelector("ytd-comments, #comments");
+    if (section) section.scrollIntoView({block: "start"});
+    selector = "ytd-comment-thread-renderer #content-text";
+  } else if (/reddit\.com$/.test(host)) {
+    selector = "shreddit-comment div[slot=comment], div[data-testid=comment] p";
+  } else if (/(^|\.)amazon\./.test(host)) {
+    selector = "[data-hook=review-body]"; kind = "reviews";
+  } else if (/flipkart\.com$/.test(host)) {
+    selector = "div.t-ZTKy, div.ZmyHeo, div[class*=review] p"; kind = "reviews";
+  } else if (/news\.ycombinator\.com$/.test(host)) {
+    selector = ".commtext";
+  } else if (/github\.com$/.test(host)) {
+    selector = ".comment-body, .js-comment-body";
+  } else if (document.querySelector("[itemprop=reviewBody], [data-hook=review-body]")) {
+    kind = "reviews";
+  }
+  const seen = new Set(); const out = [];
+  for (const el of document.querySelectorAll(selector)) {
+    const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+    if (text.length < 3 || seen.has(text)) continue;
+    seen.add(text); out.push(text.slice(0, 600));
+    if (out.length >= max) break;
+  }
+  return {kind, site: host, comments: out};
+}
+
+// C6: a YouTube video's transcript. open = press "...more" and "Show transcript" first; the
+// panel then loads asynchronously, so Kayra calls again without open until segments appear.
+function pageTranscript(open) {
+  if (!/youtube\.com$/.test(location.hostname)) return {supported: false};
+  const segments = () => Array.from(document.querySelectorAll(
+    "ytd-transcript-segment-renderer .segment-text, ytd-transcript-segment-renderer yt-formatted-string"))
+    .map((el) => (el.innerText || "").trim()).filter(Boolean);
+  let have = segments();
+  if (!have.length && open) {
+    const expand = document.querySelector("#description-inline-expander #expand, tp-yt-paper-button#expand");
+    if (expand) expand.click();
+    const buttons = Array.from(document.querySelectorAll("button, ytd-button-renderer, [role=button]"));
+    const show = buttons.find((b) => /show transcript/i.test(b.innerText || b.getAttribute("aria-label") || ""));
+    if (show) show.click();
+    have = segments();
+    return {supported: true, opened: !!show, text: have.join(" ").slice(0, 20000)};
+  }
+  const title = (document.querySelector("h1.ytd-watch-metadata, h1 yt-formatted-string") || {}).innerText || document.title;
+  const description = ((document.querySelector("#description-inline-expander, #description") || {}).innerText || "").slice(0, 3000);
+  return {supported: true, title, description, text: have.join(" ").slice(0, 20000)};
 }
 
 // C3: the result list of the page, site-aware. nth = 0 lists them; nth = N (or -1 = last)

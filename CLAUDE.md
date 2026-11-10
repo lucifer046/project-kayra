@@ -242,6 +242,10 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   handler that finds a request bigger than it sounded returns NEEDS_CONFIRMATION with
   `detail["confirm"]` (the exact action, e.g. with `confirmed_ids`); `execute_action` registers
   it. Bulk tab closes ask above 3.
+- **Part 3 (2026-11-10, extension 1.6.0 + downloads).** Page questions, comments, YouTube
+  transcript, translate, bookmarks, history, downloads, "it" (`web_macros.LAST_TAB`, set only
+  by name), `search_here`, `page_help`. Clearing history, deleting bookmarks and opening a
+  download ALWAYS ask (late confirmation with exact ids); a program is never opened.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

@@ -78,6 +78,14 @@ RESULTS = """<html><head><title>Search</title></head><body>
 </body></html>"""
 
 
+REVIEWS = """<html><head><title>Product</title></head><body><main>
+<div itemprop=review><p itemprop=reviewBody>Battery lasts two days.</p></div>
+<div itemprop=review><p itemprop=reviewBody>Battery lasts two days.</p></div>
+<div itemprop=review><p itemprop=reviewBody>Too heavy for travel.</p></div>
+<div class=comment><p>A plain comment.</p></div>
+</main></body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -198,6 +206,15 @@ def main():
               d.execute_script("return document.querySelectorAll('mark').length") == 0
               and text == "Pricing is simple. The pricing page lists PRICING for teams.", text)
         check("finding nothing marks nothing", call("pageHighlight", "zebra", 0, False)["count"] == 0)
+
+        check.section("[4] Part 3 — comments and reviews (C6), transcript off YouTube")
+        d.get("data:text/html;base64," + base64.b64encode(REVIEWS.encode()).decode())
+        r = call("pageComments", 12)
+        check("marked-up reviews are read as REVIEWS, duplicates dropped, in page order",
+              r["kind"] == "reviews" and r["comments"][:2] == ["Battery lasts two days.", "Too heavy for travel."], r)
+        check("the max is honoured", len(call("pageComments", 1)["comments"]) == 1)
+        check("the transcript reader says 'not YouTube' off YouTube",
+              call("pageTranscript", True) == {"supported": False})
     finally:
         d.quit()
     return check.finish()
