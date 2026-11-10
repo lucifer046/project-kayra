@@ -86,6 +86,87 @@ REVIEWS = """<html><head><title>Product</title></head><body><main>
 </main></body></html>"""
 
 
+FILES = """<html><head><title>Sheets</title></head><body><main>
+<a href="https://docs.google.com/spreadsheets/d/1AAAAAAAAAAAAAAAAAAAAAAAAAAAA/edit#gid=0" aria-label="Budget 2026">x</a>
+<a href="https://docs.google.com/document/d/1BBBBBBBBBBBBBBBBBBBBBBBBBBBB/edit">Offer letter</a>
+<a href="https://docs.google.com/spreadsheets/d/1AAAAAAAAAAAAAAAAAAAAAAAAAAAA/edit">Budget 2026 again</a>
+<div data-id="1CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"><span class="docs-homescreen-list-item-title-value">Team roster</span></div>
+<div data-id="short">not a file</div>
+<div data-id="1DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD" style="display:none">Hidden</div>
+</main></body></html>"""
+
+CALENDAR = """<html><body><main>
+<div data-eventid="e1" style="width:300px;height:20px">10:00 Standup</div>
+<div data-eventid="e2" style="width:300px;height:20px" onclick="document.getElementById('d').style.display='block'">15:00 Review</div>
+<div id=d style="display:none"><a href="https://meet.google.com/abc-defg-hij">Join with Google Meet</a></div>
+</main></body></html>"""
+
+
+# Markup shapes seen LIVE on 2026-11-10 (tuning pass V9), reduced to what the functions read.
+AMAZON = """<html><body><main>
+<div data-component-type="s-search-result"><span class="puis-sponsored-label-text">Sponsored</span>
+ <a href="/sspa/click?ad=1"><h2>Sponsored hub</h2></a></div>
+<div data-component-type="s-search-result"><a href="/sspa/click?ad=2"><h2>Another ad</h2></a></div>
+<div data-component-type="s-search-result"><a href="https://www.amazon.in/Portronics-Mport/dp/B09"><h2>Portronics Mport 31C USB C Hub</h2></a></div>
+<div data-component-type="s-search-result"><a href="https://www.amazon.in/Anker-Hub/dp/B0A"><h2>Anker 7-in-1 USB C Hub</h2></a></div>
+<div id="customerReviews"><li data-hook="review"><span data-hook="reviewText">Compact and reliable, works with my laptop.</span></li>
+<li data-hook="review"><span data-hook="reviewText">Gets warm after an hour.</span></li></div>
+</main></body></html>"""
+
+YOUTUBE_WATCH = """<html><body>
+<ytd-ad-slot-renderer><a id="video-title" href="https://www.youtube.com/watch?v=ad">An ad</a></ytd-ad-slot-renderer>
+<ytd-ad-slot-renderer><yt-lockup-view-model><a href="https://www.youtube.com/watch?v=AD"><h3>App review, sponsored</h3></a></yt-lockup-view-model></ytd-ad-slot-renderer>
+<div id="related">
+ <yt-lockup-view-model><a href="https://www.youtube.com/watch?v=A1">0:59</a><h3><a href="https://www.youtube.com/watch?v=A1">How might LLMs store facts</a></h3></yt-lockup-view-model>
+ <yt-lockup-view-model><a href="https://www.youtube.com/watch?v=B2">12:01</a><h3><a href="https://www.youtube.com/watch?v=B2">Quantum mechanics, seen</a></h3></yt-lockup-view-model>
+</div>
+<ytd-button-renderer style="display:none">Show transcript</ytd-button-renderer>
+<button style="display:none" onclick="document.title='hidden-transcript'">Show transcript</button>
+<button onclick="document.title='transcript'">Show transcript</button>
+</body></html>"""
+
+BING = """<html><body><ol id="b_results">
+<li class="b_algo"><h2><a href="https://github.com/x/kokoro-onnx">GitHub - kokoro-onnx</a></h2></li>
+<li class="b_ans"><h2><a href="https://www.bing.com/news">News about kokoro</a></h2></li>
+<li class="b_algo"><h2><a href="https://huggingface.co/kokoro">Kokoro on Hugging Face</a></h2></li>
+</ol></body></html>"""
+
+WIKI = """<html><body><div id="content">
+<p>There is a page named "<a href="https://en.wikipedia.org/wiki/T">Transformer deep learning</a>". You can
+<a href="https://en.wikipedia.org/wiki/Help:Draft">create a draft and submit it for review</a>.</p>
+<ul><li><div class="mw-search-result-heading"><a href="https://en.wikipedia.org/wiki/Transformer_(deep_learning)">Transformer (deep learning)</a></div></li>
+<li><div class="mw-search-result-heading"><a href="https://en.wikipedia.org/wiki/GPT">Generative pre-trained transformer</a></div></li></ul>
+</div></body></html>"""
+
+BLOG = """<html><body><main>
+<p><a href="https://b.example/help">Read our very long help page first</a></p>
+<h2><a href="https://b.example/one">First article about attention</a></h2>
+<p><a href="https://b.example/footnote">a footnote link with long text</a></p>
+<h2><a href="https://b.example/two">Second article about memory</a></h2>
+<h3><a href="https://b.example/three">Third article about speed</a></h3>
+</main></body></html>"""
+
+WHATSAPP = """<html><head><title>WhatsApp</title></head><body>
+<div id="pane-side" aria-label="Chat list"><div role="grid">
+ <div role="row"><div role="gridcell"><span dir="auto" title="PR and Outreach Core Team 2026-27">PR and Outreach Core Team 2026-27</span>
+   <div>10:21</div><span title="Ana: meeting at 6">Ana: meeting at 6</span>
+   <span aria-label="5 unread messages">5</span></div></div>
+ <div role="row"><div role="gridcell" onmousedown="document.title='open-rahul'"><span dir="auto" title="Rahul Sharma">Rahul Sharma</span>
+   <div>Yesterday</div><span title="ok see you">ok see you</span></div></div>
+</div></div>
+<div id="main"><header><span dir="auto" title="PR and Outreach Core Team 2026-27">PR and Outreach Core Team 2026-27</span></header>
+ <div role="application">
+  <div role="row"><div class="message-in"><div class="copyable-text" data-pre-plain-text="[10:00, 11/10/2026] Ana: ">
+    <span class="selectable-text"><span>Meeting at 6 in room 204</span></span></div></div></div>
+  <div role="row"><div class="message-out"><div class="copyable-text" data-pre-plain-text="[10:02, 11/10/2026] Me: ">
+    <span class="selectable-text"><span>I'll be there</span></span></div></div></div>
+ </div>
+ <footer><div contenteditable="true" role="textbox" aria-label="Type a message">draft text</div></footer>
+</div></body></html>"""
+
+CAPTCHA = """<html><body><form action="/sorry/validateCaptcha" id="captcha-form"><a href="https://g.example/why">Why did this happen?</a></form></body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -207,6 +288,62 @@ def main():
               and text == "Pricing is simple. The pricing page lists PRICING for teams.", text)
         check("finding nothing marks nothing", call("pageHighlight", "zebra", 0, False)["count"] == 0)
 
+        check.section("[6] Tuning pass V9 — markup seen live on Amazon, YouTube, Bing, Wikipedia")
+
+        def at(html, host, name, *args, path="/"):
+            # The page functions read `location`; run them as if served from `host`.
+            d.get("data:text/html;base64," + base64.b64encode(html.encode()).decode())
+            fake = {"hostname": host, "pathname": path, "search": "", "href": f"https://{host}{path}"}
+            return d.execute_script(
+                f"return (function(location){{ return ({function(name)}).apply(null, arguments[1]); }})"
+                f"(arguments[0], arguments[1])", fake, list(args))
+
+        r = at(AMAZON, "www.amazon.in", "pageResults", 1, "", path="/s")
+        check("Amazon: sponsored listings are skipped — 'the first result' is the first REAL one",
+              r["result"]["url"].endswith("/Portronics-Mport/dp/B09") and r["count"] == 2, r)
+        r = at(AMAZON, "www.amazon.in", "pageComments", 12)
+        check("Amazon: reviews are read from data-hook=reviewText (review-body is gone)",
+              r["kind"] == "reviews" and r["comments"] == ["Compact and reliable, works with my laptop.",
+                                                           "Gets warm after an hour."], r)
+        r = at(YOUTUBE_WATCH, "www.youtube.com", "pageResults", 2, "", path="/watch")
+        check("YouTube watch page: Up next lockups are the results, titled from <h3>, never the ad",
+              r["count"] == 2 and r["result"]["title"] == "Quantum mechanics, seen", r)
+        r = at(YOUTUBE_WATCH, "www.youtube.com", "pageTranscript", True, path="/watch")
+        check("YouTube: 'Show transcript' presses the VISIBLE button, not a hidden duplicate",
+              r["opened"] and d.title == "transcript", (r, d.title))
+        r = at(BING, "www.bing.com", "pageResults", 2, "", path="/search")
+        check("Bing: only organic results count (the news block is not 'the second result')",
+              r["count"] == 2 and r["result"]["url"] == "https://huggingface.co/kokoro", r)
+        r = at(WIKI, "en.wikipedia.org", "pageResults", 1, "", path="/w/index.php")
+        check("Wikipedia search: the result headings, not 'create a draft'",
+              r["site"] == "wikipedia" and r["result"]["title"] == "Transformer (deep learning)", r)
+        r = at(BLOG, "b.example", "pageResults", 0, "")
+        check("generic page: heading links win over help and footnote links",
+              [x["url"] for x in r["results"]] == ["https://b.example/one", "https://b.example/two",
+                                                   "https://b.example/three"], r)
+        check.section("[7] Part 5 — WhatsApp Web (H0.4), by roles, titles and aria-labels")
+        r = at(WHATSAPP, "web.whatsapp.com", "pageChatList", 60)
+        check("the chat list: names in WhatsApp's order, preview, time and unread count",
+              r["ready"] and [c["name"] for c in r["chats"]] == ["PR and Outreach Core Team 2026-27", "Rahul Sharma"]
+              and r["chats"][0]["unread"] == 5 and r["chats"][0]["when"] == "10:21"
+              and r["chats"][0]["preview"] == "Ana: meeting at 6" and r["chats"][1]["unread"] == 0, r)
+        r = at(WHATSAPP, "web.whatsapp.com", "pageChatOpen", "Rahul Sharma")
+        check("a chat is opened by its EXACT name with real mouse events", r["opened"] and d.title == "open-rahul", (r, d.title))
+        check("a name not in the list is not clicked", not at(WHATSAPP, "web.whatsapp.com", "pageChatOpen", "Rahul")["opened"])
+        r = at(WHATSAPP, "web.whatsapp.com", "pageChatMessages", 30)
+        check("messages: the open chat, sender, time, date, text, and which are mine",
+              r["chat"] == "PR and Outreach Core Team 2026-27" and r["messages"][0] ==
+              {"time": "10:00", "date": "11/10/2026", "from": "Ana", "text": "Meeting at 6 in room 204", "out": False}
+              and r["messages"][1]["out"] is True, r)
+        r = at(WHATSAPP, "web.whatsapp.com", "pageChatComposer")
+        check("the message box: its text (for the read-back before sending) and the open chat",
+              r == {"found": True, "text": "draft text", "chat": "PR and Outreach Core Team 2026-27"}, r)
+        r = at("<html><body>loading…</body></html>", "web.whatsapp.com", "pageChatList", 60)
+        check("WhatsApp still loading is 'not ready', not an empty chat list", r == {"ready": False, "chats": []}, r)
+
+        r = at(CAPTCHA, "www.google.com", "pageResults", 1, "", path="/sorry/index")
+        check("a bot-check page is reported as blocked, never as results", r.get("blocked") and r["count"] == 0, r)
+
         check.section("[4] Part 3 — comments and reviews (C6), transcript off YouTube")
         d.get("data:text/html;base64," + base64.b64encode(REVIEWS.encode()).decode())
         r = call("pageComments", 12)
@@ -215,6 +352,24 @@ def main():
         check("the max is honoured", len(call("pageComments", 1)["comments"]) == 1)
         check("the transcript reader says 'not YouTube' off YouTube",
               call("pageTranscript", True) == {"supported": False})
+
+        check.section("[5] Part 4 — the file list (D3: names read in the page only) and Calendar")
+        d.get("data:text/html;base64," + base64.b64encode(FILES.encode()).decode())
+        r = call("pageDocList", 40)
+        titles = [x["title"] for x in r]
+        check("Docs/Sheets links and data-id rows are listed once each, hidden ones skipped",
+              titles == ["Budget 2026", "Offer letter", "Team roster"], r)
+        check("a link keeps its own address (no #gid fragment), a data-id row opens through Drive",
+              r[0]["url"] == "https://docs.google.com/spreadsheets/d/1AAAAAAAAAAAAAAAAAAAAAAAAAAAA/edit"
+              and r[0]["kind"] == "sheet" and r[1]["kind"] == "doc"
+              and r[2]["url"] == "https://drive.google.com/open?id=1CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", r)
+        d.get("data:text/html;base64," + base64.b64encode(CALENDAR.encode()).decode())
+        r = call("pageCalendarNext", False)
+        check("the next event is the first one listed; a HIDDEN Meet link is never taken",
+              r["title"] == "10:00 Standup" and r["events"] == 2 and r["meet"] == "", r)
+        d.execute_script("document.getElementById('d').style.display='block'")
+        r = call("pageCalendarNext", False)
+        check("...a visible one is", r["meet"] == "https://meet.google.com/abc-defg-hij", r)
     finally:
         d.quit()
     return check.finish()

@@ -327,6 +327,58 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-10 — round 5, part 5: WhatsApp, app context, the semantic matcher
+
+- **H0.2** `common.front_site` + the rules-first route: with WhatsApp in front (web-app window or
+  Chrome on web.whatsapp.com), "open X", "click on X", "go to X chat" are a chat; a known site or
+  app ("open youtube") stays itself unless "chat"/"group" is said. `linux.situation` remembers
+  the app the user was in for 2 minutes while Kayra's own window is in front.
+- **H0.3** `automation/semantic_match.py`: order-free stemmed / prefix / near-spelling word
+  overlap, spoken numbers, initials, taught aliases, local embeddings (nomic, LM Studio; meaning
+  alone can only ASK), recency for ties, usage; decisions pick / ask / none.
+- **H0.4** extension 1.9.0 `chat.list/open/messages/composer`; `web_macros.wa_open`, `wa_unread`,
+  `wa_read` (today filter; local-only summaries), `message_send` (opens the chat, then a late
+  confirmation naming it; on yes: same chat re-checked, typed, read back, Send, arrival checked).
+  `message.send` left the static CONFIRM set for that reason. Fixed: a failed WhatsApp search
+  left its text in the search box and filtered every later chat list; "tell rahul saying hi"
+  was addressed to "tell".
+- Tests: `test_browser_control.py` [19], `test_browser_extension.py` [7], `test_dmm_browser.py`
+  (72/72). Not verified on a live, logged-in WhatsApp.
+
+### 2026-11-10 — tuning pass V9: rules first, fewer round trips, live-checked lookups
+
+- `common.direct_tokens` + `llm_engine.set_rule_router`: utterances the browser parser fully
+  understands (allow-listed actions) skip the classifier — 466 ms -> < 1 ms; screen-aware for
+  Sheets / Slides / "close it". `tests/test_dmm_browser.py`: 62/62 on the local model, 50 rules-first.
+- Boot warm-up of the classifier and understanding prompts; per-site catalog trimming rejected
+  (it would break LM Studio's prompt cache).
+- Extension 1.8.0 `untilReady` (`waitMs`) for lists / comments / results / Calendar / transcript;
+  `web_macros._ready`; per-command `tabs.active` cache (`new_command`); file lists reuse a tab.
+- `ai.relevant` for page questions (1.1 s -> 0.74 s, answer kept); spoken numbers + near
+  spellings in `rank_titles`; `spoken_email`; Sheets header row detection and `where` filters.
+- Live site findings and fixes: `updates/UPDATE_V9.md` §2.
+
+### 2026-11-10 — round 5, part 4: Google Workspace
+
+- **E1 Sheets**: open by name (`page.docList` + local `rank_titles`; ties ask), create + name
+  (Rename + real keys), Name Box (`page.focus`), total / average / highest / lowest / count of a
+  column by letter or header, rows, a row read with its headers, the headers — from
+  `gviz/tq?tqx=out:csv` (export as fallback) fetched in the page (`page.fetchText`,
+  docs.google.com only), computed in Python. **E2 Docs**: open / search / create; read,
+  summarize, ask from `export?format=txt` (the editor is a canvas); Find = the editor's Ctrl+F;
+  share = Share + the address typed, the user presses Send. **E3 Slides**: present (also an
+  unqualified "start presenting" when Slides is in front — decided before the share question),
+  next / previous (also on the DMM fast path) / end. **E4 Drive**: search (`type:pdf`), recent,
+  download (xlsx / docx / pptx / the file). **E5 Gmail**: search, unread this week/today,
+  compose, labels. **E6 Calendar**: next meeting, join it (a VISIBLE Meet link only), weekday
+  agendas. **E7 Meet**: admit everyone. **E8** Keep note, a form's responses, Classroom due.
+- Not done from E: Sheets "add a row" / sort / chart, Docs typing beyond the existing `type`,
+  Gmail "mark all as read" and attachments, Calendar "move my 3 pm to 4", Meet noise
+  cancellation / layout / recording, Drive share.
+- Extension 1.7.0 (no new permission). Fixed while testing: `ws_download` unpacked four values
+  from a three-value helper; a hidden Meet link could have been taken as the next meeting's.
+- Tests: `test_browser_control.py` [17], `test_browser_extension.py` [5].
+
 ### 2026-11-10 — round 5, part 3: about the page, bookmarks, history, downloads, "it"
 
 - **C5** `page_ask`: a question answered from the page text by the model ("the page doesn't

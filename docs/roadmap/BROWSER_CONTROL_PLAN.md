@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M and 3 done (2026-11-10).**
-> See §10 for the parts and what is next (Part 4, which needs D3; 2M still needs a live-call try). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, the V9 tuning pass and 5 done (2026-11-10).**
+> See §10 for the parts and what is next (Part 6, which needs D1/D2; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -384,7 +384,7 @@ most recent message), learn from how the user talks, and reuse what it learned.
 - **D1** Shopping: stop at "add to cart"? (recommended: yes)
 - **D2** Form profile fields to store in `data/profile.json` (name, email, phone, address,
   college, roll number?) — never passwords/cards.
-- **D3** May Kayra read Drive/Docs **file names** (in Chrome only, never stored) to search them?
+- **D3** May Kayra read Drive/Docs **file names** (in Chrome only, never stored) to search them? — **approved 2026-11-10**: matched locally, never sent to a model.
 - **D4** URLs of the user's IITM portals for the site registry.
 - **D5** Extra permissions: `downloads` (C11) — **approved 2026-11-10**, in 1.6.0; `tabGroups` (B4) — **approved 2026-11-10**, in 1.5.0. `debugger` is NOT to be added.
 
@@ -436,11 +436,11 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 - [x] B1 [x] B2 [x] B3 [x] B4 [x] B5 [x] B6 [x] B7 [x] B8
 - [x] C1 [x] C2 [x] C3 [x] C4 [x] C5 [x] C6 [x] C7 [x] C8 [x] C9 [x] C10 [x] C11
 - [ ] D1 [ ] D2 [ ] D3 [ ] D4 [ ] D5
-- [ ] E1 [ ] E2 [ ] E3 [ ] E4 [ ] E5 [ ] E6 [ ] E7 [ ] E8
+- [x] E1 [x] E2 [x] E3 [x] E4 [~] E5 [~] E6 [~] E7 [x] E8  *(E5: no mark-all-read / attach; E6: no "move my 3 pm"; E7: admit only — see §10 Part 4)*
 - [ ] F1 [ ] F2 [ ] F3 [ ] F4 [ ] F5 [ ] F6
 - [x] G1 [x] G2 [x] G3 [x] G4 [ ] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
 - §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [ ] M2.2 [ ] M2.3 [ ] M3 [ ] M4  *(M1.2: Chrome's tab list opens, the user picks the tab)*
-- [x] H0.1 [ ] H0.2 [ ] H0.3 [ ] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
+- [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
 
 ## 9. Known state at the time of writing
 
@@ -473,10 +473,81 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 2M | §12 Meetings and screen sharing. M0 bugs (misroutes, fake meet code, fixed waits, confirm, test log hygiene), M1 share a named window / tab / monitor (xdph picker helper), M2.1 DND | **done 2026-11-10** except M0.7 (try it in a live call — needs the user) and M2.2/M2.3, M3, M4 (next meeting slice, after 2c or when asked) |
 | N | §13 neighbouring features (browser N1, models N2, interface N3, voice N4, housekeeping N5) — pick up beside the part each neighbours | |
 | 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | **done 2026-11-10** (extension 1.6.0 + `downloads`) |
-| 4 | E1–E8 Google Workspace (needs D3 answered) | |
-| 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | |
+| 4 | E1–E8 Google Workspace (needs D3 answered) | **done 2026-11-10** (D3 approved; extension 1.7.0). Left for later: Sheets add-row/sort/chart, Gmail mark-all-read/attach, Calendar move, Meet layout/recording, Drive share |
+| 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | **done 2026-11-10** (extension 1.9.0; not yet tried on a live, logged-in WhatsApp) |
+| 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | planned |
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Part 5 — WhatsApp, app context, the semantic matcher** (done 2026-11-10, extension 1.9.0).
+- H0.2 app context: `common.front_site(situation)` — a web-app window's site, or Chrome's tab
+  when CHROME is in front (Chrome's active tab is not "in front" while another app is). With
+  WhatsApp in front, `direct_tokens` turns "open X" / "click on X" / "go to X chat" into
+  `message open X` (a known site or app stays itself unless "chat"/"group" is said), "read it"
+  into `message read this`, "who messaged me" into `message who messaged me`.
+  `linux.situation` remembers the app the user was in for 2 min while Kayra's window is in front.
+  Not added: a DMM context hint (the rules-first route covers it without touching the cached prompt).
+- H0.3 `automation/semantic_match.py` — `match(query, candidates, embed, aliases)` -> pick / ask /
+  none. Measured on the user's example and 9 more names; local nomic embeddings were tried as a
+  blend and made "PR group" a confident wrong pick, so meaning breaks near-ties only and can by
+  itself only ASK. Aliases are an input; learning them is H2 (Part 7). `ws_open` (Part 4) still
+  uses `rank_titles`.
+- H0.4 WhatsApp: `message open <chat>` (visible list, then WhatsApp's search; the search box is
+  emptied when nothing opens), `message who messaged me`, `message read <chat> [today]` / `message
+  read this` (short -> read out; long -> LOCAL model only; no local model -> the latest 3),
+  `message <chat>: <text>` (opens the chat, then asks "Send '<text>' to <real chat name>?"; on yes
+  the open chat is re-checked, typed with clear, read back, Send (else Enter), arrival checked).
+  `message.send` moved from the static CONFIRM set to this late confirmation (asserted).
+- Tests: [19] (matcher table, app context, situation memory, open / ambiguous / search / unread /
+  read / privacy / send / no / chat switched / old extension), `test_browser_extension.py` [7]
+  (WhatsApp-shaped page), `test_dmm_browser.py` 72/72 on the local model (55 rules-first).
+- **Not verified on a live, logged-in WhatsApp** (it needs the user's phone to link; Claude in
+  Chrome was not connected). The selectors are by role / title / aria-label with the old class
+  names as fallback.
+
+**Tuning pass V9** (2026-11-10, extension 1.8.0, local model only) — see `updates/UPDATE_V9.md`.
+Rules before the classifier (466 ms -> < 1 ms for browser commands; 62/62 on the new
+`tests/test_dmm_browser.py`), boot warm-up, waits inside the browser, a per-command active-tab
+cache, relevant text for page questions, spoken numbers / near spellings / spoken emails, Sheets
+header + `where` filter, and site lookups fixed after live checks (Google bot page, YouTube Up
+next + ads + transcript button, Amazon sponsored + `reviewText`, Bing organic, Wikipedia,
+generic heading links). Open from the pass: streaming spoken answers (needs the turn pipeline),
+live checks of the signed-in Google apps (Claude in Chrome was not connected).
+
+**Part 4 — Google Workspace** (done 2026-11-10, extension 1.7.0, no new permission; D3
+approved by the user: names read in Chrome, matched locally, never stored or sent to a model).
+- Names: `page.docList` (Docs/Sheets/Slides/Forms links + `data-id` rows; Drive rows open via
+  `drive.google.com/open?id=`) and `web_macros.rank_titles` (exact 100 / phrase 80 / all words
+  60 / partial 40×share, shorter first). Two near-equal results under 80 → asks which.
+- E1 `open my <name> sheet`, `create a new sheet called <Title>` (Rename + real keyboard; the
+  user's capitals kept), `go to cell B12` (`page.focus` on the Name Box), `what's the total |
+  average | highest | lowest | count of column C | the <header> column`, `how many rows`,
+  `read row N`, `what are the columns` — from `gviz/tq?tqx=out:csv&headers=1&gid=<the tab>`
+  (export as fallback) through `page.fetchText`, parsed with `csv`, currency / thousands
+  separators / (negatives) understood, text cells skipped and said so. Sheets values never
+  reach a model.
+- E2 Docs `open the doc about X`, `search my docs for X`, `create a new doc`; read / summarize /
+  ask use `export?format=txt` (`_page_of` → `doc_text`); `find X` in any Google editor = its
+  Ctrl+F; `share this doc with <email>` opens Share and types the address — Kayra NEVER
+  presses Send.
+- E3 `start the slideshow` (Ctrl+F5); a bare "start presenting" with a Slides tab in front is
+  the slideshow (`AutomationRuntime._slides_in_front`, decided before the share CONFIRM);
+  `next slide` / `previous slide` (fast path — the local model read them as chat), `end the
+  slideshow`.
+- E4 `find the PDF Ravi sent me` (`type:pdf`; opens the one clear match), `search my drive
+  for`, `open my recent files`, `download this file` (xlsx / docx / pptx / uc?export=download).
+- E5 `email search for X`, `email show unread from this week|today`, `email compose`, `email
+  open my <name> label`. E6 `calendar next meeting`, `calendar join my next meeting` (the event's
+  own visible Meet link → `meet_join`), `calendar friday`. E7 `meet admit everyone`. E8 `add a
+  note saying …` (Keep), `open the responses of my <name> form`, `what assignments are due`
+  (Classroom to-do page, summarized).
+- Live local DMM: 20 Workspace phrasings, 19 right first time; "next slide" now on the fast
+  path. DMM matrix 50/53 (baseline).
+- Tests: `test_browser_control.py` [17], `test_browser_extension.py` [5].
+- **Not done** (later): Sheets add-row / sort / chart, Gmail mark-all-read and attachments,
+  Calendar "move my 3 pm to 4", Meet noise cancellation / layout / recording, Drive share.
+- **Not verified** against the live Google apps with the extension connected; the Docs home
+  list markup and Calendar's schedule view are the most likely to need tuning.
 
 **Part 3 — about the page, bookmarks, history, downloads, "it"** (done 2026-11-10,
 extension 1.6.0 + `downloads`, approved by the user for D5).
@@ -830,3 +901,86 @@ the user's system.
 - N5.2 **Audit log viewer** in Automation: search, filter by risky actions, export.
 - N5.3 **Test hygiene sweep** — find every other place a unit suite writes to the developer's
   `logs/`, `data/` or `Reports/` (M0.6 found one) and route it to a temp dir.
+
+---
+
+## 14. Chrome profiles  *(requested 2026-11-10, planned — part 5P)*
+
+**What the user asked.** "Open Google Chrome" shows Chrome's *Who's using Chrome?* picker. The
+user has five profiles that they renamed themselves (for example Personal, Work, Study, Study 2
+and one named after a person); three are signed in to accounts on the same school
+domain. They want "open my Work Chrome" / "open Chrome on <email>" to open straight into that
+profile. (No real names, emails or domains are recorded here or anywhere in the repository.)
+
+**Hard requirement: fully dynamic.** Nothing about anyone's profiles is ever written in the
+code or the repository, and no user is asked to edit code, `.env` or a config file. Kayra
+reads the profiles from Chrome itself every time, so it works for any user, any number of
+profiles, renamed or never named.
+
+### P1. Discover profiles from Chrome (read-only, local)
+- Source: Chrome's own `Local State` JSON, `profile.info_cache` — one entry per profile folder
+  (`Default`, `Profile 1`, …) with the profile `name` (what the picker shows above the avatar:
+  "Personal", "Work"), the account's `gaia_name` / `gaia_given_name` (the account's display name),
+  `user_name` (the email), `hosted_domain` (e.g. a school domain), `is_using_default_name`
+  (true when the user never renamed it — "Person 1"), plus `profile.last_used` and
+  `profile.last_active_profiles`.
+- Locations (through `kayra.platforms`, never guessed in a shared module): Linux
+  `~/.config/google-chrome/Local State` (also `chromium`, `BraveSoftware/Brave-Browser`,
+  `microsoft-edge` — same format); Windows `%LOCALAPPDATA%\Google\Chrome\User Data\Local
+  State`. The browser that "open Chrome" means is the one Kayra already resolves.
+- Re-read when the file's modification time changes (a rename in Chrome shows up at the next
+  request; no restart, no cache to clear). Parse failures -> "I can't read Chrome's profiles"
+  and plain "open Chrome" still works.
+- Privacy: read on this computer only; emails and names are matched locally
+  (`semantic_match`), never logged in full (counts only), never sent to any model. The
+  classifier sees only the user's words.
+
+### P2. Say it any way
+- Shapes: "open Chrome as / with / for / on / in <X>", "open my <X> Chrome", "open <X>'s
+  Chrome", "open Chrome with my <domain or org> account", "open Chrome on <email>" (spoken
+  emails via `common.spoken_email`), "switch to my <X> profile", "which Chrome profiles do I
+  have?", and a site inside a profile: "open Gmail in my Work Chrome" (= the profile + the URL).
+- Matching (`semantic_match.match`) against EVERY field of every profile: profile name, account
+  name and given name, email and its local part, domain and its first labels ("my school
+  account"), and
+  ordinal words for unnamed profiles ("the first profile", "profile 2"). The profile name
+  wins a tie over an account name ("Study" -> the profile named Study, not every Study-domain
+  account); spoken numbers make "study two" -> "Study 2".
+- Ambiguity asks, naming what tells them apart, from the data — e.g. "my school Chrome" with
+  three profiles on one domain -> "Work, Study or Study 2?"; for never-renamed profiles it
+  describes them by account: "Person 1 (<account name>) or Person 2 (<account name>)?"
+- Plain "open Chrome" is unchanged (Chrome's picker) unless the user says "always open Chrome
+  as Work" — stored as a USER SETTING (Settings + `.env` key written by Settings, never by hand),
+  with "use the last profile I used" as the other option (`profile.last_used`).
+- Optional, spoken: "call the Study 2 profile my exam prep" -> a local alias
+  (`data/aliases.json`, H2) — again data, never code. Renaming in Chrome works just as well.
+
+### P3. Open it
+- `<browser> --profile-directory="<folder>" [url]` through the existing launcher (argv, no
+  shell). If that browser is already running, Chrome opens a window in that profile; then the
+  new window is focused (Hyprland: the newest window of the browser's class).
+- Spoken result names the profile and the account: "Opened Chrome as Work (<account name>)."
+
+### P4. The Kayra Bridge in more than one profile (follow-up)
+- The extension is installed per profile. After opening a profile Kayra checks whether the
+  bridge connected FROM it; if not: "Chrome is open as Study 2, but the Kayra extension isn't
+  installed there — say 'browser set up' to add it."
+- The bridge must accept one connection per profile and route each command to the profile in
+  front (the extension reports its profile with `chrome.identity`-free means: the hello carries
+  a per-install id kept in `chrome.storage.local`). Until then, browser commands go to the
+  profile that connected first, and Kayra says which.
+- "switch to my Work Chrome window" needs the window <-> profile link (Hyprland sees one class
+  for all profiles): from the bridge per profile (P4), else the window title when Chrome puts
+  the profile name in it.
+
+### P5. Tests
+- A temporary `Local State` with: renamed profiles (the user's five shapes, with made-up
+  emails), never-renamed ones ("Person 1"), two on one domain, one without an account, a
+  corrupt file, and a rename between two requests (mtime).
+- Phrasings: every shape in P2, spoken emails, "study two", ties (profile name beats account
+  name), ambiguity questions built from the data, plain "open Chrome" untouched.
+- Launch argv recorded by the fake runner (no real browser); the extension-missing sentence.
+- A guard test: no profile name, email or domain from the user's machine appears anywhere in
+  `src/` or `tests/` (the feature must stay data-driven).
+- Add the phrasings to `tests/test_dmm_browser.py` (rules-first where the shape is unambiguous).
+

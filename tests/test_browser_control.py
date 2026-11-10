@@ -571,7 +571,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.6.0")
+        web_macros.BRIDGE = current = Bridge(version="1.9.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1421,7 +1421,7 @@ class PageBridge(GroupBridge):
     """GroupBridge at 1.6.0 with an active page of a chosen address, bookmarks, history and
     downloads."""
 
-    def __init__(self, version="1.6.0", url="https://docs.google.com/", comments=None,
+    def __init__(self, version="1.7.0", url="https://docs.google.com/", comments=None,
                  transcript="", selection="", downloads=None):
         super().__init__(version=version)
         self.url, self.selection = url, selection
@@ -1661,9 +1661,657 @@ def section_part_3():
         check("an extension older than 1.6.0 is never sent a 1.6.0 command",
               rig.bridge.last("page.comments") is None and not r.ok, r.message)
     manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
-    check("extension 1.6.0 adds downloads and still no debugger",
-          manifest["version"] == "1.6.0" and web_macros.REQUIRED_VERSION == (1, 6, 0)
-          and "downloads" in manifest["permissions"] and "debugger" not in manifest["permissions"])
+    check("the extension has downloads (1.6.0+) and still no debugger",
+          "downloads" in manifest["permissions"] and "debugger" not in manifest["permissions"])
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │       PART 4 — Google Workspace (E1–E8), names matched locally (D3)     │
+# └────────────────────────────────────────────────────────────────────────┘
+
+SHEET = "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit#gid=42"
+DOC = "https://docs.google.com/document/d/1DoCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit"
+CSV = ("Name,Amount,Status\nRavi,500,paid\nAna,\"1,250.50\",due\nMeera,₹300,paid\nTotal row,n/a,\n")
+
+
+class WorkspaceBridge(PageBridge):
+    """PageBridge at 1.7.0: file lists, in-page fetches, the Name Box, Calendar, Keep, Meet."""
+
+    def __init__(self, version="1.8.0", url=SHEET, files=None, csv=CSV, doc="Offer letter. Start date "
+                 "is 1 December. The stipend is 40,000 a month. Report to the Bengaluru office.", calendar=None, clickable=()):
+        super().__init__(version=version, url=url)
+        self.files = files if files is not None else [
+            {"id": "a" * 30, "title": "Budget 2026", "url": "https://docs.google.com/spreadsheets/d/" + "a" * 30 + "/edit"},
+            {"id": "b" * 30, "title": "Budget 2025 (old)", "url": "https://docs.google.com/spreadsheets/d/" + "b" * 30 + "/edit"},
+            {"id": "c" * 30, "title": "Team roster", "url": "https://docs.google.com/spreadsheets/d/" + "c" * 30 + "/edit"}]
+        self.csv, self.doc = csv, doc
+        self.calendar = calendar or {"title": "Standup 10:00", "events": 3, "meet": ""}
+        self.extra = set(clickable)
+        self.fetched = []
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd in ("tabs.navigate", "tabs.open") and args.get("url"):
+            self.calls.append((cmd, args))
+            if args.get("where") != "next":
+                self.url = args["url"]
+            return {"id": 13, "url": args["url"], "title": "x"}
+        if cmd == "page.docList":
+            self.calls.append((cmd, args))
+            self.doclist_calls = getattr(self, "doclist_calls", 0) + 1
+            return list(self.files)
+        if cmd == "page.fetchText":
+            self.calls.append((cmd, args))
+            self.fetched.append(args["url"])
+            if "/spreadsheets/" in args["url"]:
+                return {"ok": True, "text": self.csv}
+            return {"ok": True, "text": self.doc}
+        if cmd == "page.focus":
+            self.calls.append((cmd, args))
+            return {"focused": True}
+        if cmd == "calendar.next":
+            self.calls.append((cmd, args))
+            out = dict(self.calendar)
+            if args.get("open"):
+                out["meet"] = self.calendar.get("link", "")
+            return out
+        if cmd == "page.click" and args.get("text") in {"Rename", "Share", "Take a note"} | self.extra:
+            self.calls.append((cmd, args))
+            return {"clicked": True, "label": args["text"]}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_part_4():
+    check.section("[17] Part 4 — Google Workspace: Sheets, Docs, Slides, Drive, Gmail, Calendar, Meet, "
+                  "Keep, Forms, Classroom")
+    table = (
+        ("open my budget sheet", "browser.ws_open", "budget"),
+        ("browser open my budget sheet", "browser.ws_open", "budget"),
+        ("browser open the doc about the internship", "browser.ws_open", "internship"),
+        ("browser open my thesis deck", "browser.ws_open", "thesis"),
+        ("browser search my docs for offer letter", "browser.ws_search", "offer letter"),
+        ("browser find the pdf ravi sent me", "browser.ws_search", "ravi"),
+        ("browser create a new sheet called Expenses 2026", "browser.ws_create", "sheet"),
+        ("create a new doc", "browser.ws_create", "doc"),
+        ("browser go to cell B12", "browser.sheet_cell", "B12"),
+        ("browser what's the total of column C", "browser.sheet_calc", "c"),
+        ("browser what is the average of the amount column", "browser.sheet_calc", "amount"),
+        ("browser how many rows are there", "browser.sheet_calc", "rows"),
+        ("browser read row 5", "browser.sheet_row", "5"),
+        ("browser what are the columns", "browser.sheet_row", "1"),
+        ("browser share this doc with ana@x.com", "browser.ws_share", "ana@x.com"),
+        ("browser start the slideshow", "browser.slides_present", "current"),
+        ("next slide", "browser.slides_nav", "next"),
+        ("browser end the slideshow", "browser.slides_nav", "end"),
+        ("browser open my recent files", "browser.ws_recent", "recent"),
+        ("browser download this file", "browser.ws_download", "current"),
+        ("take a note buy milk", "browser.keep_note", "keep"),
+        ("browser open the responses of my feedback form", "browser.form_responses", "feedback"),
+        ("browser what assignments are due", "browser.classroom_due", "due"),
+        ("email search for fee receipt", "email.search", "fee receipt"),
+        ("email show unread from this week", "email.search", "is:unread newer_than:7d"),
+        ("email compose", "email.compose", "new"),
+        ("email open my work label", "email.label", "work"),
+        ("calendar what's my next meeting", "calendar.next", "next"),
+        ("calendar join my next meeting", "calendar.next", "next"),
+        ("meet join my next meeting", "calendar.next", "next"),
+        ("calendar friday", "calendar.agenda", "friday"),
+        ("meet admit everyone", "meet.admit", "everyone"),
+        # neighbours that must not move
+        ("open google sheets", "browser.open_url", "google sheets"),
+        ("open the report file", "app.open", "the report file"),
+        ("email read latest", "email.read", "latest"),
+        ("meet join abc-defg-hij", "meet.join", "abc-defg-hij"),
+    )
+    for token, key, target in table:
+        a = n(token)
+        check(f"'{token}' -> {key} {target!r}", a is not None and a.key == key and a.target == target,
+              f"{a.key if a else None} {a.target if a else ''}")
+    from kayra.intelligence import llm_engine as E
+    check("'next slide' / 'previous slide' are exact commands (no model): the local model read them as chat",
+          E.fast_intent("Next slide.") == "browser next slide" and E.fast_intent("previous slide") ==
+          "browser previous slide" and E.fast_intent("what is the next slide about") is None)
+    check("Workspace shapes are in the understanding catalog",
+          all(p in interpreter.CATALOG for p in ("browser open my <name> sheet", "browser read row <n>",
+                                                 "email search for <text>", "calendar join my next meeting")))
+
+    # Local, deterministic name matching (D3): nothing goes to a model.
+    rank = web_macros.rank_titles
+    items = [{"title": "Budget 2026"}, {"title": "Budget 2025 (old)"}, {"title": "Team roster"}]
+    check("ranking: 'budget 2026' -> exactly that one first", rank("budget 2026", items)[0][1]["title"] == "Budget 2026")
+    check("ranking: an unrelated name ranks nothing", rank("holiday photos", items) == [])
+
+    with WebRig(WorkspaceBridge()) as rig, Models("SHOULD NOT BE ASKED") as models:
+        r = rig.do("open my budget sheet")
+        check("E1: two equally good 'Budget' sheets -> asks which (no guess)",
+              r.status == Status.AMBIGUOUS and "Budget 2026" in r.message and "Budget 2025" in r.message, r.message)
+        check("...and the names were never sent to a model (D3)", models.asked == [], models.asked)
+        opened = [a for c, a in rig.bridge.calls if c == "tabs.open"]
+        check("...searched Sheets' own list for the name",
+              opened and opened[0]["url"] == "https://docs.google.com/spreadsheets/u/0/?q=budget", opened)
+        r = rig.do("browser open my budget 2026 sheet")
+        check("E1: an exact name opens it", rig.bridge.last("tabs.navigate") ==
+              {"url": "https://docs.google.com/spreadsheets/d/" + "a" * 30 + "/edit"} and "Budget 2026" in r.message,
+              r.message)
+        r = rig.do("browser open my holiday sheet")
+        check("E1: no match is said so", not r.ok and "holiday" in r.message, r.message)
+        waits = [a for c, a in rig.bridge.calls if c == "page.docList"]
+        check("V9: from 1.8.0 the file list is ONE call that waits inside the browser (waitMs)",
+              all(a.get("waitMs") == 6000 for a in waits) and rig.bridge.doclist_calls == len(waits) == 3, waits)
+        tabs_open = [a for c, a in rig.bridge.calls if c == "tabs.open"]
+        check("V9: a tab already on the Sheets list is reused (search 2); an OPEN sheet is never "
+              "navigated away from (search 3 gets a new tab)", len(tabs_open) == 2, tabs_open)
+
+    with WebRig(WorkspaceBridge(url=SHEET)) as rig, Models("SHOULD NOT BE ASKED") as models:
+        r = rig.do("browser what's the total of column B")
+        check("E1: total of column B = 500 + 1,250.50 + ₹300 (text cell skipped, said so)",
+              "2,050.5" in r.message and "Amount" in r.message and "skipped 1" in r.message, r.message)
+        check("...read through Sheets' own export on docs.google.com, this sheet's tab (gid 42)",
+              rig.bridge.fetched and rig.bridge.fetched[0].startswith(
+                  "https://docs.google.com/spreadsheets/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/gviz/tq?tqx=out:csv")
+              and "gid=42" in rig.bridge.fetched[0], rig.bridge.fetched)
+        r = rig.do("browser what is the average of the amount column")
+        check("E1: a column by its header name", "683.5" in r.message, r.message)
+        r = rig.do("browser what's the highest of column amount")
+        check("E1: highest", "1,250.5" in r.message, r.message)
+        r = rig.do("browser how many rows are there")
+        check("E1: rows below the header", "4 rows" in r.message, r.message)
+        r = rig.do("browser read row 3")
+        check("E1: a row is read with its column names", r.message == "Row 3: Name Ana, Amount 1,250.50, Status due.",
+              r.message)
+        r = rig.do("browser what are the columns")
+        check("E1: the headers", "Name, Amount, Status" in r.message, r.message)
+        r = rig.do("browser what's the total of column Q")
+        check("E1: a column that doesn't exist is said so", not r.ok, r.message)
+        check("...no sheet value ever went to a model", models.asked == [], models.asked)
+        r = rig.do("browser go to cell B12")
+        typed = [(a, given) for a, given in rig.runner.ran if a[:1] == ["wtype"]]
+        check("E1: 'go to cell B12' focuses the Name Box, types B12, Enter",
+              rig.bridge.last("page.focus") and typed[0] == (["wtype", "-"], "B12")
+              and typed[1][0] == linux.wtype_argv("enter"), typed)
+        r = rig.do("browser find ravi on this page")
+        typed = [(a, given) for a, given in rig.runner.ran if a[:1] == ["wtype"]]
+        check("E2: 'find X' inside a Google editor uses its own Ctrl+F (the page is a canvas)",
+              typed[-2][0] == linux.wtype_argv("ctrl+f") and typed[-1] == (["wtype", "-"], "ravi")
+              and rig.bridge.last("page.highlight") is None, (typed[-2:], r.message))
+        r = rig.do("browser download this file")
+        check("E4: download a Sheet as .xlsx, in the background",
+              rig.bridge.last("tabs.open") == {"url": "https://docs.google.com/spreadsheets/d/"
+                                               "1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789/export?format=xlsx",
+                                               "where": "next", "active": False}, rig.bridge.last("tabs.open"))
+
+    with WebRig(WorkspaceBridge(url=DOC)) as rig, Models("A 40,000 a month internship from 1 December.") as models:
+        r = rig.do("browser summarize this document")
+        check("E2: a Doc is summarized from its TEXT EXPORT (not the empty canvas page)",
+              r.message.startswith("A 40,000") and "stipend is 40,000" in str(models.asked[-1])
+              and rig.bridge.fetched[-1].endswith("/export?format=txt"), (r.message, rig.bridge.fetched))
+        r = rig.do("browser share this doc with ana@x.com")
+        typed = [(a, given) for a, given in rig.runner.ran if a[:1] == ["wtype"]]
+        check("E2: share opens Share and types the address — and never presses Send",
+              rig.bridge.last("page.click") == {"text": "Share", "nth": 1} and typed[-1] == (["wtype", "-"], "ana@x.com")
+              and "press Send yourself" in r.message
+              and not any(a == linux.wtype_argv("enter") for a, _ in typed), (typed, r.message))
+
+    with WebRig(WorkspaceBridge(url="https://docs.google.com/spreadsheets/u/0/")) as rig:
+        r = rig.do("browser create a new sheet called Expenses 2026")
+        typed = [(a, given) for a, given in rig.runner.ran if a[:1] == ["wtype"]]
+        check("E1: a new sheet is created and named through Rename, with the user's capitals",
+              rig.bridge.calls[0][1].get("url") == "https://docs.google.com/spreadsheets/create"
+              and (["wtype", "-"], "Expenses 2026") in typed and "Expenses 2026" in r.message, (typed, r.message))
+        r = rig.do("browser what's the total of column B")
+        check("E1: sums need a Sheet in front", not r.ok, r.message)
+        r = rig.do("take a note buy milk")
+        typed = [(a, given) for a, given in rig.runner.ran if a[:1] == ["wtype"]]
+        check("E8: a Keep note: Take a note, the text, Escape to save",
+              typed[-2] == (["wtype", "-"], "buy milk") and typed[-1][0] == linux.wtype_argv("escape")
+              and "Keep" in r.message, typed[-2:])
+
+    pres = "https://docs.google.com/presentation/d/1PrCdEfGhIjKlMnOpQrStUvWxYz0123456789/edit"
+    with WebRig(WorkspaceBridge(url=pres)) as rig:
+        linux.RUNTIME.situation_fn, saved = (lambda: {"tab_url": pres}), linux.RUNTIME.situation_fn
+        try:
+            r = rig.do("start presenting")
+            check("E3: 'start presenting' with Slides in front starts the SLIDESHOW, without the share question",
+                  r.status != Status.NEEDS_CONFIRMATION and any(a == linux.wtype_argv("ctrl+f5")
+                                                                for a, _ in rig.runner.ran), r.message)
+            rig.do("next slide")
+            check("E3: next slide = Right", rig.runner.ran[-1][0] == linux.wtype_argv("right"))
+            rig.do("browser end the slideshow")
+            check("E3: end = Escape", rig.runner.ran[-1][0] == linux.wtype_argv("escape"))
+        finally:
+            linux.RUNTIME.situation_fn = saved
+    with WebRig(WorkspaceBridge(url="https://meet.google.com/abc-defg-hij")) as rig:
+        linux.RUNTIME.situation_fn, saved = (lambda: {"tab_url": "https://meet.google.com/abc"}), linux.RUNTIME.situation_fn
+        try:
+            r = rig.do("start presenting")
+            check("...in a Meet call it is still a screen share, which asks first",
+                  r.status == Status.NEEDS_CONFIRMATION, r.message)
+            linux.resolve_confirmation("no")
+        finally:
+            linux.RUNTIME.situation_fn = saved
+
+    with WebRig(WorkspaceBridge(url="https://mail.google.com/mail/u/0/#inbox")) as rig:
+        rig.do("email search for fee receipt")
+        check("E5: mail search", rig.bridge.last("tabs.navigate") ==
+              {"url": "https://mail.google.com/mail/u/0/#search/fee%20receipt"}, rig.bridge.last("tabs.navigate"))
+        rig.do("email show unread from this week")
+        check("E5: unread from this week", rig.bridge.last("tabs.navigate") ==
+              {"url": "https://mail.google.com/mail/u/0/#search/is%3Aunread%20newer_than%3A7d"},
+              rig.bridge.last("tabs.navigate"))
+        rig.do("email open my work label")
+        check("E5: a label", rig.bridge.last("tabs.navigate") == {"url": "https://mail.google.com/mail/u/0/#label/Work"})
+
+    cal = {"title": "Design review 15:00", "events": 2, "meet": "", "link": "https://meet.google.com/xyz-abcd-efg"}
+    with WebRig(WorkspaceBridge(url="https://calendar.google.com/", calendar=cal)) as rig:
+        r = rig.do("calendar what's my next meeting")
+        check("E6: the next event by name", "Design review" in r.message, r.message)
+        r = rig.do("calendar join my next meeting")
+        check("E6: join my next meeting opens the event's own Meet link",
+              any(c == "tabs.open" and a.get("url") == "https://meet.google.com/xyz-abcd-efg" for c, a in rig.bridge.calls),
+              r.message)
+    with WebRig(WorkspaceBridge(url="https://calendar.google.com/", calendar={"title": "Lunch", "events": 1, "meet": ""})) as rig:
+        r = rig.do("calendar join my next meeting")
+        check("E6: an event without a Meet link is said so", not r.ok and "no Google Meet link" in r.message, r.message)
+    with WebRig(WorkspaceBridge(url="https://meet.google.com/abc", clickable=("Admit all",))) as rig:
+        r = rig.do("meet admit everyone")
+        check("E7: admit everyone clicks Meet's Admit all", rig.bridge.last("page.click") ==
+              {"text": "Admit all", "nth": 1} and r.ok, r.message)
+
+    with WebRig(WorkspaceBridge(files=[{"id": "f" * 30, "title": "Feedback survey",
+                                        "url": "https://docs.google.com/forms/d/" + "f" * 30 + "/edit"}])) as rig:
+        r = rig.do("browser open the responses of my feedback form")
+        check("E8: a form's Responses tab", rig.bridge.last("tabs.navigate") ==
+              {"url": "https://docs.google.com/forms/d/" + "f" * 30 + "/edit#responses"}
+              and "responses" in r.message, (rig.bridge.last("tabs.navigate"), r.message))
+
+    with WebRig(WorkspaceBridge(version="1.6.0")) as rig:
+        r = rig.do("open my budget sheet")
+        check("an extension older than 1.7.0 is never sent a 1.7.0 command",
+              rig.bridge.last("page.docList") is None and not r.ok, r.message)
+    source = open(os.path.join(ROOT, "extension", "kayra-bridge", "background.js")).read()
+    check("page.fetchText refuses anything but docs.google.com", 'only docs.google.com' in source)
+    manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
+    check("extension 1.8.0+ (waits inside the browser), no new permission since 1.6.0",
+          tuple(int(x) for x in manifest["version"].split(".")) >= (1, 8, 0)
+          and set(manifest["permissions"]) == {"tabs", "scripting", "history", "bookmarks", "sessions",
+                                               "alarms", "storage", "tabGroups", "downloads"})
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │          TUNING PASS V9 — speed and accuracy (no model, no host)        │
+# └────────────────────────────────────────────────────────────────────────┘
+
+def section_tuning_v9():
+    check.section("[18] Tuning pass V9 — rules before the classifier, one waiting call, relevant text, "
+                  "spoken names")
+    d = common.direct_tokens
+    web_macros.LAST_TAB.update(id=None, title="", at=0.0)      # no tab remembered from earlier sections
+    sheet = lambda: {"tab_url": "https://docs.google.com/spreadsheets/d/x/edit"}
+    slides = lambda: {"tab_url": "https://docs.google.com/presentation/d/x/edit"}
+    for said, expected in (
+            ("open the third result", ["browser open the third result"]),
+            ("create a new doc", ["browser create a new doc"]),          # live: went to the essay writer
+            ("Create a new sheet called Expenses 2026", ["browser Create a new sheet called Expenses 2026"]),
+            ("summarize this video", ["browser summarize this video"]),
+            ("what does this page say about refunds", ["browser what does this page say about refunds"]),
+            ("share the LM Studio window", ["meet share the LM Studio window"]),
+            ("let them in", ["meet admit everyone"]),
+            ("search my mail for the fee receipt", ["email search my mail for the fee receipt"]),
+            ("join my next meeting", ["calendar join my next meeting"]),
+            ("what's my next meeting", ["calendar next meeting"]),
+            ("find pricing on this page", ["browser find pricing on this page"]),
+            ("search my drive for invoices", ["browser search my drive for invoices"])):
+        check(f"rules first: {said!r} -> {expected}", d(said) == expected, d(said))
+    for said in ("who invented the telephone", "search for best laptops", "highlight the sky",
+                 "what's the total of 25 and 30", "open the report file", "find a file called report",
+                 "how do I share my screen on zoom", "what are the results of the election",
+                 "tell me about the history of rome", "open youtube", "close it"):
+        check(f"left to the model: {said!r}", d(said) is None, d(said))
+    check("Sheets maths goes rules-first only with a Sheet in front",
+          d("what's the total of column C", sheet) == ["browser what's the total of column C"]
+          and d("what's the total of column C") is None)
+    check("slide steps go rules-first only with Slides in front",
+          d("go back a slide", slides) == ["browser go back a slide"] and d("go back a slide") is None)
+    saved = (web_macros.LAST_TAB.copy(), web_macros.CLOCK)
+    try:
+        web_macros.CLOCK = lambda: 100.0
+        web_macros.LAST_TAB.update(id=15, title="GitHub", at=99.0)
+        check("'close it' goes rules-first only while Kayra remembers a tab", d("close it") == ["browser close it"])
+        web_macros.LAST_TAB.update(at=-10_000.0)
+        check("...and not once that memory expired", d("close it") is None)
+    finally:
+        web_macros.LAST_TAB.clear(); web_macros.LAST_TAB.update(saved[0]); web_macros.CLOCK = saved[1]
+    check("the router never answers an existing token", d("browser open the third result") is None)
+
+    from kayra.intelligence import llm_engine as E
+
+    class Engine(E.CentralizedLLMEngine):
+        def __init__(self):                       # no providers, no network: only the routing
+            self.env_vars = {"ASSISTANT_NAME": "Kayra"}
+
+    saved_router = E.RULE_ROUTER
+    try:
+        E.set_rule_router(lambda text: d(text))
+        got = Engine().classify_intent("open the third result")
+        check("classify_intent returns the rule route WITHOUT a model call", got == ["browser open the third result"], got)
+        E.set_rule_router(lambda text: (_ for _ in ()).throw(RuntimeError("bug")))
+        try:
+            Engine().classify_intent("open the third result")
+            survived = True
+        except RuntimeError:
+            survived = False
+        except Exception:
+            survived = True                       # it went on to the (absent) model: fine
+        check("a broken rule router never breaks the turn", survived)
+    finally:
+        E.set_rule_router(saved_router)
+
+    # One "which tab is active?" per command.
+    class Counting(TabBridge):
+        def __init__(self):
+            super().__init__(version="1.8.0")
+            self.active_calls = 0
+
+        def call(self, cmd, timeout=10.0, **args):
+            if cmd == "tabs.active":
+                self.active_calls += 1
+            return super().call(cmd, timeout=timeout, **args)
+
+    bridge = Counting()
+    with WebRig(bridge):
+        web_macros.new_command()
+        web_macros._call("tabs.active"); web_macros._call("tabs.active")
+        check("a repeated tabs.active is served from the per-command cache", bridge.active_calls == 1,
+              bridge.active_calls)
+        web_macros._call("tabs.navigate", url="https://x.example/")
+        web_macros._call("tabs.active")
+        check("...and asked again after anything that can change it (navigate)", bridge.active_calls == 2,
+              bridge.active_calls)
+        web_macros.new_command()
+        web_macros._call("tabs.active")
+        check("...and at the start of every command", bridge.active_calls == 3, bridge.active_calls)
+
+    # The relevant part of a long page.
+    page = ("Acme Cloud pricing. " + "Our platform offers storage and compute. " * 300
+            + "Refunds: you get a full refund within 30 days of purchase. " + "Partners and features. " * 300)
+    picked = ai.relevant(page, "what does this page say about refunds", 4000)
+    check("relevant(): the paragraph that answers is kept (a blind 3 K cut lost it, measured live)",
+          "full refund within 30 days" in picked and len(picked) <= 4200 and picked.startswith("Acme Cloud"),
+          len(picked))
+    check("relevant(): short text is unchanged", ai.relevant("short page", "q", 4000) == "short page")
+    check("relevant(): no match keeps the opening, as before", ai.relevant("x" * 9000, "zebra", 4000) == "x" * 4000)
+    with WebRig(PageBridge(version="1.8.0")) as rig, Models("It costs 10 dollars.") as models:
+        rig.do("browser what does this page say about pricing")
+        check("page questions send at most ~4 K characters of page", len(str(models.asked[-1])) < 6000,
+              len(str(models.asked[-1])))
+
+    # Names said aloud.
+    n2 = web_macros.spoken_numbers
+    check("spoken numbers: 'twenty twenty six' -> 2026, 'two thousand twenty five' -> 2025, "
+          "'nineteen oh five' -> 1905, 'twenty five' -> 25",
+          n2("budget twenty twenty six") == "budget 2026" and n2("two thousand twenty five plan") == "2025 plan"
+          and n2("nineteen oh five") == "1905" and n2("twenty five") == "25")
+    items = [{"title": "Budget 2026"}, {"title": "Budget 2025 (old)"}, {"title": "Team roster"}]
+    r = web_macros.rank_titles("budjet twenty twenty six", items)
+    check("a misheard name ('budjet twenty twenty six') still finds Budget 2026 first",
+          r and r[0][1]["title"] == "Budget 2026", r)
+    check("'team rooster' finds Team roster", web_macros.rank_titles("team rooster", items)[0][1]["title"] == "Team roster")
+    check("unrelated names still match nothing", web_macros.rank_titles("holiday photos", items) == [])
+    se = common.spoken_email
+    check("spoken emails: 'ana at x dot com', 'ravi underscore k at iitm dot ac dot in'",
+          se("ana at x dot com") == "ana@x.com" and se("ravi underscore k at iitm dot ac dot in") == "ravi_k@iitm.ac.in"
+          and se("ana") == "")
+    a = n("browser share this doc with ana at x dot com")
+    check("share takes a spoken address", a.action == "ws_share" and a.target == "ana@x.com", a.target)
+    check("share without an address is not a share", n("browser share this doc with ana").action != "ws_share")
+
+    # Sheets: a title row above the table, and a filter.
+    titled = "Expenses 2026,,\n,,\nName,Amount,Status\nRavi,500,paid\nAna,250,due\nMeera,300,paid\n"
+    with WebRig(WorkspaceBridge(url=SHEET, csv=titled)) as rig, Models("SHOULD NOT BE ASKED"):
+        r = rig.do("browser what's the total of amount where status is paid")
+        check("Sheets: header found below a title row, and 'where status is paid' filters",
+              "800" in r.message and "where status is paid" in r.message, r.message)
+        r = rig.do("browser what's the total of amount where status is refunded")
+        check("...a filter that matches nothing is said so", not r.ok, r.message)
+
+    # A bot check is not a result list.
+    class Blocked(GroupBridge):
+        def call(self, cmd, timeout=10.0, **args):
+            if cmd == "page.results":
+                self.calls.append((cmd, args))
+                return {"site": "blocked", "blocked": True, "count": 0, "result": None, "results": []}
+            return super().call(cmd, timeout=timeout, **args)
+
+    with WebRig(Blocked()) as rig:
+        r = rig.do("browser open the first result")
+        check("a captcha page is said so, and nothing is opened",
+              "bot check" in r.message and rig.bridge.last("tabs.navigate") is None, r.message)
+    js = open(os.path.join(ROOT, "extension", "kayra-bridge", "background.js")).read()
+    check("waits run inside the extension (untilReady) for lists, comments, results, Calendar",
+          js.count("untilReady(args,") >= 5)
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 5 — app context (H0.2), semantic matcher (H0.3), WhatsApp (H0.4) │
+# └────────────────────────────────────────────────────────────────────────┘
+
+TODAY = __import__("datetime").date.today()
+TODAY_MARK = f"{TODAY.day}/{TODAY.month}/{TODAY.year}"
+
+
+class WhatsAppBridge(Bridge):
+    """WhatsApp Web as a table: a chat list in recency order, search, open, messages, composer."""
+
+    def __init__(self, version="1.9.0", chats=None, ready=True):
+        super().__init__(version=version, tabs=[{"id": 5, "title": "WhatsApp", "url": "https://web.whatsapp.com/"}])
+        self.chats = chats if chats is not None else [
+            {"name": "PR and Outreach Core Team 2026-27", "unread": 5, "preview": "meeting at 6", "when": "10:21"},
+            {"name": "Rahul Sharma", "unread": 0, "preview": "ok", "when": "09:02"},
+            {"name": "Rahul Verma", "unread": 2, "preview": "call me", "when": "Yesterday"},
+            {"name": "Design team 2026", "unread": 0, "preview": "", "when": "Monday"}]
+        self.archive = [{"name": "Old Hostel Friends", "unread": 0, "preview": "", "when": "1/1/2026"}]
+        self.ready, self.open_chat, self.searching, self.composer = ready, "", "", ""
+        self.sent, self.history = [], {
+            "PR and Outreach Core Team 2026-27": [
+                {"from": "Ana", "text": "Meeting at 6 in room 204", "date": TODAY_MARK, "time": "10:00", "out": False},
+                {"from": "Ravi", "text": "I'll bring the posters", "date": TODAY_MARK, "time": "10:05", "out": False},
+                {"from": "Ana", "text": "Old message", "date": "1/1/2026", "time": "09:00", "out": False}]}
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd.startswith("chat.") or cmd == "page.type" or (cmd == "page.click" and args.get("text") == "Send"):
+            self.calls.append((cmd, args))
+        if cmd == "chat.list":
+            if not self.ready:
+                return {"ready": False, "chats": []}
+            rows = [c for c in self.chats + self.archive if self.searching.lower() in c["name"].lower()] \
+                if self.searching else self.chats
+            return {"ready": True, "chats": [dict(c) for c in rows]}
+        if cmd == "chat.open":
+            known = {c["name"] for c in self.chats + self.archive}
+            if args["name"] in known:
+                self.open_chat, self.searching, self.composer = args["name"], "", ""
+                return {"opened": True, "name": args["name"]}
+            return {"opened": False}
+        if cmd == "chat.messages":
+            msgs = self.history.get(self.open_chat, []) + [
+                {"from": "", "text": t, "date": TODAY_MARK, "time": "11:00", "out": True} for t in self.sent]
+            return {"chat": self.open_chat, "messages": msgs[-args.get("limit", 30):]}
+        if cmd == "chat.composer":
+            return {"found": bool(self.open_chat), "text": self.composer, "chat": self.open_chat}
+        if cmd == "page.type":
+            if args.get("field") == "search":
+                self.searching = args.get("text", "")
+                return {"typed": True}
+            if args.get("field") == "type a message":
+                if args.get("submit"):
+                    if self.composer:
+                        self.sent.append(self.composer); self.composer = ""
+                    return {"typed": True}
+                self.composer = args.get("text", "") if args.get("clear") else self.composer + args.get("text", "")
+                return {"typed": True}
+        if cmd == "page.click" and args.get("text") == "Send":
+            if self.composer:
+                self.sent.append(self.composer); self.composer = ""
+                return {"clicked": True}
+            return {"clicked": False}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_part_5():
+    check.section("[19] Part 5 — WhatsApp: app context, the semantic matcher, open / read / send")
+    from kayra.automation import semantic_match as S
+    names = ["PR and Outreach Core Team 2026-27", "PR Outreach 2025", "Core Team", "Design team 2026",
+             "Maa", "Rahul Sharma", "Rahul Verma", "Pune Tech Club", "Dev Club 2026 (coding)", "Ana"]
+    for said, decision, best in (
+            ("PR and outreach core team", "pick", "PR and Outreach Core Team 2026-27"),   # the user's example
+            ("core team", "pick", "Core Team"),                 # the full name, as written
+            ("design team", "pick", "Design team 2026"),
+            ("rahool sharma", "pick", "Rahul Sharma"),          # a misheard spelling
+            ("rahul", "pick", "Rahul Sharma"),                  # a true tie: the most recent chat wins
+            ("ptc", "pick", "Pune Tech Club"),                  # initials
+            ("the coding group", "pick", "Dev Club 2026 (coding)"),
+            ("PR group", "ask", None), ("outreach", "ask", None),   # two close: ask, never guess
+            ("xyz", "none", None)):
+        m = S.match(said, names)
+        ok = m.decision == decision and (best is None or (m.best and m.best.name == best))
+        check(f"match {said!r} -> {decision} {best or ''}", ok, m)
+    m = S.match("PR group", names)
+    check("an 'ask' offers the two closest by name", [c.name for c in m.top(2)] ==
+          ["PR Outreach 2025", "PR and Outreach Core Team 2026-27"], m.top(2))
+    check("a taught alias picks exactly that chat", S.match("mom", names, aliases={"mom": "Maa"}).best.name == "Maa")
+
+    def far_embed(texts):                 # meaning that is strongly "similar" to everything
+        return [[1.0, 0.0]] * len(texts)
+    check("meaning alone can only ASK, never open a chat by itself",
+          S.match("zzz qqq", ["Alpha", "Beta"], embed=far_embed).decision in ("ask", "none"))
+
+    # H0.2 — the app in front.
+    wa = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+    chrome_wa = lambda: {"app": "google-chrome", "tab_url": "https://web.whatsapp.com/"}
+    code = lambda: {"app": "code", "tab_url": "https://web.whatsapp.com/"}
+    d = common.direct_tokens
+    check("H0.2: 'open XYZ chat' with WhatsApp in front is a CHAT (the bug report)",
+          d("open XYZ chat", wa) == ["message open XYZ"], d("open XYZ chat", wa))
+    check("...also in a normal Chrome window on web.whatsapp.com", d("open XYZ chat", chrome_wa) == ["message open XYZ"])
+    check("...never when another app is in front (Chrome's tab is not 'in front')", d("open XYZ chat", code) is None)
+    check("'click on Design Team 2026' keeps the name exactly", d("click on Design Team 2026", wa) ==
+          ["message open Design Team 2026"])
+    check("'open youtube' in front of WhatsApp is still YouTube; 'open youtube chat' is a chat",
+          d("open youtube", wa) is None and d("open youtube chat", wa) == ["message open youtube"])
+    check("'read it' / 'who messaged me' with WhatsApp in front", d("read it", wa) == ["message read this"]
+          and d("who messaged me", wa) == ["message who messaged me"])
+    for token, key, target in (("message open the PR group", "message.open", "pr"),
+                               ("message who messaged me", "message.unread", "whatsapp"),
+                               ("message read the core team today", "message.read", "core team"),
+                               ("message tell rahul saying hi", "message.send", "rahul"),
+                               ("message rahul: running late", "message.send", "rahul")):
+        a = n(token)
+        check(f"'{token}' -> {key} {target!r}", a.key == key and a.target == target, (a.key, a.target))
+    check("a 'tell' is not sent to someone called 'tell'", n("message tell rahul saying hi").parameters["text"] == "hi")
+    saved = (dict(linux._LAST_FRONT), linux.HYPR)
+    try:
+        hypr = FakeHyprland([client("0xw", "chrome-web.whatsapp.com__-Default", "WhatsApp", focus=0),
+                             client("0xk", "kayra", "Kayra", focus=1)], active="0xw")
+        linux.HYPR = hypr
+        first = linux.situation()
+        hypr.active = "0xk"                              # the user looks at Kayra's own window
+        second = linux.situation()
+        check("H0.2: talking to Kayra's window keeps the app the user was just in (2 minutes)",
+              first.get("site") == "web.whatsapp.com" and second.get("site") == "web.whatsapp.com", (first, second))
+        linux._LAST_FRONT["at"] -= 1000
+        check("...and forgets it after that", linux.situation().get("site") is None)
+    finally:
+        linux._LAST_FRONT.clear(); linux._LAST_FRONT.update(saved[0]); linux.HYPR = saved[1]
+
+    saved_embed = web_macros.EMBEDDER
+    web_macros.EMBEDDER = False                          # no local embeddings in a unit test
+    try:
+        with WebRig(WhatsAppBridge()) as rig, Models("SHOULD NOT SEND CHATS ANYWHERE") as models:
+            r = rig.do("message open PR and outreach core team")
+            check("open: the user's example opens 'PR and Outreach Core Team 2026-27' and says the unread count",
+                  rig.bridge.open_chat == "PR and Outreach Core Team 2026-27" and "5 unread" in r.message, r.message)
+            rig.bridge.chats.insert(1, {"name": "PR Outreach 2025", "unread": 0, "preview": "", "when": "10:00"})
+            r = rig.do("message open PR group")
+            check("open: an ambiguous name asks with BOTH names and opens nothing",
+                  r.status == Status.AMBIGUOUS and r.message == "Do you mean PR Outreach 2025 or "
+                  "PR and Outreach Core Team 2026-27?" and rig.bridge.open_chat == "PR and Outreach Core Team 2026-27",
+                  (r.message, rig.bridge.open_chat))
+            rig.bridge.chats.pop(1)
+            r = rig.do("message open old hostel friends")
+            check("open: a chat outside the visible list is found through WhatsApp's own search",
+                  rig.bridge.open_chat == "Old Hostel Friends"
+                  and ("page.type", {"field": "search", "text": "old hostel friends", "clear": True}) in rig.bridge.calls,
+                  r.message)
+            r = rig.do("message open nobody at all")
+            check("open: nobody is said so", not r.ok and "nobody at all" in r.message, r.message)
+            check("...and WhatsApp's search box is emptied again (it filtered every later list)",
+                  rig.bridge.searching == "", rig.bridge.searching)
+            r = rig.do("message who messaged me")
+            check("who messaged me: names with counts, most recent first",
+                  r.message.startswith("Unread on WhatsApp: PR and Outreach Core Team 2026-27 (5), Rahul Verma (2)"), r.message)
+        with WebRig(WhatsAppBridge()) as rig, Models("Ana set the meeting for 6 in room 204; Ravi brings posters.") as models:
+            r = rig.do("message read the core team today")
+            check("read today: only today's messages, read out directly when there are few",
+                  "Meeting at 6" in r.message and "Old message" not in r.message and models.asked == [], r.message)
+            rig.bridge.history["PR and Outreach Core Team 2026-27"] += [
+                {"from": "Ana", "text": f"note {i}", "date": TODAY_MARK, "time": "12:00", "out": False} for i in range(6)]
+            r = rig.do("message read the core team today")
+            check("read: a longer conversation is summarized by the model", r.message.startswith("Ana set the meeting"), r.message)
+        saved_local = ai._local_chat
+        ai._local_chat = lambda *a, **k: ""              # no local model running
+        try:
+            with WebRig(WhatsAppBridge()) as rig, Models("A CLOUD SUMMARY") as models:
+                rig.bridge.history["PR and Outreach Core Team 2026-27"] += [
+                    {"from": "Ana", "text": f"note {i}", "date": TODAY_MARK, "time": "12:00", "out": False} for i in range(6)]
+                ai.TEXT_MODEL, scripted = None, ai.TEXT_MODEL      # take the path a real install takes
+                saved_complete = ai.complete
+                ai.complete = lambda *a, **k: "A CLOUD SUMMARY"
+                try:
+                    r = rig.do("message read the core team")
+                finally:
+                    ai.TEXT_MODEL, ai.complete = scripted, saved_complete
+                check("PRIVACY: with no local model, chats are NOT sent to a cloud model — the latest few are read",
+                      "A CLOUD SUMMARY" not in r.message and "note 5" in r.message, r.message)
+        finally:
+            ai._local_chat = saved_local
+
+        with WebRig(WhatsAppBridge()) as rig:
+            r = rig.do("message rahool sharma: running late")
+            check("send: the chat is resolved and OPENED, then it ASKS naming the real chat and the text",
+                  r.status == Status.NEEDS_CONFIRMATION and r.message == 'Send "running late" to Rahul Sharma?'
+                  and rig.bridge.open_chat == "Rahul Sharma", r.message)
+            check("...nothing was typed into the message box and nothing sent before the yes",
+                  rig.bridge.composer == "" and rig.bridge.sent == []
+                  and not any(c == "page.type" and a.get("field") == "type a message" for c, a in rig.bridge.calls))
+            ok, said = linux.resolve_confirmation("yes")
+            check("...'yes' types it, reads it back, presses Send and sees it arrive",
+                  rig.bridge.sent == ["running late"] and said == "Sent to Rahul Sharma.", said)
+            rig.do("message rahul sharma: hello again")
+            ok, said = linux.resolve_confirmation("no")
+            check("send: 'no' sends nothing", rig.bridge.sent == ["running late"] and "won't" in said, said)
+            rig.do("message rahul sharma: are you there")
+            rig.bridge.open_chat = "Design team 2026"      # the user clicked another chat meanwhile
+            ok, said = linux.resolve_confirmation("yes")
+            check("send: if another chat is open by the time of the yes, NOTHING is sent",
+                  rig.bridge.sent == ["running late"] and "didn't send" in said, said)
+            rig.bridge.chats.insert(1, {"name": "PR Outreach 2025", "unread": 0, "preview": "", "when": "10:00"})
+            r = rig.do("message pr group: hi")
+            check("send: an ambiguous chat asks WHICH, and never asks to send", r.status == Status.AMBIGUOUS
+                  and rig.bridge.sent == ["running late"], r.message)
+        with WebRig(WhatsAppBridge(ready=False)) as rig:
+            r = rig.do("message open rahul")
+            check("not logged in / not loaded is said so", not r.ok and "logged in" in r.message, r.message)
+        with WebRig(WhatsAppBridge(version="1.8.0")) as rig:
+            r = rig.do("message open rahul")
+            check("an extension older than 1.9.0 is never sent a chat command",
+                  not any(c.startswith("chat.") for c, _a in rig.bridge.calls) and not r.ok, r.message)
+    finally:
+        web_macros.EMBEDDER = saved_embed
+    check("message.send is not a static policy CONFIRM any more (the handler asks, naming the chat)",
+          policy_classify("message rahul: hi") == "ALLOW")
+    check("the WhatsApp shapes are in the understanding catalog",
+          "message open <chat or group>" in interpreter.CATALOG and "message who messaged me" in interpreter.CATALOG)
+
+
+def policy_classify(token):
+    from kayra.automation.policy import classify_action
+    return str(getattr(classify_action(n(token))[0], "name", classify_action(n(token))[0])).upper()
 
 
 def main():
@@ -1682,6 +2330,9 @@ def main():
         section_part_2b()
         section_part_2c()
         section_part_3()
+        section_part_4()
+        section_tuning_v9()
+        section_part_5()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

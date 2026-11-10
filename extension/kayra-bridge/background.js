@@ -102,6 +102,19 @@ function waitForLoad(tabId, timeoutMs) {
   });
 }
 
+// 1.8.0: run a page function until its answer is "ready", INSIDE the extension: one Kayra
+// round trip instead of one per 250 ms poll. The page may still be loading or navigating, so
+// a failed injection is retried too. Returns the last answer when time runs out.
+async function untilReady(args, func, fargs, ready) {
+  const deadline = Date.now() + Math.min(Math.max(args.waitMs || 0, 0), 15000);
+  let last = null;
+  while (true) {
+    try { last = await inPage(await targetTab(args), func, fargs); } catch (e) { last = null; }
+    if (ready(last) || Date.now() >= deadline) return last;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+}
+
 // ── commands ─────────────────────────────────────────────────────────────
 
 async function run(cmd, args) {
@@ -272,13 +285,20 @@ async function run(cmd, args) {
       const all = await chrome.windows.getAll({windowTypes: ["normal"]});
       return {count: all.length};
     }
-    case "page.results": return inPage(await targetTab(args), pageResults, [args.nth || 0, args.kind || ""]);
+    case "page.results": return untilReady(args, pageResults, [args.nth || 0, args.kind || ""], (r) => r && r.count);
     case "page.highlight": return inPage(await targetTab(args), pageHighlight, [args.text || "", args.step || 0, !!args.clear]);
 
     // ── 1.6.0: comments/reviews (C6), transcript (C6), selection (C8), bookmarks (C9),
     //    history (C10), downloads (C11) ──
-    case "page.comments": return inPage(await targetTab(args), pageComments, [args.max || 12]);
-    case "page.transcript": return inPage(await targetTab(args), pageTranscript, [!!args.open]);
+    case "page.comments": return untilReady(args, pageComments, [args.max || 12], (r) => r && r.comments && r.comments.length);
+    case "page.transcript": {
+      if (args.waitMs) {                       // 1.8.0: open the panel, then wait for its text
+        const first = await inPage(await targetTab(args), pageTranscript, [true]);
+        if (!first || !first.supported || first.text) return first;
+        return untilReady(args, pageTranscript, [false], (r) => r && r.text);
+      }
+      return inPage(await targetTab(args), pageTranscript, [!!args.open]);
+    }
     case "page.selection": return inPage(await targetTab(args), () => String(window.getSelection() || "").slice(0, 6000), []);
     case "bookmarks.add": {
       const t = await targetTab(args);
@@ -322,6 +342,28 @@ async function run(cmd, args) {
     case "downloads.pause": { await chrome.downloads.pause(args.id); return {paused: true}; }
     case "downloads.resume": { await chrome.downloads.resume(args.id); return {resumed: true}; }
     case "downloads.cancel": { await chrome.downloads.cancel(args.id); return {cancelled: true}; }
+
+    // ── 1.7.0: Google Workspace (Part 4) ──
+    case "page.docList": return untilReady(args, pageDocList, [args.max || 40], (r) => r && r.length);
+    case "page.fetchText": {
+      // A Sheet's CSV or a Doc's text, fetched INSIDE the Google page with the user's own
+      // session. Only docs.google.com addresses: this is not a general fetch.
+      if (!/^https:\/\/docs\.google\.com\//.test(String(args.url || ""))) throw new Error("only docs.google.com");
+      return inPage(await targetTab(args), pageFetchText, [args.url, args.max || 2000000]);
+    }
+    case "page.focus": return inPage(await targetTab(args), (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return {focused: false};
+      el.focus(); if (el.select) el.select();
+      return {focused: true};
+    }, [args.selector]);
+    case "calendar.next": return untilReady(args, pageCalendarNext, [!!args.open], (r) => r && (args.open ? r.meet : r.events));
+
+    // ── 1.9.0: WhatsApp Web (Part 5, H0.4) — one site function each, read-only except open ──
+    case "chat.list": return untilReady(args, pageChatList, [args.max || 60], (r) => r && r.ready);
+    case "chat.open": return inPage(await targetTab(args), pageChatOpen, [args.name || ""]);
+    case "chat.messages": return untilReady(args, pageChatMessages, [args.limit || 30], (r) => r && r.chat);
+    case "chat.composer": return inPage(await targetTab(args), pageChatComposer, []);
 
     case "page.text": return inPage(await targetTab(args), pageText, [args.max || 15000]);
     case "page.click": return inPage(await targetTab(args), pageClick, [args.text, args.nth || 1]);
@@ -601,12 +643,132 @@ function pageFind(text) {
   return {count};
 }
 
+// Part 5 (H0.4): WhatsApp Web, by what a screen reader announces first (roles, titles,
+// aria-labels), with the older class names only as a fallback. Rows are in WhatsApp's own
+// order — most recent first — which the matcher uses to break ties.
+function pageChatList(max) {
+  const side = document.querySelector("#pane-side, [aria-label='Chat list'], [aria-label*='Chat list' i]");
+  if (!side) return {ready: false, chats: []};
+  const rows = Array.from(side.querySelectorAll("[role=listitem], [role=row]"))
+    .filter((r) => !r.parentElement.closest("[role=listitem], [role=row]"));   // outermost rows only
+  const chats = [];
+  for (const row of rows) {
+    const titled = Array.from(row.querySelectorAll("span[title], div[title]")).filter((e) => e.getAttribute("title").trim());
+    if (!titled.length) continue;
+    const name = titled[0].getAttribute("title").trim();
+    const preview = titled.length > 1 ? titled[titled.length - 1].getAttribute("title").trim() : "";
+    const badge = row.querySelector("[aria-label*='unread message' i], [aria-label*='unread' i]");
+    const unread = badge ? parseInt((badge.getAttribute("aria-label").match(/\d+/) || ["1"])[0], 10) : 0;
+    const when = Array.from(row.querySelectorAll("div, span")).map((e) => (e.childElementCount ? "" : e.textContent.trim()))
+      .find((t) => /^(\d{1,2}:\d{2}(\s?[AP]M)?|yesterday|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\/\d{1,2}\/\d{2,4})$/i.test(t)) || "";
+    chats.push({name, preview: preview === name ? "" : preview.slice(0, 160), unread, when});
+    if (chats.length >= max) break;
+  }
+  return {ready: true, chats};
+}
+
+function pageChatOpen(name) {
+  const side = document.querySelector("#pane-side, [aria-label='Chat list'], [aria-label*='Chat list' i]");
+  if (!side) return {opened: false, reason: "no chat list"};
+  const target = Array.from(side.querySelectorAll("span[title], div[title]"))
+    .find((e) => e.getAttribute("title").trim() === name);
+  if (!target) return {opened: false, reason: "not in the list"};
+  const row = target.closest("[role=listitem], [role=row]") || target;
+  const r = row.getBoundingClientRect();
+  const opts = {bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) {
+    target.dispatchEvent(new (type.startsWith("pointer") ? PointerEvent : MouseEvent)(type, opts));
+  }
+  target.click();
+  return {opened: true, name};
+}
+
+function pageChatMessages(limit) {
+  const main = document.querySelector("#main");
+  if (!main) return {chat: "", messages: []};
+  const head = main.querySelector("header span[title], header [dir=auto]");
+  const chat = head ? (head.getAttribute("title") || head.textContent).trim() : "";
+  const out = [];
+  for (const el of main.querySelectorAll("[data-pre-plain-text]")) {
+    const meta = el.getAttribute("data-pre-plain-text") || "";          // "[10:21, 11/10/2026] Ana: "
+    const m = meta.match(/^\[([^,\]]+),\s*([^\]]+)\]\s*(.*?):\s*$/);
+    const text = (el.querySelector(".selectable-text, [dir]") || el).innerText.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    out.push({time: m ? m[1].trim() : "", date: m ? m[2].trim() : "", from: m ? m[3].trim() : "",
+              text: text.slice(0, 1000), out: !!el.closest(".message-out, [class*='message-out']")});
+  }
+  return {chat, messages: out.slice(-limit)};
+}
+
+function pageChatComposer() {
+  const box = document.querySelector("footer [contenteditable=true], #main [contenteditable=true][role=textbox]");
+  const head = document.querySelector("#main header span[title], #main header [dir=auto]");
+  return {found: !!box, text: box ? box.innerText.trim() : "",
+          chat: head ? (head.getAttribute("title") || head.textContent).trim() : ""};
+}
+
+// Part 4: the files listed on a Docs / Sheets / Slides / Forms home page or a Drive page, in
+// page order: {id, title, url, kind}. Read only while Kayra is acting; never stored.
+function pageDocList(max) {
+  const kinds = {spreadsheets: "sheet", document: "doc", presentation: "slides", forms: "form"};
+  const out = []; const seen = new Set();
+  const add = (id, title, url, kind) => {
+    title = String(title || "").replace(/\s+/g, " ").trim();
+    if (!id || seen.has(id) || !title) return;
+    seen.add(id); out.push({id, title: title.slice(0, 150), url, kind: kind || "file"});
+  };
+  for (const a of document.querySelectorAll("a[href]")) {
+    const m = a.href.match(/docs\.google\.com\/(spreadsheets|document|presentation|forms)\/d\/([\w-]{20,})/);
+    if (m) add(m[2], a.getAttribute("aria-label") || a.title || a.innerText, a.href.split("#")[0], kinds[m[1]]);
+  }
+  const path = location.pathname;
+  const here = Object.keys(kinds).find((k) => path.startsWith("/" + k));
+  for (const el of document.querySelectorAll("[data-id]")) {
+    const id = el.getAttribute("data-id");
+    if (!/^[\w-]{25,}$/.test(id)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    const t = el.querySelector(".docs-homescreen-list-item-title-value, [data-tooltip], [aria-label]");
+    const title = (t && (t.innerText || t.getAttribute("data-tooltip") || t.getAttribute("aria-label")))
+      || (el.getAttribute("aria-label") || (el.innerText || "").split("\n")[0]);
+    const url = location.hostname === "drive.google.com" || !here
+      ? `https://drive.google.com/open?id=${id}`
+      : `https://docs.google.com/${here}/d/${id}/edit`;
+    add(id, title, url, here ? kinds[here] : "file");
+    if (out.length >= max) break;
+  }
+  return out.slice(0, max);
+}
+
+// Part 4: text from a docs.google.com address with the page's own session (same origin).
+async function pageFetchText(url, max) {
+  const response = await fetch(url, {credentials: "include"});
+  if (!response.ok) return {ok: false, status: response.status};
+  const text = await response.text();
+  return {ok: true, text: text.slice(0, max), truncated: text.length > max};
+}
+
+// Part 4 (E6): the next event in Calendar's agenda/schedule view. open = click it, so its
+// details (and the Meet link) are shown; Kayra then calls again to read the link.
+function pageCalendarNext(open) {
+  // Only a VISIBLE link: Calendar keeps other events' details in the page, hidden.
+  const meet = Array.from(document.querySelectorAll("a[href^='https://meet.google.com/']"))
+    .filter((a) => { const r = a.getBoundingClientRect(); return r.width > 2 && r.height > 2; })
+    .map((a) => a.href).find((h) => /meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/.test(h));
+  const chips = Array.from(document.querySelectorAll("[data-eventid], [data-eventchip]"))
+    .filter((el) => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; });
+  const first = chips[0];
+  const title = first ? (first.innerText || first.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim() : "";
+  if (open && first && !meet) first.click();
+  return {title: title.slice(0, 200), meet: meet || "", events: chips.length};
+}
+
 // C6: comments or reviews, site-aware, the visible ones in page order. On YouTube the comments
 // load only once scrolled to, so the section is scrolled into view and an empty list means
 // "not loaded yet" (Kayra polls again).
 function pageComments(max) {
   const host = location.hostname;
-  let selector = "[itemprop=reviewBody], [data-hook=review-body], .comment-body, .comment p, " +
+  let selector = "[itemprop=reviewBody], [data-hook=reviewText], [data-hook=review-body], .comment-body, .comment p, " +
                  "[class*=comment-content], [class*=review-text], [class*=reviewText]";
   let kind = "comments";
   if (/youtube\.com$/.test(host)) {
@@ -616,7 +778,11 @@ function pageComments(max) {
   } else if (/reddit\.com$/.test(host)) {
     selector = "shreddit-comment div[slot=comment], div[data-testid=comment] p";
   } else if (/(^|\.)amazon\./.test(host)) {
-    selector = "[data-hook=review-body]"; kind = "reviews";
+    // Live 2026-11-10: review text is data-hook="reviewText" (review-body is gone), and the
+    // reviews load only once the section is scrolled to.
+    const section = document.querySelector("#customerReviews, #reviewsMedley, #cm-cr-dp-review-list");
+    if (section) section.scrollIntoView({block: "start"});
+    selector = "[data-hook=reviewText], [data-hook=review-body], [data-hook=review-collapsed]"; kind = "reviews";
   } else if (/flipkart\.com$/.test(host)) {
     selector = "div.t-ZTKy, div.ZmyHeo, div[class*=review] p"; kind = "reviews";
   } else if (/news\.ycombinator\.com$/.test(host)) {
@@ -647,8 +813,11 @@ function pageTranscript(open) {
   if (!have.length && open) {
     const expand = document.querySelector("#description-inline-expander #expand, tp-yt-paper-button#expand");
     if (expand) expand.click();
-    const buttons = Array.from(document.querySelectorAll("button, ytd-button-renderer, [role=button]"));
-    const show = buttons.find((b) => /show transcript/i.test(b.innerText || b.getAttribute("aria-label") || ""));
+    // The VISIBLE <button> (live: two renderers + two buttons match, two of them hidden).
+    const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; };
+    const buttons = Array.from(document.querySelectorAll("button, ytd-button-renderer, [role=button]"))
+      .filter((b) => /show transcript/i.test(b.innerText || b.getAttribute("aria-label") || ""));
+    const show = buttons.find((b) => b.tagName === "BUTTON" && visible(b)) || buttons.find(visible);
     if (show) show.click();
     have = segments();
     return {supported: true, opened: !!show, text: have.join(" ").slice(0, 20000)};
@@ -668,12 +837,37 @@ function pageResults(nth, kind) {
     .filter((x) => x && visible(x.a));
   let items = [];
   let site = "page";
+  // A bot check ("unusual traffic", a captcha) is not a result list: say so instead of
+  // offering "Why did this happen?" as the first result (seen live on Google, 2026-11-10).
+  if (/\/sorry\/|captcha|validateCaptcha/i.test(location.pathname + location.search) ||
+      document.querySelector("form[action*='captcha' i], iframe[src*='recaptcha'], #captcha-form")) {
+    return {site: "blocked", count: 0, blocked: true, results: [], result: null};
+  }
   if (/(^|\.)google\./.test(host) && location.pathname.startsWith("/search")) {
     site = "google"; items = pick("#search a h3, #rso a h3", (h) => h.closest("a"));
   } else if (/youtube\.com$/.test(host)) {
-    site = "youtube"; items = pick("ytd-video-renderer a#video-title, ytd-rich-item-renderer a#video-title-link, ytd-compact-video-renderer a#thumbnail, a#video-title");
+    site = "youtube";
+    // Search results (a#video-title), the home grid, and the newer "lockup" cards YouTube uses
+    // for Up next (seen live 2026-11-10: 20 lockups, no compact renderers). Never an ad slot.
+    const lockups = () => pick("yt-lockup-view-model a[href*='/watch?v=']:has(h3), yt-lockup-view-model h3 a[href*='/watch?v='], yt-lockup-view-model a[href*='/watch?v=']")
+      .filter((x) => !x.a.closest("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer"))   // live: card 1 was an ad
+      .map((x) => { const card = x.a.closest("yt-lockup-view-model"); const h = card && card.querySelector("h3");
+                    return {a: x.a, label: (h && h.textContent.trim()) || x.label}; });
+    const titled = () => pick("ytd-video-renderer a#video-title, ytd-rich-item-renderer a#video-title-link, a#video-title")
+      .filter((x) => !x.a.closest("ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer"));
+    // On a video page the Up next cards are the list (live: a shelf of 4 other links there
+    // labelled "1:03" won before); on search and home, the titled results.
+    items = location.pathname.startsWith("/watch") ? (lockups().length ? lockups() : titled())
+                                                   : (titled().length ? titled() : lockups());
+    // A bare duration is not a title.
+    items = items.filter((x) => !/^\d{1,2}(:\d{2}){1,2}$/.test(x.label.trim()));
   } else if (/(^|\.)amazon\./.test(host)) {
-    site = "amazon"; items = pick("div[data-component-type='s-search-result'] h2 a, div[data-component-type='s-search-result'] a:has(h2)");
+    site = "amazon";
+    // Sponsored listings are skipped: "open the first result" means the first REAL result
+    // (live 2026-11-10: the first two were /sspa/ ads). The title link is now an <a> around <h2>.
+    items = pick("div[data-component-type='s-search-result'] a:has(h2), div[data-component-type='s-search-result'] h2 a")
+      .filter((x) => !/\/sspa\//.test(x.a.getAttribute("href") || "") &&
+        !x.a.closest("div[data-component-type='s-search-result']").querySelector(".puis-sponsored-label-text, .s-sponsored-label-text"));
   } else if (/flipkart\.com$/.test(host)) {
     site = "flipkart"; items = pick("a[href*='/p/']");
   } else if (/github\.com$/.test(host)) {
@@ -683,13 +877,20 @@ function pageResults(nth, kind) {
   } else if (/duckduckgo\.com$/.test(host)) {
     site = "duckduckgo"; items = pick("a[data-testid='result-title-a'], h2 a.result__a");
   } else if (/bing\.com$/.test(host)) {
-    site = "bing"; items = pick("#b_results h2 a");
+    site = "bing"; items = pick("#b_results li.b_algo h2 a");     // organic only (live: 10 of 12 h2 links)
+  } else if (/wikipedia\.org$/.test(host)) {
+    site = "wikipedia"; items = pick(".mw-search-result-heading a");
   }
   if (!items.length) {
     // Generic: links with real text inside the main content, not the header, nav or footer.
+    // When the page lists several HEADING links (a result list, a blog index, news), those are
+    // the results — help and footnote links in between are not (live: Wikipedia search).
     const root = document.querySelector("main, [role=main], article, #content") || document.body;
-    items = pick("a[href]").filter(({a, label}) => root.contains(a) && label.length >= 12 &&
+    const content = pick("a[href]").filter(({a, label}) => root.contains(a) && label.length >= 12 &&
       !a.closest("nav, header, footer, [role=navigation], [role=banner], [role=contentinfo], aside"));
+    const headed = content.filter(({a}) => a.closest("h1, h2, h3, h4") || a.querySelector("h1, h2, h3, h4"));
+    items = headed.length >= 3 ? headed : content;
+    if (headed.length >= 3) site = "headings";
   }
   const seen = new Set(); const list = [];
   for (const it of items) {

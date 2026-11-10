@@ -2061,6 +2061,7 @@ def _dispatch_extended(domain, verb, target, params, action):
     """Round 3 domains: web, diagnostics, screen, scenes, plans, triggers, files, dev."""
     from kayra.automation import (web_macros as W, diagnostics as D, screen_ai as V,
                                   workflows as F, linux_system as S)
+    W.new_command()                       # a fresh "which tab is active?" for this command
     if domain == "browser":
         table = {"tabs_list": lambda: W.tabs_list(),
                  "tab_switch": lambda: W.tab_switch(target),
@@ -2117,6 +2118,20 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "download_control": lambda: W.download_control(target),
                  "search_here": lambda: W.search_here(target),
                  "page_help": lambda: W.page_help(),
+                 "ws_open": lambda: W.ws_open(target, params.get("kind", "file")),
+                 "ws_search": lambda: W.ws_search(target, params.get("kind", "file"), params.get("open", False)),
+                 "ws_create": lambda: W.ws_create(target, params.get("title", "")),
+                 "sheet_cell": lambda: W.sheet_cell(target),
+                 "sheet_calc": lambda: W.sheet_calc(target, params.get("op", "sum"), params.get("where")),
+                 "sheet_row": lambda: W.sheet_row(target, params.get("headers", False)),
+                 "ws_share": lambda: W.ws_share(target),
+                 "slides_present": lambda: W.slides_present(),
+                 "slides_nav": lambda: W.slides_nav(target),
+                 "ws_recent": lambda: W.ws_recent(),
+                 "ws_download": lambda: W.ws_download(),
+                 "keep_note": lambda: W.keep_note(params.get("text", "")),
+                 "form_responses": lambda: W.form_responses(target),
+                 "classroom_due": lambda: W.classroom_due(),
                  "page_find": lambda: W.page_find(target), "page_controls": lambda: W.page_controls(),
                  "history_open": lambda: W.history_open(target, params.get("days", 7)),
                  "bookmark_open": lambda: W.bookmark_open(target),
@@ -2125,6 +2140,8 @@ def _dispatch_extended(domain, verb, target, params, action):
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
+        if verb == "admit":
+            return W.meet_admit(True)
         if verb == "join":
             return W.meet_join(target)
         if verb == "share":
@@ -2148,12 +2165,23 @@ def _dispatch_extended(domain, verb, target, params, action):
                                              params.get("query", "")),
                 "draft": lambda: W.email_draft(target, params.get("subject", ""),
                                                params.get("body", "")),
-                "send": lambda: W.email_send()}[verb]()
+                "send": lambda: W.email_send(),
+                "search": lambda: W.email_search(target),
+                "compose": lambda: W.email_compose(),
+                "label": lambda: W.email_label(target)}[verb]()
     if domain == "calendar":
+        if verb == "next":
+            return W.calendar_next(bool(params.get("join")))
         return W.calendar_add(params.get("text", target)) if verb == "add" else \
             W.calendar_agenda(target)
     if domain == "message":
-        return W.message_send(target, params.get("text", ""))
+        if verb == "open":
+            return W.wa_open(target)
+        if verb == "unread":
+            return W.wa_unread()
+        if verb == "read":
+            return W.wa_read(target, bool(params.get("today")))
+        return W.message_send(target, params.get("text", ""), params.get("confirmed_chat"), action)
     if domain == "diagnose":
         if verb == "fix":
             return ActionResult.success(D.apply_fixes())
@@ -2260,6 +2288,10 @@ shutdown_automation = RUNTIME.shutdown
 take_chat_handoff = RUNTIME.take_chat_handoff
 
 
+_LAST_FRONT = {}
+FRONT_MEMORY_S = 120.0
+
+
 def situation():
     """
     What is on screen, for the understanding layer: the app in front, the web app / site it
@@ -2269,6 +2301,10 @@ def situation():
     out = {}
     try:
         front = active_window()
+        if (front is None or front.kayra_owned) and _LAST_FRONT.get("at") and \
+                time.monotonic() - _LAST_FRONT["at"] <= FRONT_MEMORY_S:
+            # Talking to Kayra's own window: the app the user was in a moment ago (H0.2).
+            out.update({k: v for k, v in _LAST_FRONT.items() if k != "at"})
         if front is not None and not front.kayra_owned:
             out["app"] = front.initial_class or front.cls
             out["window_title"] = (front.title or "")[:120]
@@ -2276,6 +2312,9 @@ def situation():
                          if linux_apps.site_of_window_class(c)), None)
             if site:
                 out["site"] = site
+            _LAST_FRONT.clear()
+            _LAST_FRONT.update({k: out[k] for k in ("app", "window_title", "site") if k in out},
+                               at=time.monotonic())
     except Exception:
         pass
     try:

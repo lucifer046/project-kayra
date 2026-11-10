@@ -125,6 +125,62 @@ def _local_chat(system, user, timeout, max_tokens, temperature=0.0):
         return ""
 
 
+def relevant(text, question, budget=4000, chunk=420):
+    """
+    The parts of `text` that bear on `question`, in their original order, within `budget`
+    characters — so a page question sends ~4 K characters instead of 12 K (measured on
+    gemma-4-e4b: 1.1 s -> ~0.45 s) WITHOUT the blind cut that dropped the answer. Chunks are
+    scored by the question's content words (5-letter stems, so "refunds" finds "refund"); the
+    page's opening chunk is always kept for context. Short text is returned unchanged.
+    """
+    text = str(text or "")
+    if len(text) <= budget:
+        return text
+    stop = {"what", "does", "this", "page", "say", "about", "the", "and", "for", "with", "that",
+            "from", "have", "tell", "mention", "there", "which", "when", "where", "who", "how",
+            "document", "doc", "site", "article"}
+    stems = {w[:5] for w in re.findall(r"[a-z0-9]{3,}", str(question).lower()) if w not in stop}
+    pieces, start = [], 0
+    while start < len(text):                       # sentence-aligned chunks of ~`chunk` chars
+        end = min(len(text), start + chunk)
+        if end < len(text):
+            cut = text.rfind(". ", start + chunk // 2, end + 120)
+            end = cut + 1 if cut != -1 else end
+        pieces.append(text[start:end])
+        start = end
+    scored = []
+    for index, piece in enumerate(pieces):
+        low = piece.lower()
+        score = sum(low.count(stem) for stem in stems)
+        scored.append((score, index))
+    keep, used = {0}, len(pieces[0])
+    for score, index in sorted(scored, key=lambda item: (-item[0], item[1])):
+        if score <= 0 or index in keep:
+            continue
+        if used + len(pieces[index]) > budget:
+            continue
+        keep.add(index)
+        used += len(pieces[index])
+    if len(keep) == 1:                              # nothing matched: the opening, as before
+        return text[:budget]
+    return " … ".join(pieces[i].strip() for i in sorted(keep))
+
+
+def warm_up(systems, timeout=20.0):
+    """
+    Loads each system prompt into the local server's prompt cache with a one-token request,
+    so the FIRST real call after boot is as fast as the rest (measured: the understanding
+    layer's first call 1.3 s, later ones ~0.5 s). Local only; silent; never raises.
+    """
+    if TEXT_MODEL is not None or _cloud_forced():
+        return 0
+    warmed = 0
+    for system in systems:
+        if _local_chat(system, "ok", timeout, max_tokens=1):
+            warmed += 1
+    return warmed
+
+
 def _truthy(name):
     return str(_env(name, "")).strip().lower() in ("1", "true", "yes", "on")
 
@@ -157,7 +213,7 @@ def fast(system, user, timeout=8.0, max_tokens=120):
     return text if text.strip() else complete(system, user, timeout)
 
 
-def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700):
+def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700, local_only=False):
     """
     A short spoken answer from a model, or `fallback`. Never raises, never hangs.
 
@@ -169,7 +225,8 @@ def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=70
     if TEXT_MODEL is None and not _cloud_forced():
         text = _clean(_local_chat(system, user, timeout, max_tokens=max(160, max_chars // 2),
                                   temperature=0.3))
-    if not text:
+    # Private content (chats) never goes to a cloud model; a scripted TEXT_MODEL (tests) is fine.
+    if not text and (not local_only or TEXT_MODEL is not None):
         text = _clean(complete(system, user, timeout))
     if not text:
         return fallback

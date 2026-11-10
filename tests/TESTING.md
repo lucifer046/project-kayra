@@ -361,6 +361,19 @@ Against a local model it typically scores 50–51/53; the failing cases are the 
 boundaries. **The matrix is not deterministic at the last decimal** — re-run before concluding
 a change caused a single-case drop.
 
+Browser, Meet and Workspace phrasings have their own suite (added in the V9 tuning pass),
+which runs the REAL routing path — rules first (`common.direct_tokens`), then the classifier —
+and scores the action each utterance ends as. Local model only; it skips itself otherwise:
+
+```bash
+.venv/bin/python tests/test_dmm_browser.py [--verbose]
+```
+
+Healthy (2026-11-10, gemma-4-e4b): 72/72, "Rules first (no model): 55/72" (62 cases in V9,
+plus the WhatsApp phrasings of Part 5). A failure names the
+tokens the classifier produced; a phrasing that should not need the model belongs on the
+`_DIRECT_BROWSER` allow-list only if its whole-utterance shape cannot be conversation.
+
 Relevant log lines: `[DMM] Provider: Claude (claude-haiku-5-5)`, `[DMM] Result: RATE_LIMITED`,
 `[DMM] Fallback: Groq`.
 
@@ -888,6 +901,7 @@ voice state machine exists to prevent.
 | `test_tts_device.py` | ONNX Runtime device | unit | onnxruntime | nothing | 20s |
 | `test_audio_pipeline.py` | Audio pipeline | integration | Kokoro model | nothing | 30s |
 | `test_stt_lifecycle.py` | STT session lifecycle | integration | Chrome or Edge | nothing | 60s |
+| `test_dmm_browser.py` | Browser intents, rules first | integration | a local model | nothing | 30s |
 | `test_dmm_matrix.py` | DMM intent boundaries | integration | a model provider | nothing | 180s |
 | `test_DMM.py` | DMM smoke | integration | a model provider | nothing | 20s |
 | `test_engine.py` | LLM engine smoke | integration | a model provider | nothing | 20s |

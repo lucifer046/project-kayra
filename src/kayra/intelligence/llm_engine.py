@@ -189,7 +189,21 @@ _FAST_PATTERNS = (
     (re.compile(r"^(?:set )?(?:the )?brightness (?:to )?(\d{1,3})(?: percent)?$"), "system brightness {0}"),
     (re.compile(r"^mute$"), "system mute"),
     (re.compile(r"^unmute$"), "system unmute"),
+    # Slides (Part 4, E3): two words the local model reads as chat.
+    (re.compile(r"^(next|previous) slide$"), "browser {0} slide"),
+    (re.compile(r"^(?:go )?back a slide$"), "browser previous slide"),
 )
+
+
+# Rules before the model (tuning pass V9): a callable (utterance) -> [token] | None that the
+# automation backend registers at boot (`common.direct_tokens`). The intelligence layer never
+# imports automation; it only calls what it was handed. None = no router (tests, Windows).
+RULE_ROUTER = None
+
+
+def set_rule_router(fn):
+    global RULE_ROUTER
+    RULE_ROUTER = fn
 
 
 def _fast_path_enabled(engine):
@@ -721,12 +735,35 @@ class CentralizedLLMEngine:
                ("go to my sent mails"); 'email reply', 'email forward', 'email archive',
                'email delete', 'email back'; 'email draft to (address) about (subject) saying
                (text)', 'email send'. Opening an email is NEVER 'open (something)' — it is
-               'email open ...'.
+               'email open ...'. 'search my mail for the fee receipt' -> 'email search for fee
+               receipt'; 'show my unread emails from this week' -> 'email show unread from this
+               week'; 'compose a new email' -> 'email compose'; 'open my Work label' -> 'email
+               open my work label'.
+            -> GOOGLE WORKSPACE files are 'browser ...': 'open my budget sheet' -> 'browser open
+               my budget sheet'; 'open the doc about the internship' -> 'browser open the doc
+               about the internship'; 'search my docs for offer letter' -> 'browser search my docs
+               for offer letter'; 'find the PDF Ravi sent me' -> 'browser find the pdf ravi sent
+               me'; 'create a new sheet called Expenses' -> 'browser create a new sheet called
+               expenses'; 'go to cell B12' -> 'browser go to cell b12'; 'what's the total of
+               column C' -> 'browser what's the total of column c'; 'read row 5' -> 'browser read
+               row 5'; 'share this doc with ana@x.com' -> 'browser share this doc with ana@x.com';
+               'start the slideshow' / 'next slide' / 'end the slideshow' -> 'browser ' + the same
+               words; 'open my recent files' -> 'browser open my recent files'; 'add a note
+               saying buy milk' -> 'browser add a note saying buy milk'; 'open the responses of
+               my feedback form' -> 'browser open the responses of my feedback form'; 'what
+               assignments are due' -> 'browser what assignments are due'. A Google file is
+               NEVER 'open (app)'.
             -> ANY "click on X" / "scroll down" while the user is in the browser is fine as
                plain 'click on X' / 'scroll down': Kayra sends it into the page itself.
-            -> 'calendar today', 'calendar tomorrow', 'calendar add (title) (day) at (time)'.
+            -> 'calendar today', 'calendar tomorrow', 'calendar friday', 'calendar add (title)
+               (day) at (time)'; 'what's my next meeting' -> 'calendar next meeting'; 'join my
+               next meeting' -> 'calendar join my next meeting'. In a call, 'let them in' /
+               'admit everyone' -> 'meet admit everyone'.
             -> 'message (contact): (text)' — WhatsApp: "tell rahul I'm running late" ->
-               'message rahul: i'm running late'.
+               'message rahul: i'm running late'. Other WhatsApp requests: 'open the PR group on
+               WhatsApp' -> 'message open the pr group'; 'who messaged me on WhatsApp' ->
+               'message who messaged me'; 'what did they say in the core team today' -> 'message
+               read the core team today'.
             -> 'diagnose (what)' — "diagnose my computer", "why is my laptop slow", "why is the
                fan so loud", "what's draining my battery", "why is the internet slow", "is my
                computer secure", "what crashed" -> 'diagnose computer' / 'diagnose slow' /
@@ -1388,6 +1425,15 @@ class CentralizedLLMEngine:
             if token:
                 debug(Subsystem.DMM, f"fast path: {token}")
                 return [token]
+            if RULE_ROUTER is not None:
+                try:
+                    routed = RULE_ROUTER(prompt)
+                except Exception as exc:          # a rule bug must never cost the turn
+                    debug(Subsystem.DMM, f"rule route skipped: {exc}")
+                    routed = None
+                if routed:
+                    debug(Subsystem.DMM, f"rule route: {routed}")
+                    return list(routed)
 
         if not retries:
             # Local or cloud, re-checked here (throttled) — AFTER the fast path, so a command

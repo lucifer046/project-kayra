@@ -92,16 +92,29 @@ INSIDE THE BROWSER PAGE (also inside web apps like WhatsApp, YouTube, X):
   browser pause the download | browser resume the download | browser cancel the download |
   browser close it | browser go back to it | browser search for <text> here |
   browser what can i do here |
+  browser open my <name> sheet | browser open the doc about <topic> | browser open my <name> deck |
+  browser search my docs for <text> | browser search my drive for <text> |
+  browser find the pdf <name> sent me | browser create a new sheet called <title> |
+  browser create a new doc | browser go to cell <B12> | browser what's the total of column <C> |
+  browser what is the average of the <header> column | browser read row <n> |
+  browser what are the columns | browser share this doc with <email> |
+  browser start the slideshow | browser next slide | browser previous slide |
+  browser end the slideshow | browser open my recent files | browser download this file |
+  browser add a note saying <text> | browser open the responses of my <name> form |
+  browser what assignments are due |
   browser open the page i read yesterday about <topic> | browser bookmark <name>
-EMAIL (Gmail): email check | email open latest | email open the email from <name> |
+EMAIL (Gmail): email search for <text> | email show unread from this week | email compose |
+  email open my <name> label | email check | email open latest | email open the email from <name> |
   email read latest | email read this | email go to sent | email reply | email archive |
   email draft to <address> about <subject> saying <text> | email send
-CALENDAR / MEET: calendar today | calendar tomorrow | calendar add <event> <day> at <time> |
+CALENDAR / MEET: calendar next meeting | calendar join my next meeting | calendar friday |
+  meet admit everyone | calendar today | calendar tomorrow | calendar add <event> <day> at <time> |
   meet join <code the user said> | meet join new | meet mic off | meet camera off |
   meet share screen | meet share the <app> window | meet share this tab |
   meet share the <site> tab | meet share my second screen | meet share screen with audio |
   meet share <app> instead | meet am i sharing | meet stop sharing | meet leave
-MESSAGES: message <contact>: <text>
+MESSAGES (WhatsApp): message <contact>: <text> | message open <chat or group> |
+  message read <chat> | message read <chat> today | message read this | message who messaged me
 MEDIA & SYSTEM: play <song> | pause | resume | next track | previous track |
   system volume <0-100> | system mute | system brightness <0-100> | wifi on | wifi off |
   system bluetooth on | system do not disturb on | system night light on | battery |
@@ -124,8 +137,8 @@ Reply with ONLY one JSON object, no prose:
 
 Rules:
 - Use the screen context. If a web app or site is in front (WhatsApp, Gmail, YouTube...), \
-"open X", "click X", "go to X" usually mean something INSIDE that page: use \
-"browser click on X" with the name as the person said it.
+"open X", "click X", "go to X" usually mean something INSIDE that page: in WhatsApp use \
+"message open X", elsewhere "browser click on X", with the name as the person said it.
 - Keep names and text exactly as the person said them. Never invent email addresses, \
 contacts, file names or URLs.
 - Never output shutdown, restart, delete, install, terminal or shell commands.
@@ -134,9 +147,9 @@ contacts, file names or URLs.
 
 Examples:
 Said: "open PR and outreach core team chat" | in front: web.whatsapp.com
--> {{"kind": "automation", "commands": ["browser click on PR and outreach core team"]}}
+-> {{"kind": "automation", "commands": ["message open PR and outreach core team"]}}
 Said: "open the design team 2026 group" | in front: web.whatsapp.com
--> {{"kind": "automation", "commands": ["browser click on design team 2026"]}}
+-> {{"kind": "automation", "commands": ["message open design team 2026"]}}
 Said: "can you make the tab quiet" | active tab: Lo-fi - YouTube
 -> {{"kind": "automation", "commands": ["browser mute this tab"]}}
 Said: "put google sheets in this tab" | active tab: New Tab
@@ -148,6 +161,11 @@ Said: "who invented the telephone"
 Said: "open the budget thing"
 -> {{"kind": "ask", "question": "Do you mean a Google Sheet, a Doc or a file called budget?"}}
 Copy names EXACTLY as said, every word ("PR", "and", numbers), minus the words chat/group."""
+
+
+def system_prompt():
+    """The understanding layer's system prompt — one stable string, so it stays cached."""
+    return _SYSTEM.format(catalog=CATALOG, limit=MAX_COMMANDS)
 
 
 def enabled():
@@ -240,7 +258,7 @@ def interpret(request, situation=None, reason="", normalize=None, classify=None)
         return Interpretation("none")
     # Thinking OFF: this is a one-line decision, and a thinking model spends ~85 % of its
     # time reasoning before it — measured 4 s -> 0.5 s on the reference laptop.
-    raw = ai.fast(_SYSTEM.format(catalog=CATALOG, limit=MAX_COMMANDS), user, timeout=TIMEOUT_S,
+    raw = ai.fast(system_prompt(), user, timeout=TIMEOUT_S,
                   max_tokens=160)
     data = _parse(raw)
     if not data:

@@ -60,6 +60,18 @@ anywhere else; one is never needed for an unpacked extension.
 | "close it", "go back to it", "read it" | "it" = the tab Kayra last opened or switched to by name (10 minutes) |
 | "search for Ravi here", "search this sheet for Ravi" | searches INSIDE what's in front: Gmail, YouTube, Drive, GitHub (this repo), Amazon, Flipkart, Wikipedia, Reddit, Stack Overflow, Google; Docs/Sheets use their own Find; any other site its search box; else Google |
 | "what can I do here?" | a few things worth saying on the site in front |
+| "open my budget sheet", "open the doc about the internship", "open my thesis deck" | searches that app's own file list and opens the best title match; two equally good matches → asks which. Names are matched on this computer, never by a model |
+| "search my docs for offer letter", "find the PDF Ravi sent me", "open my recent files" | lists the matches (opens the one clear match for "find …") |
+| "create a new sheet called Expenses 2026", "create a new doc" | a new Sheet / Doc / presentation / form, named through its own title box |
+| "what's the total of column C", "the average of the amount column", "how many rows", "read row 5", "what are the columns", "go to cell B12" | from the open Sheet's own values, computed by Kayra (not a model); text cells are skipped and said so |
+| "summarize this document", "what does this doc say about the stipend", "find deadline in this doc" | Docs are read through their text export; Find uses the editor's own Ctrl+F |
+| "share this doc with ana@x.com" | opens Share with the address typed in — **you** press Send |
+| "start the slideshow" (or "start presenting" with Slides in front), "next slide", "end the slideshow" | presents and steps through the deck |
+| "download this file" | a Sheet as .xlsx, a Doc as .docx, a deck as .pptx, a Drive file as itself |
+| "search my mail for the fee receipt", "show my unread emails from this week", "compose a new email", "open my Work label" | Gmail search, a blank compose, a label |
+| "what's my next meeting", "join my next meeting", "what's on Friday" | Calendar's schedule; join uses the event's own Meet link |
+| "let them in" / "admit everyone" (in a call) | Meet's own Admit all |
+| "add a note saying buy milk", "open the responses of my feedback form", "what assignments are due" | Keep, Forms, Classroom |
 | "mute everything except this tab", "unmute all other tabs" | every other tab |
 | "what did I just close?" | the last few closed tabs and windows |
 | "reopen the YouTube tab I closed" | that tab, not just the last one closed |
@@ -87,7 +99,10 @@ anywhere else; one is never needed for an unpacked extension.
 | "send it" | **asks first**, then clicks Send |
 | "what's on my calendar today/tomorrow" | reads your Google Calendar day view aloud |
 | "add standup tomorrow at 10am to my calendar" | **asks first**, then fills and saves the event |
-| "tell Rahul I'm running late" | **asks first**, then sends it on WhatsApp Web |
+| "tell Rahul I'm running late" | finds and opens the chat, then **asks** naming the real chat ("Send 'I'm running late' to Rahul Sharma?"); on yes it types, reads the text back, sends, and checks it arrived. If you switched chats meanwhile, nothing is sent |
+| "open the PR group on WhatsApp", or with WhatsApp in front "open XYZ chat" / "click on design team 2026" | the chat whose name best matches what you said — loose names, misheard spellings, initials; two close matches → it asks which; a tie → the most recent chat |
+| "who messaged me on WhatsApp" | the chats with unread messages and how many |
+| "what did they say in the core team today", "read it" (the open chat) | read out when short, summarized by the LOCAL model when long — never by a cloud model; without a local model it reads the latest few |
 | "join my meeting abc-defg-hij", "start a new meeting" | opens Meet and clicks Join now |
 | "mute me", "turn off my camera", "turn on captions", "raise my hand", "leave the call" | clicks Meet's own buttons |
 | "share my screen", "start screen sharing", "present now" | **asks first** ("Share your entire screen with everyone in the call?"), then shares the screen you're on (see below) |
@@ -139,7 +154,7 @@ have yet, it sends `runtime.reload` (Chrome re-reads this folder) and says *"I'v
 the Kayra Bridge extension…"* — ask again a few seconds later. You can also say **"browser
 update"**. Only a 1.0.x extension needs the manual **reload arrow** on `chrome://extensions`.
 
-Current version: **1.6.0** (1.6.0: comments, transcript, selection, bookmarks add/remove, history clearing, downloads — adds the `downloads` permission; 1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
+Current version: **1.9.0** (1.9.0: WhatsApp Web — `chat.list`, `chat.open`, `chat.messages`, `chat.composer`; 1.8.0: lists, comments, results, the next event and the transcript wait INSIDE the browser (`waitMs`), and the site lookups were re-checked on live sites — sponsored Amazon results and YouTube ads skipped, Amazon `reviewText`, YouTube Up next cards, Bing organic only, Wikipedia, bot-check pages reported; 1.7.0: Google Workspace — file lists, an in-page read of a Sheet's CSV / a Doc's text fenced to docs.google.com, the Name Box, Calendar's next event; no new permission; 1.6.0: comments, transcript, selection, bookmarks add/remove, history clearing, downloads — adds the `downloads` permission; 1.5.0: tab groups, windows, result lists, find with highlight — adds the `tabGroups` permission; 1.4.0: the Meet page hook can include system audio in a share; 1.2.0 added `tabs.open` with `where` and `page.waitFor`; 1.2.1 makes
 click matching and `page.waitFor` cheaper; 1.2.2 adds `tabs.close {tabIds}`; 1.3.0 adds
 `tabs.recentlyClosed`, `tabs.restore {sessionId}`, `tabs.muteOthers`, `tabs.discard`,
 `tabs.zoom` and `tabs.reload {hard}` — no new permissions). An older 1.1.0+ extension is
@@ -209,6 +224,15 @@ fakes. If a picker stays open, press Share and tell me what you saw.
   by the user 2026-11-10: list, show in folder, pause / resume / cancel; Kayra opens a
   finished file itself with xdg-open, after a yes, and never a program). No cookies,
   debugger or native messaging (`downloads.open` is not requested either).
+- **Workspace file names stay on this computer** (decision D3, approved 2026-11-10): read from
+  the page while acting, matched locally, never stored, never sent to a model. A Sheet's values
+  are added up by Kayra itself; a Doc's text goes to a model only when you ask about it. The
+  in-page read (`page.fetchText`) accepts docs.google.com addresses only — it is the
+  extension's one `fetch`, and a unit test fences it.
+- **WhatsApp messages stay on this computer**: chat names are matched locally (embeddings, if
+  used, come from the LOCAL LM Studio and are cached in memory only); message text is read only
+  when you ask, summarized only by the local model, and never logged. Sending always asks,
+  naming the chat Kayra resolved, and re-checks that chat is still the open one before sending.
 - **Clearing history, deleting bookmarks and opening a download always ask**, whatever the
   count, and the "yes" acts on exactly what was named.
 - **Bulk closes ask first.** More than 3 tabs (by site, all but pinned, a group) is a

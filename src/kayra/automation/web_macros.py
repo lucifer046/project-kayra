@@ -19,9 +19,12 @@ calendar events, sharing the screen, and clicking buttons whose label sounds des
 extension refuses password and payment fields on its own side as well.
 """
 
+import io
 import os
 import re
+import csv
 import time
+import difflib
 import datetime
 from urllib.parse import quote, quote_plus, urlsplit
 
@@ -44,7 +47,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 6, 0)
+REQUIRED_VERSION = (1, 9, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -59,9 +62,30 @@ def _version():
         return (0,)
 
 
+# Reads that change nothing. Within ONE command, "which tab is active?" is asked once and
+# reused until something that can change the answer (open, navigate, activate, close…) runs.
+# Cleared at the start of every command by `new_command()` (tuning pass V9).
+_READ_ONLY = frozenset({"tabs.active", "tabs.list", "page.text", "page.controls", "groups.list",
+                        "downloads.list", "page.docList", "page.results", "page.comments",
+                        "page.selection", "page.find", "history.search", "bookmarks.search",
+                        "bookmarks.find", "calendar.next", "page.waitFor", "page.fetchText", "ping"})
+_ACTIVE = {"tab": None}
+
+
+def new_command():
+    _ACTIVE["tab"] = None
+
+
 def _call(cmd, timeout=10.0, **args):
+    if cmd == "tabs.active" and not args and _ACTIVE["tab"] is not None:
+        return dict(_ACTIVE["tab"])
+    if cmd not in _READ_ONLY:
+        _ACTIVE["tab"] = None
     try:
-        return BRIDGE.call(cmd, timeout=timeout, **args)
+        result = BRIDGE.call(cmd, timeout=timeout, **args)
+        if cmd == "tabs.active" and not args and isinstance(result, dict):
+            _ACTIVE["tab"] = dict(result)
+        return result
     except browser_bridge.BridgeError as e:
         if "unknown command" in str(e):
             raise browser_bridge.BridgeError(_self_update() or UPDATE_HINT)
@@ -128,6 +152,20 @@ def _wait_for(timeout_ms=8000, **condition):
 
 
 POLL_S = 0.25
+
+
+def _ready(cmd, ready, wait_s, **args):
+    """
+    `cmd` until `ready(result)`: from extension 1.8.0 ONE call that waits inside the browser
+    (no 250 ms polling round trips); older extensions keep the polling `_until`.
+    """
+    if _version() >= (1, 8, 0):
+        try:
+            result = _call(cmd, timeout=wait_s + 5.0, waitMs=int(wait_s * 1000), **args)
+        except browser_bridge.BridgeError:
+            return None
+        return result
+    return _until(lambda: (lambda r: r if ready(r) else None)(_call(cmd, **args)), wait_s)
 
 
 def _until(attempt, timeout_s=2.5):
@@ -745,8 +783,12 @@ def page_result(nth, new_tab=False):
     stop = _bridge_at((1, 5, 0))
     if stop:
         return stop
-    found = _until(lambda: (lambda r: r if r.get("count") else None)(
-        _call("page.results", nth=int(nth)) or {}), 3.0) or {}
+    # Up to 6 s: the wait ends the moment results appear (a slow YouTube load took ~7 s live).
+    found = _ready("page.results", lambda r: bool((r or {}).get("count") or (r or {}).get("blocked")),
+                   6.0, nth=int(nth)) or {}
+    if found.get("blocked"):
+        return ActionResult.not_found("This page is a bot check, not a list of results. Solve it "
+                                      "in Chrome, then ask me again.")
     result = found.get("result")
     which = _ORDINAL_WORDS.get(int(nth), f"number {nth}")
     if not found.get("count"):
@@ -766,6 +808,8 @@ def page_results():
     if stop:
         return stop
     found = _call("page.results", nth=0) or {}
+    if found.get("blocked"):
+        return ActionResult.not_found("This page is a bot check, not a list of results.")
     results = found.get("results") or []
     if not results:
         return ActionResult.not_found("I don't see a list of results on this page.")
@@ -845,6 +889,13 @@ def page_find(text):
     missing = _need_bridge()
     if missing:
         return missing
+    if _version() >= (1, 7, 0) and _active_doc()[0] in ("doc", "sheet", "slides"):
+        # The Google editors draw on a canvas: their own Find (Ctrl+F) is the only way in.
+        L = _L()
+        _focus_chrome()
+        L.send_keys("ctrl+f")
+        L.type_text(text)
+        return ActionResult.success(f"Searching this {_WS_NOUN[_active_doc()[0]]} for {text}.")
     if _version() >= (1, 5, 0):
         # C4: highlighted on the page, the first one scrolled to; "next match" steps on.
         found = _call("page.highlight", text=text) or {}
@@ -894,11 +945,16 @@ def _page_text(max_chars=15000):
 
 
 def _page_of(target):
-    """page.text of the active tab, or of the remembered tab for "it" (G1)."""
+    """page.text of the active tab, or of the remembered tab for "it" (G1). A Google Doc is
+    read through its text export (Part 4, E2): its page draws on a canvas."""
     if target == "it":
         tab = _referent_tab()
         if tab is not None:
             return _call("page.text", tabId=tab["id"], max=15000, timeout=15.0) or {}
+    if _version() >= (1, 7, 0):
+        doc = doc_text()
+        if doc and doc.get("text", "").strip():
+            return doc
     return _page_text()
 
 
@@ -906,7 +962,7 @@ def page_read(target="current"):
     missing = _need_bridge()
     if missing:
         return missing
-    page = _page_of(target) if target == "it" else _page_text(4000)
+    page = _page_of(target)
     text = " ".join((page.get("text") or "").split())
     if not text:
         return ActionResult.not_found("This page has no readable text.")
@@ -991,14 +1047,15 @@ def page_ask(question):
     missing = _need_bridge()
     if missing:
         return missing
-    page = _page_text(15000)
+    page = _page_of("current")
     text = page.get("text") or ""
     if len(text.strip()) < 40:
         return ActionResult.not_found("This page has no readable text to answer from.")
     answer = ai.summarize(
         "You are Kayra. Answer the user's question using ONLY the web page below, in one to "
         "three spoken sentences. If the page does not say, answer exactly: The page doesn't say.",
-        f"Question: {question}\n\nTitle: {page.get('title')}\nURL: {page.get('url')}\n\n{text[:12000]}",
+        f"Question: {question}\n\nTitle: {page.get('title')}\nURL: {page.get('url')}\n\n"
+        f"{ai.relevant(text, question, budget=4000)}",
         fallback="")
     if not answer:
         return ActionResult.failure("I couldn't reach a model to answer that. Say \"find <word> on "
@@ -1007,14 +1064,14 @@ def page_ask(question):
 
 
 def page_comments(summarize=False):
+    max_comments = 30 if summarize else 12
     """C6: "read the comments" / "summarize the reviews" — YouTube, Reddit, Amazon, Flipkart,
     Hacker News, GitHub, or any page that marks up its reviews."""
     stop = _bridge_at((1, 6, 0))
     if stop:
         return stop
     # YouTube loads comments only once scrolled to: the first call scrolls, then poll.
-    found = _until(lambda: (lambda r: r if r.get("comments") else None)(
-        _call("page.comments", max=12) or {}), 4.0) or {}
+    found = _ready("page.comments", lambda r: bool((r or {}).get("comments")), 6.0, max=max_comments) or {}
     comments, kind = found.get("comments") or [], found.get("kind", "comments")
     if not comments:
         return ActionResult.not_found(f"I don't see any {kind} on this page.")
@@ -1035,11 +1092,16 @@ def video_summary():
     stop = _bridge_at((1, 6, 0))
     if stop:
         return stop
-    first = _call("page.transcript", open=True) or {}
-    if not first.get("supported"):
-        return page_summarize()                  # not YouTube: the page itself
-    data = _until(lambda: (lambda r: r if r.get("text") else None)(
-        _call("page.transcript") or {}), 5.0) or (_call("page.transcript") or {})
+    if _version() >= (1, 8, 0):
+        data = _call("page.transcript", open=True, waitMs=5000, timeout=10.0) or {}
+        if not data.get("supported"):
+            return page_summarize()              # not YouTube: the page itself
+    else:
+        first = _call("page.transcript", open=True) or {}
+        if not first.get("supported"):
+            return page_summarize()
+        data = _until(lambda: (lambda r: r if r.get("text") else None)(
+            _call("page.transcript") or {}), 5.0) or (_call("page.transcript") or {})
     text, title = data.get("text") or "", data.get("title") or "this video"
     source = f"Transcript:\n{text[:14000]}" if text else \
         f"(No transcript is available.) Description:\n{data.get('description', '')}"
@@ -1362,6 +1424,576 @@ def page_help():
                                 "say about something, find a word on this page, open the third "
                                 "result, bookmark this page, translate this page, or what can I "
                                 "click.")
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │             PART 4 — GOOGLE WORKSPACE (Sheets, Docs, Slides,           │
+# │                 Drive, Gmail, Calendar, Meet, Keep, Forms)             │
+# └────────────────────────────────────────────────────────────────────────┘
+# File NAMES are read from the page in Chrome while acting and matched HERE, locally, with no
+# model (decision D3, 2026-11-10): never stored, never sent to a cloud model. Contents are read
+# only when the user asks a question about them.
+
+_WS_HOME = {"sheet": "https://docs.google.com/spreadsheets/u/0/?q={q}",
+            "doc": "https://docs.google.com/document/u/0/?q={q}",
+            "slides": "https://docs.google.com/presentation/u/0/?q={q}",
+            "form": "https://docs.google.com/forms/u/0/?q={q}",
+            "file": "https://drive.google.com/drive/search?q={q}",
+            "pdf": "https://drive.google.com/drive/search?q=type:pdf%20{q}"}
+_WS_NEW = {"sheet": "https://docs.google.com/spreadsheets/create",
+           "doc": "https://docs.google.com/document/create",
+           "slides": "https://docs.google.com/presentation/create",
+           "form": "https://docs.google.com/forms/create"}
+_WS_NOUN = {"sheet": "sheet", "doc": "document", "slides": "presentation", "form": "form",
+            "file": "file", "pdf": "PDF"}
+_NAME_STOP = frozenset("the a an my our of for and to in on about with called named file sheet "
+                       "spreadsheet doc document deck presentation slides form pdf".split())
+
+
+_UNITS = {"zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+          "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+          "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+          "nineteen": 19}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+         "eighty": 80, "ninety": 90}
+
+
+def spoken_numbers(text):
+    """'budget twenty twenty six' -> 'budget 2026'; 'q three' -> 'q 3'; 'two thousand twenty
+    five' -> '2025'. Speech recognisers write numbers in words often enough to matter here."""
+    words, out, i = str(text or "").lower().split(), [], 0
+
+    def pair(j):                                   # a number below 100 at j -> (value, used)
+        if j < len(words) and words[j] in _TENS:
+            if j + 1 < len(words) and words[j + 1] in _UNITS and _UNITS[words[j + 1]] < 10:
+                return _TENS[words[j]] + _UNITS[words[j + 1]], 2
+            return _TENS[words[j]], 1
+        if j < len(words) and words[j] in _UNITS:
+            return _UNITS[words[j]], 1
+        return None, 0
+
+    while i < len(words):
+        if words[i] in ("two", "one") and i + 1 < len(words) and words[i + 1] == "thousand":
+            base, j = (2000 if words[i] == "two" else 1000), i + 2
+            if j < len(words) and words[j] == "and":
+                j += 1
+            rest, used = pair(j)
+            out.append(str(base + (rest or 0)))
+            i = j + used
+            continue
+        first, used = pair(i)
+        if first is not None and 10 <= first <= 99:
+            j = i + used
+            if j + 1 < len(words) and words[j] == "oh" and words[j + 1] in _UNITS and _UNITS[words[j + 1]] < 10:
+                out.append(f"{first}{_UNITS[words[j + 1]]:02d}")     # "nineteen oh five" -> 1905
+                i = j + 2
+                continue
+            second, used2 = pair(j)
+            if second is not None and second >= 10:
+                out.append(f"{first}{second:02d}")   # "twenty twenty six" -> 2026, "nineteen oh five"
+                i += used + used2
+                continue
+        if first is not None:
+            out.append(str(first))
+            i += used
+            continue
+        out.append(words[i])
+        i += 1
+    return " ".join(out)
+
+
+def _words(text):
+    return [w for w in re.findall(r"[a-z0-9]+", spoken_numbers(text)) if w not in _NAME_STOP]
+
+
+def _same_word(a, b):
+    """Exact, or a near spelling the recogniser produced ("budjet" / "budget") for words of 4+."""
+    if a == b:
+        return True
+    if len(a) < 4 or len(b) < 4 or a.isdigit() or b.isdigit():
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.8
+
+
+def rank_titles(name, items):
+    """
+    [(score, item)] best first. Exact title 100; the whole phrase inside the title 80; every
+    word present 60 (+ shorter titles first); some words: 40 × the share present. Local and
+    deterministic — names never leave the machine.
+    """
+    want = " ".join(_words(name))
+    words = want.split()
+    ranked = []
+    for item in items:
+        title = " ".join(_words(item.get("title", "")))
+        if not title or not words:
+            continue
+        title_words = title.split()
+        near = [any(_same_word(w, t) or (len(w) >= 3 and t.startswith(w)) for t in title_words)
+                for w in words]
+        if title == want:
+            score = 100.0
+        elif want in title:
+            score = 80.0
+        elif all(w in title_words or w in title for w in words):
+            score = 60.0
+        elif all(near):
+            score = 55.0                           # every word, allowing a misheard spelling
+        else:
+            score = 40.0 * sum(near) / len(words)
+        if score:
+            ranked.append((score - min(len(title), 200) / 1000.0, item))
+    ranked.sort(key=lambda pair: -pair[0])
+    return ranked
+
+
+def _file_list(url):
+    # Reuse a tab that is already on a Google file list / Drive, instead of a new tab each time.
+    host = _host((_call("tabs.active") or {}).get("url"))
+    if host in ("docs.google.com", "drive.google.com") and not _doc_ids((_call("tabs.active") or {}).get("url"))[0]:
+        _call("tabs.navigate", url=url, wait=True, timeoutMs=20000, timeout=25.0)
+    else:
+        _call("tabs.open", url=url, where="tab", wait=True, timeoutMs=20000, timeout=25.0)
+    return _ready("page.docList", bool, 6.0, max=40) or []
+
+
+def ws_open(name, kind="sheet"):
+    """E1–E4: "open my budget sheet" — the best title match in Sheets/Docs/Slides/Forms/Drive."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    noun = _WS_NOUN.get(kind, "file")
+    items = _file_list(_WS_HOME.get(kind, _WS_HOME["file"]).format(q=quote(name)))
+    ranked = rank_titles(name, items)
+    if not ranked:
+        return ActionResult.not_found(f"I don't see a {noun} called {name}. The search is open.")
+    best_score, best = ranked[0]
+    close = [item for score, item in ranked[1:4] if best_score - score < 1.0 and best_score < 80]
+    if close:
+        names = ", ".join(_short(i["title"], 40) for i in [best] + close)
+        return ActionResult.ambiguous(f"I found {len(close) + 1} {noun}s: {names}. Which one?",
+                                      candidates=[best["title"]] + [i["title"] for i in close])
+    _call("tabs.navigate", url=best["url"])
+    remember_tab({"id": (_call("tabs.active") or {}).get("id"), "title": best["title"]})
+    more = f", the best of {len(ranked)} matches" if len(ranked) > 1 else ""
+    return ActionResult.success(f"Opened {_short(best['title'])}{more}.")
+
+
+def ws_search(query, kind="file", open_best=False):
+    """'search my docs for offer letter' lists the matches; 'find the PDF Ravi sent me' opens
+    the one clear match."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    noun = _WS_NOUN.get(kind, "file")
+    items = _file_list(_WS_HOME.get(kind, _WS_HOME["file"]).format(q=quote(query)))
+    if not items:
+        return ActionResult.not_found(f"No {noun}s match {query}. The search is open.")
+    ranked = rank_titles(query, items) or [(0.0, i) for i in items]
+    if open_best and (len(items) == 1 or ranked[0][0] >= 60):
+        _call("tabs.navigate", url=ranked[0][1]["url"])
+        return ActionResult.success(f"Opened {_short(ranked[0][1]['title'])}.")
+    names = ", ".join(_short(i["title"], 40) for _s, i in ranked[:4])
+    return ActionResult.success(f"I found {len(items)} {noun}{'s' if len(items) != 1 else ''}: {names}. "
+                                f"Say open the {noun} called one of them.")
+
+
+def ws_create(kind="sheet", title=""):
+    """E1/E2/E3/E8: a new Sheet / Doc / presentation / form, named when a name was said."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    url = _WS_NEW.get(kind)
+    if url is None:
+        return ActionResult.failure("I can create a sheet, a document, a presentation or a form.")
+    tab = _call("tabs.open", url=url, where="tab", wait=True, timeoutMs=25000, timeout=30.0) or {}
+    remember_tab(tab)
+    noun = _WS_NOUN[kind]
+    if not title:
+        return ActionResult.success(f"Here's a new {noun}.")
+    # The title box is Docs' own "Rename" control; typed with the real keyboard so the editor
+    # sees genuine key events.
+    if not _until(lambda: (_call("page.click", text="Rename", nth=1) or {}).get("clicked"), 6.0):
+        return ActionResult.success(f"Here's a new {noun}. I couldn't reach its title to name it {title}.")
+    L = _L()
+    _focus_chrome()
+    L.send_keys("ctrl+a")
+    L.type_text(title)
+    L.send_keys("enter")
+    return ActionResult.success(f"Created a new {noun} called {title}.")
+
+
+def _doc_ids(url):
+    """('sheet'|'doc'|'slides'|None, file id, gid) from a docs.google.com address."""
+    m = re.search(r"docs\.google\.com/(spreadsheets|document|presentation)/d/([\w-]{20,})", str(url or ""))
+    if not m:
+        return None, None, None
+    gid = re.search(r"[#&?]gid=(\d+)", str(url))
+    kind = {"spreadsheets": "sheet", "document": "doc", "presentation": "slides"}[m.group(1)]
+    return kind, m.group(2), gid.group(1) if gid else "0"
+
+
+def _active_doc():
+    tab = _call("tabs.active") or {}
+    return (*_doc_ids(tab.get("url")), tab)
+
+
+def sheet_rows():
+    """The visible sheet as rows (list of lists), fetched in the page with the user's session."""
+    kind, file_id, gid, _tab = _active_doc()
+    if kind != "sheet":
+        return None, "Open a Google Sheet first."
+    for url in (f"https://docs.google.com/spreadsheets/d/{file_id}/gviz/tq?tqx=out:csv&headers=1&gid={gid}",
+                f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=csv&gid={gid}"):
+        try:
+            got = _call("page.fetchText", url=url, timeout=20.0) or {}
+        except browser_bridge.BridgeError:
+            got = {}
+        if got.get("ok") and got.get("text", "").strip():
+            return list(csv.reader(io.StringIO(got["text"]))), None
+    return None, "I couldn't read this sheet."
+
+
+def _number(value):
+    text = re.sub(r"[₹$€£,%\s]", "", str(value or ""))
+    text = text[1:-1] if text.startswith("(") and text.endswith(")") else text
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _column_index(spec, header):
+    spec = str(spec or "").strip().lower()
+    if re.fullmatch(r"[a-z]{1,3}", spec) and not any(spec == h.strip().lower() for h in header):
+        index = 0
+        for ch in spec:
+            index = index * 26 + (ord(ch) - 96)
+        return index - 1
+    for i, h in enumerate(header):
+        if h.strip().lower() == spec:
+            return i
+    for i, h in enumerate(header):
+        if spec and spec in h.strip().lower():
+            return i
+    return None
+
+
+def _fmt(n):
+    return f"{n:,.2f}".rstrip("0").rstrip(".") if n != int(n) else f"{int(n):,}"
+
+
+def _split_header(rows):
+    """(header, body): the header is the first row with two or more filled cells that are
+    mostly NOT numbers — a title line or blank rows above the table are skipped."""
+    for index, row in enumerate(rows[:6]):
+        filled = [c.strip() for c in row if c.strip()]
+        if len(filled) >= 2 and sum(_number(c) is None for c in filled) > len(filled) / 2:
+            return row, rows[index + 1:]
+    return rows[0], rows[1:]
+
+
+def sheet_calc(column, op="sum", where=None):
+    """E1: 'what's the total of column C' / 'average of the amount column' / 'how many rows'.
+    Computed here, from the sheet's own values — never by a model."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    rows, problem = sheet_rows()
+    if rows is None:
+        return ActionResult.not_found(problem)
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return ActionResult.success("This sheet is empty.")
+    header, body = _split_header(rows)
+    if where:
+        col = _column_index(where[0], header)
+        if col is None:
+            return ActionResult.not_found(f"I don't see a column {where[0]}.")
+        want = str(where[1]).strip().lower()
+        body = [r for r in body if col < len(r) and r[col].strip().lower() == want]
+        if not body:
+            return ActionResult.not_found(f"No rows where {where[0]} is {where[1]}.")
+    if op == "rows":
+        return ActionResult.success(f"This sheet has {len(body)} rows below the header.")
+    index = _column_index(column, header)
+    if index is None or index >= max(len(r) for r in rows):
+        return ActionResult.not_found(f"I don't see a column {column}.")
+    label = header[index].strip() if index < len(header) and header[index].strip() else f"column {column.upper()}"
+    values = [_number(r[index]) for r in body if index < len(r)]
+    numbers = [v for v in values if v is not None]
+    if op == "count":
+        filled = sum(1 for r in body if index < len(r) and r[index].strip())
+        return ActionResult.success(f"{label} has {filled} filled cells.")
+    if not numbers:
+        return ActionResult.not_found(f"{label} has no numbers.")
+    value = {"sum": sum(numbers), "avg": sum(numbers) / len(numbers), "max": max(numbers),
+             "min": min(numbers)}[op]
+    word = {"sum": "total", "avg": "average", "max": "highest", "min": "lowest"}[op]
+    skipped = len(values) - len(numbers)
+    note = f" I skipped {skipped} cell{'s' if skipped != 1 else ''} that weren't numbers." if skipped else ""
+    scope = f" where {where[0]} is {where[1]}" if where else ""
+    return ActionResult.success(f"The {word} of {label}{scope} is {_fmt(value)}, over {len(numbers)} rows.{note}")
+
+
+def sheet_row(number, headers=False):
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    rows, problem = sheet_rows()
+    if rows is None:
+        return ActionResult.not_found(problem)
+    if not rows:
+        return ActionResult.success("This sheet is empty.")
+    header = rows[0]
+    if headers:
+        names = [h for h in header if h.strip()]
+        return ActionResult.success("The columns are: " + ", ".join(names) + "." if names else
+                                    "The first row is empty.")
+    index = int(number) - 1
+    if not 0 <= index < len(rows):
+        return ActionResult.not_found(f"There's no row {number}; the sheet has {len(rows)} rows.")
+    row = rows[index]
+    if index == 0:
+        return ActionResult.success("Row 1 is the header: " + ", ".join(c for c in row if c.strip()) + ".")
+    parts = [f"{(header[i].strip() if i < len(header) and header[i].strip() else chr(65 + i) if i < 26 else str(i + 1))} {c.strip()}"
+             for i, c in enumerate(row) if c.strip()]
+    return ActionResult.success(f"Row {number}: " + ", ".join(parts) + "." if parts else f"Row {number} is empty.")
+
+
+def sheet_cell(cell):
+    """E1: 'go to cell B12' — Sheets' own Name Box, typed with the real keyboard."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    kind, _id, _gid, _tab = _active_doc()
+    if kind != "sheet":
+        return ActionResult.not_found("Open a Google Sheet first.")
+    if not (_call("page.focus", selector="#t-name-box, input[aria-label='Name Box'], input[aria-label='Name box']") or {}).get("focused"):
+        return ActionResult.not_found("I can't find the sheet's Name Box.")
+    L = _L()
+    _focus_chrome()
+    L.type_text(cell)
+    L.send_keys("enter")
+    return ActionResult.success(f"Here's {cell}.")
+
+
+def doc_text(max_chars=20000):
+    """The open Google Doc's text, exported in the page (Docs draws on a canvas, so the page's
+    own text is nearly empty). None when the active tab is not a Doc."""
+    kind, file_id, _gid, tab = _active_doc()
+    if kind != "doc":
+        return None
+    try:
+        got = _call("page.fetchText", url=f"https://docs.google.com/document/d/{file_id}/export?format=txt",
+                    max=max_chars, timeout=20.0) or {}
+    except browser_bridge.BridgeError:
+        got = {}
+    if not got.get("ok"):
+        return None
+    return {"title": re.sub(r"\s+-\s+Google Docs$", "", tab.get("title") or ""), "url": tab.get("url"),
+            "text": got.get("text", "")}
+
+
+def ws_share(email):
+    """E2/E4: opens Share with the address typed in. Kayra stops there; you press Send."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    kind, _id, _gid, _tab = _active_doc()
+    if kind is None:
+        return ActionResult.not_found("Open the document, sheet or presentation first.")
+    if not _until(lambda: (_call("page.click", text="Share", nth=1) or {}).get("clicked"), 4.0):
+        return ActionResult.not_found("I can't find the Share button.")
+    # The Share dialog opens with "Add people" focused: wait for the dialog, then type.
+    if not _wait_for(selector="div[role=dialog] iframe, div[role=dialog]", timeout_ms=5000):
+        return ActionResult.not_found("The Share dialog didn't open.")
+    L = _L()
+    _focus_chrome()
+    L.type_text(email)
+    return ActionResult.success(f"I've opened Share with {email} filled in. Check who and what "
+                                "access, then press Send yourself.")
+
+
+def slides_present():
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    kind, _id, _gid, _tab = _active_doc()
+    if kind != "slides":
+        return ActionResult.not_found("Open a Google Slides presentation first.")
+    _focus_chrome()
+    _L().send_keys("ctrl+f5")
+    return ActionResult.success("Presenting. Say next slide, previous slide, or end the slideshow.")
+
+
+def slides_nav(verb):
+    missing = _need_bridge()
+    if missing:
+        return missing
+    kind, _id, _gid, _tab = _active_doc()
+    if kind != "slides":
+        return ActionResult.not_found("No presentation is open.")
+    _focus_chrome()
+    _L().send_keys({"next": "right", "previous": "left", "end": "escape"}[verb])
+    return ActionResult.success({"next": "Next slide.", "previous": "Previous slide.",
+                                 "end": "Ended the slideshow."}[verb])
+
+
+def ws_recent():
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    items = _file_list("https://drive.google.com/drive/recent")
+    if not items:
+        return ActionResult.success("Here are your recent files in Drive.")
+    names = ", ".join(_short(i["title"], 40) for i in items[:5])
+    return ActionResult.success(f"Your recent files: {names}.")
+
+
+def ws_download():
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    tab = _call("tabs.active") or {}
+    url = tab.get("url") or ""
+    kind, file_id, _gid = _doc_ids(url)
+    m = re.search(r"drive\.google\.com/(?:file/d/|open\?id=)([\w-]{20,})", url)
+    if kind == "sheet":
+        target = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
+    elif kind == "doc":
+        target = f"https://docs.google.com/document/d/{file_id}/export?format=docx"
+    elif kind == "slides":
+        target = f"https://docs.google.com/presentation/d/{file_id}/export/pptx"
+    elif m:
+        target = f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    else:
+        return ActionResult.not_found("Open the Drive file, document or sheet first.")
+    _call("tabs.open", url=target, where="next", active=False)
+    return ActionResult.success("Downloading it. Say what did I download to check on it.")
+
+
+def keep_note(text):
+    """E8: a note in Google Keep — "Take a note…", typed with the real keyboard, closed."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    try:
+        _call("tabs.activate", match="keep.google.com")
+    except browser_bridge.BridgeError:
+        _call("tabs.open", url="https://keep.google.com/", where="tab", wait=True, timeoutMs=20000, timeout=25.0)
+    if not _until(lambda: (_call("page.click", text="Take a note", nth=1) or {}).get("clicked"), 6.0):
+        return ActionResult.not_found("Keep is open, but I can't find Take a note.")
+    L = _L()
+    _focus_chrome()
+    L.type_text(text)
+    L.send_keys("escape")                 # Keep saves and closes the note on Escape
+    return ActionResult.success("Saved to Keep.")
+
+
+def form_responses(name):
+    """E8: a form's responses — the form by name, then its Responses tab."""
+    result = ws_open(name, "form")
+    if not result.ok:
+        return result
+    tab = _call("tabs.active") or {}
+    url = str(tab.get("url") or "").split("#")[0]
+    if "/forms/d/" in url:
+        _call("tabs.navigate", url=re.sub(r"/(edit|viewform)?$", "", url.rstrip("/")) + "/edit#responses")
+    return ActionResult.success(result.message.replace("Opened", "Here are the responses for", 1))
+
+
+def classroom_due():
+    missing = _need_bridge()
+    if missing:
+        return missing
+    _call("tabs.open", url="https://classroom.google.com/a/not-turned-in/all", where="tab", wait=True,
+          timeoutMs=20000, timeout=25.0)
+    _wait_for(text="Assigned", timeout_ms=4000)
+    page = _page_text(8000)
+    spoken = ai.summarize("You are Kayra. From this Google Classroom 'to-do' page, list the assignments "
+                          "that are due, nearest first, with their class and due date, in at most four "
+                          "spoken sentences. If there are none, say so.", page.get("text", "")[:8000],
+                          fallback="I've opened your Classroom to-do list.")
+    return ActionResult.success(spoken)
+
+
+# E5 Gmail extras.
+def email_search(query):
+    missing = _need_bridge()
+    if missing:
+        return missing
+    url = f"https://mail.google.com/mail/u/0/#search/{quote(query)}"
+    try:
+        _call("tabs.activate", match="mail.google.com")
+        _call("tabs.navigate", url=url)
+    except browser_bridge.BridgeError:
+        _call("tabs.open", url=url, where="tab")
+    return ActionResult.success(f"Here's your mail for {query}." if not query.startswith(("is:", "in:", "label:"))
+                                else "Here they are.")
+
+
+def email_compose():
+    return open_in("https://mail.google.com/mail/?view=cm&fs=1", "tab", "a new email")
+
+
+def email_label(name):
+    missing = _need_bridge()
+    if missing:
+        return missing
+    url = f"https://mail.google.com/mail/u/0/#label/{quote(name.strip().title())}"
+    try:
+        _call("tabs.activate", match="mail.google.com")
+        _call("tabs.navigate", url=url)
+    except browser_bridge.BridgeError:
+        _call("tabs.open", url=url, where="tab")
+    return ActionResult.success(f"Here's your {name} label.")
+
+
+# E6 Calendar extras.
+def calendar_next(join=False):
+    """'what's my next meeting' / 'join my next meeting' — Calendar's schedule view."""
+    stop = _bridge_at((1, 7, 0))
+    if stop:
+        return stop
+    url = "https://calendar.google.com/calendar/u/0/r/agenda"
+    try:
+        _call("tabs.activate", match="calendar.google.com")
+        _call("tabs.navigate", url=url, wait=True, timeoutMs=20000, timeout=25.0)
+    except browser_bridge.BridgeError:
+        _call("tabs.open", url=url, wait=True, timeoutMs=20000, timeout=25.0)
+    first = _ready("calendar.next", lambda r: bool((r or {}).get("events")), 5.0) or {}
+    if not first.get("events"):
+        return ActionResult.success("You have nothing coming up on your calendar.")
+    title = _short(first.get("title") or "your next event", 90)
+    if not join:
+        return ActionResult.success(f"Next up: {title}.")
+    found = _ready("calendar.next", lambda r: bool((r or {}).get("meet")), 4.0, open=True) or {}
+    link = found.get("meet")
+    if not link:
+        return ActionResult.not_found(f"Your next event, {title}, has no Google Meet link.")
+    return meet_join(link)
+
+
+# E7 Meet extras.
+def meet_admit(everyone=True):
+    """E7: "admit everyone" — Meet's own Admit all (or Admit), and its second "Admit all"."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    try:
+        _call("tabs.activate", match="meet.google.com")
+    except browser_bridge.BridgeError:
+        return ActionResult.not_found("You're not in a Google Meet call.")
+    labels = ["Admit all", "Admit"] if everyone else ["Admit"]
+    clicked = _click_first(labels)
+    if not clicked and _click_first(["View all"]):          # the waiting list is collapsed
+        clicked = _until(lambda: _click_first(labels), 2.0)
+    if not clicked:
+        return ActionResult.not_found("Nobody is waiting to join.")
+    if clicked == "Admit all":
+        _until(lambda: _click_first(["Admit all"]), 1.5)    # Meet's own "Admit all?" check
+    return ActionResult.success("Let them in.")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1741,7 +2373,13 @@ CALENDAR = "https://calendar.google.com/calendar/u/0/r/day"
 def calendar_agenda(day="today"):
     if not BRIDGE.connected():
         return _L().open_url(CALENDAR)
-    when = datetime.date.today() + datetime.timedelta(days=1 if day == "tomorrow" else 0)
+    when = datetime.date.today()
+    if day == "tomorrow":
+        when += datetime.timedelta(days=1)
+    elif day == "day after tomorrow":
+        when += datetime.timedelta(days=2)
+    elif day in _WEEKDAYS:                       # the next one; today counts if it IS that day
+        when += datetime.timedelta(days=(_WEEKDAYS.index(day) - when.weekday()) % 7)
     url = f"https://calendar.google.com/calendar/u/0/r/day/{when:%Y/%m/%d}"
     try:
         _call("tabs.activate", match="calendar.google.com")
@@ -1817,25 +2455,181 @@ def calendar_add(text):
 # │                         WHATSAPP WEB                                   │
 # └────────────────────────────────────────────────────────────────────────┘
 
-def message_send(contact, text):
-    missing = _need_bridge()
-    if missing:
-        return missing
+# ── WhatsApp Web (Part 5, H0.4) ──
+# Chats are matched by `semantic_match` (loose names, recency for ties, ask when two are
+# close). Message text is read only when asked, summarized by the LOCAL model only, and never
+# logged. Sending ALWAYS asks first, naming the exact chat and the text.
+WHATSAPP = "https://web.whatsapp.com/"
+EMBEDDER = None                  # set to semantic_match.local_embedder() lazily; tests replace it
+
+
+def _embedder():
+    global EMBEDDER
+    if EMBEDDER is None:
+        from kayra.automation import semantic_match
+        EMBEDDER = semantic_match.local_embedder() or False
+    return EMBEDDER or None
+
+
+def _wa_ready():
+    """WhatsApp open and its chat list loaded: the list, or an ActionResult to return."""
+    stop = _bridge_at((1, 9, 0))
+    if stop:
+        return None, stop
+    _ensure_tab("web.whatsapp.com", WHATSAPP)
+    listing = _ready("chat.list", lambda r: bool((r or {}).get("ready")), 15.0, max=60) or {}
+    if not listing.get("ready"):
+        return None, ActionResult.failure("WhatsApp isn't ready. Is it open and logged in?")
+    return listing.get("chats") or [], None
+
+
+def _wa_find(name):
+    """(chat dict, None) | (None, ActionResult). Visible list first, then WhatsApp's own search."""
+    from kayra.automation import semantic_match as S
+    chats, problem = _wa_ready()
+    if problem:
+        return None, problem
+
+    def decide(rows):
+        cands = [S.Candidate(c["name"], recent=i, data=c) for i, c in enumerate(rows)]
+        return S.match(name, cands, embed=_embedder())
+
+    found = decide(chats)
+    searched = False
+    if found.decision != S.PICK:
+        # Not clearly in the visible list: WhatsApp's own search, then match its results.
+        if (_call("page.type", field="search", text=name, clear=True) or {}).get("typed"):
+            searched = True
+            listing = _ready("chat.list", lambda r: bool((r or {}).get("chats")), 4.0, max=30) or {}
+            again = decide(listing.get("chats") or [])
+            if again.decision != S.NONE or found.decision == S.NONE:
+                found = again
+    if found.decision == S.PICK:
+        return found.best.data, None
+    if searched:
+        # Nothing will be opened: empty WhatsApp's search box again, or every later chat list
+        # (who messaged me, the next open) would only see this search's results.
+        _call("page.type", field="search", text="", clear=True)
+    if found.decision == S.ASK:
+        a, b = [c.name for c in found.top(2)]
+        return None, ActionResult(Status.AMBIGUOUS, f"Do you mean {a} or {b}?", {"candidates": [a, b]})
+    return None, ActionResult.not_found(f"I don't see a chat called {name} in WhatsApp.")
+
+
+def _wa_open(chat):
+    """Opens `chat` (a chat.list row) and waits until its conversation is the one shown."""
+    _call("chat.open", name=chat["name"])
+    shown = _ready("chat.messages", lambda r: (r or {}).get("chat") == chat["name"], 4.0, limit=1) or {}
+    return shown.get("chat") == chat["name"]
+
+
+def wa_open(name):
+    """H0.4: "open the PR group" / "open XYZ chat" inside WhatsApp."""
+    chat, problem = _wa_find(name)
+    if problem:
+        return problem
+    if not _wa_open(chat):
+        return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
+    unread = f" {chat['unread']} unread." if chat.get("unread") else ""
+    return ActionResult.success(f"Opened {chat['name']}.{unread}")
+
+
+def wa_unread():
+    """H0.4: "who messaged me" — the chats with unread messages, by name and count."""
+    chats, problem = _wa_ready()
+    if problem:
+        return problem
+    waiting = [c for c in chats if c.get("unread")]
+    if not waiting:
+        return ActionResult.success("No unread WhatsApp messages.")
+    parts = [f"{c['name']} ({c['unread']})" for c in waiting[:6]]
+    more = f", and {len(waiting) - 6} more chats" if len(waiting) > 6 else ""
+    return ActionResult.success(f"Unread on WhatsApp: {', '.join(parts)}{more}. Say read and a name "
+                                "to hear one.")
+
+
+def _today_marks():
+    now = datetime.date.today()
+    return {f"{now.day}/{now.month}/{now.year}", f"{now.month}/{now.day}/{now.year}",
+            f"{now.day:02d}/{now.month:02d}/{now.year}", f"{now.month:02d}/{now.day:02d}/{now.year}"}
+
+
+def wa_read(name, today=False):
+    """H0.4: "read the PR group" / "what did they say in the core team today"."""
+    if name in ("", "current", "this", "it"):
+        stop = _bridge_at((1, 9, 0))
+        if stop:
+            return stop
+        data = _call("chat.messages", limit=30) or {}
+        if not data.get("chat"):
+            return ActionResult.not_found("No chat is open in WhatsApp.")
+    else:
+        chat, problem = _wa_find(name)
+        if problem:
+            return problem
+        if not _wa_open(chat):
+            return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
+        data = _call("chat.messages", limit=30) or {}
+    messages = data.get("messages") or []
+    if today:
+        marks = _today_marks()
+        messages = [m for m in messages if m.get("date") in marks]
+    title = data.get("chat") or name
+    if not messages:
+        return ActionResult.success(f"No messages in {title}{' today' if today else ''}.")
+    lines = [f"{'You' if m.get('out') else (m.get('from') or 'They')}: {m.get('text')}" for m in messages]
+    if len(lines) <= 4:
+        return ActionResult.success(f"In {title}: " + " ... ".join(_short(l, 200) for l in lines))
+    spoken = ai.summarize(
+        "You are Kayra. Summarize this WhatsApp conversation for the user in two to four spoken "
+        "sentences: who said what that matters, any question for the user, any plan or time. "
+        "Never read out codes, OTPs or passwords.",
+        f"Chat: {title}\n" + "\n".join(lines[-30:]), fallback="", local_only=True)
+    if not spoken:                       # no local model: the latest few, not a cloud summary
+        return ActionResult.success(f"The latest in {title}: " + " ... ".join(_short(l, 160) for l in lines[-3:]))
+    return ActionResult.success(spoken)
+
+
+def message_send(contact, text, confirmed_chat=None, action=None):
+    """
+    H0.4: "tell Rahul I'm running late". Finds and OPENS the chat first, then ALWAYS asks —
+    "Send 'I'm running late' to Rahul Sharma?" — naming the chat it resolved, not the words
+    said. On yes: the same chat is checked to be the open one, the text typed and read back,
+    then sent, and the sent message is looked for.
+    """
     if not contact or not text:
         return ActionResult.failure("Who should I message, and what should I say?")
-    _ensure_tab("web.whatsapp.com", "https://web.whatsapp.com/")
-    # Each step is tried until the page is ready for it (WhatsApp can take ten seconds to load
-    # and under one when it is already open) instead of pausing 3 + 1.5 + 1 seconds every time.
-    if not _until(lambda: (_call("page.type", field="search", text=contact, clear=True)
-                           or {}).get("typed"), 10.0):
-        return ActionResult.failure("WhatsApp isn't ready. Is it logged in?")
-    if not _until(lambda: (_call("page.click", text=contact, nth=1) or {}).get("clicked"), 4.0):
-        return ActionResult.not_found(f"I couldn't find {contact} in WhatsApp.")
-    typed = _until(lambda: (lambda r: r if r.get("typed") else None)(
-        _call("page.type", field="type a message", text=text, submit=True) or {}), 3.0) or {}
-    if not typed.get("typed"):
-        return ActionResult.failure("I opened the chat but couldn't type the message.")
-    return ActionResult.success(f"Sent to {contact}.")
+    if confirmed_chat is None:
+        chat, problem = _wa_find(contact)
+        if problem:
+            return problem
+        if not _wa_open(chat):
+            return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
+        if action is None:
+            return ActionResult.failure("I need to ask before sending a message.")
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed_chat": chat["name"]}, raw=action.raw)
+        return ActionResult(Status.NEEDS_CONFIRMATION, f"Send \"{_short(text, 120)}\" to {chat['name']}?",
+                            {"confirm": approved})
+    stop = _bridge_at((1, 9, 0))
+    if stop:
+        return stop
+    state = _call("chat.composer") or {}
+    if state.get("chat") != confirmed_chat:
+        return ActionResult.failure(f"{confirmed_chat} is no longer the open chat, so I didn't send it.")
+    typed = (_call("page.type", field="type a message", text=text, clear=True) or {}).get("typed")
+    readback = (_call("chat.composer") or {}).get("text", "")
+    if not typed or " ".join(readback.split()) != " ".join(str(text).split()):
+        return ActionResult.failure("I couldn't type the message exactly, so I didn't send it.")
+    if not _click_first(["Send"]):
+        _call("page.type", field="type a message", text="", submit=True)    # Enter in the composer
+    sent = _ready("chat.messages", lambda r: any(m.get("out") and " ".join(m.get("text", "").split())
+                                                 == " ".join(str(text).split())
+                                                 for m in ((r or {}).get("messages") or [])[-3:]), 4.0, limit=5) or {}
+    ok = any(m.get("out") and " ".join(m.get("text", "").split()) == " ".join(str(text).split())
+             for m in (sent.get("messages") or [])[-3:])
+    return ActionResult.success(f"Sent to {confirmed_chat}." if ok else
+                                f"I pressed send in {confirmed_chat}; I couldn't see it arrive yet.")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

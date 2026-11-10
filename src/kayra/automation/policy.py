@@ -280,7 +280,11 @@ _CONFIRM_ACTIONS = {
     # Round 3 (2026-11-10): things that spend, send, publish, remove or close a lot.
     "system.update_system", "system.install", "system.uninstall", "system.wifi_forget",
     "system.close_except", "system.close_hog",
-    "browser.tabs_close_others", "browser.tabs_close_side", "email.send", "message.send", "calendar.add",
+    "browser.tabs_close_others", "browser.tabs_close_side", "email.send", "calendar.add",
+    # message.send is NOT here since Part 5: the handler resolves and opens the chat FIRST and
+    # then always asks with the chat's real name ("Send 'x' to Rahul Sharma?"); asking here as
+    # well would ask twice, the first time about words, not a chat. It never sends without that
+    # yes — asserted in tests/test_browser_control.py [19].
     "meet.share",                # your whole screen goes to everyone in the call
     "diagnose.fix", "dev.git_commit", "email.delete", "email.spam",
 }

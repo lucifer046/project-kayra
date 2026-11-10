@@ -12,6 +12,9 @@ order. Newest last.
 | [V5](UPDATE_V5.md) | 2026-11-10 | Meetings and screen sharing: four misroutes fixed, share the named window/monitor/tab (Part 2M) | Bug fixes, feature, test hygiene |
 | [V6](UPDATE_V6.md) | 2026-11-10 | Tabs and windows finished: close by site, tab groups, windows, the Nth result, find with highlight (Part 2c) | Feature |
 | [V7](UPDATE_V7.md) | 2026-11-10 | About the page, comments, video summaries, translate, bookmarks, history, downloads, "it", search here (Part 3) | Feature, bug fix |
+| [V8](UPDATE_V8.md) | 2026-11-10 | Google Workspace by voice: Sheets, Docs, Slides, Drive, Gmail, Calendar, Meet, Keep, Forms, Classroom (Part 4) | Feature |
+| [V9](UPDATE_V9.md) | 2026-11-10 | Tuning pass: rules before the classifier, waits inside the browser, relevant text, spoken names, site lookups fixed on live sites | Performance, accuracy, fixes |
+| [V10](UPDATE_V10.md) | 2026-11-10 | WhatsApp by voice, the app in front, and a semantic name matcher (Part 5) | Feature, privacy, fixes |
 
 ## Adding an update
 

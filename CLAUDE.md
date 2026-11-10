@@ -81,6 +81,12 @@ process. A tier-1 suite must not read the host (battery, load, `.env`, memory st
   which moves the window's composition to the GPU; shadows are cached layers; confirmations are
   the in-window `ConfirmDialog` (no `QMessageBox`). `KAYRA_UI_GPU=off` / `KAYRA_UI_PROFILE=1`.
   Measurements and the reverted snapshot fade: `docs/reference/UI.md` → GPU rendering.
+- **Rules before the classifier (V9)**: `common.direct_tokens`, registered through
+  `llm_engine.set_rule_router` in `app.bootstrap`, answers allow-listed browser / Workspace /
+  Meet / Gmail / Calendar utterances in < 1 ms (was ~0.47 s per command); open-ended shapes still
+  go to the model. Add a new command's action to `_DIRECT_BROWSER` only when its whole-utterance
+  shape cannot be conversation, and add the phrasing to `tests/test_dmm_browser.py`. Do NOT make
+  the understanding prompt vary per site — it would break LM Studio's prompt cache (measured).
 - **The UI is responsive down to 480×520** (was a 1040px minimum): compact rail below 1100,
   Home's wide/medium/narrow layouts, settings rows that stack. Never pin a column with
   `setFixedWidth` in `resizeEvent`. See `docs/reference/UI.md` → Responsive layout.
@@ -246,6 +252,17 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   transcript, translate, bookmarks, history, downloads, "it" (`web_macros.LAST_TAB`, set only
   by name), `search_here`, `page_help`. Clearing history, deleting bookmarks and opening a
   download ALWAYS ask (late confirmation with exact ids); a program is never opened.
+- **Part 4 (2026-11-10, extension 1.7.0) — Google Workspace.** File NAMES (D3) are read with
+  `page.docList` and matched locally (`web_macros.rank_titles`) — never sent to a model. Sheet
+  values come from `page.fetchText` (docs.google.com only — the extension's ONE fetch, test-
+  fenced) and are computed in Python; a Doc is read from its txt export (the editor is a canvas,
+  so its Find is Ctrl+F). Share only fills the address; Kayra never presses Send.
+- **Part 5 (2026-11-10, extension 1.9.0) — WhatsApp.** Names go through
+  `automation/semantic_match.py` (pick / ask / none; meaning from LOCAL embeddings may only
+  ASK). `common.front_site` decides "in front" (Chrome's tab only when Chrome is in front).
+  WhatsApp text is summarized with `ai.summarize(..., local_only=True)` — never a cloud model.
+  `message.send` is a late confirmation naming the RESOLVED chat (not in the static CONFIRM set);
+  it re-checks the open chat before sending.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and
