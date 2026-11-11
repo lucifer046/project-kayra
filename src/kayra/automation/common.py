@@ -819,6 +819,9 @@ def normalize_command(command, context=None):
 
     # 1a''. Workspace phrasings without the `browser` prefix (Part 4): "open my budget sheet"
     # is a file in Sheets, never an app called "my budget sheet".
+    found = profile_action(lowered, raw, raw)           # Part 5P: "open my Work Chrome"
+    if found is not None:
+        return found
     found = _bare_workspace(lowered, raw)
     if found is not None:
         return found
@@ -1275,6 +1278,9 @@ def _web_action(kind, payload, raw):
             return Action("browser", "search_close", target="search", raw=raw)
         if _WA_NAMED_RE.fullmatch(low) or _WA_READ_RECENT.fullmatch(low) or last_messages_request(low):
             return _web_action("message", payload, raw)      # "browser open X group in whatsapp"
+        found = profile_action(low, raw, text)             # Part 5P: Chrome profiles
+        if found is not None:
+            return found
         found = part_6b_action(low, raw, text)             # Part 6b: AI sites, Reddit / LinkedIn / GitHub
         if found is not None:
             return found
@@ -2288,6 +2294,81 @@ def part_6b_direct(low, text, situation_fn=None):
     return [f"message {text}"]
 
 
+# ── Part 5P: Chrome profiles (BROWSER_CONTROL_PLAN §14) ──
+# The SHAPES only. Which profile a name means is decided at run time from Chrome's own
+# `Local State` (`automation.chrome_profiles`) — the parser never reads it, so no suite and no
+# parse touches the host's profiles.
+_PB = r"(google chrome|chrome|chromium|brave|microsoft edge|edge)"
+_PROFILE_NOT = re.compile(r"^(?:google|my|our|new|a new|the|incognito|private|a private|guest|full ?screen|dark mode|"
+                          r"another|the other|other)$|\b(?:window|tab|tabs|incognito|private mode|screen)\b")
+_PROFILE_LIST_RE = re.compile(r"(?:which|what) (?:" + _PB + r" )?profiles (?:do i have|are there|have i got)"
+                              r"(?: (?:in|on|for) " + _PB + r")?|(?:list|show|tell)(?: me)? (?:all )?(?:my |the )?"
+                              r"(?:" + _PB + r" )?profiles(?: (?:in|on|for) " + _PB + r")?")
+_PROFILE_AS_RE = re.compile(r"(?:open|launch|start|run) (?:up )?(?:google )?" + _PB + r" (as|with|for|on|in|using|under|"
+                            r"logged in as|signed in as|with the account) (my |the )?(.+?)(?: profile| account| user)?")
+_PROFILE_MY_RE = re.compile(r"(?:open|launch|start) (?:up )?(?:my |the )?(.+?)(?:'s|’s| s)? (?:google )?" + _PB +
+                            r"(?: profile| window| browser)?")
+_PROFILE_SWITCH_RE = re.compile(r"(?:switch|change|go) to (?:my |the )?(.+?) (?:" + _PB + r" )?profile|"
+                                r"use (?:my |the )?(.+?) (?:" + _PB + r" )?profile")
+_PROFILE_URL_RE = re.compile(r"(?:open|launch) (.+?) in (?:my |the )?(.+?)(?:'s|’s| s)? (?:google )?" + _PB +
+                             r"(?: profile| window)?|(?:open|launch) (.+?) in (?:google )?" + _PB +
+                             r" (?:as|with|on|for) (?:my |the )?(.+?)(?: profile| account)?")
+
+
+def _profile_name_ok(name, strict=True):
+    """A plausible profile name. `strict` (the user did not say "my" / "as"): a site's name is
+    the site ("open chrome with youtube"), never a profile."""
+    name = name.strip()
+    if not name or _PROFILE_NOT.search(name) or re.search(r"\b(?:in|on|with|at|using|into|and)$", name):
+        return False
+    return not (strict and targets.website_url(name) and not spoken_email(name))
+
+
+def profile_action(low, raw, text=None):
+    """'open my Work Chrome', 'open Chrome as Ravi', 'open Gmail in my Study Chrome', 'which Chrome
+    profiles do I have' -> a structured action, or None."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+
+    def act(name, browser, url=""):
+        found = re.search(re.escape(name.strip()), text, re.I)
+        said = found.group(0) if found else name.strip()
+        if said.lower() in ("guest", "a guest", "guest mode"):
+            return Action("browser", "chrome_guest", target="guest", parameters={"browser": browser}, raw=raw)
+        return Action("browser", "chrome_profile", target=said,
+                      parameters={"browser": browser, "url": url, "email": spoken_email(name)}, raw=raw)
+
+    m = _PROFILE_LIST_RE.fullmatch(low)
+    if m:
+        browser = next((g for g in m.groups() if g), "chrome")
+        return Action("browser", "chrome_profiles", target=browser, parameters={"browser": browser}, raw=raw)
+    m = re.fullmatch(r"(?:open|launch|start) (?:google )?" + _PB + r" (?:as|in) (?:a )?guest(?: mode)?", low)
+    if m:
+        return Action("browser", "chrome_guest", target="guest", parameters={"browser": m.group(1)}, raw=raw)
+    m = _PROFILE_URL_RE.fullmatch(low)
+    if m:
+        site, name, browser = (m.group(1), m.group(2), m.group(3)) if m.group(1) else (m.group(4), m.group(6), m.group(5))
+        url = targets.website_url(site.strip()) or ""
+        if url and _profile_name_ok(name):
+            return act(name, browser, url)
+    m = _PROFILE_AS_RE.fullmatch(low)
+    if m and _profile_name_ok(m.group(4), strict=not (m.group(2) in ("as", "logged in as", "signed in as",
+                                                                     "with the account", "under") or m.group(3))):
+        return act(m.group(4), m.group(1))
+    m = _PROFILE_SWITCH_RE.fullmatch(low)
+    if m:
+        name = m.group(1) or m.group(3)
+        browser = m.group(2) or m.group(4) or "chrome"
+        if _profile_name_ok(name):
+            return act(name, browser)
+    m = _PROFILE_MY_RE.fullmatch(low)
+    owned = len(low.split()) > 1 and low.split()[1] == "my" or bool(re.search(r"'s|’s", low))
+    if m and _profile_name_ok(m.group(1), strict=not owned) and (owned or low.split()[1] == "the"
+                                                                 or len(m.group(1).split()) <= 3):
+        return act(m.group(1), m.group(2))
+    return None
+
+
 # ── Rules before the classifier (tuning pass V9) ──
 # A whole utterance that the rules understand COMPLETELY and that can only mean one command is
 # routed straight to them, skipping the classifier model (~0.45 s on the local model, and its
@@ -2457,6 +2538,8 @@ def _direct_one(utterance, situation_fn=None):
         return [f"message {text}"]                      # "open graphics team group in whatsapp"
     if last_messages_request(low) and not re.search(r"\b(?:e-?mails?|mails?|gmail|inbox)\b", low):
         return [f"message {text}"]                      # "read the last three messages of mota panda"
+    if profile_action(low, f"browser {text}", text) is not None:
+        return [f"browser {text}"]                      # Part 5P: a Chrome profile
     found = part_6_direct(low, text, situation_fn)
     if found:
         return found                                    # Part 6: forms, video, site search, shopping

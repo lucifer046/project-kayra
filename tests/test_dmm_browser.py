@@ -154,6 +154,12 @@ CASES = (
     ("open the github repo pallets/flask", WEB, "browser.social", "repo"),
     ("search linkedin jobs for data analyst", WEB, "browser.site_search", "data analyst"),
     ("open the budget sheet and total column c", WEB, "browser.ws_open", "budget"),
+    # Part 5P: Chrome profiles
+    ("open my work chrome", WEB, "browser.chrome_profile", "work"),
+    ("open chrome as kiran", WEB, "browser.chrome_profile", "kiran"),
+    ("open gmail in my study chrome", WEB, "browser.chrome_profile", "study"),
+    ("which chrome profiles do I have", WEB, "browser.chrome_profiles", None),
+    ("open chrome", WEB, "app.open", "chrome"),
     ("what is chatgpt", WEB, "chat", None),
     ("is claude better than gemini", WEB, "chat", None),
     ("what's the price of gold today", WEB, "chat", None),

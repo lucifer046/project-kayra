@@ -123,6 +123,9 @@ SITES & SHOPPING (search and open only — never add to a cart, buy or pay):
   browser search amazon for <product> under <price> | browser images of <thing> |
   browser sort by price low to high | browser show only under <price> | browser how much is this |
   browser what's the rating
+CHROME PROFILES (names come from Chrome itself; copy what was said): browser open my <name> chrome |
+  browser open chrome as <name or email> | browser open <site> in my <name> chrome |
+  browser which chrome profiles do i have | browser open chrome as a guest
 AI SITES, REDDIT, LINKEDIN, GITHUB: browser read chatgpt's answer | browser read the whole answer |
   browser open r/<subreddit> | browser what's the top post on r/<subreddit> this week |
   browser what's trending on reddit | browser read my <linkedin | github | reddit> notifications |

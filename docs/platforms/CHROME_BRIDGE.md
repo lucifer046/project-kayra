@@ -140,6 +140,7 @@ anywhere else; one is never needed for an unpacked extension.
 | "read my LinkedIn notifications", "any new GitHub notifications", "read my LinkedIn messages" | opens that page and reads the latest five |
 | "what's the top post on r/python this week", "what's trending on Reddit", "open r/python", "open the github repo pallets/flask", "search LinkedIn jobs for data analyst" | Reddit / GitHub / LinkedIn by voice |
 | "open the budget sheet and total column C", "tick I agree and then submit this form" | several steps in one sentence, in order; a step that asks first holds the rest until you answer |
+| "open my Work Chrome", "open Chrome as Kiran", "open Chrome on ana at school dot edu", "open Gmail in my Study Chrome", "which Chrome profiles do I have", "open Chrome as a guest" | Chrome straight into that profile (no "Who's using Chrome?" picker), read from Chrome's own list every time; asks when two profiles fit. Works without the extension |
 | "add this to cart", "buy it now", "checkout" | **refused** (decision D1, 2026-11-11): Kayra searches and opens products only; the cart and paying are yours |
 
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the

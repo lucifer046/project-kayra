@@ -18,6 +18,7 @@ order. Newest last.
 | [V11](UPDATE_V11.md) | 2026-11-11 | Fix round: scrolling inside web apps, one search action + "close the search", WhatsApp chats by loose name from anywhere, file names said the short way | Fixes, tuning |
 | [V12](UPDATE_V12.md) | 2026-11-11 | Forms with your saved details, drop-downs, ticks, dates, submit, file upload; video controls; search any site, sort and filter shops, product facts; shopping stops before the cart (Part 6a) | Feature, privacy |
 | [V13](UPDATE_V13.md) | 2026-11-11 | Ask ChatGPT / Claude / Gemini, WhatsApp replies and files, Reddit / LinkedIn / GitHub, several steps in one sentence (Part 6b) | Feature, safety |
+| [V14](UPDATE_V14.md) | 2026-11-11 | Open Chrome straight into a profile, read from Chrome itself: by name, account, email or domain (Part 5P) | Feature, privacy |
 
 ## Adding an update
 

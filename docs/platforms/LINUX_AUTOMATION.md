@@ -327,6 +327,23 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — round 5, part 5P: Chrome profiles
+
+- "open my Work Chrome", "open Chrome as Kiran", "open Chrome on <spoken email>", "open Gmail in
+  my Study Chrome", "switch to my Study 2 profile", "which Chrome profiles do I have", "open
+  Chrome as a guest" (also Chromium / Brave / Edge). Profiles are read from the browser's own
+  `Local State` every time (re-parsed when it changes), so renaming a profile in Chrome needs
+  nothing else. `automation/chrome_profiles.py`; the folder comes from
+  `platforms.browser_user_data_dirs()`.
+- Launch: `<binary> --profile-directory=<folder> [url]` (argv through `RUNNER`), the new window
+  focused. Ambiguous names ask once ("Which one: Work (…), Study (…) or Study 2 (…)?"); unknown
+  names list the profiles; an unreadable file says so.
+- Privacy: names and emails are matched on this computer only; nothing is logged in full or
+  sent to a model. `tests/test_profile_privacy_guard.py` checks the repository never contains
+  them.
+- Tests: `tests/test_chrome_profiles.py` (100), `test_dmm_browser.py` +5 (115/115 locally).
+- **Not done**: the extension in more than one profile (P4), "always open Chrome as X".
+
 ### 2026-11-11 — round 5, part 6 (slice 6b): ask ChatGPT / Claude / Gemini, WhatsApp files, Reddit / LinkedIn / GitHub, several steps (extension 1.13.0)
 
 - **F4** `browser.ai_ask` / `ai_read` — "ask ChatGPT what a monad is", "ask Claude to …", "what

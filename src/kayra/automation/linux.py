@@ -2122,6 +2122,11 @@ def _dispatch(action):
     return _dispatch_extended(domain, verb, target, params, action)
 
 
+def _profiles():
+    from kayra.automation import chrome_profiles
+    return chrome_profiles
+
+
 def _dispatch_extended(domain, verb, target, params, action):
     """Round 3 domains: web, diagnostics, screen, scenes, plans, triggers, files, dev."""
     from kayra.automation import (web_macros as W, diagnostics as D, screen_ai as V,
@@ -2227,7 +2232,12 @@ def _dispatch_extended(domain, verb, target, params, action):
                                             bool(params.get("new"))),
                  "ai_read": lambda: W.ai_read("" if target == "current" else target, bool(params.get("full"))),
                  "social": lambda: W.social(target, params.get("site", ""), params.get("name", ""),
-                                            params.get("period", ""), params.get("read", True))}
+                                            params.get("period", ""), params.get("read", True)),
+                 # ── Part 5P: Chrome profiles, read from Chrome's own Local State ──
+                 "chrome_profile": lambda: _profiles().open_profile(target, params.get("browser", ""),
+                                                                    params.get("url", ""), params.get("email", "")),
+                 "chrome_profiles": lambda: _profiles().list_profiles(params.get("browser", "")),
+                 "chrome_guest": lambda: _profiles().open_guest(params.get("browser", ""))}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":

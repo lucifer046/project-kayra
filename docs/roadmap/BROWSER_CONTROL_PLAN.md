@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, the V9 / V11 fix rounds and 6 (6a + 6b) done (2026-11-11).**
-> See §10 for the parts and what is next (5P Chrome profiles, then Part 7; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, the V9 / V11 fix rounds and 6 (6a + 6b) done (2026-11-11).**
+> See §10 for the parts and what is next (Part 7 next; 5P's P4 open; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -478,9 +478,32 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 4 | E1–E8 Google Workspace (needs D3 answered) | **done 2026-11-10** (D3 approved; extension 1.7.0). Left for later: Sheets add-row/sort/chart, Gmail mark-all-read/attach, Calendar move, Meet layout/recording, Drive share |
 | 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | **done 2026-11-10** (extension 1.9.0; not yet tried on a live, logged-in WhatsApp) |
 | 5F | Fix round V11 after live use of Parts 4–5: scrolling inside web apps, one search action + close search, WhatsApp chats by loose name from anywhere, "recent chat", year ranges and recency for file names | **done 2026-11-11** (extension 1.11.0 after the second pass from the audit log; `updates/UPDATE_V11.md`; not yet re-tried on live Gmail / WhatsApp / Sheets) |
-| 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | planned |
+| 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | **done 2026-11-11** (P1, P2, P3, P5; `updates/UPDATE_V14.md`). Open: P4 (the extension in several profiles), "always open Chrome as X" (a Settings key), spoken aliases (H2) |
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **done 2026-11-11** — 6a (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`); 6b (F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply + send a file, F6 Reddit/LinkedIn/GitHub, G5 several steps; extension 1.13.0; `updates/UPDATE_V13.md`) |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Part 5P — Chrome profiles** (done 2026-11-11; §14 P1, P2, P3, P5). Detail:
+`updates/UPDATE_V14.md`.
+- P1 `automation/chrome_profiles.py` reads `Local State` (`profile.info_cache`) of Chrome,
+  Chromium, Brave or Edge — folder from `platforms.browser_user_data_dirs()` (all three backends)
+  — and re-parses only when its mtime / size changes; an unreadable file is said so, plain "open
+  Chrome" still works. Nothing about any profile is in code or config.
+- P2 `common.profile_action` (shapes only; the parser never reads the file): "open my X Chrome",
+  "open Chrome as / with / on X", "open X's Chrome", "open <site> in my X Chrome", "switch to my X
+  profile", "which Chrome profiles do I have", "open Chrome as a guest". `resolve()` tiers:
+  profile name > email / its prefix > account name > domain (whole or any label) > position >
+  loose match; ties ask ONE question naming name + account.
+- P3 `<binary> --profile-directory=<folder> [url]` through `linux.RUNNER`, the new window
+  focused, "Opened Chrome as Work (account name)".
+- P5 `tests/test_chrome_profiles.py` (unit, made-up Local State) and
+  `tests/test_profile_privacy_guard.py` (integration: the real profiles' emails, prefixes,
+  domains and account names must not be in any tracked file; prints only file + kind). Its
+  first run flagged a public portal URL in the site table that shares a hosted domain — web
+  addresses are now allowed, everything else still fails.
+- **Open**: P4 (one bridge connection per profile; "Chrome is open as X but the extension isn't
+  installed there"), "always open Chrome as X" (needs a Settings control), spoken aliases (H2).
+  Not tried by voice on the live machine (the parser and launcher were checked with recorded
+  argv; the resolver was checked against this machine's real profiles, counts only).
 
 **Part 6b — AI sites, WhatsApp files, Reddit / LinkedIn / GitHub, several steps** (done
 2026-11-11, extension 1.13.0, no new permission). Detail: `updates/UPDATE_V13.md` and the
@@ -958,7 +981,7 @@ the user's system.
 
 ---
 
-## 14. Chrome profiles  *(requested 2026-11-10, planned — part 5P)*
+## 14. Chrome profiles  *(requested 2026-11-10; P1, P2, P3, P5 done 2026-11-11 — part 5P; P4 and the default-profile setting open)*
 
 **What the user asked.** "Open Google Chrome" shows Chrome's *Who's using Chrome?* picker. The
 user has five profiles that they renamed themselves (for example Personal, Work, Study, Study 2

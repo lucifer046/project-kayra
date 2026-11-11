@@ -116,6 +116,14 @@ def default_browser_hint():
         return None
 
 
+def browser_user_data_dirs():
+    """[(browser key, user-data folder)] for Chromium-family browsers; [] when unknown."""
+    try:
+        return list(backend().browser_user_data_dirs())
+    except Exception:
+        return []
+
+
 def pointer_injector():
     """(injector, detail). The injector is None when the desktop cannot be driven."""
     try:
@@ -146,5 +154,5 @@ __all__ = [
     "backend", "is_windows", "is_linux", "active_window", "active_window_support",
     "reveal_command", "file_manager_label", "prefers_reduced_motion", "displays",
     "default_browser_hint", "pointer_injector", "automation_support",
-    "battery_status",
+    "battery_status", "browser_user_data_dirs",
 ]

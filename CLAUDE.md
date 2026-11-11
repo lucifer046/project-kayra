@@ -286,6 +286,9 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   (`interpreter.from_model_ok`, also the planner). G5: `direct_tokens` splits "X and Y" only
   when both halves are complete commands; a batch parks its rest behind a yes. Adding a 6b
   paragraph to the DMM preamble broke "mute me" on the local model — keep new shapes rules-first.
+- **Part 5P (2026-11-11) — Chrome profiles.** `automation/chrome_profiles.py` reads `Local State`
+  (folder from `platforms.browser_user_data_dirs()`) at run time, never at parse time; no
+  profile data in code or config, ever — `tests/test_profile_privacy_guard.py` enforces it.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

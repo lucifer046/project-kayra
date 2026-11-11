@@ -468,3 +468,17 @@ def battery_status(root=None):
         "level": _read(os.path.join(battery, "capacity_level")),
         "name": os.path.basename(battery),
     }
+
+
+# Chromium-family browsers keep every profile under one "user data" folder, whose `Local State`
+# file lists the profiles (Part 5P). Same format for all four; only the folder differs.
+_CHROMIUM_DATA = (("google-chrome", "google-chrome"), ("chromium", "chromium"),
+                  ("brave", os.path.join("BraveSoftware", "Brave-Browser")),
+                  ("microsoft-edge", "microsoft-edge"))
+
+
+def browser_user_data_dirs():
+    """[(browser key, user-data folder)] for the Chromium-family browsers, in preference order.
+    Folders are listed whether or not they exist; the caller checks."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return [(key, os.path.join(config_home, sub)) for key, sub in _CHROMIUM_DATA]
