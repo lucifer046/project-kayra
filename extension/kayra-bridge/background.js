@@ -600,7 +600,16 @@ function gmailOpen(which, nth, query) {
   };
   let pool = rows.map((r, i) => ({r, i, info: info(r)}));
   const q = String(query || "").toLowerCase().trim();
-  if (q) pool = pool.filter((p) => (p.info.name + " " + p.info.email + " " + p.info.subject).toLowerCase().includes(q));
+  // 1.16.1: "iitm bs meet up team" finds "IITM BS Meetup Team" — spaces and punctuation are not
+  // part of a name, and every spoken word being there (in any order) is a match too.
+  const compact = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const qWords = q.split(/\s+/).map(compact).filter((w) => w.length > 1);
+  if (q) pool = pool.filter((p) => {
+    const text = (p.info.name + " " + p.info.email + " " + p.info.subject).toLowerCase();
+    const flat = compact(text);
+    return text.includes(q) || (compact(q) && flat.includes(compact(q))) ||
+      (qWords.length > 1 && qWords.every((w) => flat.includes(w)));
+  });
   if (which === "unread") pool = pool.filter((p) => p.info.unread);
   if (!pool.length) return {opened: false, reason: q ? "no email matches " + q : "no matching email"};
   let pick;

@@ -81,8 +81,21 @@ def year_ranges(words):
     return out
 
 
+def _join_letters(words):
+    """L4: "P.R." / "p r" -> "pr": a name spelled out letter by letter is one short word."""
+    out, run = [], False
+    for word in words:
+        single = len(word) == 1 and word.isalpha()
+        if single and run:
+            out[-1] += word
+        else:
+            out.append(word)
+        run = single or (run and single)
+    return out
+
+
 def tokens(text, keep_stop=False):
-    words = re.findall(r"[a-z0-9]+", _numbers(str(text or "").lower()))
+    words = _join_letters(re.findall(r"[a-z0-9]+", _numbers(str(text or "").lower())))
     return year_ranges(words if keep_stop else [w for w in words if w not in _STOP])
 
 
@@ -112,6 +125,13 @@ def _word_hit(spoken, name_words):
     return best
 
 
+# L4 (audit log 2026-11-11): "core team" offered "Outreach team 2026" and "Namita Graphics Team"
+# — they share only "team". Words like these say what KIND of chat it is, not which one: a
+# name matched ONLY on them, while a distinctive spoken word found nothing, is no match.
+GENERIC = frozenset("team teams club official family friends class batch committee members "
+                    "society admins admin community squad gang updates announcements".split())
+
+
 def lexical(query, name):
     """0..1: how much of what was said is in the name, lightly penalising a much longer name."""
     q, n = tokens(query), tokens(name)
@@ -121,6 +141,9 @@ def lexical(query, name):
         return 1.0
     hits = [_word_hit(w, n) for w in q]
     coverage = sum(hits) / len(q)
+    distinctive = [h for w, h in zip(q, hits) if w not in GENERIC and not w.isdigit()]
+    if coverage and distinctive and not any(distinctive):
+        return 0.0                                        # only "team" matched: not this chat
     if coverage == 0:
         initials = "".join(w[0] for w in tokens(name, keep_stop=True))
         if len(q) == 1 and 2 <= len(q[0]) <= 6 and q[0].isalpha() and initials.startswith(q[0]):

@@ -572,7 +572,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.16.0")
+        web_macros.BRIDGE = current = Bridge(version="1.16.1")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1795,11 +1795,13 @@ def section_part_4():
         r = rig.do("browser open my holiday sheet")
         check("E1: no match is said so", not r.ok and "holiday" in r.message, r.message)
         waits = [a for c, a in rig.bridge.calls if c == "page.docList"]
-        check("V9: from 1.8.0 the file list is ONE call that waits inside the browser (waitMs)",
-              all(a.get("waitMs") == 6000 for a in waits) and rig.bridge.doclist_calls == len(waits) == 4, waits)
-        check("V11: a name Google's search does not find is looked for once more in the recent list",
+        check("V9: from 1.8.0 the file list is ONE call that waits inside the browser (waitMs; "
+              "2 s for the list already on screen, L7)",
+              all(a.get("waitMs") in (6000, 2000) for a in waits) and rig.bridge.doclist_calls == len(waits) == 4, waits)
+        check("L7: a name Google's search does not find is looked for once more — in Drive (every kind) — "
+              "and that is the LAST page load (two at most, was three)",
               [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")][-2:] ==
-              ["https://docs.google.com/spreadsheets/u/0/?q=holiday", "https://docs.google.com/spreadsheets/u/0/?q="],
+              ["https://docs.google.com/spreadsheets/u/0/?q=holiday", "https://drive.google.com/drive/search?q=holiday"],
               [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")])
         tabs_open = [a for c, a in rig.bridge.calls if c == "tabs.open"]
         check("V9: a tab already on the Sheets list is reused (search 2); an OPEN sheet is never "
@@ -2609,7 +2611,7 @@ def section_fix_round_v11():
                 run_tokens(["message open cultural core team"])
             check("LOG: the model proposing the SAME command does not run it a second time (it ran twice)",
                   [a["text"] for c, a in rig.bridge.calls if c == "chat.search"].count("cultural core team") == 1,
-                  [a for c, a in rig.bridge.calls if c == "chat.search"])
+                  [a for c, a in rig.bridge.calls if c in ("chat.search", "page.searchClose")])
             rig.bridge.open_chat = "Rahul Sharma"
             r = rig.do("message close this chat")
             check("'close the chat' closes the open conversation", rig.bridge.open_chat == "" and r.message == "Closed the chat.", r.message)
@@ -4525,6 +4527,7 @@ def main():
         section_part_7()
         section_parts_8_to_10()
         section_parts_12_13()
+        section_audit_review_17()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()
@@ -4536,6 +4539,365 @@ def main():
           f"{size_before} -> {size_after}")
     check("nothing the developer owns was modified", not guard.modified(), guard.report())
     return check.finish()
+
+
+class LateBridge(Bridge):
+    """The extension of a Chrome that was closed: it connects only after Chrome is started."""
+
+    def __init__(self, runner, **kw):
+        super().__init__(version="1.16.0", **kw)
+        self.runner = runner
+
+    def connected(self):
+        return any(a[:1] == ["google-chrome-stable"] for a in self.runner.spawned)
+
+
+def section_audit_review_17():
+    check.section("[30] Part 17 — the audit-log review of 2026-11-11 (L1–L8)")
+    wa = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+    gmail = lambda: {"app": "google-chrome", "tab_url": "https://mail.google.com/mail/u/0/"}
+    tools = ALL_TOOLS + ("google-chrome-stable",)
+
+    # ── L1: Chrome closed is not "set up the extension" ──
+    runner = RecordingRunner(tools)
+    with WebRig(LateBridge(runner), runner=runner) as rig:
+        r = rig.do("browser list tabs")
+        check("L1: Chrome closed -> Kayra starts it, waits for the extension, then does the command",
+              r.ok and ["google-chrome-stable"] in rig.runner.spawned and "browser set up" not in r.message,
+              (r.message, rig.runner.spawned))
+    with WebRig(Bridge(connected=False), runner=RecordingRunner(tools)) as rig:
+        r = rig.do("browser list tabs")
+        check("L1: started, but the extension never connects -> says it started Chrome, then the setup hint",
+              r.status == Status.UNSUPPORTED and "started Chrome" in r.message and "browser set up" in r.message,
+              r.message)
+    chrome = FakeHyprland([client("0xc", "google-chrome", "New Tab - Google Chrome")], active="0xc")
+    with WebRig(Bridge(connected=False), hypr=chrome, runner=RecordingRunner(tools)) as rig:
+        r = rig.do("browser list tabs")
+        check("L1: Chrome RUNNING without the extension -> the setup hint, and no second Chrome",
+              r.status == Status.UNSUPPORTED and r.message == web_macros.SETUP_HINT and not rig.runner.spawned,
+              (r.message, rig.runner.spawned))
+
+    # ── L2: "send it" sends what is typed, after asking; placeholders never become names ──
+    d = common.direct_tokens
+    for said in ("send it", "press the send button", "click on send button", "okay send it", "send the message",
+                 "click sand button"):
+        check(f"L2: '{said}' with WhatsApp in front -> send the draft", d(said, wa) == ["message send the draft"],
+              d(said, wa))
+    check("L2: 'send it' with Gmail in front sends the email draft", d("send it", gmail) == ["email send"])
+    check("L2: 'send hello to raju' is still a message to raju, not the draft", d("send hello to raju", wa) is None)
+    check("L2: placeholders are recognised", web_macros.is_placeholder("(contact)") and web_macros.is_placeholder("<text>")
+          and web_macros.is_placeholder("[name]") and not web_macros.is_placeholder("Rahul (IITM)"))
+    clean = interpreter.validate(["message <contact>: <text>", "message (contact): (text)", "message open rahul"],
+                                 n, common.classify_action)
+    check("L2: a model reply that copies the catalog's <contact> is dropped", clean == ["message open rahul"], clean)
+    check("L2: a model may never send the draft on its own",
+          not interpreter.from_model_ok(n("message send the draft")))
+    with WebRig(WhatsApp11()) as rig:
+        rig.bridge.open_chat, rig.bridge.composer = "Rahul Sharma", "see you at 6"
+        r = rig.do("message send the draft")
+        check("L2: the draft is NOT sent before a yes, and the question names the open chat and the text",
+              r.status == Status.NEEDS_CONFIRMATION and r.message == 'Send "see you at 6" to Rahul Sharma?'
+              and rig.bridge.sent == [], r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("L2: on yes it is sent, and that is checked", rig.bridge.sent == ["see you at 6"] and "Sent to Rahul Sharma" in str(said),
+              (rig.bridge.sent, said))
+        rig.bridge.composer = "second"
+        r = rig.do("message (contact): (text)")
+        check("L2: the logged 'message (contact): (text)' becomes the same draft question, never a chat called (contact)",
+              r.status == Status.NEEDS_CONFIRMATION and "Rahul Sharma" in r.message and "(contact)" not in r.message, r.message)
+        rig.bridge.composer = "changed"
+        ok, said = linux.resolve_confirmation("yes")
+        check("L2: text changed between the question and the yes -> not sent", "second" not in rig.bridge.sent
+              and "changed" not in rig.bridge.sent, (rig.bridge.sent, said))
+        rig.bridge.composer = ""
+        r = rig.do("message send the draft")
+        check("L2: nothing typed -> said so", r.status == Status.NOT_FOUND and "Nothing is typed" in r.message, r.message)
+        r = rig.do("message <contact>: running late")
+        check("L2: a placeholder contact with real text asks who", not r.ok and "Who should I send" in r.message, r.message)
+
+    # ── L3: a search box that was not ready, and doubled commands ──
+    class FlakySearch(WhatsApp11):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.flaky = 1
+
+        def call(self, cmd, timeout=10.0, **args):
+            if cmd == "chat.search" and self.flaky and args.get("text"):
+                self.flaky -= 1
+                self.calls.append((cmd, args))
+                return {"searched": False, "typed": False}
+            return super().call(cmd, timeout=timeout, **args)
+
+    saved_embed = web_macros.EMBEDDER
+    web_macros.EMBEDDER = False
+    try:
+        with WebRig(FlakySearch()) as rig:
+            r = rig.do("message open old hostel friends")
+            check("L3: WhatsApp's search not usable at first -> closed and tried again IN the same request",
+                  r.ok and rig.bridge.open_chat == "Old Hostel Friends", r.message)
+            rig.bridge.calls.clear()
+            run_tokens(["message open nobody at all", "message open nobody at all"])
+            searches = [a.get("text") for c, a in rig.bridge.calls if c == "chat.search" and a.get("text")]
+            check("L3: the same command twice in one request runs once", searches.count("nobody at all") == 1, searches)
+
+        class NeverSearch(WhatsApp11):
+            def call(self, cmd, timeout=10.0, **args):
+                if cmd == "chat.search" and args.get("text"):
+                    return {"searched": False, "typed": False}
+                return super().call(cmd, timeout=timeout, **args)
+
+        with WebRig(NeverSearch()) as rig:
+            r = rig.do("message open old hostel friends")
+            check("L3: a search that never works is said honestly (not 'no such chat')",
+                  r.status == Status.FAILED and "couldn't use WhatsApp's search" in r.message, r.message)
+
+        # ── L4: generic words and spelled-out names ──
+        from kayra.automation import semantic_match as S
+        names = ["Outreach team 2026", "Namita Graphics Team 2026-27"]
+        check("L4: 'core team' is NOT offered chats that share only 'team'", S.match("core team", names).decision == "none",
+              S.match("core team", names))
+        check("L4: 'graphics team' still finds its chat", S.match("graphics team", names).best.name == "Namita Graphics Team 2026-27")
+        pr = ["PR & Outreach 2026", "Public Relations Cell", "Priya Sharma"]
+        for said in ("pr", "p r", "P.R."):
+            m = S.match(said, pr)
+            check(f"L4: {said!r} -> PR & Outreach 2026", m.decision == "pick" and m.best.name == "PR & Outreach 2026", m)
+        with WebRig(WhatsApp11(chats=[{"name": "Rahul Sharma", "unread": 0, "preview": "", "when": "1"}])) as rig:
+            rig.bridge.archive.append({"name": "PR & Outreach 2026", "unread": 0, "preview": "", "when": "2"})
+            r = rig.do("message open p r")
+            check("L4: 'p r' is searched as 'pr' and opens the PR chat",
+                  rig.bridge.open_chat == "PR & Outreach 2026" and rig.bridge.last("chat.search") is not None, r.message)
+    finally:
+        web_macros.EMBEDDER = saved_embed
+
+    # ── L5: two commands handed over as one token ──
+    sc = common.split_compound
+    check("L5: 'open X chat and read the last three messages' -> open, then read",
+          sc("message open megha sharma chat and read the last three messages") ==
+          ["message open megha sharma", "message read the last three messages"])
+    check("L5: '... and read the last three' (no noun) too",
+          sc("message open megha sharma iitm and read the last three") ==
+          ["message open megha sharma iitm", "message read the last three"])
+    for one in ("message rahul: going to market and buying milk", "message tell rahul i will come and bring food",
+                "browser ask chatgpt to compare rust and go", "message open safe house"):
+        check(f"L5: one command stays one: {one!r}", sc(one) == [one], sc(one))
+    a = n("message read the last three")
+    check("L5: 'read the last three' is the open chat's last 3", a.key == "message.read" and a.parameters.get("count") == 3)
+
+    # ── L6: a site with no window is its tab ──
+    drive_tabs = [{"id": 7, "title": "My Drive", "url": "https://drive.google.com/drive/my-drive", "active": True},
+                  {"id": 8, "title": "Inbox", "url": "https://mail.google.com/mail/u/0/"}]
+    with WebRig(Bridge(version="1.16.0", tabs=[dict(t) for t in drive_tabs])) as rig:
+        r = rig.do("close google drive")
+        closes = [a for c, a in rig.bridge.calls if c == "tabs.close"]
+        check("L6: 'close Google Drive' closes the Drive tab (was 'I couldn't find google drive open')",
+              r.ok and closes and closes[-1].get("tabIds") == [7] and "Drive" in r.message, (r.message, closes))
+        r = web_macros.group_close("whatsapp")
+        check("L6: 'close the WhatsApp group' with no tab groups and no WhatsApp tab -> the honest answer",
+              r.status == Status.NOT_FOUND and "tab groups" in r.message, r.message)
+    wa_tab = [{"id": 9, "title": "WhatsApp", "url": "https://web.whatsapp.com/", "active": True}]
+    with WebRig(Bridge(version="1.16.0", tabs=wa_tab)) as rig:
+        r = web_macros.group_close("whatsapp")
+        check("L6: ... and with a WhatsApp tab, that tab is closed", r.ok and
+              [a for c, a in rig.bridge.calls if c == "tabs.close"][-1].get("tabIds") == [9], r.message)
+
+    # ── L7: Workspace file names ──
+    rank = web_macros.rank_titles
+    files = [{"title": "Council Details 2026_27"}, {"title": "Council Meeting Notes"}]
+    for said in ("council detail", "council details google", "details 202627", "council details 2026 27"):
+        top = rank(said, files)
+        check(f"L7: {said!r} -> Council Details 2026_27", top and top[0][0] >= 55 and top[0][1]["title"] ==
+              "Council Details 2026_27", top[:1])
+    council = [{"id": "d" * 30, "title": "Council Details 2026_27",
+                "url": "https://docs.google.com/spreadsheets/d/" + "d" * 30 + "/edit"}]
+    with WebRig(WorkspaceBridge(url="https://docs.google.com/spreadsheets/u/0/?q=council", files=council)) as rig:
+        r = rig.do("browser open the council details 202627 sheet")
+        check("L7: the list ALREADY on screen is read first: no new search, no new tab",
+              r.ok and not [a for c, a in rig.bridge.calls if c == "tabs.open"] and "Council Details" in r.message,
+              (r.message, rig.bridge.opened()))
+    with WebRig(WorkspaceBridge(url=SHEET, files=[])) as rig:
+        r = rig.do("browser open the holiday document")
+        loads = [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")]
+        check("L7: a miss costs two page loads at most (was three), the second in Drive (every kind), in ONE new tab",
+              len(loads) == 2 and loads[1].startswith("https://drive.google.com/drive/search")
+              and len([1 for c, _a in rig.bridge.calls if c == "tabs.open"]) == 1 and not r.ok, loads)
+    check("L7: a failed app open stops a following 'open the first result'",
+          common._opens_page(n("open details 2026")) and common._needs_page(n("browser open the first result")))
+
+    # ── L8: the step after an open waits for that page ──
+    waited = []
+    with WebRig(Bridge(version="1.16.0")) as rig:
+        common._settle_page(n("browser open google sheets"),
+                            common.ActionResult.success("Opening.", url="https://docs.google.com/spreadsheets/", tab=21))
+        waited = [a for c, a in rig.bridge.calls if c == "page.waitFor"]
+    check("L8: after 'open Google Sheets' the next step waits for docs.google.com in THAT tab",
+          waited and waited[-1].get("urlIncludes") == "docs.google.com" and waited[-1].get("tabId") == 21, waited)
+    saved, settled = common._settle_page, []
+    common._settle_page = lambda action, result: settled.append(action.key)
+    try:
+        with WebRig(Bridge(version="1.16.0")) as rig:
+            run_tokens(["browser open youtube in a new tab", "browser scroll down"])
+    finally:
+        common._settle_page = saved
+    check("L8: a batch settles each step before the next one", settled and settled[0] == "browser.open_url", settled)
+
+    # ── L9: the small ones ──
+    for token, key, target, kind in (
+            ("open folder images in google drive", "browser.ws_open", "images", "folder"),
+            ("open the images folder in google drive", "browser.ws_open", "images", "folder"),
+            ("browser open the group leader images folder in my drive", "browser.ws_open", "group leader images", "folder"),
+            ("open images in google drive", "browser.ws_open", "images", "file")):
+        a = n(token)
+        check(f"L9: {token!r} is a Drive item, never a local folder", a and (a.key, a.target, a.parameters.get("kind"))
+              == (key, target, kind), a and (a.key, a.target, a.parameters))
+    check("L9: a Drive folder search asks Drive for folders only",
+          web_macros._WS_HOME["folder"].startswith("https://drive.google.com/drive/search?q=type:folder"))
+    a = n("open folder sundarbans house general panchayat group")
+    check("L9: 'open folder <name> group' is the group (tab group, else WhatsApp), not a folder called that",
+          a.key == "browser.group_collapse" and a.target == "sundarbans house general panchayat"
+          and a.parameters.get("or_chat"), (a.key, a.target))
+    a = n("open folder")
+    check("L9: a bare 'open folder' opens the home folder (was 'no app called folder')",
+          a.key == "file.open_folder" and a.target == "home", (a.key, a.target))
+    check("L9: 'open folder downloads' is unchanged", n("open folder downloads").target == "downloads")
+    a = n("open google chat")
+    check("L9: Google Chat is a site", a.key == "browser.open_url" and a.parameters.get("url") == "https://chat.google.com/",
+          (a.key, a.parameters))
+    check("L9: the bare word 'chat' is never Google Chat", targets.website_url("chat") is None)
+    acts = common.merge_share_steps([n("meet share screen"), n("click on share"), n("browser click on share")])
+    check("L9: a 'click share' after a screen share in the same request is dropped (it found nothing)",
+          [x.key for x in acts] == ["meet.share"], [x.key for x in acts])
+    check("L9: a lone 'click on share' is still a click",
+          [x.key for x in common.merge_share_steps([n("click on share")])] == ["mouse.click_text"])
+    from kayra.automation.policy import read_confirmation_reply as reply
+    for said, verdict in (("yes yes", True), ("yes go ahead", True), ("okay sure do it", True),
+                          ("yes please do it", True), ("yes, and also open chrome", None), ("yes no", None),
+                          ("do it now", None), ("no", False)):
+        check(f"L9: confirmation reply {said!r} -> {verdict}", reply(said) is verdict, reply(said))
+    with WebRig() as rig:
+        r = rig.do("email delete this")
+        check("L9: deleting an email asks first", r.status == Status.NEEDS_CONFIRMATION, r.message)
+        ok, said = linux.resolve_confirmation("yes, delete it")
+        check("L9: 'yes, delete it' is a yes (the log: asked twice, never deleted)",
+              ok and any(c == "page.click" and a.get("text") == "Delete" for c, a in rig.bridge.calls), said)
+        rig.do("email delete this")
+        ok, said = linux.resolve_confirmation("delete it")
+        check("L9: restating the request ('delete it') is a yes too", ok, said)
+        rig.do("email delete this")
+        ok, said = linux.resolve_confirmation("open chrome")
+        check("L9: a different request is not a yes", not ok, said)
+        linux.CONFIRMATIONS.cancel()
+
+    class NoGmail(Bridge):
+        def __init__(self):
+            super().__init__(version="1.16.0", tabs=[{"id": 2, "title": "YouTube", "url": "https://www.youtube.com/"}])
+            self.loading = 3
+
+        def call(self, cmd, timeout=10.0, **args):
+            if cmd == "tabs.open":
+                self.calls.append((cmd, args))
+                self.tabs.append({"id": 30, "title": "Gmail", "url": args["url"]})
+                return {"id": 30, "url": args["url"]}
+            if cmd == "gmail.open":
+                self.calls.append((cmd, args))
+                if self.loading:
+                    self.loading -= 1
+                    raise web_macros.browser_bridge.BridgeError("Frame with ID 0 is showing error page")
+                return {"opened": True, "from": "Bank", "subject": "Statement"}
+            return super().call(cmd, timeout=timeout, **args)
+
+    # ── the half hour after V21 (the log of 15:11–15:46) ──
+    d = common.direct_tokens
+    for said, token in (("open email", "email check"), ("open my email", "email check"), ("Open Gmail.", "email check"),
+                        ("check my email", "email check"), ("open the latest email", "email open latest"),
+                        ("open latest email", "email open latest"), ("open latest email and read it", "email read latest"),
+                        ("read the latest email", "email read latest"), ("open email and read it", "email read latest"),
+                        ("open and read the latest email", "email read latest")):
+        check(f"EMAIL: {said!r} -> {token!r} (open email never reads the latest one)", d(said) == [token], d(said))
+    check("EMAIL: 'open email from rahul' is not the inbox", d("open email from rahul") != ["email check"])
+    sheets = lambda: {"app": "google-chrome", "tab_url": "https://docs.google.com/spreadsheets/u/0/"}
+    check("LOG: 'search for sundarbans house' with Sheets in front searches Sheets (was Google Docs)",
+          d("search for sundarbans house", sheets) == ["browser search for sundarbans house"]
+          and n("browser search for sundarbans house").key == "browser.search_here")
+    check("LOG: ...but 'search for x on google' is still the web", d("search for x on google", sheets) is None)
+    for said in ("close all tabs", "browser close all tabs", "close all the tabs", "browser close every tab"):
+        a = n(said)
+        check(f"LOG: {said!r} closes every tab in the window (was: the tabs whose NAME contains 'all')",
+              a.key == "browser.tabs_close_unpinned", (a.key, a.target))
+    check("LOG: 'close all other tabs' keeps this one", n("close all other tabs").key == "browser.tabs_close_others")
+    with WebRig() as rig:
+        r = rig.do("close (app name)")
+        check("LOG: 'close (app name)' (a model's template) touches nothing and says so",
+              not r.ok and "which one" in r.message and not rig.runner.spawned, r.message)
+    check("LOG: a model reply 'close (app name)' is dropped",
+          interpreter.validate(["close (app name)"], n, common.classify_action) == [])
+    docs_tabs = [{"id": 1, "title": "Budget", "url": "https://docs.google.com/spreadsheets/d/x/edit", "active": True},
+                 {"id": 2, "title": "Notes", "url": "https://docs.google.com/document/d/y/edit"}]
+    with WebRig(Bridge(version="1.16.1", tabs=[dict(t) for t in docs_tabs])) as rig:
+        r = rig.do("close google docs")
+        closes = [a for c, a in rig.bridge.calls if c == "tabs.close"]
+        check("LOG: 'close Google Docs' closes the Doc, never the Sheet on the same host",
+              r.ok and closes and closes[-1].get("tabIds") == [2], (r.message, closes))
+
+    class MailSearch(Bridge):
+        def __init__(self):
+            super().__init__(version="1.16.1")
+            self.searched = False
+
+        def call(self, cmd, timeout=10.0, **args):
+            if cmd == "tabs.navigate" and "#search/" in args.get("url", ""):
+                self.calls.append((cmd, args))
+                self.searched = True
+                return {"id": 1, "url": args["url"]}
+            if cmd == "gmail.open":
+                self.calls.append((cmd, args))
+                if self.searched and not args.get("query"):
+                    return {"opened": True, "from": "IITM BS Meetup Team", "subject": "Meetup"}
+                return {"opened": False, "reason": "no email matches " + args.get("query", "")}
+            return super().call(cmd, timeout=timeout, **args)
+
+    with WebRig(MailSearch()) as rig:
+        r = rig.do("email open from iitm bs meet up team")
+        check("LOG: an email not on screen is found with Gmail's own search, then opened",
+              r.ok and rig.bridge.searched and "Meetup" in r.message, r.message)
+
+    from kayra.automation import chrome_profiles
+    import tempfile
+    root = tempfile.mkdtemp(prefix="kayra-chrome-")
+    try:
+        os.makedirs(os.path.join(root, "Default"))
+        os.makedirs(os.path.join(root, "Profile 1"))
+        with open(os.path.join(root, "Local State"), "w") as handle:
+            json.dump({"profile": {"last_used": "Default", "info_cache": {
+                "Default": {"name": "Home"}, "Profile 1": {"name": "Office"}}}}, handle)
+        with open(os.path.join(root, "Profile 1", "Secure Preferences"), "w") as handle:
+            json.dump({"extensions": {"settings": {web_macros.browser_bridge.EXTENSION_ID: {"state": 1}}}}, handle)
+        with open(os.path.join(root, "Default", "Preferences"), "w") as handle:
+            json.dump({"extensions": {"settings": {}}}, handle)
+        runner = RecordingRunner(tools)
+        with WebRig(Bridge(connected=False), runner=runner) as rig:
+            chrome_profiles.USER_DATA_DIRS = [("google-chrome", root)]
+            check("PROFILE: the profile with the Kayra extension is found from Chrome's own files",
+                  [p.name for p in chrome_profiles.with_extension(web_macros.browser_bridge.EXTENSION_ID)] == ["Office"])
+            r = rig.do("browser list tabs")
+            check("PROFILE: Chrome closed and its default profile lacks the extension -> started IN the profile that has it",
+                  ["google-chrome-stable", "--profile-directory=Profile 1"] in rig.runner.spawned and "Office" in r.message,
+                  (rig.runner.spawned, r.message))
+        chrome = FakeHyprland([client("0xc", "google-chrome", "Inbox | Home - Google Chrome")], active="0xc")
+        with WebRig(Bridge(connected=False), hypr=chrome, runner=RecordingRunner(tools)) as rig:
+            chrome_profiles.USER_DATA_DIRS = [("google-chrome", root)]
+            r = rig.do("browser list tabs")
+            check("PROFILE: Chrome open in a profile without the extension -> says which profile has it, opens nothing",
+                  r.status == Status.UNSUPPORTED and "Office" in r.message and "open Chrome as Office" in r.message
+                  and not rig.runner.spawned, r.message)
+    finally:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+    with WebRig(NoGmail()) as rig:
+        r = rig.do("email open latest")
+        opens = [a for c, a in rig.bridge.calls if c == "tabs.open"]
+        check("L9: Gmail not open -> opened WITHOUT waiting for the whole page, the email opened once the list is there",
+              r.ok and opens and opens[0].get("wait") is False and "Bank" in r.message, (r.message, opens))
 
 
 if __name__ == "__main__":

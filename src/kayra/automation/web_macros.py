@@ -30,6 +30,8 @@ import datetime
 from urllib.parse import quote, quote_plus, urlsplit
 
 from kayra.automation import ai
+from kayra.core import logbus
+from kayra.core.logbus import Subsystem
 from kayra.automation import browser_bridge
 # Kayra's lane into the Hyprland screen-share portal. Replaced by a fake in the test suite:
 # the real one reads ~/.config/hypr/xdph.conf and writes under $XDG_RUNTIME_DIR.
@@ -49,7 +51,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 16, 0)
+REQUIRED_VERSION = (1, 16, 1)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -153,6 +155,22 @@ def _wait_for(timeout_ms=8000, **condition):
     return bool(result.get("ok"))
 
 
+def wait_page(url, tab_id=None, timeout_ms=10000):
+    """
+    L8 (audit log 2026-11-11): "open Google Sheets and search council details" searched 0.4 s
+    after the open, before Sheets had loaded, so the search went to whatever page was there.
+    Waits until the tab that was opened shows `url`'s site and its page can be read. True when
+    it does; False (never raises) when it timed out or there is no extension.
+    """
+    if not BRIDGE.connected() or not url:
+        return False
+    host = _host(url)
+    condition = {"urlIncludes": host, "selector": "body"} if host else {"selector": "body"}
+    if tab_id:
+        condition["tabId"] = tab_id
+    return _wait_for(timeout_ms=timeout_ms, **condition)
+
+
 POLL_S = 0.25
 
 
@@ -191,8 +209,80 @@ def _until(attempt, timeout_s=2.5):
     return result
 
 
+# L1 (audit log 2026-11-11): every email command failed with "set up the extension" while the
+# extension was installed and only Chrome was closed. Now a closed Chrome is STARTED and the
+# extension's hello is waited for (it connects on Chrome's onStartup); the setup hint is only
+# for a Chrome that runs and still does not connect.
+CHROME_WAKE_S = 12.0
+CHROME_STARTED_HINT = ("I started Chrome, but the Kayra Bridge extension didn't connect. Say "
+                       "\"browser set up\" and I'll walk you through adding it.")
+
+
 def _need_bridge():
-    return None if BRIDGE.connected() else ActionResult.unsupported(SETUP_HINT)
+    if BRIDGE.connected():
+        return None
+    return _wake_chrome()
+
+
+def _extension_profiles():
+    """[(folder, name)] of the Chrome profiles the Kayra Bridge is installed in; [] if unknown."""
+    try:
+        from kayra.automation import chrome_profiles
+        return [(p.folder, p.name) for p in chrome_profiles.with_extension(browser_bridge.EXTENSION_ID)]
+    except Exception:
+        return []
+
+
+def _default_profile():
+    try:
+        from kayra.automation import chrome_profiles
+        return chrome_profiles.last_used()
+    except Exception:
+        return ""
+
+
+def _wake_chrome():
+    """
+    None once the bridge is connected; otherwise the honest reason it is not.
+
+    Chrome closed: started — in the profile that HAS the extension when Chrome's default
+    profile does not (the audit log of 2026-11-11: the extension was only in "Work", Chrome
+    opened as "Personal", and every browser command said "set up the extension").
+    Chrome open in a profile without the extension: says which profile has it.
+    """
+    started, profile = False, None
+    homes = _extension_profiles()
+    try:
+        L = _L()
+        windows = [w for w in L.list_windows() if L._is_browser_window(w)]
+        if not windows:
+            binary = next((b for b in ("google-chrome-stable", "google-chrome") if L._have(b)), None) \
+                or L._browser_binary()
+            argv = [binary] if binary else []
+            if homes and _default_profile() not in {folder for folder, _name in homes}:
+                profile = homes[0]
+                argv.append(f"--profile-directory={profile[0]}")
+            if argv and L.RUNNER.spawn(argv):
+                started = True
+                logbus.info(Subsystem.AUTO, "Chrome was closed: started it for a browser command"
+                            + (" in the profile with the Kayra extension" if profile else ""))
+            if started and _until(lambda: BRIDGE.connected(), CHROME_WAKE_S):
+                return None
+        elif homes:
+            # The extension may simply be reconnecting (it retries every 30 s): a short wait first.
+            if _until(lambda: BRIDGE.connected(), 2.0):
+                return None
+            names = " or ".join(name for _folder, name in homes[:2])
+            return ActionResult.unsupported(
+                f"Chrome is open, but the Kayra extension is only in your {names} profile, and that one "
+                f"isn't open. Say \"open Chrome as {homes[0][1]}\" and ask me again — or say \"browser set up\" "
+                f"to add the extension to this profile too.")
+    except Exception:
+        pass
+    if started and profile:
+        return ActionResult.unsupported(f"I started Chrome as {profile[1]}, where the Kayra extension is, "
+                                        "but it didn't connect. Say \"browser set up\" and I'll walk you through it.")
+    return ActionResult.unsupported(CHROME_STARTED_HINT if started else SETUP_HINT)
 
 
 def _focus_chrome():
@@ -724,6 +814,51 @@ def group_ungroup(name):
     return ActionResult.success(f"Ungrouped {_group_label(group)} ({count} tabs).")
 
 
+def site_tabs(name):
+    """The open tabs on the site called `name` ("google drive", "whatsapp", "drive.google.com"),
+    [] when none or no extension. Read only."""
+    if not BRIDGE.connected():
+        return []
+    from kayra.automation import targets
+    url = targets.website_url(name) or (targets.normalize_url(name) if targets.is_explicit_url(name) else None)
+    host = _host(url) if url else ""
+    if not host:
+        try:
+            from kayra.automation import linux_apps
+            host = _host(linux_apps.webapp_url(getattr(linux_apps.resolve(name), "entry", None)) or "")
+        except Exception:
+            host = ""
+    if not host:
+        return []
+    # Docs, Sheets and Slides share one host: "close Google Docs" must not close a Sheet.
+    path = urlsplit(url).path.rstrip("/") if url else ""
+    try:
+        return [t for t in (_call("tabs.list") or []) if _host(t.get("url")) == host
+                and (not path or urlsplit(str(t.get("url") or "")).path.startswith(path))]
+    except browser_bridge.BridgeError:
+        return []
+
+
+def close_site_tabs(name, confirmed_ids=None, action=None):
+    """
+    L6 (audit log 2026-11-11): "close Google Drive" said "I couldn't find google drive open" —
+    Drive is a TAB, not an app. The site's tabs are closed (more than CONFIRM_ABOVE asks first).
+    None when the site has no open tab, so the caller keeps its own answer.
+    """
+    if confirmed_ids is not None:
+        return _close_ids(confirmed_ids)
+    tabs = site_tabs(name)
+    if not tabs:
+        return None
+    from kayra.automation import targets
+    key = targets.canonical_website(name)
+    label = display_name(key) if key else str(name).strip().title()
+    result = _close_many(tabs, f"{label} tab", f"{label} tabs", action)
+    if result.ok:
+        result.message = f"{label} is closed." if len(tabs) == 1 else f"Closed {len(tabs)} {label} tabs."
+    return result
+
+
 def group_close(name, confirmed_ids=None, action=None):
     """Closes the tabs of one group; more than CONFIRM_ABOVE asks first."""
     stop = _bridge_at((1, 5, 0))
@@ -733,7 +868,9 @@ def group_close(name, confirmed_ids=None, action=None):
         return _close_ids(confirmed_ids)
     group, problem = _find_group(name)
     if group is None:
-        return ActionResult.not_found(problem)
+        # L6: "close the WhatsApp group" with no tab group of that name: the site's tab.
+        closed = close_site_tabs(name, action=action)
+        return closed if closed is not None else ActionResult.not_found(problem)
     tabs = [t for t in (_call("tabs.list") or []) if t.get("groupId") == group["id"]]
     return _close_many(tabs, f"tab in {_group_label(group)}", f"tabs in {_group_label(group)}", action)
 
@@ -1570,15 +1707,18 @@ _WS_HOME = {"sheet": "https://docs.google.com/spreadsheets/u/0/?q={q}",
             "slides": "https://docs.google.com/presentation/u/0/?q={q}",
             "form": "https://docs.google.com/forms/u/0/?q={q}",
             "file": "https://drive.google.com/drive/search?q={q}",
+            "folder": "https://drive.google.com/drive/search?q=type:folder%20{q}",
             "pdf": "https://drive.google.com/drive/search?q=type:pdf%20{q}"}
 _WS_NEW = {"sheet": "https://docs.google.com/spreadsheets/create",
            "doc": "https://docs.google.com/document/create",
            "slides": "https://docs.google.com/presentation/create",
            "form": "https://docs.google.com/forms/create"}
 _WS_NOUN = {"sheet": "sheet", "doc": "document", "slides": "presentation", "form": "form",
-            "file": "file", "pdf": "PDF"}
+            "file": "file", "pdf": "PDF", "folder": "Drive folder"}
 _NAME_STOP = frozenset("the a an my our of for and to in on about with called named file sheet "
-                       "spreadsheet doc document deck presentation slides form pdf".split())
+                       "spreadsheet doc document deck presentation slides form pdf "
+                       # L7: "council details google" — where it lives is not part of its name
+                       "google sheets docs drive spreadsheets documents".split())
 
 
 _UNITS = {"zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -1633,8 +1773,22 @@ def spoken_numbers(text):
     return " ".join(out)
 
 
+def _split_year_run(word):
+    """L7: '202627' / '20262027' (a year range said or heard as one number) -> ['2026', '27']."""
+    m = re.fullmatch(r"(20\d\d)(?:20)?(\d\d)", word)
+    if m and len(word) in (6, 8) and int(m.group(2)) == (int(m.group(1)) + 1) % 100:
+        return [m.group(1), m.group(2)]
+    return [word]
+
+
 def _words(text):
-    return year_ranges([w for w in re.findall(r"[a-z0-9]+", spoken_numbers(text)) if w not in _NAME_STOP])
+    raw = [w for w in re.findall(r"[a-z0-9]+", spoken_numbers(text)) if w not in _NAME_STOP]
+    return year_ranges([part for w in raw for part in _split_year_run(w)])
+
+
+def _singular(word):
+    """'details' -> 'detail': a spoken singular / plural is the same name."""
+    return word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
 
 
 def _same_word(a, b):
@@ -1662,9 +1816,11 @@ def rank_titles(name, items):
         if not title or not words:
             continue
         title_words = title.split()
-        near = [any(_same_word(w, t) or (len(w) >= 3 and t.startswith(w)) for t in title_words)
+        near = [any(_same_word(w, t) or (len(w) >= 3 and t.startswith(w)) or
+                    _singular(w) == _singular(t) for t in title_words)
                 for w in words]
-        if title == want:
+        flat = lambda text: " ".join(_singular(w) for w in text.split())
+        if title == want or flat(title) == flat(want):
             score = 100.0
         elif title.startswith(want + " "):
             score = 85.0
@@ -1682,36 +1838,61 @@ def rank_titles(name, items):
     return ranked
 
 
-def _file_list(url):
-    # Reuse a tab that is already on a Google file list / Drive, instead of a new tab each time.
-    host = _host((_call("tabs.active") or {}).get("url"))
-    if host in ("docs.google.com", "drive.google.com") and not _doc_ids((_call("tabs.active") or {}).get("url"))[0]:
-        _call("tabs.navigate", url=url, wait=True, timeoutMs=20000, timeout=25.0)
+def _on_file_list(url):
+    return _host(url) in ("docs.google.com", "drive.google.com") and not _doc_ids(url)[0]
+
+
+def _file_list(url, tab=None, reuse_active=True):
+    """
+    The file list at `url`. `tab` (an id) is navigated when given. Otherwise the active tab is
+    reused when it already shows a Google file list and `reuse_active` — else a new tab opens.
+    Returns the items; `_file_list_tab(url, …)` also returns the tab used.
+    """
+    return _file_list_tab(url, tab, reuse_active)[0]
+
+
+def _file_list_tab(url, tab=None, reuse_active=True):
+    if tab is None and reuse_active and _on_file_list((_call("tabs.active") or {}).get("url")):
+        tab = (_call("tabs.active") or {}).get("id")
+    if tab is not None:
+        _call("tabs.navigate", url=url, wait=True, timeoutMs=20000, timeout=25.0,
+              **({"tabId": tab} if isinstance(tab, int) else {}))
     else:
-        _call("tabs.open", url=url, where="tab", wait=True, timeoutMs=20000, timeout=25.0)
-    return _ready("page.docList", bool, 6.0, max=40) or []
+        opened = _call("tabs.open", url=url, where="tab", wait=True, timeoutMs=20000, timeout=25.0) or {}
+        tab = opened.get("id")
+    return (_ready("page.docList", bool, 6.0, max=40) or []), tab
 
 
 def _find_files(name, kind):
     """
-    The files matching a spoken name, best first. Google's own search is asked for the words
-    as said; when that finds no good title — a year said another way ("2026 2027" for
-    "2026-27"), a misheard word — it is asked again without the numbers, and last the recent
-    list is matched locally. Only the failure path pays for the extra page loads.
+    The files matching a spoken name, best first.
+
+    L7 (audit log 2026-11-11): one miss loaded three pages (24 s), searched Docs with Sheets in
+    front, and navigated away from the results the user was looking at. Now:
+      0. the file list ALREADY on screen is read first (the user's own search results);
+      1. Google's search for the words as said, in the kind said — in a NEW tab, so the user's
+         page stays as it was;
+      2. once more in that same tab, in Drive (every kind) with the most distinctive words — a
+         sheet asked for as a "document", a misheard word, a year said another way.
+    At most two page loads. Names are matched locally (`rank_titles`) and never sent anywhere.
     """
-    home = _WS_HOME.get(kind, _WS_HOME["file"])
+    active = _call("tabs.active") or {}
+    if _on_file_list(active.get("url")):
+        here = rank_titles(name, _ready("page.docList", bool, 2.0, max=40) or [])
+        if here and here[0][0] >= 55:
+            return here
     words = _words(name)
-    queries = [" ".join(words) or name]      # numbers as digits, a year range as "2026 27"
-    plain = " ".join(w for w in words if not w.isdigit())
-    if plain and plain != " ".join(words):
-        queries.append(plain)
-    if kind in ("sheet", "doc", "slides", "form"):
-        queries.append("")
-    best = []
-    for query in queries:
-        ranked = rank_titles(name, _file_list(home.format(q=quote(query))))
-        if not query:
-            ranked = [pair for pair in ranked if pair[0] >= 40]     # recents: no weak guesses
+    plain = [w for w in words if not w.isdigit()]
+    distinctive = sorted(plain, key=len, reverse=True)[:2]
+    queries = [(kind, " ".join(words) or name)]
+    second = " ".join(w for w in plain if w in distinctive) or " ".join(words)
+    if kind in ("sheet", "doc", "slides", "form") or second != queries[0][1]:
+        queries.append(("file" if kind in ("sheet", "doc", "slides", "form") else kind, second))
+    best, tab = [], None
+    for which, query in queries[:2]:
+        home = _WS_HOME.get(which, _WS_HOME["file"])
+        items, tab = _file_list_tab(home.format(q=quote(query)), tab, reuse_active=False)
+        ranked = rank_titles(name, items)
         if ranked and ranked[0][0] >= 55:
             return ranked
         if ranked and (not best or ranked[0][0] > best[0][0]):
@@ -2392,9 +2573,8 @@ def email_check():
     match = re.search(r"\((\d[\d,]*)\)", title)
     if match:
         count = int(match.group(1).replace(",", ""))
-        return ActionResult.success(f"You have {count} unread email{'s' if count != 1 else ''}. "
-                                    "Say \"read my latest emails\" to hear them.")
-    return ActionResult.success("No unread email." if "inbox" in title.lower() else
+        return ActionResult.success(f"Gmail is open. You have {count} unread email{'s' if count != 1 else ''}.")
+    return ActionResult.success("Gmail is open. No unread email." if "inbox" in title.lower() else
                                 "Gmail is open.")
 
 
@@ -2427,20 +2607,44 @@ def email_open(which="first", nth=1, query=""):
     missing = _need_bridge()
     if missing:
         return missing
-    _ensure_tab("mail.google.com", GMAIL)
+    # L9 (audit log 2026-11-11: "open the latest email" took 9 s): a Gmail tab that has to be
+    # OPENED is not waited for until the whole page has loaded (Gmail keeps loading long after
+    # its list is on screen) — the email is opened as soon as the list can be read.
+    try:
+        _call("tabs.activate", match="mail.google.com")
+        fresh = False
+    except browser_bridge.BridgeError:
+        _call("tabs.open", url=GMAIL, wait=False)
+        fresh = True
     _focus_chrome()
     result = {}
-    for _attempt in range(12):             # the list may still be rendering after a switch
+    attempts = 60 if fresh else 12          # 15 s for a Gmail that is still starting, else 3 s
+    for attempt in range(attempts):        # the list may still be rendering after a switch
         try:
             result = _call("gmail.open", which=which, nth=nth, query=query) or {}
         except browser_bridge.BridgeError as e:
+            if fresh and attempt < attempts - 1:
+                SLEEP(POLL_S)              # the page is still navigating: not an answer yet
+                continue
             return ActionResult.failure(str(e))
         if result.get("opened") or "visible" not in str(result.get("reason", "")):
             break
         SLEEP(POLL_S)
+    if not result.get("opened") and query and _version() >= (1, 16, 1):
+        # Not among the emails on screen: Gmail's own search for it, then the first result (the
+        # log of 2026-11-11: "open the email from IITM BS meetup team" — it was further down).
+        email_search(query)
+        for _attempt in range(24):
+            SLEEP(POLL_S)
+            try:
+                result = _call("gmail.open", which="first", nth=1, query="") or {}
+            except browser_bridge.BridgeError:
+                continue
+            if result.get("opened") or "visible" not in str(result.get("reason", "")):
+                break
     if not result.get("opened"):
         if query:
-            return ActionResult.not_found(f"I don't see an email from or about {query} here.")
+            return ActionResult.not_found(f"I don't see an email from or about {query}, here or in Gmail's search.")
         return ActionResult.not_found("I can't see the email list. Is your inbox open?")
     who = result.get("from") or "someone"
     subject = result.get("subject") or "no subject"
@@ -2709,17 +2913,27 @@ def _wa_find_named(name):
         return S.match(name, cands, embed=_embedder())
 
     found = decide(chats)
-    searched, seen = False, []
+    searched, seen, unusable = False, [], False
     if found.decision != S.PICK and _version() >= (1, 11, 0):
         # Not clearly on screen (WhatsApp only renders the chats in view): WhatsApp's own
         # search, WAITED for, then its results are matched. The whole name first; when that
         # finds nothing — a misheard word, a looser name than the real one — its most
         # distinctive words one at a time. The search is always closed again afterwards.
         words = sorted({w for w in S.tokens(name) if len(w) >= 3 and not w.isdigit()}, key=len, reverse=True)
-        queries = [name] + (words[:2] if len(S.tokens(name)) > 1 else [])
+        # L4: the name as WhatsApp would match it ("P.R." -> "pr"); a 2-letter name is searched
+        # as itself, and a single word is never split further.
+        said = " ".join(S.tokens(name, keep_stop=True)) or name
+        queries = [said] + (words[:2] if len(S.tokens(name)) > 1 else [])
         for query in queries:
             rows = _wa_search(query)
+            if rows is None and not searched:
+                # L3 (audit log 2026-11-11): the search box was not usable (a search left open,
+                # the box not focused yet) and the open failed in ~50 ms — then the SAME request
+                # a second later worked. Close the search and try once more, here.
+                _wa_search_close()
+                rows = _wa_search(query)
             if rows is None:
+                unusable = not searched
                 break
             searched = True
             seen.extend(r for r in rows if r["name"] not in {s["name"] for s in seen})
@@ -2754,6 +2968,10 @@ def _wa_find_named(name):
     if near:
         return None, ActionResult(Status.AMBIGUOUS, f"I don't see a chat called {name}. The closest I found: "
                                   f"{' and '.join(near)}. Which one?", {"candidates": near})
+    if found.decision == S.NONE and unusable:
+        # Honest: the chat may well exist further down — the search itself could not run.
+        return None, ActionResult.failure(f"I couldn't use WhatsApp's search just now, and {name} "
+                                          f"isn't in the chats on screen. Try again in a moment.")
     return None, ActionResult.not_found(f"I don't see a chat called {name} in WhatsApp.")
 
 
@@ -2949,6 +3167,14 @@ def message_send(contact, text, confirmed_chat=None, action=None):
     said. On yes: the same chat is checked to be the open one, the text typed and read back,
     then sent, and the sent message is looked for.
     """
+    if is_placeholder(contact) and (is_placeholder(text) or not text):
+        # L2: a model copied its template ("message (contact): (text)") for "send it".
+        return message_send_draft(action=action and Action(action.domain, "send_draft", target="current",
+                                                            parameters={}, raw=action.raw))
+    if is_placeholder(contact):
+        return ActionResult.failure("Who should I send that to?")
+    if is_placeholder(text):
+        return ActionResult.failure(f"What should I say to {contact}?")
     if not contact or not text:
         return ActionResult.failure("Who should I message, and what should I say?")
     if confirmed_chat is None:
@@ -4042,6 +4268,54 @@ def find_send_file(what):
         shot = _newest_screenshot()
         return [shot] if shot else []
     return find_upload(what)
+
+
+def message_send_draft(confirmed_chat=None, confirmed_text=None, action=None):
+    """
+    L2 (audit log 2026-11-11): "send it" / "press send" after the text was typed. There was no
+    such command, so the models filled in their own placeholders and Kayra looked for a chat
+    called "(contact)". Now: the OPEN chat and the text in its message box are read, Kayra asks
+    'Send "…" to <chat>?', and on yes sends only if both are still exactly the same.
+    """
+    stop = _bridge_at((1, 9, 0))
+    if stop:
+        return stop
+    if open_tab_on("web.whatsapp.com") is None:
+        return ActionResult.not_found("WhatsApp isn't open, so there's nothing typed to send.")
+    try:
+        state = _call("chat.composer", match="web.whatsapp.com") or {}
+    except browser_bridge.BridgeError:
+        state = {}
+    chat = str(state.get("chat") or "")
+    draft = " ".join(str(state.get("text") or "").split())
+    if not chat:
+        return ActionResult.not_found("No chat is open in WhatsApp. Say who to send it to.")
+    if not draft:
+        return ActionResult.not_found(f"Nothing is typed in {chat} yet. Tell me what to send.")
+    if confirmed_chat is None:
+        if action is None:
+            return ActionResult.failure("I need to ask before sending a message.")
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed_chat": chat, "confirmed_text": draft},
+                          raw=action.raw)
+        return ActionResult(Status.NEEDS_CONFIRMATION, f"Send \"{_short(draft, 120)}\" to {chat}?",
+                            {"confirm": approved})
+    if chat != confirmed_chat or draft != confirmed_text:
+        return ActionResult.failure("The open chat or the typed text changed, so I didn't send it.")
+    _ensure_tab("web.whatsapp.com", WHATSAPP)
+    if not _click_first(["Send"]):
+        _call("page.type", field="type a message", text="", submit=True)    # Enter in the composer
+    sent = _ready("chat.messages", lambda r: any(m.get("out") and " ".join(m.get("text", "").split()) == draft
+                                                 for m in ((r or {}).get("messages") or [])[-3:]), 4.0, limit=5) or {}
+    ok = any(m.get("out") and " ".join(m.get("text", "").split()) == draft
+             for m in (sent.get("messages") or [])[-3:])
+    return ActionResult.success(f"Sent to {chat}." if ok else f"I pressed send in {chat}; I couldn't see it arrive yet.")
+
+
+def is_placeholder(value):
+    """True for a model's template slot copied literally: "(contact)", "<text>", "[name]", "{chat}"."""
+    from kayra.automation.common import is_placeholder as check
+    return check(value)
 
 
 def open_chat_name():

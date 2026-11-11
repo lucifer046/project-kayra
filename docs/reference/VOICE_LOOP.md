@@ -542,6 +542,39 @@ accessors, so a new control kind joins automatically and a rename cannot silentl
 Every change prints `[TRANSCRIPT] 'x' -> 'y' (reason)`. An invisible correction layer is
 worse than none.
 
+### Names on screen (added 2026-11-11, V19)
+
+The audit log of 2026-11-11 was full of names the recognizer could not know: "make her
+sharma" for the chat *Megha Sharma IITM*, "sand button" for WhatsApp's *Send*, "punchayat",
+"sapphire house". Two changes:
+
+- **`INPUT_LANGUAGE=en-IN`** on the reference machine (was `en-US`). Indian English hears
+  Indian names and accents far better. Not `hi-IN`: that is Hindi plus a translation step.
+- **The repair stage is told what is on screen.** `automation/screen_vocabulary.names()`
+  reads the WhatsApp chat list (any tab), the active tab's Docs/Sheets/Drive file titles and
+  its buttons — three extension calls, 0.35 s timeout each, `[]` without the bridge, never
+  raises. `app._repair_stage()` injects it with `set_screen_source()`; the input layer still
+  imports nothing from automation. Read at most once per `SCREEN_TTL_S` (1.5 s).
+
+Two rules use it, both only for a COMMAND that names something (`COMMAND_HEADS`: open,
+click, press, send, message, read, join …; never search/play/type, whose tail is free text):
+
+- **Rule 1 first asks for an alternative that names something on screen**
+  (`alternative:screen`) when the top reading names nothing there. Invents nothing.
+- **Rule 2a replaces a NAME SLOT** — a run of words between `SLOT_BREAKS` ("the", "chat",
+  "button", "and" …) — with the one on-screen name it sounds like (`screen:0.90`). Score =
+  60 % consonant skeleton (`sound_skeleton`) + 40 % spelling; ≥ `SCREEN_MATCH` 0.80
+  (0.86 and one word for a name of < 3 consonant sounds). Refused when: confidence ≥ 0.95;
+  the sentence already contains an on-screen name; the slot is a correct PART of a name
+  ("Megha Sharma" of "Megha Sharma IITM"); the first letter differs ("Central" vs "General"
+  — the other may exist further down a list that only shows what is in view); two names
+  are within `SCREEN_MARGIN` 0.06; the result would be a dangerous control. For send /
+  message / reply only the slot after "to" (or, without "to", the first slot) is a name, so
+  the message text is never rewritten. A long name also matches its leading words.
+
+A "Send" reached this way is still a risky click and asks first (`policy._RISKY_CLICK`).
+Tests: `tests/test_capture_pipeline.py::section_screen_names`.
+
 **What this does NOT fix, stated plainly:** "quit" heard as "great" is not phonetically close
 (`q300` vs `g630`) and no guard in rule 2 will ever bridge it. That pair can only be fixed
 upstream — by the capture and endpointing work above — or by rule 1, if the recognizer offers

@@ -1,7 +1,8 @@
 # Kayra — Project Context for AI Agents
 
 > **Pending work:** [`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) —
-> the planned full browser-control round. Implement it only when the user asks.
+> new features (implement only when the user asks). **Bugs and errors:**
+> [`docs/roadmap/BUGS.md`](docs/roadmap/BUGS.md) — open bugs on top; a log review adds to it.
 >
 > **Start with [`AGENTS.md`](AGENTS.md)** — the concise rules, layout and workflow for every agent.
 >
@@ -309,6 +310,11 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   `/api/v0/models` and drives `lms`; key checks cost money, so never automatic by default.
   `backup.py` never writes a secret into a backup. `run_all.py` FAILS if a suite touches
   `data/ logs/ Reports/ backups/` — see `docs/reference/DEV_WORKFLOW.md`.
+- **Part 17 (2026-11-11, V20) — audit-log fixes L1–L8.** A closed Chrome is STARTED for a browser
+  command (`web_macros._wake_chrome`); "send it" = `message.send_draft` (asks, re-checks); a model's
+  `(contact)`/`<text>` is never a name; one request never runs an identical command twice; model
+  tokens holding two commands are split (`common.split_compound`); steps after `open_url` wait
+  for the page (`_settle_page`); file search reads the list on screen first, ≤ 2 loads, new tab.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

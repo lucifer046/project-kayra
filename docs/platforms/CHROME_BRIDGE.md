@@ -304,7 +304,8 @@ a WebSocket that exchanges a ping every 20 seconds keeps its service worker runn
 
 | Symptom | Fix |
 |---|---|
-| "Chrome isn't connected to me yet" | Is the extension enabled on `chrome://extensions`? Click its toolbar icon to force a reconnect. |
+| "Chrome isn't connected to me yet" | Chrome running: is the extension enabled on `chrome://extensions`? Click its toolbar icon to force a reconnect. Chrome CLOSED: since Part 17 (L1) Kayra starts `google-chrome-stable` itself and waits up to 12 s (`web_macros.CHROME_WAKE_S`) for the extension's hello; "I started Chrome, but the extension didn't connect" means it is not installed in that profile. |
+| "the Kayra extension is only in your Work profile" | The extension is installed per Chrome profile. Say "open Chrome as Work", or add it to the profile you use (chrome://extensions → Load unpacked → `extension/kayra-bridge`). |
 | Port 17893 busy | Set `KAYRA_BRIDGE_PORT` in `.env` **and** `PORTS` in `background.js`, reload the extension. |
 | A button "can't be found" | Say "what can I click here?" to hear the exact names, then use one. |
 | Meet picker stays open | Press Share; report what you saw so the key presses can be tuned. For a named window, check `PYTHONPATH=src .venv/bin/python -m kayra.automation.share_picker status` says `installed`. |

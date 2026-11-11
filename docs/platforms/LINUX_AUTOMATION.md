@@ -327,6 +327,73 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — after V21: "open email", the extension's profile, close all tabs (V22, extension 1.16.1)
+
+- `common.email_words` (rules-first): "open email" = inbox (`email check`, "Gmail is open. You have
+  N unread"); "open the latest email" = `email open latest`; "… and read it" / "read my latest
+  email" = `email read latest`.
+- `chrome_profiles.with_extension` / `last_used`; `web_macros._wake_chrome` starts a closed Chrome
+  in the profile that has the Kayra extension, and names that profile when Chrome is open in
+  another one.
+- `common._all_tabs`: "close all tabs" = `tabs_close_unpinned` (was `tab_close "all"` = tabs whose
+  name contains "all"); "close all other tabs" = `tabs_close_others`.
+- `common.is_placeholder` checked in `execute_action` (all actions but `message.send`, which means
+  the draft) and in `interpreter.validate`.
+- `web_macros.site_tabs` matches the site's PATH too (Docs ≠ Sheets on docs.google.com).
+- With Docs/Sheets/Drive in front, "search for X" = that page's search (`search_here`).
+- Extension 1.16.1: `gmailOpen` matches a sender/subject ignoring spaces, or by every spoken word;
+  `email_open` falls back to Gmail's search and opens the first result.
+- Tests: `test_browser_control.py` [30] +25, `test_browser_extension.py` +2; unit tier 6062/0.
+
+### 2026-11-11 — Part 17 L9: the small fixes (V21)
+
+- "open (the) X folder in (Google) Drive" / "open folder X in my drive" -> `browser.ws_open` kind
+  `folder` (Drive search `type:folder`); "open X in Google Drive" -> any Drive item
+  (`common.folder_action`). Was a local `file.open_folder`.
+- "open folder <name> group/chat" -> that group (tab group, else WhatsApp); bare "open folder"
+  -> the home folder in the file manager.
+- `sites.py`: "google chat" (chat.google.com; never the bare word "chat").
+- `merge_share_steps`: a "click share" after a screen share in the same request is dropped.
+- Confirmations: "yes yes", "yes go ahead", "okay sure do it" are yes (`policy.read_confirmation_reply`);
+  "yes, delete it" and a plain restatement ("delete it") answer the pending question
+  (`AutomationRuntime._restated`) instead of asking again.
+- "open the latest email" with no Gmail tab: Gmail opens without waiting for the full page; the
+  email opens as soon as the list can be read (15 s budget). The 9 s in the log is not measured
+  against this yet.
+- Tests: `tests/test_browser_control.py` [30] +25; unit tier 6037/0; extension suite 158/0.
+
+### 2026-11-11 — Part 17: fixes from the audit-log review (V20)
+
+Found in `logs/automation.log` (sessions 00:08–02:24, 14:23–14:52); plan §15 L1–L8.
+
+- **L1** Chrome closed: `web_macros._need_bridge` starts it and waits for the extension
+  (`CHROME_WAKE_S` 12 s) instead of saying "browser set up". Chrome open without the extension
+  still gets the setup hint; Chrome is never started twice.
+- **L2** "send it" / "press send" / "click send button" with WhatsApp in front ->
+  `message.send_draft`: reads the open chat and its typed text, asks 'Send "…" to <chat>?',
+  re-checks both on yes. Gmail in front -> `email send`. A `(contact)` / `<text>` placeholder from
+  a model is never a chat name (`web_macros.is_placeholder`, `interpreter._PLACEHOLDER`); a model
+  may not propose `send_draft`.
+- **L3** WhatsApp search not usable on the first try -> closed and retried inside the same
+  request (was: "no such chat" in 50 ms, then the same request worked a second later); honest
+  "couldn't use WhatsApp's search" when it never works. One request runs an identical command
+  once (`translate_and_execute` de-duplicates; a NOT_FOUND is not re-run within 3 s).
+- **L4** `semantic_match.GENERIC`: a chat matched only on "team"/"club"/… is no match; "P.R." /
+  "p r" -> "pr".
+- **L5** `common.split_compound`: a model token holding two complete commands ("message open X
+  chat and read the last three messages") is split; "read the last three" needs no noun.
+- **L6** `app.close` of a site with no window ("close Google Drive") closes its tab(s)
+  (`web_macros.close_site_tabs`, asks above 3); "close the WhatsApp group" with no tab group
+  closes the WhatsApp tab.
+- **L7** Workspace files: the list already on screen is read first; at most two page loads (the
+  kind said, then Drive = every kind) in ONE new tab — the user's page is never navigated away;
+  "202627" = 2026-27; singular = plural; "google/sheets/docs/drive" are not part of a name; a
+  failed `app.open` stops a following "open the first result".
+- **L8** `common._settle_page`: after `open_url` / web or YouTube search, the next step waits
+  for that tab to show the site (`web_macros.wait_page`), never a fixed sleep.
+- Tests: `tests/test_browser_control.py` section [30] (+48); unit tier 6012/0;
+  `test_browser_extension.py` 158/0. Not yet tried live.
+
 ### 2026-11-11 — parts 14–16: Kayra's voice, local models and keys, backups
 
 - **Voice**: "speak a bit faster" / "slower" / "at normal speed" / "set your speaking speed to 1.3"

@@ -23,6 +23,10 @@ order. Newest last.
 | [V16](UPDATE_V16.md) | 2026-11-11 | WhatsApp mute / pin / react / reply / forward / call, in-call Meet controls and a share warning, one inbox across apps (Parts 8–10) | Feature, safety, privacy |
 | [V17](UPDATE_V17.md) | 2026-11-11 | Smooth scrolling everywhere; tab sessions, reading list, PiP, page screenshots; Zoom/Teams/Discord, present a deck, meeting notes, recording (Parts 11–13) | Feature, UI, privacy |
 | [V18](UPDATE_V18.md) | 2026-11-11 | Speaking speed and a voice per language; LM Studio and key health by voice; backups without keys; the test-hygiene sweep (Parts 14–16) | Feature, privacy, test hygiene |
+| [V19](UPDATE_V19.md) | 2026-11-11 | Hearing the names on screen: en-IN recognition, misheard chat/file/button names corrected to the one on screen | Fix (speech) |
+| [V20](UPDATE_V20.md) | 2026-11-11 | Audit-log fixes L1–L8: Chrome started when closed, "send it", double runs, WhatsApp names, compound commands, closing tabs, Workspace file search, open-then-act wait | Fix |
+| [V21](UPDATE_V21.md) | 2026-11-11 | L9 small fixes: Drive folders, Google Chat, "open folder", stray share click, "yes, delete it", faster email open | Fix |
+| [V22](UPDATE_V22.md) | 2026-11-11 | "open email" = inbox only; the extension's Chrome profile; close all tabs; extension 1.16.1; bugs moved to docs/roadmap/BUGS.md | Fix, docs |
 
 ## Adding an update
 

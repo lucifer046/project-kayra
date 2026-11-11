@@ -1692,6 +1692,14 @@ def _repair_stage():
             except Exception:
                 vocabulary = []
             _REPAIR_STAGE = get_transcript_repair(vocabulary=vocabulary)
+            # The names on screen (chats, file titles, buttons), so "make her sharma" can
+            # become the Megha Sharma that is actually in the list. Injected: the input layer
+            # never imports automation.
+            try:
+                from kayra.automation import screen_vocabulary
+                _REPAIR_STAGE.set_screen_source(screen_vocabulary.names)
+            except Exception as exc:
+                print_warning(f"On-screen names unavailable to transcript repair (non-fatal): {exc}")
         except Exception as exc:
             print_warning(f"Transcript repair unavailable (non-fatal): {exc}")
             _REPAIR_STAGE = False          # False, not None: do not retry every utterance

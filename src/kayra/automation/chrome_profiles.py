@@ -136,6 +136,45 @@ def load(browser="google-chrome", folder=None):
     return profiles
 
 
+def with_extension(extension_id, browser="google-chrome"):
+    """
+    The profiles that have the extension `extension_id` installed and not disabled, read from
+    each profile's own Preferences at run time (the audit log of 2026-11-11: the Kayra Bridge
+    was in ONE profile while Chrome was open in another, so every browser command said "set up
+    the extension"). [] when unknown. Never raises.
+    """
+    folder = dict(_dirs()).get(browser)
+    if not folder:
+        return []
+    try:
+        profiles = load(browser, folder)
+    except ProfilesUnreadable:
+        return []
+    out = []
+    for profile in profiles:
+        for name in ("Secure Preferences", "Preferences"):
+            try:
+                with open(os.path.join(folder, profile.folder, name), "r", encoding="utf-8") as handle:
+                    settings = ((json.load(handle).get("extensions") or {}).get("settings") or {})
+            except (OSError, ValueError, AttributeError):
+                continue
+            entry = settings.get(extension_id) if isinstance(settings, dict) else None
+            if isinstance(entry, dict) and not entry.get("disable_reasons"):
+                out.append(profile)
+                break
+    return out
+
+
+def last_used(browser="google-chrome"):
+    """The profile folder Chrome opens by default (Local State's last_used), or ''."""
+    folder = dict(_dirs()).get(browser)
+    try:
+        with open(os.path.join(folder or "", "Local State"), "r", encoding="utf-8") as handle:
+            return str(((json.load(handle).get("profile") or {}).get("last_used")) or "")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+
+
 def label(profile):
     """How Kayra SAYS a profile: its name, plus the account when that tells it apart."""
     who = profile.account or profile.given

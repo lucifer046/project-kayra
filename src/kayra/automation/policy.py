@@ -907,7 +907,20 @@ def read_confirmation_reply(text: str):
         return True
     if cleaned in _NEGATIVE:
         return False
+    # L9 (audit log 2026-11-11): "yes yes", "yes go ahead", "okay sure, do it" — every word an
+    # agreeing word, with a real yes among them — is a yes. Any other word makes it a new
+    # command, exactly as before ("yes, and also open chrome").
+    words = cleaned.split()
+    if set(words) <= _AGREEING and set(words) & _CORE_YES and not set(words) & _NEGATIVE_WORDS:
+        return True
     return None
+
+
+_CORE_YES = frozenset({"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "proceed", "confirm",
+                       "confirmed", "affirmative", "absolutely", "definitely"})
+_AGREEING = _CORE_YES | frozenset({"please", "go", "ahead", "do", "it", "for", "of", "course", "right",
+                                   "now", "that's", "fine", "correct", "kayra"})
+_NEGATIVE_WORDS = frozenset({"no", "not", "don't", "dont", "cancel", "stop", "never", "nope", "nah"})
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

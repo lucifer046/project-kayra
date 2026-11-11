@@ -1947,10 +1947,17 @@ def _dispatch(action):
                         return ActionResult.not_found(result.message, web_fallback=True)
                     return web_macros.open_site(target, None)
             return result
-        if verb == "close":
-            return close_target(target)
-        if verb == "close_all":
-            return close_target(target, all_instances=True)
+        if verb in ("close", "close_all"):
+            from kayra.automation import web_macros
+            if params.get("confirmed_ids") is not None:
+                return web_macros.close_site_tabs(target, params["confirmed_ids"])
+            result = close_target(target, all_instances=verb == "close_all")
+            if result is not None and result.status == Status.NOT_FOUND:
+                # L6: a site with no window of its own ("close Google Drive") is its tab(s).
+                closed = web_macros.close_site_tabs(target, action=action)
+                if closed is not None:
+                    return closed
+            return result
         if verb == "restart":
             return restart_app(target)
         if verb == "content":
@@ -2374,6 +2381,8 @@ def _dispatch_extended(domain, verb, target, params, action):
         if verb == "act":
             return W.wa_message(params.get("op", "star"), target, params.get("text", ""), params.get("to", ""),
                                 params.get("confirmed"), action)
+        if verb == "send_draft":
+            return W.message_send_draft(params.get("confirmed_chat"), params.get("confirmed_text"), action)
         if verb == "send_file":
             return W.wa_send_file(target, params.get("what", ""), params.get("confirmed_path"),
                                   params.get("confirmed_chat"), action)

@@ -106,6 +106,10 @@ SITES = {
     "google photos": _s("https://photos.google.com/", ("my google photos",),
                  ("google photos",), "google", "https://photos.google.com/search/{q}"),
     "meet": _s("https://meet.google.com/", ("google meet",), ("meet",), "google"),
+    # L9 (audit log 2026-11-11): "open Google Chat" was "no app called google chat". Never the
+    # bare word "chat" — that is a WhatsApp chat.
+    "google chat": _s("https://chat.google.com/", ("gchat", "hangouts chat", "google hangouts"),
+                      ("google chat",), "google"),
     "calendar": _s("https://calendar.google.com/", ("google calendar", "my calendar"),
                    ("google calendar",), "google"),
     "classroom": _s("https://classroom.google.com/", ("google classroom",),

@@ -259,7 +259,15 @@ _USER_ONLY = frozenset({"profile_set", "profile_forget", "profile_clear", "form_
                         # said to send there, routed by the rules — a model never forwards a request.
                         "ai_ask"})
 # Part 6b: a file is only ever sent to a chat from the user's own words.
-_USER_ONLY_MESSAGE = frozenset({"send_file"})
+_USER_ONLY_MESSAGE = frozenset({"send_file", "send_draft"})
+
+
+# A template slot from CATALOG or the DMM preamble ("<contact>", "(text)") copied into a reply.
+_PLACEHOLDER = re.compile(r"[<(\[{]\s*(?:contact|text|chat|name|chat or group|app|site|n|code|event|"
+                          r"time|day|query|thing|message|number|person)\s*[>)\]}]", re.I)
+
+
+_SLOT = re.compile(r"\s*[\(<\[\{]\s*[a-z _-]{1,24}\s*[\)>\]\}]\s*", re.I)
 
 
 def from_model_ok(action):
@@ -291,6 +299,8 @@ def validate(commands, normalize, classify):
             continue                                   # the parser's own guess, not a command
         if not from_model_ok(action):
             continue                                   # the user's own details and decisions
+        if _PLACEHOLDER.search(command) or _SLOT.fullmatch(str(action.target or "")):
+            continue                                   # L2: a template slot ("<contact>", "(app name)") copied literally
         if classify(action)[0] == Risk.DENY:
             continue
         clean.append(command)

@@ -1,5 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
+> **Bugs and errors are NOT in this file** — see [`BUGS.md`](BUGS.md) (open bugs first).
+>
 > **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8–16 and the V9 / V11 fix rounds done (2026-11-11).**
 > See §10 for the parts and what is next (left: H2 phrasings + tone, H3 other apps, H4 multi-app sends, M4.2–M4.5, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
@@ -509,6 +511,7 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 14 | §13 N4.1 speaking speed (voice + Settings, live), N4.2 a voice per language (Hindi / Japanese / Mandarin by script), N3.5 voice preview | **done 2026-11-11** (`updates/UPDATE_V18.md`) |
 | 15 | §13 N2.3 LM Studio by voice (what is loaded, load / unload, vision warning), N2.2 local speed test, N2.4 key health (on request; at boot only with `KEY_HEALTH_ON_BOOT=on`) | **done 2026-11-11** |
 | 16 | §13 N5.1 + N2.6 backup / restore without keys, N5.3 the test-hygiene sweep in `run_all.py` | **done 2026-11-11** (the sweep found no suite writing to `data/`, `logs/`, `Reports/`, `backups/`) |
+| 17 | Audit-log bugs L1–L9 (now in `BUGS.md`) (Chrome closed, placeholder targets, double runs, WhatsApp names, compound sentences, closing tabs, Workspace files, open-then-act race) | **done 2026-11-11** — L1–L8 `updates/UPDATE_V20.md`, L9 `updates/UPDATE_V21.md`, L0 mishearing V19. Not tried live |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | **7a/7b/7c done 2026-11-11** (§7a benchmark, H1 page agent, H1.1 recipes, H2 aliases + transparency; extension 1.14.0; `updates/UPDATE_V15.md`). Open: H2 phrasings / tone, H3, H4 |
 
 **Parts 14–16 — Kayra's voice, local models and keys, backups** (done 2026-11-11). Detail:
@@ -1083,6 +1086,11 @@ the user's system.
 - N4.2 **Per-language voice** — answer in Hindi with a Hindi voice when asked in Hindi.
 - N4.3 **Wake word** ("Kayra, …") as an option to the always-listening microphone, with a
   local detector so nothing leaves the machine.
+- N4.4 **Hearing the names on screen** *(done 2026-11-11, V19)* — recognition in `en-IN`, and
+  the transcript repair stage corrects a misheard chat / file / button name to the one on
+  screen it sounds like (`automation/screen_vocabulary.py`, `docs/reference/VOICE_LOOP.md` →
+  Names on screen). Open: N4.5 local Whisper with the on-screen names as hot words, if the
+  audit log still shows mishearings after a week of en-IN.
 
 ### N5. Safety and housekeeping
 
@@ -1173,3 +1181,10 @@ profiles, renamed or never named.
   `src/` or `tests/` (the feature must stay data-driven).
 - Add the phrasings to `tests/test_dmm_browser.py` (rules-first where the shape is unambiguous).
 
+
+---
+
+## 15. Bugs and errors — moved  *(2026-11-11)*
+
+Bugs are tracked in their own file now: **[`BUGS.md`](BUGS.md)** — open bugs at the top, fixed
+ones (L0–L10, V19–V22) at the bottom. This plan is for NEW features only.

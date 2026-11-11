@@ -186,6 +186,11 @@ class Rig:
         learning.LAST.update(kind=None, app=None, said=None, at=0.0)
         web_macros.LAST_PICK.update(said=None, chosen=None, others=[], at=0.0)
         linux.RUNTIME.pending_choice = None
+        # Never the developer's real Chrome profiles (which one has the Kayra extension).
+        from kayra.automation import chrome_profiles
+        self._profiles = chrome_profiles.USER_DATA_DIRS
+        if chrome_profiles.USER_DATA_DIRS is None:          # a suite that pinned its own keeps it
+            chrome_profiles.USER_DATA_DIRS = []
         return self
 
     def __exit__(self, *exc):
@@ -198,6 +203,8 @@ class Rig:
         page_agent.ACTIVE, learning.DATA_DIR = self._agent, self._learn
         shutil.rmtree(self._learn_dir, ignore_errors=True)
         linux.RUNTIME.pending_choice = None
+        from kayra.automation import chrome_profiles
+        chrome_profiles.USER_DATA_DIRS = self._profiles
         (linux.HYPR, linux.RUNNER, linux.SLEEP, linux.LAUNCH_TIMEOUT_S,
          linux.CLOSE_TIMEOUT_S) = self._saved
         linux.CONFIRMATIONS.cancel()

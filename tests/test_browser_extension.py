@@ -504,6 +504,11 @@ def main():
         check("'open the email from Ana'", r["opened"] and d.title == "row2", r)
         r = call("gmailOpen", "unread", 2, "")
         check("'open the second unread email'", r["opened"] and d.title == "row3", r)
+        r = call("gmailOpen", "first", 1, "week ly digest")
+        check("1.16.1: spaces are not part of a name ('week ly digest' -> 'Weekly digest')",
+              r["opened"] and d.title == "row1", r)
+        r = call("gmailOpen", "first", 1, "friday lunch")
+        check("1.16.1: every spoken word present, in any order, is a match", r["opened"] and d.title == "row2", r)
         r = call("gmailOpen", "first", 1, "nobody")
         check("no match is reported, nothing opened", not r["opened"], r)
 

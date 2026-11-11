@@ -50,7 +50,9 @@ start a browser. Vocabulary from those layers is INJECTED by the caller instead.
 """
 
 import re
+import time
 import unicodedata
+from difflib import SequenceMatcher
 
 from kayra.core.conversation_context import get_conversation_context
 from kayra.core.voice_control import normalize_utterance
@@ -77,6 +79,50 @@ MIN_PHONETIC_LENGTH = 3
 
 # Alternatives beyond this rank are noise in practice.
 MAX_ALTERNATIVES = 6
+
+# ── Names on screen (2026-11-11) ──────────────────────────────────────────
+# The recognizer does not know the user's chat names, file titles or the buttons on the page,
+# so it writes the nearest ordinary words: "make her sharma" for "Megha Sharma", "sand button"
+# for "Send". When the caller supplies what is on screen (`set_screen_source`), a NAME SLOT of
+# a command may be replaced by the on-screen name it sounds like. Every limit is here.
+#
+# How alike a slot and a name must sound (0..1: consonant skeleton 60 %, spelling 40 %).
+SCREEN_MATCH = 0.80
+# A name with fewer than three consonant sounds ("Join", "Chats") is too short to be
+# distinctive: it needs a closer match AND a one-word slot.
+SCREEN_MATCH_SHORT = 0.86
+# The best name must beat the next one by this much, or nothing changes (no guessing).
+SCREEN_MARGIN = 0.06
+# Above this the recognizer was all but certain; a near-name is then left alone.
+SCREEN_CONFIDENT = 0.95
+# How long one read of the screen is reused (a sentence and its alternatives share it).
+SCREEN_TTL_S = 1.5
+# Slots are short: a long run of words is dictation, not a name.
+MAX_SLOT_WORDS = 6
+
+# A name slot only exists after one of these: the utterance must be a command that names
+# something. Conversation ("tell me about sand dunes") never has one, so it is never touched.
+# Free-text commands (search, play, type, ask) are deliberately absent: what follows them is
+# the user's own words, not a name, and must reach the classifier as it was heard.
+COMMAND_HEADS = frozenset({
+    "open", "close", "click", "press", "tap", "select", "choose", "hit", "send", "message",
+    "text", "read", "reply", "join", "share", "switch", "go", "call", "focus", "launch", "pin",
+    "star", "mute", "unmute", "leave",
+})
+# After these the tail also holds the message itself ("send hello to Megha"). Only the slot
+# after "to" is a name, or — without a "to" — only the first slot ("message Megha saying hi").
+MESSAGE_HEADS = frozenset({"send", "message", "text", "reply"})
+# Leading politeness before the command word.
+_LEADING = frozenset({"please", "can", "could", "would", "will", "you", "kindly", "just", "now", "and"})
+# Words that are never part of a name: they bound the slots. "open the X chat and read …"
+# has one slot, X.
+SLOT_BREAKS = frozenset({
+    "to", "the", "a", "an", "on", "in", "into", "at", "of", "for", "from", "with", "up", "my",
+    "me", "it", "this", "that", "and", "then", "also", "button", "chat", "group", "tab",
+    "sheet", "spreadsheet", "doc", "document", "file", "folder", "page", "link", "whatsapp",
+    "chrome", "browser", "window", "app", "please", "now", "called", "named", "last", "latest",
+    "first", "second", "third", "messages", "message", "all", "again", "saying", "say", "tell",
+})
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -125,6 +171,32 @@ def phonetic_key(word):
         else:
             previous = ""
     return (key + "000")[:4]
+
+
+def sound_skeleton(text):
+    """
+    The consonant sounds of a phrase, as phonetic classes, spaces ignored: "Megha Sharma" and
+    "make her sharma" both reduce to nearly the same digits. Vowels, h, w and y carry accent,
+    not identity, and are dropped; a repeated class collapses (g+s, k+c).
+    """
+    letters = [c for c in _ascii_fold(str(text or "").lower()) if c.isalpha()]
+    out = []
+    for char in letters:
+        code = _CODES.get(char, "")
+        if code and (not out or out[-1] != code):
+            out.append(code)
+    return "".join(out)
+
+
+def sounds_like(spoken, name):
+    """0..1: how alike a spoken phrase and a name sound — 60 % consonant skeleton, 40 % spelling."""
+    a = "".join(_WORD.findall(_ascii_fold(str(spoken or "").lower())))
+    b = "".join(_WORD.findall(_ascii_fold(str(name or "").lower())))
+    if not a or not b:
+        return 0.0
+    skeleton = SequenceMatcher(None, sound_skeleton(a), sound_skeleton(b)).ratio()
+    spelling = SequenceMatcher(None, a, b).ratio()
+    return 0.6 * skeleton + 0.4 * spelling
 
 
 def _ascii_fold(text):
@@ -207,9 +279,191 @@ class TranscriptRepair:
         self.context = context if context is not None else get_conversation_context()
         self._extra_vocabulary = frozenset()
         self.set_vocabulary(vocabulary)
+        self._screen_source = None
+        self._screen_cache = (0.0, ())
+        self.clock = time.monotonic
         # Diagnostics. Cheap counters; nothing here grows.
-        self.stats = {"seen": 0, "reranked": 0, "phonetic": 0, "unchanged": 0}
+        self.stats = {"seen": 0, "reranked": 0, "phonetic": 0, "screen": 0, "unchanged": 0}
         self.last = None
+
+    # ──────────────────────────────────────────────────────────────────────
+    #                          NAMES ON SCREEN
+    # ──────────────────────────────────────────────────────────────────────
+
+    def set_screen_source(self, source):
+        """
+        `source()` returns the names on screen right now (chat names, file titles, buttons).
+        INJECTED by the orchestrator, like the vocabulary: this module cannot import the
+        layer that reads the browser. None switches the screen rules off.
+        """
+        self._screen_source = source
+        self._screen_cache = (0.0, ())
+
+    def _screen_names(self):
+        """[(display name, its words)], read at most once per SCREEN_TTL_S. Never raises."""
+        if self._screen_source is None:
+            return []
+        at, cached = self._screen_cache
+        now = self.clock()
+        if cached and now - at <= SCREEN_TTL_S:
+            return list(cached)
+        try:
+            raw = list(self._screen_source() or ())
+        except Exception:
+            raw = []
+        names = []
+        for name in raw[:400]:
+            words = _WORD.findall(_ascii_fold(str(name or "").lower()))
+            # A name made only of slot words ("Chat", "Send to") names nothing distinctive.
+            if words and any(w not in SLOT_BREAKS for w in words):
+                names.append((str(name).strip(), tuple(words)))
+        self._screen_cache = (now, tuple(names))
+        return names
+
+    @staticmethod
+    def _command_words(normalized):
+        """The words after the command head, or None when this is not a command that names
+        something. Leading politeness ("can you please open …") is skipped."""
+        words = normalized.split()
+        i = 0
+        while i < len(words) and words[i] in _LEADING:
+            i += 1
+        if i >= len(words) or words[i] not in COMMAND_HEADS:
+            return None
+        return words[i], words[i + 1:]
+
+    @staticmethod
+    def _slots(head, tail):
+        """[(start, end)] index ranges in `tail` that may hold a name."""
+        runs, start = [], None
+        for i, word in enumerate(tail + [None]):
+            if word is None or word in SLOT_BREAKS:
+                if start is not None:
+                    runs.append((start, i))
+                    start = None
+            elif start is None:
+                start = i
+        runs = [(s, e) for s, e in runs if e - s <= MAX_SLOT_WORDS]
+        if head in MESSAGE_HEADS:
+            after_to = [(s, e) for s, e in runs if s > 0 and tail[s - 1] == "to"]
+            runs = after_to if "to" in tail else runs[:1]
+        return runs
+
+    @staticmethod
+    def _name_forms(names):
+        """Each name, plus its leading two or more words for a long name: people say
+        "Megha Sharma" for the chat "Megha Sharma IITM". A form maps back to the FULL name."""
+        for display, words in names:
+            yield display, words
+            for k in range(2, len(words)):
+                yield display, words[:k]
+
+    @staticmethod
+    def _contains(words, name_words):
+        n = len(name_words)
+        return any(tuple(words[i:i + n]) == name_words for i in range(len(words) - n + 1))
+
+    def _screen_rerank(self, original, alternatives):
+        """
+        Rule 1 for names: the recognizer's first reading names nothing on screen, and one of
+        its OWN other readings does ("open sapphire house" / "open safe house" with a chat
+        called Safe House). Invents nothing.
+        """
+        if len(alternatives) < 2:
+            return None
+        top = _normalized(original)
+        readings = [(rank, _normalized(a.get("text")), a.get("text")) for rank, a in enumerate(alternatives)]
+        if self._command_words(top) is None and not any(
+                self._command_words(r) is not None for _rank, r, _t in readings):
+            return None
+        names = self._screen_names()
+        if not names:
+            return None
+        top_words = top.split()
+        if any(self._contains(top_words, words) for _n, words in names):
+            return None
+        for rank, reading, text in readings:
+            if not reading or reading == top or self._command_words(reading) is None:
+                continue
+            if any(self._contains(reading.split(), words) for _n, words in names):
+                return str(text).strip(), "alternative:screen"
+        return None
+
+    def _screen_phonetic(self, original, confidence):
+        """
+        A NAME SLOT that sounds like exactly one name on screen becomes that name:
+        "click sand button" -> "click Send button" with WhatsApp's Send in view,
+        "open make her sharma iitm chat" -> "open Megha Sharma IITM chat".
+
+        Only the slot is replaced — the command around it is the user's, word for word. Refused
+        when: not a command, no screen names, the recognizer was all but sure, the sentence
+        already names something on screen, two names fit about equally, or the result would
+        be a dangerous control.
+        """
+        if confidence is not None and confidence >= SCREEN_CONFIDENT:
+            return None
+        normalized = _normalized(original)
+        parsed = self._command_words(normalized)
+        if parsed is None:
+            return None
+        head, tail = parsed
+        slots = self._slots(head, tail)
+        if not slots:
+            return None
+        names = self._screen_names()
+        if not names:
+            return None
+        words = normalized.split()
+        if any(self._contains(words, name_words) for _n, name_words in names):
+            return None                      # it already names something that is there
+
+        best = None                          # (score, slot, display name)
+        runner_up = 0.0
+        for start, end in slots:
+            spoken = " ".join(tail[start:end])
+            spoken_skeleton = sound_skeleton(spoken)
+            if not spoken_skeleton:
+                continue
+            slot_words = tuple(tail[start:end])
+            if any(self._contains(list(name_words), slot_words) for _d, name_words in names):
+                continue                     # heard right, just part of a name ("Megha Sharma")
+            for display, name_words in self._name_forms(names):
+                name = " ".join(name_words)
+                name_skeleton = sound_skeleton(name)
+                a, b = spoken.replace(" ", ""), name.replace(" ", "")
+                # The first sound survives a mishearing ("sand"/"Send", "make her"/"Megha");
+                # a different first letter is usually a different name ("Central"/"General"),
+                # which may well exist further down a list that only shows what is in view.
+                if not name_skeleton or name_skeleton[0] != spoken_skeleton[0] or a[:1] != b[:1]:
+                    continue
+                if abs(len(a) - len(b)) > 0.45 * max(len(a), len(b)):
+                    continue
+                short = len(name_skeleton) < 3
+                if short and end - start != 1:
+                    continue
+                score = sounds_like(spoken, name)
+                if score < (SCREEN_MATCH_SHORT if short else SCREEN_MATCH):
+                    continue
+                if best is None or score > best[0]:
+                    if best is not None and best[2].lower() != display.lower():
+                        runner_up = max(runner_up, best[0])
+                    best = (score, (start, end), display)
+                elif display.lower() != best[2].lower():
+                    runner_up = max(runner_up, score)
+        if best is None or best[0] - runner_up < SCREEN_MARGIN:
+            return None
+
+        score, (start, end), display = best
+        offset = len(words) - len(tail)
+        repaired = " ".join(words[:offset + start] + [display] + words[offset + end:])
+        try:
+            from kayra.core.voice_control import classify_control, DANGEROUS_KINDS
+            control = classify_control(repaired)
+            if control is not None and control.kind in DANGEROUS_KINDS:
+                return None
+        except Exception:
+            return None
+        return repaired, f"screen:{score:.2f}"
 
     # ──────────────────────────────────────────────────────────────────────
     #                             VOCABULARY
@@ -303,10 +557,21 @@ class TranscriptRepair:
         alternatives = list(alternatives or [])[:MAX_ALTERNATIVES]
 
         # ── Rule 1: prefer an alternative the recognizer itself offered ────
-        picked = self._rerank(original, alternatives)
+        # First one that names something on screen, then one the context makes plausible.
+        picked = self._screen_rerank(original, alternatives) or self._rerank(original, alternatives)
         if picked is not None:
             chosen, reason = picked
             self.stats["reranked"] += 1
+            result = RepairResult(chosen, original, True, reason, confidence,
+                                  len(alternatives))
+            self.last = result
+            return result
+
+        # ── Rule 2a: a name slot that sounds like one name on screen ───────
+        repaired = self._screen_phonetic(original, confidence)
+        if repaired is not None:
+            chosen, reason = repaired
+            self.stats["screen"] += 1
             result = RepairResult(chosen, original, True, reason, confidence,
                                   len(alternatives))
             self.last = result

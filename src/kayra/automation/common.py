@@ -840,6 +840,12 @@ def normalize_command(command, context=None):
     found = backup_action(lowered, raw)                 # Part 16: backups
     if found is not None:
         return found
+    found = folder_action(lowered.strip(" .?!"), raw, context)   # L9: Drive folders, "open folder"
+    if found is not None:
+        return found
+    found = _all_tabs(lowered.strip(" .?!"), raw)              # "close all tabs" is never app "tabs"
+    if found is not None:
+        return found
     found = _bare_workspace(lowered, raw)
     if found is not None:
         return found
@@ -988,8 +994,20 @@ def merge_share_steps(actions):
                 if action.parameters.get("name") and not earlier.parameters.get("name"):
                     out[out.index(earlier)] = action
                 continue
+        if _is_share_click(action) and any(a.domain == "meet" and a.action == "share" for a in out):
+            # L9 (audit log 2026-11-11): "share screen" also arrived as "click share"; the click ran
+            # after the share and found nothing ("I can't find share on this page"). The share
+            # already pressed it.
+            continue
         out.append(action)
     return out
+
+
+def _is_share_click(action):
+    return (action.domain == "mouse" and action.action == "click_text" or
+            action.domain == "browser" and action.action == "page_click") and \
+        re.fullmatch(r"(?:the )?(?:share|share screen|present|present now|share (?:my |the )?(?:screen|tab|window))"
+                     r"(?: button)?", str(action.target or "").lower().strip()) is not None
 
 
 # ── Screen sharing (BROWSER_CONTROL_PLAN §12, M0.1 / M1) ──
@@ -1186,6 +1204,10 @@ _SEARCH_CLOSE_RE = re.compile(
     r"(?:go|step|get|take me) back to (?:my |the )?(?:chats|chat list)")
 _WA_CLOSE_CHAT = re.compile(r"(?:close|exit|leave|get out of|come out of) (?:this |the |that |current |open )*"
                             r"(?:whats ?app )?(?:chat|group|conversation)(?: (?:in|on) whats ?app)?")
+# L2: "send it" / "press send" — the text already typed in the open chat (or the open Gmail draft).
+_SEND_DRAFT = re.compile(r"(?:(?:ok(?:ay)?|yes|now|please|just|and|go ahead and),? )*"
+                         r"(?:send(?: it| this| that| now| it now)?|send (?:the |this |my )?(?:message|draft|text|reply)(?: now)?|"
+                         r"(?:press|click|hit|tap)(?: on)? (?:the )?(?:send|sand)(?: button)?)(?: please)?")
 _WA_NTH = re.compile(r"(?:the )?(first|second|third|fourth|fifth|top|1st|2nd|3rd|4th|5th) (?:search )?(?:result|one|chat|group)\b.*")
 
 
@@ -1227,7 +1249,10 @@ _WA_LAST_N_POSS = re.compile(
     r"(?:open (?:and|then) )?(?:read|show|tell me|summari[sz]e)(?: me)?(?: out)? (.+?)(?:'s|s') "
     r"((?:" + _WA_AGE + r" |" + _NUM + r" )+)(?:chats?|messages?|texts?|msgs?)" + _WA_SUFFIX + r"?")
 _WA_LAST_HERE = re.compile(r"(?:read|show|tell|give)(?: me)?(?: out)? (?:the |my )?((?:" + _WA_AGE + r" |" + _NUM + r" )+)"
-                           r"(?:chats?|messages?|texts?|msgs?)(?: here| in (?:this|the) (?:chat|group))?")
+                           r"(?:chats?|messages?|texts?|msgs?)(?: here| in (?:this|the) (?:chat|group))?"
+                           # L5: "…and read the last three" — the noun is often left off
+                           r"|(?:read|show|tell|give)(?: me)?(?: out)? (?:the |my )?((?:" + _WA_AGE + r" )+"
+                           r"(?:" + _NUM + r"))")
 _COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
                 "nine": 9, "ten": 10, "couple of": 2, "few": 3}
 
@@ -1366,6 +1391,9 @@ def _web_action(kind, payload, raw):
         m = re.fullmatch(r"close (?:all )?(?:the |my )?(?:other )?tabs (?:to|on) the (right|left)", low)
         if m:
             return Action("browser", "tabs_close_side", target=m.group(1), raw=raw)
+        found = _all_tabs(low, raw)
+        if found is not None:
+            return found
         m = re.fullmatch(r"close (.+)", low)
         position = tab_position(m.group(1)) if m else None
         if position:
@@ -1558,6 +1586,8 @@ def _web_action(kind, payload, raw):
             return Action("message", "unread", target="whatsapp", raw=raw)
         if _WA_CLOSE_CHAT.fullmatch(low):
             return Action("message", "close", target="current", raw=raw)
+        if _SEND_DRAFT.fullmatch(low):
+            return Action("message", "send_draft", target="current", raw=raw)
         if re.fullmatch(r"(?:open|search|show|find|go to|check)(?: (?:it|that|the|a|chat|group|one))*", low):
             return None          # a verb with no name is not a chat called "it", nor a message to "open"
         asked = last_messages_request(low)
@@ -1565,7 +1595,7 @@ def _web_action(kind, payload, raw):
             return Action("message", "read", target=asked[0], parameters={"today": False, "count": asked[1]}, raw=raw)
         m = _WA_LAST_HERE.fullmatch(low)
         if m:                                    # "read the last three messages": the open chat
-            found = re.search(r"\d{1,2}|couple of|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|few)\b", m.group(1))
+            found = re.search(r"\d{1,2}|couple of|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|few)\b", m.group(1) or m.group(2))
             count = 0 if not found else int(found.group(0)) if found.group(0).isdigit() else _COUNT_WORDS[found.group(0)]
             return Action("message", "read", target="recent" if not count else "current",
                           parameters={"today": False, "count": min(count, 30)}, raw=raw)
@@ -2900,6 +2930,63 @@ def _split_steps(text, situation_fn, depth=0):
     return None
 
 
+_WA_FRONT = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+
+
+# ── What "open email" means (the user, 2026-11-11) ──
+# "open email" opens Gmail and nothing else; "open the latest email" opens that one email; only
+# "… and read it" / "read my latest email" reads it out. The model used to turn "open email"
+# into "open the latest email + read it". Decided here, before any model.
+_MAIL = r"(?:e-?mails?|mails?|gmail|g mail|inbox|mailbox)"
+_NEWEST = r"(?:latest|newest|last|most recent|recent|new|top)"
+_POLITE = r"(?:(?:please|can you|could you|just|kayra)\s+)*"
+_EMAIL_INBOX = re.compile(_POLITE + r"(?:open(?: up)?|show(?: me)?|go to|take me to|check|bring up)"
+                          r" (?:my |the )?" + _MAIL + r"(?: inbox| app| account)?(?: please)?")
+_EMAIL_OPEN_NEWEST = re.compile(_POLITE + r"(?:open|show(?: me)?|bring up) (?:my |the )?" + _NEWEST
+                                + r" (?:e-?mail|mail|message in (?:my )?(?:inbox|gmail))(?: please)?")
+_EMAIL_READ_NEWEST = re.compile(
+    _POLITE + r"(?:(?:open (?:and|&) read|read(?: out)?|read me)(?: me)? (?:my |the )?" + _NEWEST
+    + r" (?:e-?mail|mail)(?: out| aloud| to me)?"
+    r"|(?:open|show(?: me)?) (?:my |the )?(?:" + _NEWEST + r" )?(?:e-?mail|mail) (?:and|then|and then) read"
+    r"(?: me)? (?:it|that|it out|it aloud|it to me|that out|that one|out))(?: please)?")
+
+
+def email_words(low):
+    """[token] for the three email shapes above, else None."""
+    low = " ".join(str(low or "").lower().strip(" .?!").split())
+    if _EMAIL_READ_NEWEST.fullmatch(low):
+        return ["email read latest"]                     # open it AND read it out
+    if _EMAIL_OPEN_NEWEST.fullmatch(low):
+        return ["email open latest"]                     # open it; say whose it is, no reading
+    if _EMAIL_INBOX.fullmatch(low):
+        return ["email check"]                           # the inbox only
+    return None
+
+
+def split_compound(command, situation_fn=None):
+    """
+    L5 (audit log 2026-11-11): the model sometimes hands over TWO commands as one token —
+    "message open megha sharma chat and read the last three messages" became a chat called
+    "megha sharma chat and read the last three messages". A token whose words are two or more
+    COMPLETE commands joined by and / then is split, by the same rules as a spoken sentence
+    (G5); anything else — a message that merely contains "and" — stays one token.
+    """
+    text = " ".join(str(command or "").split())
+    if not _STEP_JOIN.search(text):
+        return [text]
+    domain, _, rest = text.partition(" ")
+    situation = situation_fn
+    if domain == "message":
+        text, situation = rest, _WA_FRONT          # the steps of a message token happen in WhatsApp
+    elif domain in ("browser", "email", "meet", "calendar"):
+        text = rest
+    try:
+        steps = _split_steps(text, situation)
+    except Exception:
+        steps = None
+    return steps if steps and len(steps) > 1 else [" ".join(str(command or "").split())]
+
+
 def direct_tokens(utterance, situation_fn=None):
     """
     [tokens] for an utterance the rules alone fully understand, else None (ask the model).
@@ -2936,6 +3023,16 @@ def _direct_one(utterance, situation_fn=None):
     if re.fullmatch(r"(?:let them in|admit (?:everyone|all|them)|let (?:everyone|people) in)", low):
         return ["meet admit everyone"]
     # Gmail and Calendar phrasings that cannot be anything else.
+    found = email_words(low)
+    if found:
+        return found                                    # "open email" opens the inbox, nothing more
+    if front_site(situation_fn) in ("docs.google.com", "drive.google.com"):
+        # The log of 2026-11-11: "search for sundarbans house" with Google Sheets in front went
+        # to the model, which searched Google DOCS. The page in front decides: its own search.
+        m = re.fullmatch(r"(?:search|find|look)(?: for| up)? (?:the |my )?(.+?)", low)
+        if m and not re.search(r"\b(?:in|on) (?:google|youtube|the web|amazon|flipkart|gmail|my (?:mail|email))\b|"
+                               r"\b(?:docs|sheets|slides|drive|documents|spreadsheets|files)\b", m.group(1)):
+            return [f"browser search for {text[m.start(1):m.end(1)]}"]
     if re.fullmatch(r"(?:search|look) (?:in |through )?(?:my )?(?:mail|email|emails|inbox|gmail) for .+", low):
         return [f"email {text}"]
     if re.fullmatch(r"(?:compose|write|start) (?:a )?new (?:email|mail)|new email", low):
@@ -2982,6 +3079,12 @@ def _direct_one(utterance, situation_fn=None):
     # H0.2 — the app in front. With WhatsApp in front, "open X", "click on X", "go to X chat"
     # are a CHAT (the bug report: "open XYZ chat" -> "no app called XYZ chat"), "read it" is the
     # open chat, and "who messaged me" is WhatsApp's unread list.
+    if _SEND_DRAFT.fullmatch(low):
+        site = front_site(situation_fn)
+        if site == "web.whatsapp.com":
+            return ["message send the draft"]               # L2: what is typed in the open chat
+        if site == "mail.google.com":
+            return ["email send"]
     if front_site(situation_fn) == "web.whatsapp.com":
         if _WA_CLOSE_CHAT.fullmatch(low):
             return ["message close this chat"]              # "close the group" is the open chat here
@@ -3605,8 +3708,10 @@ _ON_PAGE = frozenset({"sheet_calc", "sheet_row", "sheet_cell", "slides_nav", "sl
 
 
 def _opens_page(action):
+    # L7: "app.open" too — a failed "open details 2026-27" (no such app; the model then tried
+    # the file and missed) was followed by "open the first result" on whatever list was there.
     return (action.domain == "browser" and action.action in _OPENS_PAGE) or \
-        (action.domain == "message" and action.action == "open")
+        (action.domain == "message" and action.action == "open") or action.key == "app.open"
 
 
 def _needs_page(action):
@@ -3614,9 +3719,78 @@ def _needs_page(action):
         (action.domain == "message" and action.target in ("current", "this", "recent"))
 
 
+# L8: these open a page WITHOUT waiting for it (the tab is created and the call returns). A
+# step after them would act on whatever page was there before.
+_OPENS_UNWAITED = frozenset({"browser.open_url", "browser.search_web", "browser.search_youtube"})
+
+
+def _settle_page(action, result):
+    """After an open that does not wait, wait for that page before the next step runs."""
+    if action is None or result is None or not result.ok or action.key not in _OPENS_UNWAITED:
+        return
+    detail = result.detail or {}
+    if not detail.get("url"):
+        return
+    try:
+        from kayra.automation import web_macros
+        web_macros.wait_page(detail["url"], detail.get("tab"))
+    except Exception:
+        pass
+
+
+# ── L9 (audit log 2026-11-11): "folder" said where a local folder is not meant ──
+_DRIVE_WHERE = r" (?:in|on|from) (?:my |the )?(?:google )?drive"
+_DRIVE_ITEM = re.compile(r"(?:browser )?(?:open|show(?: me)?|go to|find)(?: up)? (?:the |my )?"
+                         r"(folder (?:called |named )?)?(.+?)( folder)?" + _DRIVE_WHERE)
+
+
+def is_placeholder(value):
+    """True for a model's template slot copied literally: "(contact)", "<text>", "[app name]"."""
+    return bool(re.fullmatch(r"\s*[\(<\[\{]\s*[a-z _-]{1,24}\s*[\)>\]\}]\s*", str(value or ""), re.I))
+
+
+def _all_tabs(low, raw):
+    """
+    The audit log of 2026-11-11: "close all tabs" became app.close_all "tabs" (nothing found) and
+    then browser.tab_close "all" — which closes the tabs whose NAME contains "all". Every tab in
+    the window is `tabs_close_unpinned` (pinned tabs stay; more than three asks first).
+    """
+    low = re.sub(r"^browser ", "", low)
+    if re.fullmatch(r"close (?:all|every|all of)(?: the| my)? (?:open )?(?:browser |chrome )?tabs?"
+                    r"(?: in (?:this|the) window)?(?: please)?", low):
+        return Action("browser", "tabs_close_unpinned", target="unpinned", raw=raw)
+    if re.fullmatch(r"close (?:all )?(?:the )?other tabs|close all (?:the )?tabs except (?:this|the current)(?: one| tab)?", low):
+        return Action("browser", "tabs_close_others", target="others", raw=raw)
+    return None
+
+
+def folder_action(low, raw, context=None):
+    """
+    "open the images folder in Google Drive" -> a Drive FOLDER (was ~/… "couldn't find images in
+    google drive"); "open X in Google Drive" -> that Drive item of any kind; "open folder <name>
+    group/chat" -> the WhatsApp group (the model put "folder" in front of a group's name);
+    a bare "open folder" -> the home folder in the file manager (was "no app called folder").
+    """
+    m = _DRIVE_ITEM.fullmatch(low)
+    if m and m.group(2).strip() not in ("it", "this", "that", "a", "the"):
+        name = re.sub(r"^(?:the|my) ", "", m.group(2).strip())
+        kind = "folder" if (m.group(1) or m.group(3)) else "file"
+        return Action("browser", "ws_open", target=name, parameters={"kind": kind}, raw=raw)
+    m = re.fullmatch(r"open (?:the )?folder (.+? (?:group|chat))", low)
+    if m:
+        return normalize_command(f"open {m.group(1)}", context)
+    if re.fullmatch(r"(?:open|show(?: me)?)(?: a| the| my)? (?:folder|folders|file manager|files app)", low):
+        return Action("file", "open_folder", target="home", raw=raw)
+    return None
+
+
 def _is_guess(action):
     """The parser's own catch-all: 'browser <anything>' read as a click, at low confidence."""
     return action.domain == "browser" and action.action == "page_click" and action.confidence < 1.0
+
+
+# L3: an identical lookup this soon after it found nothing is not run again.
+REPEAT_MISS_S = 3.0
 
 
 def _worth_rethinking(action, result):
@@ -3742,6 +3916,10 @@ class AutomationRuntime:
         # Confirmations the user switched off by voice ("yes, don't ask again"): key -> expiry.
         # Only `_TRUSTABLE` keys, cleared when the call ends (meet.leave).
         self.trusted = {}
+        # L3: the last lookup that found nothing, so an identical request seconds later (a
+        # model re-proposing it, a doubled token) is answered without running it again.
+        self._last_miss = None
+        self._in_batch = False                  # the repeat guard applies within ONE request
 
     def _slides_in_front(self):
         try:
@@ -3775,6 +3953,10 @@ class AutomationRuntime:
     def execute_action(self, action, skip_policy=False):
         if action is None:
             return ActionResult.unsupported("I didn't understand that one.")
+        if is_placeholder(action.target) and action.key != "message.send":   # that one means 'the draft' (L2)
+            # A model's template slot copied literally ("close (app name)", the log of
+            # 2026-11-11): there is nothing real to act on, and nothing to look up.
+            return ActionResult.failure("I didn't catch which one. Say its name.")
         audit(AUDIT_STARTED, action)
 
         if not skip_policy:
@@ -3796,11 +3978,21 @@ class AutomationRuntime:
                 audit(AUDIT_CONFIRM, action, reason=reason)
                 return ActionResult(Status.NEEDS_CONFIRMATION, prompt, {"reason": reason}, action)
 
+        signature = (action.key, str(action.target), repr(sorted((action.parameters or {}).items())))
+        miss = self._last_miss
+        if self._in_batch and miss is not None and miss[0] == signature \
+                and time.monotonic() - miss[1] <= REPEAT_MISS_S:
+            # Nothing happened the first time (NOT_FOUND), and nothing could have changed in a
+            # second: running it again only doubles the wait and the spoken "not found".
+            self._last_miss = None
+            return miss[2]
         try:
             result = self._dispatch(action)
         except Exception as e:
             audit(AUDIT_FAILED, action, error=str(e))
             return ActionResult.failure("That didn't work.", error=str(e))
+        self._last_miss = (signature, time.monotonic(), result) \
+            if result is not None and result.status == Status.NOT_FOUND else None
 
         if result is None:
             result = ActionResult.unsupported("I don't know how to do that yet.")
@@ -3836,6 +4028,14 @@ class AutomationRuntime:
     async def translate_and_execute(self, commands):
         if not commands:
             return ""
+        commands = [part for command in commands for part in split_compound(command, self.situation_fn)]
+        self._last_miss, self._in_batch = None, True
+        try:
+            return await self._translate_and_execute(commands)
+        finally:
+            self._in_batch, self._last_miss = False, None
+
+    async def _translate_and_execute(self, commands):
         actions, unmapped = [], []
         from_model = set()          # ids of actions the understanding layer proposed
         spoken = []
@@ -3864,6 +4064,14 @@ class AutomationRuntime:
         if not actions:
             return "" if self.chat_handoff else ("I'm not sure how to do that." if unmapped else "")
 
+        # L3: the same command twice in one batch (a doubled token) runs once.
+        unique, seen = [], set()
+        for action in actions:
+            key = (action.key, str(action.target), repr(sorted((action.parameters or {}).items())))
+            if key not in seen:
+                seen.add(key)
+                unique.append(action)
+        actions = unique
         self._set_state("AUTOMATING")
         outcomes = {"ok": 0, "failed": 0, "tokens": []}
         groups = plan_actions(merge_share_steps(merge_tab_steps(actions)))
@@ -3873,6 +4081,8 @@ class AutomationRuntime:
                     results = [await asyncio.to_thread(self.execute_action, group[0])]
                     if _worth_rethinking(group[0], results[0]) and id(group[0]) not in from_model:
                         results = await asyncio.to_thread(self._rethink, group[0], results[0])
+                    if index + 1 < len(groups):
+                        await asyncio.to_thread(_settle_page, group[0], results[-1])
                 else:
                     results = await asyncio.gather(
                         *(asyncio.to_thread(self.execute_action, a) for a in group))
@@ -3957,6 +4167,8 @@ class AutomationRuntime:
             result = self.execute_action(action)
             if _worth_rethinking(action, result) and (result.detail or {}).get("web_fallback"):
                 result = self._rethink(action, result)[-1]
+            if tokens:
+                _settle_page(action, result)
             if result.message:
                 spoken.append(result.message)
             if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):
@@ -4024,6 +4236,8 @@ class AutomationRuntime:
             if bare != str(reply or "").lower().strip(" ,.!") and read_confirmation_reply(bare or "yes"):
                 trust, reply = True, bare or "yes"
         verdict = read_confirmation_reply(reply)
+        if verdict is None and action is not None:
+            verdict = self._restated(action, reply)
         if verdict is None:
             return False, ""
         if action is None:
@@ -4049,6 +4263,31 @@ class AutomationRuntime:
             rest, self.pending_plan = self.pending_plan, []
             spoken += self.run_steps(rest)
         return True, " ".join(spoken)
+
+    def _restated(self, action, reply):
+        """
+        L9 (audit log 2026-11-11): Kayra asked "delete this email?", the user answered "yes,
+        delete it" — not a bare yes, so it went back to the classifier as a NEW delete, which asked
+        again, and the email was never deleted. A reply that says yes and then restates the same
+        request, or simply restates it ("delete it"), is a yes. True, or None (not an answer).
+        """
+        text = " ".join(re.sub(r"[.,!?;:]+", " ", str(reply or "").lower()).split())
+        m = re.match(r"(?:(?:yes|yeah|yep|ok|okay|sure|please|go ahead)\s+)+(.+)$", text)
+        rest = m.group(1) if m else text
+        if not rest or re.search(r"\b(?:no|not|don'?t|cancel|stop|never)\b", rest):
+            return None
+        verb = action.action.split("_")[0]
+        if m and rest.split()[0] == verb:
+            return True                          # "yes, delete it" / "yes delete this email"
+        try:
+            again = normalize_command(rest, self.context)
+            if again is None:
+                again = normalize_command(f"{action.domain} {rest}", self.context)
+        except Exception:
+            again = None
+        if again is not None and again.key == action.key:
+            return True                          # "delete it" while "delete it?" is pending
+        return None
 
     def shutdown(self):
         cancelled = self.timers.shutdown()
