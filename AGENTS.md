@@ -19,9 +19,9 @@ this repository. Read this first; follow the links when you need depth.
 ## Pending work
 
 [`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) — the
-browser-control round, built **one part per session** (§10 has the part table). Part 1 (open
-anything, anywhere) and 1b (the AI understanding layer) are done; Part 2 (tabs and windows) is
-next. Do the next part only when the user asks. The user also asked that every round proactively
+browser-control round, built **in parts** (§10 has the part table and what is next). Parts 1–6
+are done; Part 5P (Chrome profiles) and Part 7 (page agent) remain. Do the next part only when
+the user asks. The user also asked that every round proactively
 add the obvious neighbouring features and list them for veto.
 
 ## What Kayra is

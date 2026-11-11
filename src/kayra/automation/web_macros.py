@@ -48,7 +48,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 12, 0)
+REQUIRED_VERSION = (1, 13, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -1735,7 +1735,8 @@ def ws_open(name, kind="sheet"):
         names = ", ".join(_short(i["title"], 40) for i in [best] + close)
         return ActionResult.ambiguous(f"I found {len(close) + 1} {noun}s: {names}. Which one?",
                                       candidates=[best["title"]] + [i["title"] for i in close])
-    _call("tabs.navigate", url=best["url"])
+    # Waited for (G5): "open the budget sheet and total column C" reads the sheet next.
+    _call("tabs.navigate", url=best["url"], wait=True, timeoutMs=20000, timeout=25.0)
     remember_tab({"id": (_call("tabs.active") or {}).get("id"), "title": best["title"]})
     more = f", the best of {len(ranked)} matches" if len(ranked) > 1 else ""
     return ActionResult.success(f"Opened {_short(best['title'])}{more}.")
@@ -1753,7 +1754,7 @@ def ws_search(query, kind="file", open_best=False):
         return ActionResult.not_found(f"No {noun}s match {query}. The search is open.")
     ranked = rank_titles(query, items) or [(0.0, i) for i in items]
     if open_best and (len(items) == 1 or ranked[0][0] >= 60):
-        _call("tabs.navigate", url=ranked[0][1]["url"])
+        _call("tabs.navigate", url=ranked[0][1]["url"], wait=True, timeoutMs=20000, timeout=25.0)
         return ActionResult.success(f"Opened {_short(ranked[0][1]['title'])}.")
     names = ", ".join(_short(i["title"], 40) for _s, i in ranked[:4])
     return ActionResult.success(f"I found {len(items)} {noun}{'s' if len(items) != 1 else ''}: {names}. "
@@ -2910,11 +2911,22 @@ def message_send(contact, text, confirmed_chat=None, action=None):
     if not contact or not text:
         return ActionResult.failure("Who should I message, and what should I say?")
     if confirmed_chat is None:
-        chat, problem = _wa_find(contact)
-        if problem:
-            return problem
-        if not _wa_open(chat):
-            return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
+        if contact in ("current", "here", "this chat"):
+            # F5: "reply saying I'll be there" — the chat that is OPEN, named in the question.
+            stop = _bridge_at((1, 9, 0))
+            if stop:
+                return stop
+            _ensure_tab("web.whatsapp.com", WHATSAPP)
+            name = open_chat_name()
+            if not name:
+                return ActionResult.not_found("No chat is open in WhatsApp. Say who to send it to.")
+            chat = {"name": name}
+        else:
+            chat, problem = _wa_find(contact)
+            if problem:
+                return problem
+            if not _wa_open(chat):
+                return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
         if action is None:
             return ActionResult.failure("I need to ask before sending a message.")
         approved = Action(action.domain, action.action, target=action.target,
@@ -3776,3 +3788,342 @@ def profile_forget(key):
         return ActionResult.success("Forgot all your form details." if count else "There was nothing saved.")
     gone = P.forget(key)
     return ActionResult.success(f"Forgot your {P.spoken(key)}." if gone else f"I didn't have your {P.spoken(key)}.")
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 6b — ASK AN AI SITE (F4), WHATSAPP FILES AND REPLIES (F5),       │
+# │             REDDIT / LINKEDIN / GITHUB (F6)                             │
+# └────────────────────────────────────────────────────────────────────────┘
+# F4: the question goes to the site the user NAMED, in their own words (the understanding model
+# may never route one there: `interpreter._USER_ONLY`). The answer is read from the page, never
+# reworded by another model. F5: a file is only ever sent after a yes that names the file AND
+# the resolved chat. F6: lists are read from the page and spoken; nothing reaches a model.
+
+AI_SITES = {"chatgpt": ("ChatGPT", "https://chatgpt.com/", ("chatgpt.com", "chat.openai.com")),
+            "claude": ("Claude", "https://claude.ai/new", ("claude.ai",)),
+            "gemini": ("Gemini", "https://gemini.google.com/app", ("gemini.google.com",))}
+AI_WAIT_S = 90.0                    # the longest Kayra waits for an answer before saying so
+AI_CHUNK_S = 20.0                   # one in-page wait; the bridge call lives a little longer
+SPOKEN_ANSWER = 420                 # characters read out of a long answer ("read the whole answer": all)
+
+
+def _ai_tab(bot):
+    """The open tab of `bot`'s site (the active one first), or None."""
+    hosts = AI_SITES[bot][2]
+    tabs = [t for t in (_call("tabs.list") or []) if _host(t.get("url")) in hosts]
+    return next((t for t in tabs if t.get("active")), tabs[0] if tabs else None)
+
+
+def _ai_state(tab_id, op="state", **args):
+    return _call("page.aiChat", tabId=tab_id, op=op, **args) or {}
+
+
+def spoken_answer(text, full=False):
+    """An AI site's answer as speech: markdown marks dropped, code said to be on screen, and a long
+    answer cut at a sentence end with "the rest is on screen"."""
+    text = re.sub(r"\[code on screen\]", "(there's code on screen)", str(text or ""))
+    text = re.sub(r"(?m)^\s{0,3}(?:#{1,6}|[-*•]|\d+[.)])\s+", "", text)
+    text = re.sub(r"[*_`]{1,3}", "", text)
+    text = " ".join(text.split())
+    limit = 6000 if full else SPOKEN_ANSWER
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+    cut = cut[:end + 1] if end > limit // 3 else cut.rsplit(" ", 1)[0] + "…"
+    return cut + " The rest is on screen; say \"read the whole answer\" to hear it."
+
+
+def ai_ask(bot, question, new_chat=False):
+    """F4: "ask ChatGPT what a monad is". The open ChatGPT / Claude / Gemini tab (a new chat when
+    asked or when none is open), the question typed and sent, the answer waited for INSIDE the
+    page until it stops growing, then read out."""
+    stop = _bridge_at((1, 13, 0))
+    if stop:
+        return stop
+    if bot not in AI_SITES:
+        return ActionResult.unsupported("I can ask ChatGPT, Claude or Gemini.")
+    label, home, _hosts = AI_SITES[bot]
+    question = " ".join(str(question or "").split())
+    tab = _ai_tab(bot)
+    if tab and not new_chat:
+        _call("tabs.activate", tabId=tab["id"])
+    elif tab:
+        _call("tabs.navigate", tabId=tab["id"], url=home, wait=True, timeoutMs=20000, timeout=25.0)
+    else:
+        tab = _call("tabs.open", url=home, where="tab", wait=True, timeoutMs=20000, timeout=25.0) or {}
+    tab_id = tab.get("id")
+    remember_tab({"id": tab_id, "title": label})
+    if not question:
+        return ActionResult.success(f"{label} is open{' in a new chat' if new_chat or not tab else ''}. "
+                                    "What should I ask?")
+    state = _until(lambda: (lambda s: s if s.get("ready") or s.get("signedOut") else None)(_ai_state(tab_id)), 10.0) or {}
+    if state.get("signedOut"):
+        return ActionResult.failure(f"You're not signed in to {label}. Sign in there, then ask me again.")
+    if not state.get("ready"):
+        return ActionResult.failure(f"{label}'s message box didn't appear, so I didn't ask anything.")
+    sent = _call("page.aiChat", tabId=tab_id, op="ask", text=question, timeout=12.0) or {}
+    if not sent.get("sent"):
+        return ActionResult.failure(f"I couldn't send the question to {label}"
+                                    + (" — I couldn't type it." if sent.get("reason") == "could not type" else "."))
+    before = int(sent.get("before") or 0)
+    waited, done, announced = 0.0, {}, False
+    while waited < AI_WAIT_S:
+        chunk = min(AI_CHUNK_S, AI_WAIT_S - waited)
+        try:
+            done = _call("page.aiChat", tabId=tab_id, op="wait", after=before, waitMs=int(chunk * 1000),
+                         timeout=chunk + 5.0) or {}
+        except browser_bridge.BridgeError:
+            done = {}
+        if done.get("done"):
+            break
+        waited += chunk
+        if not announced:
+            from kayra.automation.common import announce
+            announce(f"{label} is still writing. I'll read it when it's done.", urgent=True)
+            announced = True
+    answer = str(done.get("last") or "")
+    if not done.get("done"):
+        if answer:
+            return ActionResult.success(f"{label} is still writing. So far: " + spoken_answer(answer))
+        return ActionResult.failure(f"I asked {label}, but no answer came back. It's on screen if it arrives.")
+    return ActionResult.success(f"{label} says: " + spoken_answer(answer), bot=bot, chars=len(answer))
+
+
+def ai_read(bot="", full=False):
+    """F4: "read ChatGPT's answer" / "read the whole answer" — the latest answer on the AI tab."""
+    stop = _bridge_at((1, 13, 0))
+    if stop:
+        return stop
+    if not bot:
+        active = _call("tabs.active") or {}
+        bot = next((b for b, (_l, _h, hosts) in AI_SITES.items() if _host(active.get("url")) in hosts), "")
+        tab = active if bot else None
+        if not bot:
+            tab = next((t for t in (_call("tabs.list") or []) for b in AI_SITES
+                        if _host(t.get("url")) in AI_SITES[b][2]), None)
+            bot = next((b for b in AI_SITES if tab and _host(tab.get("url")) in AI_SITES[b][2]), "")
+    else:
+        tab = _ai_tab(bot)
+    if not tab or not bot:
+        return ActionResult.not_found("No ChatGPT, Claude or Gemini tab is open.")
+    label = AI_SITES[bot][0]
+    state = _ai_state(tab.get("id"), op="read")
+    if not state.get("found"):
+        return ActionResult.not_found(f"There's no answer on the {label} page yet.")
+    lead = f"{label} is still writing. So far: " if state.get("busy") else f"{label} said: "
+    return ActionResult.success(lead + spoken_answer(state.get("last"), full=full))
+
+
+# ── F5: WhatsApp — reply in the open chat, send a file ──
+SCREENSHOT_DIR = None                  # the test suite points this at a temporary folder
+_IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic")
+_VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov", ".3gp")
+
+
+def _newest_screenshot():
+    folder = SCREENSHOT_DIR
+    if folder is None:
+        try:
+            folder = _L().screenshot_folder()
+        except Exception:
+            folder = os.path.join(os.path.expanduser("~"), "Pictures")
+    try:
+        paths = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(_IMAGE_EXT)]
+    except OSError:
+        return None
+    return max(paths, key=os.path.getmtime) if paths else None
+
+
+def find_send_file(what):
+    """The file "my resume" / "the last screenshot" / "budget pdf" means: [paths], best first."""
+    if re.search(r"\bscreen ?shot\b", str(what or ""), re.I):
+        shot = _newest_screenshot()
+        return [shot] if shot else []
+    return find_upload(what)
+
+
+def open_chat_name():
+    """The chat open in WhatsApp right now, or ''."""
+    try:
+        return str((_call("chat.composer", match="web.whatsapp.com") or {}).get("chat") or "")
+    except browser_bridge.BridgeError:
+        return ""
+
+
+def wa_send_file(contact, what, confirmed_path=None, confirmed_chat=None, action=None):
+    """
+    F5: "send my resume to Ravi on WhatsApp" / "send the last screenshot here". The file is
+    found, the chat resolved and OPENED, then Kayra ALWAYS asks, naming both ("Send
+    Ana-Resume.pdf to Ravi Sharma?"). On yes: the same chat must still be open, WhatsApp's Attach
+    input is armed, a real Space opens the chooser, the path is typed, and the preview's own Send
+    is pressed only when the preview shows that file.
+    """
+    stop = _bridge_at((1, 13, 0))
+    if stop:
+        return stop
+    if confirmed_path is None:
+        found = find_send_file(what)
+        if not found:
+            return ActionResult.not_found(f"I couldn't find {what} in your Documents, Downloads, Desktop "
+                                          "or screenshots.")
+        if contact in ("", "current", "here", "this chat"):
+            _ensure_tab("web.whatsapp.com", WHATSAPP)
+            chat = open_chat_name()
+            if not chat:
+                return ActionResult.not_found("No chat is open in WhatsApp. Say who to send it to.")
+        else:
+            row, problem = _wa_find(contact)
+            if problem:
+                return problem
+            if not _wa_open(row):
+                return ActionResult.failure(f"I found {row['name']} but couldn't open it.")
+            chat = row["name"]
+        if action is None:
+            return ActionResult.failure("I need to ask before sending a file.")
+        path = found[0]
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed_path": path, "confirmed_chat": chat},
+                          raw=action.raw)
+        more = f" (the newest of {len(found)})" if len(found) > 1 else ""
+        return ActionResult(Status.NEEDS_CONFIRMATION, f"Send {os.path.basename(path)}{more} to {chat}?",
+                            {"confirm": approved})
+    if not os.path.isfile(confirmed_path):
+        return ActionResult.failure("That file isn't there any more, so I didn't send anything.")
+    where = {"match": "web.whatsapp.com"}
+    _call("tabs.activate", **where)
+    if open_chat_name() != confirmed_chat:
+        return ActionResult.failure(f"{confirmed_chat} is no longer the open chat, so I didn't send it.")
+    name = os.path.basename(confirmed_path)
+    kind = "media" if name.lower().endswith(_IMAGE_EXT + _VIDEO_EXT) else "document"
+    L = _L()
+    before = {w.address for w in L.list_windows()}
+    armed = _call("chat.attach", op="arm", kind=kind, **where) or {}
+    if not armed.get("found"):
+        return ActionResult.failure("I couldn't open WhatsApp's attach menu, so nothing was sent.")
+    _focus_chrome()
+    L.send_keys("space")                     # the trusted key the page's hook turns into a click
+    chooser = _until(lambda: _chooser(before), 6.0)
+    if chooser is None:
+        return ActionResult.failure("The file chooser didn't open, so nothing was sent.")
+    L.focus_window(chooser)
+    L.send_keys("ctrl+l")
+    L.type_text(confirmed_path)
+    L.send_keys("enter")
+    shown = _until(lambda: (lambda s: s if s.get("preview") else None)(_call("chat.attach", op="state", **where) or {}), 8.0) or {}
+    if not shown.get("preview"):
+        return ActionResult.failure(f"WhatsApp didn't show {name} to send, so I didn't press send.")
+    files = shown.get("files") or []
+    if files and name not in files:
+        return ActionResult.failure(f"WhatsApp shows {_join(files[:2])}, not {name}, so I didn't send it.")
+    if (shown.get("chat") or confirmed_chat) != confirmed_chat:
+        return ActionResult.failure(f"The chat changed, so I didn't send {name}.")
+    sent = _call("chat.attach", op="send", **where) or {}
+    if not sent.get("sent"):
+        return ActionResult.failure(f"I couldn't press send for {name}; it's waiting in WhatsApp.")
+    return ActionResult.success(f"Sent {name} to {confirmed_chat}.")
+
+
+# ── F6: Reddit, LinkedIn, GitHub ──
+SOCIAL_PAGES = {
+    ("linkedin", "notifications"): "https://www.linkedin.com/notifications/",
+    ("linkedin", "messages"): "https://www.linkedin.com/messaging/",
+    ("linkedin", "feed"): "https://www.linkedin.com/feed/",
+    ("linkedin", "invitations"): "https://www.linkedin.com/mynetwork/invitation-manager/",
+    ("github", "notifications"): "https://github.com/notifications",
+    ("reddit", "notifications"): "https://www.reddit.com/notifications",
+    ("reddit", "messages"): "https://www.reddit.com/message/inbox/",
+    ("reddit", "feed"): "https://www.reddit.com/",
+}
+_REDDIT_PERIOD = {"today": "day", "day": "day", "hour": "hour", "week": "week", "this week": "week",
+                  "month": "month", "this month": "month", "year": "year", "this year": "year",
+                  "all": "all", "all time": "all", "ever": "all"}
+_SOCIAL_NAME = {"linkedin": "LinkedIn", "github": "GitHub", "reddit": "Reddit"}
+
+
+def subreddit_url(sub, top=False, period="day"):
+    sub = re.sub(r"[^A-Za-z0-9_]", "", str(sub or ""))
+    if not sub:
+        return ""
+    if top:
+        return f"https://www.reddit.com/r/{sub}/top/?t={_REDDIT_PERIOD.get(period or 'day', 'day')}"
+    return f"https://www.reddit.com/r/{sub}/"
+
+
+def _social_list(url, kind, max_items=10):
+    """Opens `url` (reusing a tab already on that page) and reads its list."""
+    tab = _call("tabs.active") or {}
+    if str(tab.get("url") or "").rstrip("/") != url.rstrip("/"):
+        same_site = _host(tab.get("url")) == _host(url)
+        if same_site:
+            _call("tabs.navigate", url=url, wait=True, timeoutMs=20000, timeout=25.0)
+        else:
+            _call("tabs.open", url=url, where="tab", wait=True, timeoutMs=20000, timeout=25.0)
+    return _ready("page.social", lambda r: bool((r or {}).get("items")), 8.0, kind=kind, max=max_items) or {}
+
+
+def _say_items(items, n):
+    parts = []
+    for i, item in enumerate(items[:n], 1):
+        meta = f" ({item['meta']})" if item.get("meta") else ""
+        parts.append(f"{i}. {_short(item['title'], 140)}{meta}")
+    return " ... ".join(parts)
+
+
+def social(op, site="", name="", period="", read=True):
+    """F6: "read my LinkedIn notifications", "what's the top post on r/python this week",
+    "open r/python", "open the github repo owner/name", "read the top posts here"."""
+    if op == "subreddit":
+        url = subreddit_url(name)
+        return open_in(url, None, f"r/{name}") if url else ActionResult.failure("Which subreddit?")
+    if op == "repo":
+        owner_repo = re.sub(r"\s*/\s*", "/", str(name or "").strip()).strip("/")
+        if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", owner_repo):
+            return open_in(f"https://github.com/{owner_repo}", None, f"{owner_repo} on GitHub")
+        from urllib.parse import quote_plus as _q
+        result = open_in(f"https://github.com/search?q={_q(owner_repo)}&type=repositories", None,
+                         f"GitHub repositories for {owner_repo}")
+        if result.ok:
+            result.message = (f"Here are GitHub's repositories for {owner_repo}. "
+                              "Say open the first result to open one.")
+        return result
+    url = ""
+    if op in ("top", "posts") and site == "reddit" and name:
+        url = subreddit_url(name, top=(op == "top"), period=period or "day")
+    elif op == "top" and site == "reddit":
+        url = f"https://www.reddit.com/r/popular/top/?t={_REDDIT_PERIOD.get(period or 'day', 'day')}"
+    elif site:
+        url = SOCIAL_PAGES.get((site, "feed" if op in ("posts", "top") else op), "")
+    if not read:
+        if not url:
+            return ActionResult.unsupported(f"I can't open that on {_SOCIAL_NAME.get(site, site)}.")
+        return open_in(url, None, f"your {_SOCIAL_NAME.get(site, site)} {op}")
+    stop = _bridge_at((1, 13, 0))
+    if stop:
+        return stop
+    if op == "posts" and not url:                  # "read the top posts" with the page in front
+        data = _ready("page.social", lambda r: bool((r or {}).get("items")), 4.0, kind="posts", max=10) or {}
+    elif not url:
+        return ActionResult.unsupported("I can read Reddit, LinkedIn and GitHub notifications, "
+                                        "messages and posts.")
+    else:
+        data = _social_list(url, "posts" if op == "top" else op)
+    items = data.get("items") or []
+    where = f"r/{name}" if name else _SOCIAL_NAME.get(site, "this page")
+    if not items:
+        if op == "notifications":
+            return ActionResult.success(f"I don't see any notifications on {where}. If you're not signed in, sign in there first.")
+        return ActionResult.not_found(f"I couldn't read anything on {where}. It's open on screen.")
+    if op == "top":
+        span = {"day": "today", "week": "this week", "month": "this month", "year": "this year",
+                "all": "of all time", "hour": "this hour"}[_REDDIT_PERIOD.get(period or "day", "day")]
+        top = items[0]
+        meta = f" ({top['meta']})" if top.get("meta") else ""
+        if top.get("url"):
+            remember_tab({"id": (_call("tabs.active") or {}).get("id"), "title": top["title"]})
+        return ActionResult.success(f"The top post on {where} {span}: {_short(top['title'], 180)}{meta}. "
+                                    "Say open the first result to open it.")
+    noun = {"notifications": "notifications", "messages": "conversations", "invitations": "invitations"}.get(op, "posts")
+    lead = f"Top posts on {where}: " if op == "posts" else f"Latest {_SOCIAL_NAME.get(site, '')} {noun}: ".replace("  ", " ")
+    said = _say_items(items, 5)
+    return ActionResult.success(lead + said + ("" if said.endswith((".", "?", "!")) else "."))

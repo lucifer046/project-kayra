@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, the V9 tuning pass and 5 done (2026-11-10).**
-> See §10 for the parts and what is next (Part 6, which needs D1/D2; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, the V9 / V11 fix rounds and 6 (6a + 6b) done (2026-11-11).**
+> See §10 for the parts and what is next (5P Chrome profiles, then Part 7; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -439,8 +439,8 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 - [x] C1 [x] C2 [x] C3 [x] C4 [x] C5 [x] C6 [x] C7 [x] C8 [x] C9 [x] C10 [x] C11
 - [x] D1 [x] D2 [x] D3 [x] D4 [x] D5  *(D5 not yet tried against the real portal file chooser)*
 - [x] E1 [x] E2 [x] E3 [x] E4 [~] E5 [~] E6 [~] E7 [x] E8  *(E5: no mark-all-read / attach; E6: no "move my 3 pm"; E7: admit only — see §10 Part 4)*
-- [x] F1 [x] F2 [~] F3 [ ] F4 [ ] F5 [ ] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b)*
-- [x] G1 [x] G2 [x] G3 [x] G4 [ ] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
+- [x] F1 [x] F2 [~] F3 [x] F4 [x] F5 [x] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b, not tried on the live sites)*
+- [x] G1 [x] G2 [x] G3 [x] G4 [x] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
 - §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [ ] M2.2 [ ] M2.3 [ ] M3 [ ] M4  *(M1.2: Chrome's tab list opens, the user picks the tab)*
 - [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
 
@@ -479,8 +479,28 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | **done 2026-11-10** (extension 1.9.0; not yet tried on a live, logged-in WhatsApp) |
 | 5F | Fix round V11 after live use of Parts 4–5: scrolling inside web apps, one search action + close search, WhatsApp chats by loose name from anywhere, "recent chat", year ranges and recency for file names | **done 2026-11-11** (extension 1.11.0 after the second pass from the audit log; `updates/UPDATE_V11.md`; not yet re-tried on live Gmail / WhatsApp / Sheets) |
 | 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | planned |
-| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **6a done 2026-11-11** (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`). **6b next**: F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply-to-open-chat + send a file, F6 LinkedIn/Reddit pages, G5 multi-step |
+| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **done 2026-11-11** — 6a (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`); 6b (F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply + send a file, F6 Reddit/LinkedIn/GitHub, G5 several steps; extension 1.13.0; `updates/UPDATE_V13.md`) |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+
+**Part 6b — AI sites, WhatsApp files, Reddit / LinkedIn / GitHub, several steps** (done
+2026-11-11, extension 1.13.0, no new permission). Detail: `updates/UPDATE_V13.md` and the
+changelog in `docs/platforms/LINUX_AUTOMATION.md`.
+- F4 `ai_ask` / `ai_read` (`page.aiChat`: state / ask / wait-in-page / read; the site's tab
+  reused; bounded 90 s wait announced once; never routed there by a model).
+- F5 `message.send` to the open chat ("reply saying …"), `message.send_file` (`chat.attach`:
+  arm with the trusted-Space hook, read the preview, press the preview's Send); late
+  confirmation naming file AND chat; never from a model.
+- F6 `social` (`page.social`): notifications / messages / top post / subreddit / repo, LinkedIn
+  jobs search through the site table.
+- G5 `direct_tokens` splits complete halves with the later half judged against the predicted
+  screen; batches park the rest behind a yes; a failed open stops the dependent step;
+  `ws_open` waits for the page; the planner's catalog grew.
+- Tried and dropped: a DMM preamble paragraph for 6b — it made the local model misread "mute
+  me"; all 6b phrasings are rules-first instead.
+- Tests: `test_browser_control.py` [22], `test_browser_extension.py` [11], `test_dmm_browser.py`
+  110/110 on the local model (91 rules-first).
+- **Not verified live**: real ChatGPT / Claude / Gemini, a real WhatsApp file send, live
+  LinkedIn / Reddit / GitHub pages.
 
 **Part 6a — forms, the video, site search and shopping** (done 2026-11-11, extension 1.12.0;
 D1 and D2 answered by the user that day). Detail: `updates/UPDATE_V12.md` and the changelog

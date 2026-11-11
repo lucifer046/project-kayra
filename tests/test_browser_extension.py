@@ -257,6 +257,79 @@ AMAZON_PRODUCT = """<html><head><meta charset=utf-8></head><body><span id=produc
 <div id=availability><span> In stock </span></div></body></html>"""
 
 
+CHATGPT = """<html><head><title>ChatGPT</title></head><body><main>
+<div data-message-author-role="user">earlier question</div>
+<div data-message-author-role="assistant"><p>Old answer.</p><button aria-label="Copy">copy</button></div>
+<form><div id="prompt-textarea" contenteditable="true" aria-label="Message ChatGPT"></div>
+<button data-testid="send-button" aria-label="Send prompt" disabled>up</button></form></main>
+<script>
+const box = document.getElementById('prompt-textarea'), btn = document.querySelector('[data-testid=send-button]');
+box.addEventListener('input', () => { btn.disabled = !box.innerText.trim(); });
+btn.addEventListener('click', () => {
+  const q = box.innerText.trim(); box.innerHTML = ''; btn.disabled = true;
+  const stop = document.createElement('button'); stop.setAttribute('aria-label', 'Stop streaming'); stop.textContent = 'stop';
+  document.body.appendChild(stop);
+  const a = document.createElement('div'); a.setAttribute('data-message-author-role', 'assistant');
+  document.querySelector('main').appendChild(a);
+  const words = ('The answer to ' + q + ' is forty two. <pre>print(42)</pre> Done.').split(' ');
+  let i = 0;
+  const t = setInterval(() => { a.innerHTML += (i ? ' ' : '') + words[i]; i++;
+    if (i >= words.length) { clearInterval(t); setTimeout(() => stop.remove(), 300); } }, 60);
+});
+</script></body></html>"""
+
+CHATGPT_OUT = """<html><head><title>ChatGPT</title></head><body><main><h1>Welcome back</h1>
+<button>Log in</button><button>Sign up</button></main></body></html>"""
+
+CLAUDE = """<html><head><title>Claude</title></head><body><main>
+<div data-is-streaming="false"><div class="font-claude-response"><p>First reply.</p></div></div>
+<div data-is-streaming="true"><div class="font-claude-response"><p>Still writ</p></div></div>
+<fieldset><div class="ProseMirror" contenteditable="true" aria-label="Write your prompt to Claude"></div>
+<button aria-label="Send message">send</button><button aria-label="Stop response">stop</button></fieldset>
+</main></body></html>"""
+
+WA_ATTACH = """<html><head><title>WhatsApp</title></head><body><div id=app><div id=side></div>
+<div id=main><header><span title="Rahul Sharma">Rahul Sharma</span></header>
+<footer><div role=button aria-label="Attach" onclick="setTimeout(openMenu, 200)"><span data-icon="plus">+</span></div>
+<div contenteditable=true role=textbox aria-label="Type a message"></div>
+<div role=button aria-label="Send" onclick="document.title='composer-send'"><span data-icon="send">&gt;</span></div></footer></div></div>
+<script>
+function openMenu() {
+  if (document.getElementById('menu')) return;
+  const m = document.createElement('ul'); m.id = 'menu';
+  m.innerHTML = '<li><div role=button>Document<input type=file accept="*" multiple style="display:none" id=docin></div></li>' +
+                '<li><div role=button>Photos &amp; videos<input type=file accept="image/*,video/mp4" style="display:none" id=medin></div></li>';
+  document.getElementById('app').appendChild(m);
+  document.getElementById('docin').addEventListener('click', () => { document.title = 'doc-chooser'; });
+  document.getElementById('medin').addEventListener('click', () => { document.title = 'media-chooser'; });
+}
+function preview(name) {
+  const p = document.createElement('div'); p.id = 'preview';
+  p.innerHTML = '<span title="' + name + '">' + name + '</span><div role=button aria-label="Send" onclick="this.parentNode.remove(); document.title=\\'sent\\'"><span data-icon="send">&gt;</span></div>';
+  document.getElementById('app').appendChild(p);
+}
+</script></body></html>"""
+
+REDDIT = """<html><head><title>r/Python top</title></head><body><main>
+<shreddit-post promoted post-title="Buy our course" score="1"></shreddit-post>
+<shreddit-post post-title="Python 3.15 is out" score="4100" comment-count="380" subreddit-prefixed-name="r/Python"
+  permalink="/r/Python/comments/1/python_315/"></shreddit-post>
+<shreddit-post post-title="My first package" score="900" comment-count="12" subreddit-prefixed-name="r/Python"
+  permalink="/r/Python/comments/2/first/"></shreddit-post>
+</main></body></html>"""
+
+GITHUB_NOTES = """<html><head><title>Notifications</title></head><body><main><ul>
+<li class="notifications-list-item"><a class="markdown-title" href="/o/r/pull/7">Fix the parser</a><span class="f6">o/r #7</span></li>
+<li class="notifications-list-item"><a class="markdown-title" href="/o/r/issues/9">Crash on start</a><span class="f6">o/r #9</span></li>
+</ul></main></body></html>"""
+
+LINKEDIN_NOTES = """<html><head><title>Notifications | LinkedIn</title></head><body><main>
+<article class="nt-card"><div>Promoted</div><div>Try Premium for free this month and see more</div></article>
+<article class="nt-card"><div>2h</div><div>Ana Rao viewed your profile and 3 others recently</div></article>
+<article class="nt-card"><div>1d</div><div>Ravi posted: we are hiring interns for the summer</div></article>
+</main></body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -645,6 +718,72 @@ def main():
               and r["rating"] == "4.4" and r["ratings"] == "1,812" and r["availability"] == "In stock", r)
         d.get("data:text/html;base64," + base64.b64encode(PAGE.encode()).decode())
         check("F3: a page that is not a product says so", call("pageProduct")["found"] is False)
+
+        check.section("[11] Part 6b — ChatGPT / Claude pages, WhatsApp's attach menu, Reddit / GitHub / LinkedIn lists")
+        ai = lambda html, host, op, args=None: (d.get("data:text/html;base64," + base64.b64encode(html.encode()).decode()),
+                                                d.execute_script(
+            f"return (function(location){{ return (async {function('pageAiChat')})(arguments[1], arguments[2]); }})"
+            f"(arguments[0], arguments[1], arguments[2])", {"hostname": host}, op, args or {}))[1]
+        r = ai(CHATGPT, "chatgpt.com", "state")
+        check("F4: ChatGPT's prompt box and its earlier answer are found", r["ready"] and r["site"] == "chatgpt"
+              and r["count"] == 1 and r["last"] == "Old answer." and not r["busy"], r)
+        run_ai = lambda op, args=None: d.execute_script(
+            f"return (function(location){{ return (async {function('pageAiChat')})(arguments[1], arguments[2]); }})"
+            f"(arguments[0], arguments[1], arguments[2])", {"hostname": "chatgpt.com"}, op, args or {})
+        r = run_ai("ask", {"text": "what is life"})
+        check("F4: the question is typed, the send button waited for until it is enabled, and pressed",
+              r["sent"] and r["pressed"] == "button" and r["before"] == 1, r)
+        r = run_ai("wait", {"after": 1, "waitMs": 10000, "settleMs": 500})
+        check("F4: the answer is waited for until it stops growing AND the Stop button is gone",
+              r["done"] and not r["busy"] and r["count"] == 2 and
+              r["last"].startswith("The answer to what is life is forty two.") and r["last"].endswith("Done."), r)
+        check("F4: code in an answer is said to be on screen, never read out", "[code on screen]" in r["last"]
+              and "print(42)" not in r["last"], r["last"])
+        r = ai(CHATGPT_OUT, "chatgpt.com", "ask", {"text": "hi"})
+        check("F4: a signed-out page is reported, nothing typed", not r["sent"] and r["reason"] == "signed out"
+              and r["signedOut"], r)
+        r = ai(CLAUDE, "claude.ai", "state")
+        check("F4: Claude's editor and answers are found, and a streaming answer counts as busy",
+              r["ready"] and r["site"] == "claude" and r["count"] == 2 and r["busy"] and r["last"] == "Still writ", r)
+
+        attach = lambda op, args=None: d.execute_script(
+            f"return (async {function('pageChatAttach')}).apply(null, arguments)", op, args or {})
+        d.get("data:text/html;base64," + base64.b64encode(WA_ATTACH.encode()).decode())
+        r = attach("state")
+        check("F5: the composer's own Send is NOT a file preview", r["chat"] == "Rahul Sharma" and not r["preview"], r)
+        r = attach("arm", {"kind": "document"})
+        check("F5: arming opens the Attach menu, WAITS for its inputs, and picks the document input",
+              r["found"] and r["armed"] and r["kind"] == "document" and r["chat"] == "Rahul Sharma", r)
+        from selenium.webdriver.common.action_chains import ActionChains
+        d.execute_script("window.dispatchEvent(new KeyboardEvent('keydown', {key: ' ', bubbles: true}))")
+        check("F5: a scripted Space opens nothing", d.title == "WhatsApp", d.title)
+        ActionChains(d).send_keys(" ").perform()
+        check("F5: a REAL Space opens the document chooser", d.title == "doc-chooser", d.title)
+        d.execute_script("document.title = 'WhatsApp'")
+        r = attach("arm", {"kind": "media"})
+        ActionChains(d).send_keys(" ").perform()
+        check("F5: a photo goes through the Photos & videos input", r["kind"] == "media" and d.title == "media-chooser", (r, d.title))
+        d.execute_script("document.title = 'WhatsApp'; preview('Ana-Resume-2026.pdf')")
+        r = attach("state")
+        check("F5: the preview and its file name are read", r["preview"] and r["files"] == ["Ana-Resume-2026.pdf"], r)
+        r = attach("send")
+        check("F5: send presses the PREVIEW's Send (not the composer's) and sees the preview close",
+              r["sent"] and d.title == "sent", (r, d.title))
+
+        r = at(REDDIT, "www.reddit.com", "pageSocial", "posts", 5, path="/r/Python/top/")
+        check("F6: Reddit posts from the post elements' own facts; promoted posts skipped",
+              [i["title"] for i in r["items"]] == ["Python 3.15 is out", "My first package"]
+              and r["items"][0]["meta"] == "r/Python, 4100 points, 380 comments"
+              and r["items"][0]["url"] == "https://www.reddit.com/r/Python/comments/1/python_315/", r["items"][:1])
+        r = at(GITHUB_NOTES, "github.com", "pageSocial", "notifications", 5, path="/notifications")
+        check("F6: GitHub notifications with their repository", [(i["title"], i["meta"]) for i in r["items"]] ==
+              [("Fix the parser", "o/r #7"), ("Crash on start", "o/r #9")], r["items"])
+        r = at(LINKEDIN_NOTES, "www.linkedin.com", "pageSocial", "notifications", 5, path="/notifications/")
+        check("F6: LinkedIn notifications, the promoted card skipped", [i["title"] for i in r["items"]] ==
+              ["Ana Rao viewed your profile and 3 others recently", "Ravi posted: we are hiring interns for the summer"],
+              r["items"])
+        r = at(RESULTS, "example.com", "pageSocial", "posts", 5)
+        check("F6: any other page falls back to the articles / list items in <main>", isinstance(r["items"], list), r)
     finally:
         d.quit()
     return check.finish()

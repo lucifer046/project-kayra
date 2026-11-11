@@ -2221,7 +2221,13 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "profile_set": lambda: W.profile_set(target, params.get("text", "")),
                  "profile_show": lambda: W.profile_show(params.get("read", False)),
                  "profile_forget": lambda: W.profile_forget(target),
-                 "profile_clear": lambda: W.profile_forget("all")}
+                 "profile_clear": lambda: W.profile_forget("all"),
+                 # ── Part 6b ──
+                 "ai_ask": lambda: W.ai_ask(params.get("bot", "chatgpt"), params.get("question", ""),
+                                            bool(params.get("new"))),
+                 "ai_read": lambda: W.ai_read("" if target == "current" else target, bool(params.get("full"))),
+                 "social": lambda: W.social(target, params.get("site", ""), params.get("name", ""),
+                                            params.get("period", ""), params.get("read", True))}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
@@ -2270,6 +2276,9 @@ def _dispatch_extended(domain, verb, target, params, action):
             return W.wa_unread()
         if verb == "read":
             return W.wa_read(target, bool(params.get("today")), int(params.get("count") or 0))
+        if verb == "send_file":
+            return W.wa_send_file(target, params.get("what", ""), params.get("confirmed_path"),
+                                  params.get("confirmed_chat"), action)
         return W.message_send(target, params.get("text", ""), params.get("confirmed_chat"), action)
     if domain == "diagnose":
         if verb == "fix":
@@ -2338,7 +2347,7 @@ def _music_sleep(text):
     seconds = common.parse_duration(text) or 30 * 60
     label = _humanize_duration(seconds)
     timer_id, error = RUNTIME.timers.add(
-        seconds, f"music sleep timer", on_fire=lambda _l: media_action("pause"))
+        seconds, "music sleep timer", on_fire=lambda _l: media_action("pause"))
     return ActionResult.failure(error) if timer_id is None else \
         ActionResult.success(f"I'll stop the music in {label}.")
 

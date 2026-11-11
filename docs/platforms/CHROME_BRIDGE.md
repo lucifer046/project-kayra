@@ -133,6 +133,13 @@ anywhere else; one is never needed for an unpacked extension.
 | "search Amazon for earbuds under 2000", "search for a wireless mouse on Flipkart sorted by price low to high", "search GitHub for kokoro", "images of red pandas" | the site's own search, with price range and sort for Amazon and Flipkart |
 | "sort by price low to high", "show only under 2000" (Amazon / Flipkart results in front) | the same search, re-sorted or filtered |
 | "how much is this", "what's the rating" (a product page in front) | name, price, rating and stock, from the page's own product data |
+| "ask ChatGPT what a monad is", "ask Claude to write a haiku", "what does Gemini think of X", "ask ChatGPT in a new chat …" | (1.13.0) the site's tab (reused, so follow-ups stay in the conversation), the question typed as you said it, the answer waited for and read out; long answers are cut with "the rest is on screen". You must be signed in to that site |
+| "read the whole answer", "read ChatGPT's answer" | the latest answer on the ChatGPT / Claude / Gemini tab |
+| "reply saying I'll be there" (WhatsApp in front), "reply to Rahul saying call me" | **asks first** naming the open (or named) chat, then sends |
+| "send my resume to Ravi on WhatsApp", "send the last screenshot here" | **asks first** naming the file and the chat; then attaches it through WhatsApp's own Attach menu and presses Send only when the preview shows that file |
+| "read my LinkedIn notifications", "any new GitHub notifications", "read my LinkedIn messages" | opens that page and reads the latest five |
+| "what's the top post on r/python this week", "what's trending on Reddit", "open r/python", "open the github repo pallets/flask", "search LinkedIn jobs for data analyst" | Reddit / GitHub / LinkedIn by voice |
+| "open the budget sheet and total column C", "tick I agree and then submit this form" | several steps in one sentence, in order; a step that asks first holds the rest until you answer |
 | "add this to cart", "buy it now", "checkout" | **refused** (decision D1, 2026-11-11): Kayra searches and opens products only; the cart and paying are yours |
 
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the

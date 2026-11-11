@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Kayra Bridge",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "Lets the Kayra desktop assistant on this computer control Chrome by voice: tabs, clicks, typing, reading pages, Google Meet.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtE02vyzNsXr4bqx8U1QSPHtsFAX2sfoBk0FeLjKVq/Pt8x5Bl89wuHfOBXpJX1Aq+f87uarywdZrejGAKCgZXedjw0hLLjHKVwPtl3Yyue0w2BNGVC3G8D9qnSf3mTuntdLy/qEsSkxmrhoqdNlHvqJ3kYKTHMz8LI6ILep6ry3F862Si8W1sUWiHXLAkNSbdhiKTajwDzDbSOA4Cz0eoDKoLv/wjI6ta0+aVFQaljXPQw5X+++UcGsuYeCFmtTy6e+yQvDA/pnJLZxi7TGWPLT9+cxVaX6lIamS1sJ/sEVuSfJMicWoIpCWHBpHqlfD6emESxpIJems3kToCaVk7QIDAQAB",
   "minimum_chrome_version": "116",

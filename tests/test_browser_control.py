@@ -572,7 +572,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.12.0")
+        web_macros.BRIDGE = current = Bridge(version="1.13.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1789,8 +1789,8 @@ def section_part_4():
         check("...searched Sheets' own list for the name",
               opened and opened[0]["url"] == "https://docs.google.com/spreadsheets/u/0/?q=budget", opened)
         r = rig.do("browser open my budget 2026 sheet")
-        check("E1: an exact name opens it", rig.bridge.last("tabs.navigate") ==
-              {"url": "https://docs.google.com/spreadsheets/d/" + "a" * 30 + "/edit"} and "Budget 2026" in r.message,
+        check("E1: an exact name opens it, and the page is waited for (G5)", rig.bridge.last("tabs.navigate") ==
+              {"url": "https://docs.google.com/spreadsheets/d/" + "a" * 30 + "/edit", "wait": True, "timeoutMs": 20000} and "Budget 2026" in r.message,
               r.message)
         r = rig.do("browser open my holiday sheet")
         check("E1: no match is said so", not r.ok and "holiday" in r.message, r.message)
@@ -2716,12 +2716,12 @@ def section_fix_round_v11():
     with WebRig(YearFiles(files=files)) as rig, Models("SHOULD NOT BE ASKED") as models:
         r = rig.do("open council details 2026-27 sheet")
         check("the reported one: 'open council details 2026-27 sheet' opens '… | Sundarbans House'",
-              rig.bridge.last("tabs.navigate") == {"url": files[1]["url"]} and "Sundarbans" in r.message, r.message)
+              (rig.bridge.last("tabs.navigate") or {}).get("url") == files[1]["url"] and "Sundarbans" in r.message, r.message)
         r = rig.do("browser open council details 2026 2027 sheet")
         searched = [a["url"] for c, a in rig.bridge.calls if c in ("tabs.open", "tabs.navigate") and "?q=" in a["url"]]
         check("...the year said the long way is searched for as '2026 27'",
               searched[-1] == "https://docs.google.com/spreadsheets/u/0/?q=council%20details%202026%2027"
-              and rig.bridge.last("tabs.navigate") == {"url": files[1]["url"]}, searched)
+              and (rig.bridge.last("tabs.navigate") or {}).get("url") == files[1]["url"], searched)
         r = rig.do("browser open zzz council details sheet")
         check("a name Google's search finds nothing for falls back to the recent list, never a weak guess",
               not r.ok or "Council" in r.message, r.message)
@@ -2730,7 +2730,7 @@ def section_fix_round_v11():
     with WebRig(WorkspaceBridge(files=twins)) as rig:
         r = rig.do("open my budget sheet")
         check("the same name with different years: the one listed first (used last) opens, no question",
-              r.ok and rig.bridge.last("tabs.navigate") == {"url": twins[0]["url"]}, r.message)
+              r.ok and (rig.bridge.last("tabs.navigate") or {}).get("url") == twins[0]["url"], r.message)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -3237,6 +3237,432 @@ def section_part_6():
               and "Amazon and Flipkart" in r.message, r.message)
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 6b — AI SITES (F4), WHATSAPP FILES (F5), SOCIAL (F6), STEPS (G5)  │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class AIBridge(Bridge):
+    """The extension at 1.13.0 with ChatGPT / Claude / Gemini pages that answer on cue."""
+
+    def __init__(self, version="1.13.0", tabs=None, answer="A monad is a way to chain steps that carry context.",
+                 busy_chunks=0, signed_out=False, typed=True):
+        super().__init__(version=version, tabs=tabs if tabs is not None else [
+            {"id": 1, "title": "Inbox (3) - Gmail", "url": "https://mail.google.com/mail/u/0/", "active": True}])
+        self.answer, self.busy_chunks, self.signed_out, self.typed = answer, busy_chunks, signed_out, typed
+        self.answers, self.asked = [], []
+
+    def _active(self):
+        return next((t for t in self.tabs if t.get("active")), self.tabs[0])
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "tabs.list":
+            return [dict(t) for t in self.tabs]
+        if cmd == "tabs.active":
+            return dict(self._active())
+        if cmd == "tabs.open":
+            self.calls.append((cmd, args))
+            for t in self.tabs:
+                t["active"] = False
+            tab = {"id": 40 + len(self.tabs), "title": "New chat", "url": args["url"], "active": True}
+            self.tabs.append(tab)
+            return dict(tab)
+        if cmd in ("tabs.activate", "tabs.navigate"):
+            self.calls.append((cmd, args))
+            tab = next(t for t in self.tabs if t["id"] == args.get("tabId", self._active()["id"]))
+            for t in self.tabs:
+                t["active"] = t is tab
+            if cmd == "tabs.navigate":
+                tab["url"], self.answers = args["url"], []
+            return dict(tab)
+        if cmd == "page.aiChat":
+            self.calls.append((cmd, args))
+            op = args.get("op")
+            state = {"ready": not self.signed_out, "signedOut": self.signed_out, "count": len(self.answers),
+                     "busy": False, "last": self.answers[-1] if self.answers else ""}
+            if op in ("state", "read"):
+                return dict(state, found=bool(self.answers))
+            if op == "ask":
+                if not self.typed:
+                    return dict(state, sent=False, reason="could not type")
+                self.asked.append(args["text"])
+                return dict(state, sent=True, before=len(self.answers))
+            if op == "wait":
+                if self.busy_chunks:
+                    self.busy_chunks -= 1
+                    return dict(state, done=False, busy=True, last="A monad is")
+                if len(self.answers) <= args.get("after", 0):
+                    self.answers.append(self.answer)
+                return dict(state, done=True, count=len(self.answers), last=self.answers[-1])
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class SocialBridge(Bridge):
+    """A Reddit / LinkedIn / GitHub page whose list the extension reads."""
+
+    def __init__(self, items=None, url="https://example.com/"):
+        super().__init__(version="1.13.0")
+        self.url = url
+        self.items = items if items is not None else [
+            {"title": "Python 3.15 is out", "meta": "r/Python, 4100 points, 380 comments", "url": "https://www.reddit.com/r/Python/1"},
+            {"title": "My first package", "meta": "r/Python, 900 points", "url": "https://www.reddit.com/r/Python/2"}]
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "tabs.active":
+            return {"id": 7, "title": "Page", "url": self.url}
+        if cmd in ("tabs.open", "tabs.navigate"):
+            self.calls.append((cmd, args))
+            self.url = args["url"]
+            return {"id": 7, "url": args["url"], "title": "x"}
+        if cmd == "page.social":
+            self.calls.append((cmd, args))
+            return {"items": [dict(i) for i in self.items], "url": self.url}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class WhatsAppFiles(WhatsApp11):
+    """WhatsApp at 1.13.0 with the Attach menu: the preview shows what the chooser was given."""
+
+    def __init__(self, preview=None, **kw):
+        super().__init__(**kw)
+        self.version, self.runner, self.preview, self.forced = "1.13.0", None, None, preview
+        self.sent_files = []
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "chat.attach":
+            self.calls.append((cmd, args))
+            op = args.get("op")
+            if op == "arm":
+                return {"found": bool(self.open_chat), "armed": True, "chat": self.open_chat, "kind": args.get("kind")}
+            if op == "state":
+                typed = [t for a, t in (self.runner.ran if self.runner else []) if a == ["wtype", "-"]]
+                if typed and self.preview is None:
+                    self.preview = self.forced if self.forced is not None else [os.path.basename(typed[-1])]
+                return {"chat": self.open_chat, "preview": bool(self.preview), "files": list(self.preview or [])}
+            if op == "send":
+                if not self.preview:
+                    return {"sent": False}
+                self.sent_files += self.preview
+                self.preview = []
+                return {"sent": True, "chat": self.open_chat}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_part_6b():
+    check.section("[22] Part 6b — ask ChatGPT / Claude / Gemini (F4), WhatsApp reply and files (F5), "
+                  "Reddit / LinkedIn / GitHub (F6), several steps in one sentence (G5)")
+    import tempfile
+    import shutil
+    from kayra.automation import workflows
+    from kayra.automation.policy import classify_action
+    from test_assistant_automation import TempData
+    d = common.direct_tokens
+    nowhere = lambda: {}
+    wa = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+    reddit = lambda: {"app": "google-chrome", "tab_url": "https://www.reddit.com/r/python/"}
+    chatgpt = lambda: {"app": "google-chrome", "tab_url": "https://chatgpt.com/c/1"}
+
+    # ── parsing ──
+    for said, key, target, params in (
+            ("ask chatgpt what is a monad", "browser.ai_ask", "what is a monad", {"bot": "chatgpt", "new": False}),
+            ("ask chat gpt what is a monad", "browser.ai_ask", "what is a monad", {"bot": "chatgpt"}),
+            ("ask Claude to write a haiku about Rain", "browser.ai_ask", "write a haiku about Rain", {"bot": "claude"}),
+            ("ask gemini about black holes", "browser.ai_ask", "Tell me about black holes", {"bot": "gemini"}),
+            ("ask chatgpt in a new chat how tides work", "browser.ai_ask", "how tides work", {"bot": "chatgpt", "new": True}),
+            ("start a new chat with claude and ask what's 2+2", "browser.ai_ask", "what's 2+2", {"bot": "claude", "new": True}),
+            ("open a new chatgpt chat", "browser.ai_ask", "new chat", {"bot": "chatgpt", "new": True, "question": ""}),
+            ("what does gemini think of the new pixel", "browser.ai_ask", "What do you think of the new pixel?", {"bot": "gemini"}),
+            ("read chatgpt's answer", "browser.ai_read", "chatgpt", {"full": False}),
+            ("read the whole answer", "browser.ai_read", "current", {"full": True}),
+            ("what did claude say", "browser.ai_read", "claude", {}),
+            ("read my linkedin notifications", "browser.social", "notifications", {"site": "linkedin", "read": True}),
+            ("any new github notifications", "browser.social", "notifications", {"site": "github"}),
+            ("check my notifications on reddit", "browser.social", "notifications", {"site": "reddit"}),
+            ("read my linkedin messages", "browser.social", "messages", {"site": "linkedin"}),
+            ("open my linkedin notifications", "browser.social", "notifications", {"site": "linkedin", "read": False}),
+            ("what's the top post on r/python this week", "browser.social", "top",
+             {"site": "reddit", "name": "python", "period": "this week"}),
+            ("what are the top posts in the rust subreddit", "browser.social", "posts", {"site": "reddit", "name": "rust"}),
+            ("what's trending on reddit", "browser.social", "top", {"site": "reddit", "name": ""}),
+            ("open r/python", "browser.social", "subreddit", {"name": "python", "read": False}),
+            ("open the python subreddit", "browser.social", "subreddit", {"name": "python"}),
+            ("open r slash india", "browser.social", "subreddit", {"name": "india"}),
+            ("open the github repo pallets/flask", "browser.social", "repo", {"name": "pallets/flask"}),
+            ("open Kokoro-FastAPI / remsky on github", "browser.social", "repo", {"name": "Kokoro-FastAPI/remsky"}),
+            ("search linkedin jobs for data analyst", "browser.site_search", "data analyst", {"site": "linkedin jobs"}),
+            ("find python developer jobs on linkedin", "browser.site_search", "python developer", {"site": "linkedin jobs"}),
+            ("send my resume to Ravi on whatsapp", "message.send_file", "Ravi", {"what": "resume"}),
+            ("send the last screenshot to mom on whatsapp", "message.send_file", "mom", {"what": "last screenshot"}),
+            ("open the sheet Ravi sent last week", "browser.ws_search", "ravi", {"kind": "sheet", "open": True}),
+            ("total column c", "browser.sheet_calc", "c", {"op": "sum"}),
+            ("add up the amount column", "browser.sheet_calc", "amount", {"op": "sum"}),
+            ("average column d", "browser.sheet_calc", "d", {"op": "avg"})):
+        a = n(said) if key.startswith("message") or said.startswith("open the sheet") else n("browser " + said)
+        ok = a is not None and a.key == key and a.target == target and all(a.parameters.get(k) == v for k, v in params.items())
+        check(f"'{said}' -> {key} {target!r}", ok, a and (a.key, a.target, a.parameters))
+    for token, key, target, params in (
+            ("message reply saying I'll be there at 6", "message.send", "current", {"text": "I'll be there at 6"}),
+            ("message reply with ok thanks", "message.send", "current", {"text": "ok thanks"}),
+            ("message respond to this chat saying see you", "message.send", "current", {"text": "see you"}),
+            ("message reply to Rahul saying call me", "message.send", "Rahul", {"text": "call me"}),
+            ("message send my resume here", "message.send_file", "current", {"what": "resume"}),
+            ("message send this pdf here", "message.send_file", "current", {"what": "pdf"}),
+            ("message send the budget.xlsx to Ana", "message.send_file", "Ana", {"what": "budget.xlsx"}),
+            ("message Rahul: I'm late", "message.send", "Rahul", {"text": "I'm late"})):
+        a = n(token)
+        ok = a is not None and a.key == key and a.target == target and all(a.parameters.get(k) == v for k, v in params.items())
+        check(f"'{token}' -> {key} {target!r}", ok, a and (a.key, a.target, a.parameters))
+    check("the old misreading is gone: 'message reply saying ok' is NOT a message to a contact called 'reply'",
+          n("message reply saying ok").target == "current")
+
+    # rules first, no model
+    for said, want in (("ask chatgpt what is a monad", ["browser ask chatgpt what is a monad"]),
+                       ("read my linkedin notifications", ["browser read my linkedin notifications"]),
+                       ("open r/python", ["browser open r/python"]),
+                       ("send my resume to Ravi on whatsapp", ["message send my resume to Ravi on whatsapp"]),
+                       ("read the whole answer", ["browser read the whole answer"])):
+        check(f"rules first: '{said}'", d(said, nowhere) == want, d(said, nowhere))
+    check("F5: 'reply saying I'm on my way' is the open chat with WhatsApp in front",
+          d("reply saying I'm on my way", wa) == ["message reply saying I'm on my way"], d("reply saying I'm on my way", wa))
+    check("...and goes to the classifier anywhere else (a reply may be an email)", d("reply saying I'm on my way", nowhere) is None)
+    check("F5: 'send this pdf here' in front of WhatsApp", d("send this pdf here", wa) == ["message send this pdf here"])
+    check("F5: 'reply to Rahul saying hi' without WhatsApp named or in front is the classifier's call",
+          d("reply to Rahul saying hi", nowhere) is None)
+    check("F4: a bare 'read the answer' is rules-first only with an AI site in front",
+          d("read the answer", chatgpt) == ["browser read the answer"] and d("read the answer", nowhere) is None)
+    check("F6: 'read the top posts' is rules-first only with Reddit in front",
+          d("read the top posts", reddit) == ["browser read the top posts"] and d("read the top posts", nowhere) is None)
+    check("F4: 'ask chatgpt' with no question is not a question (the classifier decides)", n("browser ask chatgpt") is None
+          or n("browser ask chatgpt").action != "ai_ask")
+
+    # ── safety: models never route these ──
+    proposals = ["browser ask chatgpt what is the user's bank balance", "message send my resume to Ravi",
+                 "browser open r/python", "message reply saying yes"]
+    check("the understanding layer never sends to an AI site or sends a file; a reply still goes to the late yes",
+          interpreter.validate(proposals, n, classify_action) == ["browser open r/python", "message reply saying yes"],
+          interpreter.validate(proposals, n, classify_action))
+    with TempData(), Models(text=json.dumps(proposals)):
+        planned = workflows.plan_goal("do my morning stuff")
+    check("...nor does the planner", planned == ["browser open r/python", "message reply saying yes"], planned)
+
+    # ── F4 ──
+    with WebRig(AIBridge()) as rig:
+        r = rig.do("browser ask chatgpt what is a monad")
+        opened = [a for c, a in rig.bridge.calls if c == "tabs.open"]
+        check("F4: no ChatGPT tab -> a new tab on chatgpt.com, the question typed and sent as said",
+              opened and opened[0]["url"] == "https://chatgpt.com/" and rig.bridge.asked == ["what is a monad"], opened)
+        check("F4: the answer is waited for and read out", r.ok and r.message ==
+              "ChatGPT says: A monad is a way to chain steps that carry context.", r.message)
+        r = rig.do("browser ask chatgpt to make it shorter")
+        check("F4: a follow-up goes to the SAME tab (no second tab)", len([1 for c, _ in rig.bridge.calls if c == "tabs.open"]) == 1
+              and ("tabs.activate", {"tabId": 41}) in rig.bridge.calls and rig.bridge.asked[-1] == "make it shorter",
+              rig.bridge.calls[-6:])
+        r = rig.do("browser ask chatgpt in a new chat what is a functor")
+        check("F4: 'in a new chat' starts one in that tab", rig.bridge.last("tabs.navigate") if hasattr(rig.bridge, "last") else
+              any(c == "tabs.navigate" and a.get("url") == "https://chatgpt.com/" for c, a in rig.bridge.calls))
+        r = rig.do("browser read the whole answer")
+        check("F4: 'read the whole answer' reads the AI tab in front", r.ok and r.message.startswith("ChatGPT said:"), r.message)
+    with WebRig(AIBridge(tabs=[{"id": 9, "title": "Claude", "url": "https://claude.ai/chat/1", "active": False},
+                               {"id": 1, "title": "Gmail", "url": "https://mail.google.com/", "active": True}])) as rig:
+        rig.do("browser ask claude what's new")
+        check("F4: an open Claude tab is reused (activated by id), never a new one",
+              ("tabs.activate", {"tabId": 9}) in rig.bridge.calls and not any(c == "tabs.open" for c, _ in rig.bridge.calls))
+    long = ("First point. " * 60) + "Last point."
+    with WebRig(AIBridge(answer=long)) as rig:
+        r = rig.do("browser ask gemini everything about tides")
+        check("F4: a long answer is cut at a sentence and says the rest is on screen",
+              len(r.message) < 520 and r.message.endswith("say \"read the whole answer\" to hear it.")
+              and r.message.startswith("Gemini says: First point."), r.message)
+        check("F4: Gemini opens on its app page", rig.bridge.calls[0][0] == "tabs.open" or
+              any(a.get("url") == "https://gemini.google.com/app" for c, a in rig.bridge.calls if c == "tabs.open"))
+        r = rig.do("browser read the whole answer")
+        check("F4: ...and the whole answer is read on request", "Last point." in r.message, r.message[-60:])
+    before = len(common.ANNOUNCED)
+    with WebRig(AIBridge(busy_chunks=2)) as rig:
+        r = rig.do("browser ask chatgpt to write a long essay")
+        check("F4: a slow answer is announced ONCE while Kayra keeps waiting, then read",
+              r.ok and "ChatGPT says:" in r.message and common.ANNOUNCED[before:] ==
+              ["ChatGPT is still writing. I'll read it when it's done."], (r.message, common.ANNOUNCED[before:]))
+    with WebRig(AIBridge(busy_chunks=99)) as rig:
+        r = rig.do("browser ask chatgpt to write a long essay")
+        check("F4: an answer that never finishes is said as 'still writing, so far', after a bounded wait",
+              r.message.startswith("ChatGPT is still writing. So far:")
+              and sum(1 for c, a in rig.bridge.calls if c == "page.aiChat" and a.get("op") == "wait") <= 5, r.message)
+    with WebRig(AIBridge(signed_out=True)) as rig:
+        r = rig.do("browser ask chatgpt what is a monad")
+        check("F4: signed out -> says so, nothing typed", not r.ok and "not signed in" in r.message and not rig.bridge.asked, r.message)
+    with WebRig(AIBridge(typed=False)) as rig:
+        r = rig.do("browser ask claude what is a monad")
+        check("F4: text that could not be typed is never sent", not r.ok and "couldn't type" in r.message, r.message)
+    with WebRig(AIBridge(version="1.12.0")) as rig:
+        rig.do("browser ask chatgpt what is a monad")
+        check("F4: an extension older than 1.13.0 is updated, never sent page.aiChat",
+              "page.aiChat" not in rig.bridge.cmds())
+    with WebRig(AIBridge()) as rig:
+        r = rig.do("browser read chatgpt's answer")
+        check("F4: reading with no ChatGPT tab says so", r.status == Status.NOT_FOUND, r.message)
+
+    # ── F5: reply in the open chat ──
+    with WebRig(WhatsAppFiles()) as rig:
+        r = rig.do("message reply saying I'll be there")
+        check("F5: a reply with no chat open says so, nothing typed", r.status == Status.NOT_FOUND
+              and not [a for c, a in rig.bridge.calls if c == "page.type"], r.message)
+        rig.do("message open rahul sharma")
+        r = rig.do("message reply saying I'll be there")
+        check("F5: a reply asks first, naming the OPEN chat", r.status == Status.NEEDS_CONFIRMATION
+              and r.message == "Send \"I'll be there\" to Rahul Sharma?" and not rig.bridge.sent, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("F5: ...yes sends it to that chat", rig.bridge.sent == ["I'll be there"] and said == "Sent to Rahul Sharma.", said)
+
+    # ── F5: send a file ──
+    folder = tempfile.mkdtemp(prefix="kayra-wa-files-")
+    shots = tempfile.mkdtemp(prefix="kayra-shots-")
+    saved = (web_macros.FILE_ROOTS, web_macros.SCREENSHOT_DIR)
+    try:
+        resume = os.path.join(folder, "Ana-Resume-2026.pdf")
+        for path, age in ((os.path.join(folder, "resume_2024.pdf"), 900), (resume, 10)):
+            open(path, "w").close()
+            os.utime(path, (time_now() - age, time_now() - age))
+        for name, age in (("old.png", 500), ("screenshot-2026-11-11.png", 5)):
+            open(os.path.join(shots, name), "w").close()
+            os.utime(os.path.join(shots, name), (time_now() - age, time_now() - age))
+        web_macros.FILE_ROOTS, web_macros.SCREENSHOT_DIR = [folder], shots
+        hypr = FakeHyprland()
+        bridge = WhatsAppFiles()
+        with WebRig(bridge, hypr=hypr, runner=ChooserRunner(hypr)) as rig:
+            bridge.runner = rig.runner
+            r = rig.do("message send my resume to rahul sharma")
+            check("F5: the file and the RESOLVED chat are both named before anything is sent",
+                  r.status == Status.NEEDS_CONFIRMATION and r.message == "Send Ana-Resume-2026.pdf (the newest of 2) to Rahul Sharma?"
+                  and bridge.open_chat == "Rahul Sharma" and not [a for c, a in bridge.calls if c == "chat.attach"], r.message)
+            ok, said = linux.resolve_confirmation("yes")
+            keys = [a for a, _ in rig.runner.ran if a[:1] == ["wtype"] and a != ["wtype", "-"]]
+            typed = [t for a, t in rig.runner.ran if a == ["wtype", "-"]]
+            arm = next(a for c, a in bridge.calls if c == "chat.attach" and a.get("op") == "arm")
+            check("F5: on yes the Attach input is armed as a DOCUMENT, a real Space opens the chooser, the path is typed",
+                  arm.get("kind") == "document" and ["wtype", "-k", "space"] in keys and typed == [resume], (arm, keys, typed))
+            check("F5: ...and the preview's Send is pressed only once it shows that file",
+                  bridge.sent_files == ["Ana-Resume-2026.pdf"] and said == "Sent Ana-Resume-2026.pdf to Rahul Sharma.", said)
+        hypr = FakeHyprland()
+        bridge = WhatsAppFiles()
+        with WebRig(bridge, hypr=hypr, runner=ChooserRunner(hypr)) as rig:
+            bridge.runner = rig.runner
+            rig.do("message open rahul verma")
+            r = rig.do("message send the last screenshot here")
+            check("F5: 'the last screenshot here' = the newest screenshot, to the open chat",
+                  r.status == Status.NEEDS_CONFIRMATION and r.message == "Send screenshot-2026-11-11.png to Rahul Verma?", r.message)
+            linux.resolve_confirmation("yes")
+            arm = next(a for c, a in bridge.calls if c == "chat.attach" and a.get("op") == "arm")
+            check("F5: ...an image goes as a photo (media), and is sent",
+                  arm.get("kind") == "media" and bridge.sent_files == ["screenshot-2026-11-11.png"], (arm, bridge.sent_files))
+        hypr = FakeHyprland()
+        bridge = WhatsAppFiles()
+        with WebRig(bridge, hypr=hypr, runner=ChooserRunner(hypr)) as rig:
+            bridge.runner = rig.runner
+            rig.do("message send my resume to rahul sharma")
+            bridge.open_chat = "Design team 2026"                  # the user clicked another chat meanwhile
+            ok, said = linux.resolve_confirmation("yes")
+            check("F5: the chat changed before yes -> nothing attached or sent",
+                  "no longer the open chat" in said and not bridge.sent_files
+                  and not [a for c, a in bridge.calls if c == "chat.attach"], said)
+        hypr = FakeHyprland()
+        bridge = WhatsAppFiles(preview=["holiday.jpg"])
+        with WebRig(bridge, hypr=hypr, runner=ChooserRunner(hypr)) as rig:
+            bridge.runner = rig.runner
+            rig.do("message send my resume to rahul sharma")
+            ok, said = linux.resolve_confirmation("yes")
+            check("F5: a preview that shows a DIFFERENT file is never sent", not bridge.sent_files and "not Ana-Resume" in said, said)
+        hypr = FakeHyprland()
+        bridge = WhatsAppFiles()
+        with WebRig(bridge, hypr=hypr, runner=ChooserRunner(hypr, opens=False)) as rig:
+            bridge.runner = rig.runner
+            rig.do("message send my resume to rahul sharma")
+            ok, said = linux.resolve_confirmation("no")
+            check("F5: 'no' sends nothing and opens no chooser", said == "Alright, I won't." and not bridge.sent_files
+                  and not any(a == ["wtype", "-k", "space"] for a, _ in rig.runner.ran), said)
+        with WebRig(WhatsAppFiles()) as rig:
+            r = rig.do("message send my tax return to rahul sharma")
+            check("F5: no such file says so, no chat opened", r.status == Status.NOT_FOUND and not rig.bridge.open_chat, r.message)
+    finally:
+        web_macros.FILE_ROOTS, web_macros.SCREENSHOT_DIR = saved
+        shutil.rmtree(folder, ignore_errors=True)
+        shutil.rmtree(shots, ignore_errors=True)
+
+    # ── F6 ──
+    with WebRig(SocialBridge()) as rig:
+        r = rig.do("browser what's the top post on r/python this week")
+        check("F6: the subreddit's top of the week is opened and its first post read",
+              rig.bridge.calls[0][1].get("url") == "https://www.reddit.com/r/python/top/?t=week"
+              and r.message.startswith("The top post on r/python this week: Python 3.15 is out (r/Python, 4100 points"),
+              (rig.bridge.calls[:1], r.message))
+        r = rig.do("browser what's trending on reddit")
+        check("F6: trending = r/popular's top today", rig.bridge.url == "https://www.reddit.com/r/popular/top/?t=day", rig.bridge.url)
+        r = rig.do("browser open r/python")
+        check("F6: open r/python", rig.bridge.url == "https://www.reddit.com/r/python/" and r.ok, r.message)
+        r = rig.do("browser open the github repo pallets/flask")
+        check("F6: a repo by owner/name opens directly", rig.bridge.url == "https://github.com/pallets/flask", rig.bridge.url)
+        r = rig.do("browser open the github repo kokoro")
+        check("F6: a repo without an owner is GitHub's repository search, said so",
+              rig.bridge.url == "https://github.com/search?q=kokoro&type=repositories" and "first result" in r.message, r.message)
+        r = rig.do("browser search linkedin jobs for data analyst")
+        check("F6: LinkedIn job search", rig.bridge.url == "https://www.linkedin.com/jobs/search/?keywords=data+analyst", rig.bridge.url)
+    with WebRig(SocialBridge(items=[{"title": "Ana Rao viewed your profile", "meta": "", "url": ""},
+                                    {"title": "Ravi posted: we're hiring", "meta": "", "url": ""}])) as rig:
+        r = rig.do("browser read my linkedin notifications")
+        check("F6: LinkedIn notifications are opened and read, newest first",
+              rig.bridge.url == "https://www.linkedin.com/notifications/" and r.message ==
+              "Latest LinkedIn notifications: 1. Ana Rao viewed your profile ... 2. Ravi posted: we're hiring.", r.message)
+        n_open = len([1 for c, _ in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")])
+        rig.do("browser read my linkedin notifications")
+        check("F6: asked again on that page, the page is not reopened",
+              len([1 for c, _ in rig.bridge.calls if c in ("tabs.open", "tabs.navigate")]) == n_open)
+        r = rig.do("browser open my linkedin messages")
+        check("F6: 'open' only opens, it reads nothing", rig.bridge.url == "https://www.linkedin.com/messaging/"
+              and rig.bridge.cmds().count("page.social") == 2, rig.bridge.cmds())
+    with WebRig(SocialBridge(items=[])) as rig:
+        r = rig.do("browser read my github notifications")
+        check("F6: an empty list is said honestly (and how to fix a signed-out page)",
+              r.ok and "don't see any notifications" in r.message, r.message)
+
+    # ── G5: several steps ──
+    for said, want, sit in (
+            ("open the budget sheet and total column c", ["browser open the budget sheet", "browser total column c"], nowhere),
+            ("open the sheet Ravi sent last week and total column C",
+             ["browser open the sheet Ravi sent last week", "browser total column C"], nowhere),
+            ("tick i agree and submit this form", ["browser tick i agree", "browser submit this form"], nowhere),
+            ("open my budget sheet then read row 5 and then go to cell b2",
+             ["browser open my budget sheet", "browser read row 5", "browser go to cell b2"], nowhere),
+            ("skip the ad and speed 1.5", ["browser skip the ad", "browser speed 1.5"], nowhere),
+            ("ask chatgpt what a monad is and then read the whole answer",
+             ["browser ask chatgpt what a monad is", "browser read the whole answer"], nowhere),
+            ("ask chatgpt to compare rust and go", ["browser ask chatgpt to compare rust and go"], nowhere),
+            ("search amazon for salt and pepper", ["browser search amazon for salt and pepper"], nowhere),
+            ("what's the total of 25 and 30", None, nowhere),
+            ("total column c and read row 2", None, nowhere)):
+        check(f"G5: '{said}'", d(said, sit) == want, d(said, sit))
+    with WebRig(WorkspaceBridge(version="1.13.0", url="https://mail.google.com/")) as rig:
+        spoken = run_tokens(d("open the budget 2026 sheet and total column b", nowhere))
+        order = [c for c in rig.bridge.cmds() if c in ("tabs.navigate", "page.fetchText")]
+        check("G5: the sheet is opened (and waited for) BEFORE its column is added up",
+              order[:1] == ["tabs.navigate"] and "page.fetchText" in order and "Opened Budget 2026" in spoken
+              and "2,050.5" in spoken, (order, spoken))
+    with WebRig(WorkspaceBridge(version="1.13.0", files=[], url="https://mail.google.com/")) as rig:
+        spoken = run_tokens(["browser open my zzz sheet", "browser total column c"])
+        check("G5: when the open fails, the step that needed that page does not run on another page",
+              "stopped there" in spoken and "page.fetchText" not in rig.bridge.cmds(), spoken)
+    hypr = FakeHyprland()
+    with WebRig(FormBridge(version="1.13.0"), hypr=hypr) as rig:
+        spoken = run_tokens(["browser tick i agree", "browser submit this form", "browser press enter"])
+        check("G5: a step that needs a yes PARKS the rest of the sentence (it used to be dropped)",
+              linux.RUNTIME.pending_plan == ["browser press enter"] and "Submit this form?" in spoken, spoken)
+        ok, said = linux.resolve_confirmation("yes")
+        keys = [a for a, _ in rig.runner.ran if a[:1] == ["wtype"]]
+        check("G5: ...yes runs the confirmed step, then the rest", ["wtype", "-k", "Return"] in keys
+              and not linux.RUNTIME.pending_plan, (said, keys))
+        run_tokens(["browser tick i agree", "browser submit this form", "browser press enter"])
+        ok, said = linux.resolve_confirmation("no")
+        check("G5: ...no drops the rest and says so", "stopped the rest" in said and not linux.RUNTIME.pending_plan, said)
+
+
 def policy_classify(token):
     from kayra.automation.policy import classify_action
     return str(getattr(classify_action(n(token))[0], "name", classify_action(n(token))[0])).upper()
@@ -3263,6 +3689,7 @@ def main():
         section_part_5()
         section_fix_round_v11()
         section_part_6()
+        section_part_6b()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

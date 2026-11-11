@@ -279,6 +279,13 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   `interpreter._USER_ONLY`: the model never sets/submits details or picks an upload.
   Context-dependent shapes (seek, product, sort) are rules-first only with a video / shop in
   front (`common.part_6_direct`). Tests must use `TempProfile` / `web_macros.FILE_ROOTS`.
+- **Part 6b (2026-11-11, extension 1.13.0).** `ai_ask` types the user's question into ChatGPT /
+  Claude / Gemini and waits IN the page for the answer to stop growing; `message.send_file` and
+  "reply saying …" ask first naming the resolved chat (and file); `social` reads Reddit /
+  LinkedIn / GitHub lists. A model may never route to `ai_ask` or `send_file`
+  (`interpreter.from_model_ok`, also the planner). G5: `direct_tokens` splits "X and Y" only
+  when both halves are complete commands; a batch parks its rest behind a yes. Adding a 6b
+  paragraph to the DMM preamble broke "mute me" on the local model — keep new shapes rules-first.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

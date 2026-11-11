@@ -34,7 +34,7 @@ import time
 import datetime
 import threading
 
-from kayra.automation import ai
+from kayra.automation import ai, interpreter
 from kayra.automation.common import announce, normalize_command
 from kayra.automation.policy import ActionResult, Risk, classify_action, recent_audit, Status
 
@@ -202,7 +202,14 @@ system bluetooth on|off | wifi on | system lock | pause | resume | next track | 
 browser <switch to X tab | close X tab | click on <label> | summarize this page> |
 meet <join CODE | mic off | camera off | share screen | leave> | email check | calendar today |
 scene <name> | set timer <duration> | reminder <time> <text> | diagnose <scope> |
-screen describe | take screenshot | google search <query> | battery | close tab | new tab"""
+screen describe | take screenshot | google search <query> | battery | close tab | new tab |
+browser open my <name> sheet | browser open the doc about <topic> | browser find the sheet <name> sent me |
+browser what's the total of column <C> | browser read row <n> | browser go to cell <B12> |
+browser search <amazon | flipkart | github | wikipedia | reddit | linkedin jobs> for <query> |
+browser open the first result | browser summarize this page | browser read my linkedin notifications |
+browser what's the top post on r/<subreddit> | browser open r/<subreddit> | browser open the github repo <owner/name> |
+message open <chat> | message read <chat> | email search for <text> | email compose |
+calendar next meeting | calendar join my next meeting"""
 
 MAX_PLAN_STEPS = 10
 
@@ -227,6 +234,8 @@ def plan_goal(goal):
         action = normalize_command(token)
         if action is None or action.domain in ("plan", "shell", "trigger"):
             continue
+        if not interpreter.from_model_ok(action):
+            continue                    # the user's own details, files and questions to AI sites
         if classify_action(action)[0] == Risk.DENY:
             continue
         clean.append(token)

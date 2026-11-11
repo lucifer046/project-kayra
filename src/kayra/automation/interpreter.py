@@ -123,6 +123,11 @@ SITES & SHOPPING (search and open only — never add to a cart, buy or pay):
   browser search amazon for <product> under <price> | browser images of <thing> |
   browser sort by price low to high | browser show only under <price> | browser how much is this |
   browser what's the rating
+AI SITES, REDDIT, LINKEDIN, GITHUB: browser read chatgpt's answer | browser read the whole answer |
+  browser open r/<subreddit> | browser what's the top post on r/<subreddit> this week |
+  browser what's trending on reddit | browser read my <linkedin | github | reddit> notifications |
+  browser read my linkedin messages | browser open my linkedin notifications |
+  browser open the github repo <owner/name> | browser search linkedin jobs for <role>
 EMAIL (Gmail): email search for <text> | email show unread from this week | email compose |
   email open my <name> label | email check | email open latest | email open the email from <name> |
   email read latest | email read this | email go to sent | email reply | email archive |
@@ -134,7 +139,7 @@ CALENDAR / MEET: calendar next meeting | calendar join my next meeting | calenda
   meet share the <site> tab | meet share my second screen | meet share screen with audio |
   meet share <app> instead | meet am i sharing | meet stop sharing | meet leave
 MESSAGES (WhatsApp): message <contact>: <text> | message open <chat or group> | message search for <name> | message open result <n> |
-  message close this chat |
+  message close this chat | message reply saying <text> | message reply to <chat> saying <text> |
   message read <chat> | message read <chat> today | message read this | message who messaged me
 MEDIA & SYSTEM: play <song> | pause | resume | next track | previous track |
   system volume <0-100> | system mute | system brightness <0-100> | wifi on | wifi off |
@@ -237,7 +242,21 @@ def _parse(raw):
 
 # Part 6: a model may never write, forget or submit the user's details, or pick a file to upload
 # — those come from the user's own words only.
-_USER_ONLY = frozenset({"profile_set", "profile_forget", "profile_clear", "form_submit", "file_upload"})
+_USER_ONLY = frozenset({"profile_set", "profile_forget", "profile_clear", "form_submit", "file_upload",
+                        # Part 6b: what goes to ChatGPT / Claude / Gemini is only ever what the user
+                        # said to send there, routed by the rules — a model never forwards a request.
+                        "ai_ask"})
+# Part 6b: a file is only ever sent to a chat from the user's own words.
+_USER_ONLY_MESSAGE = frozenset({"send_file"})
+
+
+def from_model_ok(action):
+    """False for an action only the user's own words may ask for (any model: this layer, the planner)."""
+    if action.domain == "browser" and action.action in _USER_ONLY:
+        return False
+    if action.domain == "message" and action.action in _USER_ONLY_MESSAGE:
+        return False
+    return True
 
 
 def validate(commands, normalize, classify):
@@ -258,7 +277,7 @@ def validate(commands, normalize, classify):
             continue
         if action.domain == "browser" and action.action == "page_click" and action.confidence < 1.0:
             continue                                   # the parser's own guess, not a command
-        if action.domain == "browser" and action.action in _USER_ONLY:
+        if not from_model_ok(action):
             continue                                   # the user's own details and decisions
         if classify(action)[0] == Risk.DENY:
             continue

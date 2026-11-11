@@ -831,6 +831,9 @@ def normalize_command(command, context=None):
     found = _bare_part_6(lowered.strip(" .?!"), raw)      # Part 6, when it can only be that
     if found is not None:
         return found
+    found = _bare_part_6b(lowered.strip(" .?!"), raw)     # Part 6b, when it can only be that
+    if found is not None:
+        return found
 
     # 1a'. Part 3 phrasings the DMM may send without the `browser` prefix: they are about
     # the page in front, never an app ("translate this page", "bookmark this page").
@@ -1272,6 +1275,9 @@ def _web_action(kind, payload, raw):
             return Action("browser", "search_close", target="search", raw=raw)
         if _WA_NAMED_RE.fullmatch(low) or _WA_READ_RECENT.fullmatch(low) or last_messages_request(low):
             return _web_action("message", payload, raw)      # "browser open X group in whatsapp"
+        found = part_6b_action(low, raw, text)             # Part 6b: AI sites, Reddit / LinkedIn / GitHub
+        if found is not None:
+            return found
         found = _named_chat(low, raw)
         if found is not None:
             return found
@@ -1502,6 +1508,10 @@ def _web_action(kind, payload, raw):
         return Action("calendar", "agenda", target=day.group(1) if day else "today", raw=raw)
 
     if kind == "message":
+        # ── Part 6b, F5: a reply in the open chat, a file to a chat — before every other shape ──
+        found = message_6b_action(re.sub(_WA_SUFFIX + r"$", "", low).strip(), raw, text)
+        if found is not None:
+            return found
         # ── Part 5, H0.4: open / read / who messaged me, before the send shapes ──
         if re.fullmatch(r"(?:who|anyone|anybody) (?:messaged|texted|wrote to|pinged) me(?: on whatsapp)?(?: today)?|"
                         r"(?:any |show |read |list |check )?(?:my )?unread(?: chats| messages| whatsapp messages)?|"
@@ -1588,6 +1598,13 @@ def part_4_action(low, raw, text=None):
                      r"(?:open|show) (?:my |the )?(.+?) form(?:'s)? responses", low)
     if m:
         return Action("browser", "form_responses", target=(m.group(1) or m.group(2)).strip(), raw=raw)
+    # G5: "open the sheet Ravi sent last week" — files shared BY someone are searched for their name.
+    m = re.fullmatch(r"(?:open|find|show me) (?:me )?(?:the |my |a )?(pdf|sheet|spreadsheet|doc|document|deck|presentation|file|form)"
+                     r" (?:that |which )?([a-z][a-z .'-]{0,40}?) (?:sent|shared|gave|emailed)(?: me| with me| to me)?"
+                     r"(?: (?:last week|this week|yesterday|today|recently|last month|earlier))?", low)
+    if m and m.group(2).strip() not in _NOT_A_NAME and m.group(2).strip() not in ("you", "i", "we"):
+        return Action("browser", "ws_search", target=m.group(2).strip(),
+                      parameters={"kind": WS_KINDS[m.group(1)], "open": True}, raw=raw)
     # E1/E2/E3/E4 — open a file BY NAME ("open my budget sheet", "open the doc about the internship").
     m = re.fullmatch(r"open (?:up )?(?:my |the |our )?(.+?) " + _KIND_WORDS, low)
     if m and m.group(1).strip() not in _NOT_A_NAME and not re.match(r"(?:new|a new|blank|google)\b", m.group(1)):
@@ -1630,6 +1647,12 @@ def part_4_action(low, raw, text=None):
         if w:
             column, params["where"] = w.group(1).strip(), [w.group(2).strip(), w.group(3).strip()]
         return Action("browser", "sheet_calc", target=column, parameters=params, raw=raw)
+    m = re.fullmatch(r"(total|sum(?: up)?|add up|average|count) (?:the )?(?:values (?:in|of) )?(?:column )?([a-z]{1,3}|.+? column)"
+                     r"(?: in this sheet)?", low)
+    if m:                                        # G5: "… and total column C" — the imperative shape
+        verb = m.group(1).split()[0].replace("add", "total")
+        return Action("browser", "sheet_calc", target=re.sub(r" column$", "", m.group(2)).strip(),
+                      parameters={"op": _CALC.get(verb, "sum")}, raw=raw)
     if re.fullmatch(r"how many (?:rows|entries|records|lines|people|items)(?: are (?:there|in this sheet)| does this sheet have| in this sheet)?", low):
         return Action("browser", "sheet_calc", target="rows", parameters={"op": "rows"}, raw=raw)
     m = re.fullmatch(r"read (?:me )?(?:out )?row (?:number )?(\d{1,6})", low)
@@ -1830,7 +1853,7 @@ def _site_search_action(low, raw, text):
         return Action("browser", "site_search", target=found.group(0) if found else m.group(1),
                       parameters={"site": "images"}, raw=raw)
     m = _SITE_SEARCH_RE.fullmatch(low)
-    tail = re.search(r",? (?:(?:sorted|sort|ordered) by .+|(?:cheapest|lowest price|best rated|newest) first|"
+    tail = re.search(r",? (?:and )?(?:(?:sorted|sort|ordered) by .+|(?:cheapest|lowest price|best rated|newest) first|"
                      r"(?:under|below|less than|between|over|above) .+)$", low)
     if tail and not (m and targets.canonical_website((m.group(1) or m.group(4) or m.group(5) or "").strip())):
         # "search for X on flipkart sorted by price": the clause after the site belongs to the query.
@@ -1855,7 +1878,7 @@ def _site_search_action(low, raw, text):
     query, where = _split_where(query)
     if where:
         params["where"] = where
-    sorted_by = re.search(r",? (?:sorted|sort|ordered|order) by (.+)$|,? (cheapest|lowest price|best rated|newest) first$", query, re.I)
+    sorted_by = re.search(r",?(?: and)? (?:sorted|sort|ordered|order) by (.+)$|,?(?: and)? (cheapest|lowest price|best rated|newest) first$", query, re.I)
     if site in ("amazon", "flipkart"):
         if sorted_by:
             params["sort"] = sort_request(sorted_by.group(1) or sorted_by.group(2))
@@ -2047,6 +2070,15 @@ def part_6_direct(low, text, situation_fn=None):
     return None
 
 
+def _bare_part_6b(lowered, raw):
+    """A 6b shape the DMM sent without a prefix: an AI site, Reddit / LinkedIn / GitHub, or a
+    WhatsApp reply / file that names WhatsApp."""
+    tokens = part_6b_direct(lowered, raw.strip(), None)
+    if not tokens:
+        return None
+    return normalize_command(tokens[0])
+
+
 def _bare_part_6(lowered, raw):
     """A Part 6 shape the DMM sent without the `browser` prefix, when it can only be that."""
     text = raw.strip()
@@ -2054,6 +2086,206 @@ def _bare_part_6(lowered, raw):
     if tokens:
         return part_6_action(lowered, raw, text)
     return None
+
+
+# ── Part 6b: ask an AI site (F4), WhatsApp replies and files (F5), Reddit / LinkedIn / GitHub (F6) ──
+_BOT = r"(chat ?gpt|chat g p t|gpt|open ?ai|claude(?: ?\.? ?ai)?|(?:google )?gemini|bard)"
+_AI_BOT_KEY = (("claude", "claude"), ("gemini", "gemini"), ("bard", "gemini"), ("gpt", "chatgpt"),
+               ("g p t", "chatgpt"), ("open", "chatgpt"))
+_AI_ASK_RE = re.compile(r"(?:please |can you |could you |go and |go )?(?:ask|check with|consult|query) " + _BOT +
+                        r"( (?:in|with|on) a (?:new|fresh) chat)?(?: and ask(?: it)?)?[,:]? ?(.*)")
+_AI_NEW_RE = re.compile(r"(?:open|start|begin|make) (?:a )?(?:new|fresh) (?:chat|conversation) (?:in|on|with) " + _BOT +
+                        r"(?: and ask(?: it)?[,:]? (.+))?|(?:open|start) (?:a )?(?:new|fresh) " + _BOT + r" (?:chat|conversation)")
+_AI_SAYS_RE = re.compile(r"what (?:does|would|will) " + _BOT + r" (say|think) (?:about|of|on) (.+)")
+_AI_READ_RE = re.compile(r"(?:read|tell me|what(?:'s| is))(?: me| out)? (?:the |" + _BOT +
+                         r"(?:'s| s)? )(whole |full |entire |complete |last |latest )?(?:answer|reply|response)(?: again)?"
+                         r"|what did " + _BOT + r" (?:say|answer|reply)")
+
+
+def _ai_bot(word):
+    word = (word or "").lower()
+    return next((key for needle, key in _AI_BOT_KEY if needle in word), "chatgpt")
+
+
+def _ai_question(low, text, start):
+    """The question as the user said it (their capitals), from `start` in the lowered sentence."""
+    said = low[start:].strip(" ,:")
+    found = re.search(re.escape(said), text, re.I) if said else None
+    q = found.group(0) if found else said
+    q = re.sub(r"^(?:to|whether)\s+", "", q, flags=re.I)
+    if re.match(r"about\s+", q, re.I):
+        q = "Tell me " + q
+    return q.strip()
+
+
+_FILE_SAID = (r"(?:file|document|doc|pdf|photo|picture|pic|image|screenshot|screen shot|resume|cv|video|report|"
+              r"presentation|ppt|slides|notes|certificate|marksheet|mark sheet|invoice|receipt|ticket|letter|"
+              r"assignment|spreadsheet|zip|[\w-]+\.(?:pdf|docx?|pptx?|xlsx?|png|jpe?g|zip|txt|csv|mp4))")
+_SEND_FILE_RE = re.compile(r"(?:send|share|forward) (?:him |her |them )?((?:my|the|this|that|a|an|our|last|latest) (?:[\w.' -]+ )?"
+                           + _FILE_SAID + r")(?: file)? (?:to|with) (.+?)" + _WA_SUFFIX + r"?")
+_SEND_FILE_HERE_RE = re.compile(r"(?:send|share|attach|forward) ((?:my|the|this|that|a|an|our|last|latest) (?:[\w.' -]+ )?"
+                                + _FILE_SAID + r")(?: file)? (?:here|in this chat|to this chat|in (?:this|the) (?:group|conversation))")
+_REPLY_RE = re.compile(r"(?:reply|respond|answer|write back|text back)(?: to (?:this chat|this message|this group|this|them|"
+                       r"him|her|the chat|it|the last message|the group))?(?: (?:saying|with|that))?[,:]? (.+)|"
+                       r"(?:send|type and send|write) (?:a message )?(?:here|in this chat)(?: (?:saying|that))?[,:]? (.+)")
+_REPLY_TO_RE = re.compile(r"(?:reply|respond|write back) to (.+?) (?:saying|with|that|:) ?(.+)")
+
+_SOCIAL_SITE = r"(linked ?in|git ?hub|reddit)"
+_SOCIAL_WHAT = r"(notifications?|messages?|inbox|dms?|invitations?|connection requests?|feed|posts?)"
+_SOCIAL_READ_RE = re.compile(r"(?:read|check|show|tell me|what(?:'s| is| are)|any|do i have any|list)(?: me)?(?: in)? (?:my |the )?"
+                             r"(?:new |latest |unread |recent )?" + _SOCIAL_SITE + r" " + _SOCIAL_WHAT +
+                             r"|(?:read|check|show|what are|any)(?: me)? (?:my |the )?(?:new |latest |unread )?" + _SOCIAL_WHAT +
+                             r" (?:on|in|from) " + _SOCIAL_SITE)
+_SOCIAL_OPEN_RE = re.compile(r"(?:open|go to|show me) (?:my |the )?" + _SOCIAL_SITE + r" " + _SOCIAL_WHAT)
+_SUBREDDIT = r"(?:r ?/ ?|r slash |the )?([a-z0-9_]{2,21})(?: subreddit)?"
+_SUB_OPEN_RE = re.compile(r"(?:open|go to|show me|take me to) (?:r ?/ ?|r slash )([a-z0-9_]{2,21})|"
+                          r"(?:open|go to|show me|take me to) (?:the )?([a-z0-9_]{2,21}) subreddit")
+_TOP_RE = re.compile(r"(?:what(?:'s| is| are)|show me|read|tell me|read me) (?:the )?(top|best|hottest|most popular|trending|latest) "
+                     r"(post|posts)(?: (?:on|in|of|from) (r ?/ ?[a-z0-9_]{2,21}|r slash [a-z0-9_]{2,21}|(?:the )?[a-z0-9_]{2,21} subreddit|reddit))?"
+                     r"(?: (today|this week|this month|this year|of all time|all time|right now|this hour))?|"
+                     r"what(?:'s| is) trending on reddit(?: (today|this week))?")
+_REPO_RE = re.compile(r"open (?:the )?(?:github )?(?:repo|repository) ([\w.-]+(?: ?/ ?[\w.-]+)?)(?: on github)?|"
+                      r"open ([\w.-]+ ?/ ?[\w.-]+) on github|open (?:the )?([\w.-]+) (?:repo|repository) on github")
+_SOCIAL_KEY = {"notification": "notifications", "notifications": "notifications", "message": "messages",
+               "messages": "messages", "inbox": "messages", "dm": "messages", "dms": "messages",
+               "invitation": "invitations", "invitations": "invitations", "connection request": "invitations",
+               "connection requests": "invitations", "feed": "feed", "post": "posts", "posts": "posts"}
+
+
+def _site_key6(word):
+    return {"linkedin": "linkedin", "linked in": "linkedin", "github": "github", "git hub": "github",
+            "reddit": "reddit"}.get(word, word)
+
+
+def part_6b_action(low, raw, text=None):
+    """Ask an AI site, Reddit / LinkedIn / GitHub (browser kind), or None. F5 lives in the message kind."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    m = _AI_NEW_RE.fullmatch(low)
+    if m:
+        bot = _ai_bot(m.group(1) or m.group(3))
+        question = _ai_question(low, text, m.start(2)) if m.group(2) else ""
+        return Action("browser", "ai_ask", target=question or "new chat",
+                      parameters={"bot": bot, "question": question, "new": True}, raw=raw)
+    m = _AI_ASK_RE.fullmatch(low)
+    if m and (m.group(3) or "").strip(" ,:") and not re.fullmatch(r"(?:it|that|this|him|her|them)", m.group(3).strip()):
+        return Action("browser", "ai_ask", target=_ai_question(low, text, m.start(3)),
+                      parameters={"bot": _ai_bot(m.group(1)), "question": _ai_question(low, text, m.start(3)),
+                                  "new": bool(m.group(2))}, raw=raw)
+    m = _AI_SAYS_RE.fullmatch(low)
+    if m:
+        topic = _ai_question(low, text, m.start(3))
+        question = (f"What do you think of {topic}?" if m.group(2) == "think" else f"Tell me about {topic}")
+        return Action("browser", "ai_ask", target=question,
+                      parameters={"bot": _ai_bot(m.group(1)), "question": question, "new": False}, raw=raw)
+    m = _AI_READ_RE.fullmatch(low)
+    if m:
+        bot_word = m.group(1) or m.group(3)
+        return Action("browser", "ai_read", target=_ai_bot(bot_word) if bot_word else "current",
+                      parameters={"full": bool(m.group(2) and m.group(2).strip() in ("whole", "full", "entire", "complete"))},
+                      raw=raw)
+    # F6
+    m = _SUB_OPEN_RE.fullmatch(low)
+    if m:
+        return Action("browser", "social", target="subreddit",
+                      parameters={"site": "reddit", "name": m.group(1) or m.group(2), "read": False}, raw=raw)
+    m = _TOP_RE.fullmatch(low)
+    if m:
+        if m.group(5) is not None or "trending on reddit" in low:
+            return Action("browser", "social", target="top",
+                          parameters={"site": "reddit", "name": "", "period": m.group(5) or "today", "read": True}, raw=raw)
+        where = m.group(3) or ""
+        if where:
+            name = "" if where == "reddit" else re.sub(r"^(?:r ?/ ?|r slash |the )|\s*subreddit$", "", where).strip()
+            op = "top" if m.group(2) == "post" or m.group(1) in ("top", "best", "hottest", "most popular") else "posts"
+            if m.group(2) == "posts" and not m.group(4):
+                op = "posts" if name else "top"
+            period = (m.group(4) or "today").replace("right now", "today")
+            return Action("browser", "social", target=op,
+                          parameters={"site": "reddit", "name": name, "period": period, "read": True}, raw=raw)
+        return Action("browser", "social", target="posts",
+                      parameters={"site": "", "name": "", "period": "", "read": True}, raw=raw)   # the page in front
+    m = _SOCIAL_READ_RE.fullmatch(low)
+    if m:
+        site = _site_key6(m.group(1) or m.group(4))
+        what = _SOCIAL_KEY.get(m.group(2) or m.group(3), "notifications")
+        what = "top" if what == "posts" and site == "reddit" else what
+        return Action("browser", "social", target=what, parameters={"site": site, "name": "", "period": "", "read": True},
+                      raw=raw)
+    m = _SOCIAL_OPEN_RE.fullmatch(low)
+    if m:
+        site, what = _site_key6(m.group(1)), _SOCIAL_KEY.get(m.group(2), "notifications")
+        return Action("browser", "social", target=what, parameters={"site": site, "name": "", "period": "", "read": False},
+                      raw=raw)
+    m = _REPO_RE.fullmatch(low)
+    if m:
+        name = (m.group(1) or m.group(2) or m.group(3)).replace(" ", "")
+        found = re.search(re.escape(name), text.replace(" / ", "/").replace(" /", "/").replace("/ ", "/"), re.I)
+        return Action("browser", "social", target="repo",
+                      parameters={"site": "github", "name": found.group(0) if found else name, "read": False}, raw=raw)
+    m = re.fullmatch(r"(?:search|find|look for) (?:linked ?in )?jobs (?:for|as|of) (.+?) on linked ?in|"
+                     r"search linked ?in(?: for)? jobs? (?:for|as) (.+)|find (.+?) jobs on linked ?in", low)
+    if m:
+        query = (m.group(1) or m.group(2) or m.group(3)).strip()
+        found = re.search(re.escape(query), text, re.I)
+        return Action("browser", "site_search", target=found.group(0) if found else query,
+                      parameters={"site": "linkedin jobs"}, raw=raw)
+    return None
+
+
+def message_6b_action(low, raw, text):
+    """F5 inside the message kind: a reply in the open chat, or a file to a chat. None otherwise."""
+    m = _SEND_FILE_HERE_RE.fullmatch(low)
+    if m:
+        return Action("message", "send_file", target="current", parameters={"what": _what(m.group(1))}, raw=raw)
+    m = _SEND_FILE_RE.fullmatch(low)
+    if m and m.group(2).strip() not in ("me", "myself"):
+        who = m.group(2).strip()
+        found = re.search(re.escape(who), text, re.I)
+        return Action("message", "send_file", target=found.group(0) if found else who,
+                      parameters={"what": _what(m.group(1))}, raw=raw)
+    m = _REPLY_TO_RE.fullmatch(low)
+    if m and m.group(1) not in ("this", "this chat", "them", "him", "her", "the chat", "it", "this message",
+                                "the last message", "the group", "this group"):
+        body = re.search(re.escape(m.group(2)), text, re.I)
+        who = re.search(re.escape(m.group(1).strip()), text, re.I)
+        return Action("message", "send", target=who.group(0) if who else m.group(1).strip(),
+                      parameters={"text": body.group(0) if body else m.group(2), "app": "whatsapp"}, raw=raw)
+    m = _REPLY_RE.fullmatch(low)
+    if m:
+        said = (m.group(1) or m.group(2)).strip()
+        body = re.search(re.escape(said), text, re.I)
+        return Action("message", "send", target="current",
+                      parameters={"text": body.group(0) if body else said, "app": "whatsapp"}, raw=raw)
+    return None
+
+
+def _what(said):
+    return re.sub(r"^(?:my|the|this|that|a|an|our)\s+", "", said.strip()).strip()
+
+
+def part_6b_direct(low, text, situation_fn=None):
+    """['browser …' | 'message …'] for a 6b utterance that is complete as said, else None."""
+    action = part_6b_action(low, f"browser {text}", text)
+    if action is not None:
+        if action.action == "ai_read" and action.target == "current":
+            host = front_site(situation_fn)
+            return [f"browser {text}"] if host in ("chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com") \
+                or "whole" in low or "full" in low or "entire" in low else None
+        if action.action == "social" and action.target == "posts" and not action.parameters.get("site"):
+            return [f"browser {text}"] if "reddit.com" in front_site(situation_fn) else None
+        return [f"browser {text}"]
+    wa_said = re.search(r"\bwhats ?app\b", low)
+    wa_front = front_site(situation_fn) == "web.whatsapp.com" if not wa_said else True
+    if not wa_front:
+        return None
+    bare = re.sub(_WA_SUFFIX + r"$", "", low).strip()
+    found = message_6b_action(bare, f"message {text}", text)
+    if found is None:
+        return None
+    if found.action == "send" and found.target != "current" and not wa_said:
+        return None                     # "reply to Ravi saying …" with no app named: the model decides
+    return [f"message {text}"]
 
 
 # ── Rules before the classifier (tuning pass V9) ──
@@ -2108,7 +2340,91 @@ def _tab_url(situation_fn):
         return ""
 
 
+# ── G5: several steps in one sentence ──
+# "open the budget sheet and total column C", "tick I agree and then submit this form". Each
+# half must be a COMPLETE command on its own, and the later half is judged against what the
+# earlier one will have put in front ("total column C" needs a Sheet; the open makes one).
+# A first step that carries free text (a question to an AI site, a message, a search) is only
+# split at "then" / "after that": its own words may contain "and".
+_STEP_JOIN = re.compile(r",? (?:and then|and after that|then|after that|and)(?= )", re.I)
+_SEQUENTIAL = re.compile(r"(?:and then|and after that|then|after that)$", re.I)
+_FREE_TEXT = frozenset({"ai_ask", "site_search", "search_here", "ws_search", "keep_note", "page_ask", "send",
+                        "page_find", "email_search", "search"})
+MAX_STEPS = 4
+
+
+def _predicted(token, situation_fn):
+    """The screen a step will leave in front, for judging the step after it."""
+    try:
+        action = normalize_command(token)
+    except Exception:
+        action = None
+    if action is None:
+        return situation_fn
+    chrome = lambda url: (lambda: {"app": "google-chrome", "tab_url": url})
+    p = action.parameters or {}
+    if action.domain == "message":
+        return lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+    if action.domain == "browser":
+        kind = p.get("kind")
+        if action.action in ("ws_open", "ws_search", "ws_create") and (kind or action.target) in ("sheet", "doc", "slides"):
+            page = {"sheet": "spreadsheets", "doc": "document", "slides": "presentation"}[kind or action.target]
+            return chrome(f"https://docs.google.com/{page}/d/predicted/edit")
+        if action.action == "site_search" and p.get("site") in ("amazon", "flipkart", "youtube"):
+            return chrome({"amazon": "https://www.amazon.in/s?k=x", "flipkart": "https://www.flipkart.com/search?q=x",
+                           "youtube": "https://www.youtube.com/results?search_query=x"}[p["site"]])
+        if action.action in ("ai_ask", "ai_read"):
+            return chrome({"claude": "https://claude.ai/", "gemini": "https://gemini.google.com/app"}
+                          .get(p.get("bot") or action.target, "https://chatgpt.com/"))
+        if action.action == "social":
+            return chrome({"reddit": "https://www.reddit.com/", "linkedin": "https://www.linkedin.com/",
+                           "github": "https://github.com/"}.get(p.get("site"), "https://example.com/"))
+        if action.action in ("page_result", "open_url"):
+            return chrome(str(p.get("url") or "https://example.com/"))
+    return situation_fn
+
+
+def _split_steps(text, situation_fn, depth=0):
+    """[tokens] when `text` is two or more complete commands joined by and / then, else None."""
+    if depth >= MAX_STEPS - 1:
+        return None
+    for m in _STEP_JOIN.finditer(text):
+        head, tail = text[:m.start()].strip(" ,"), text[m.end():].strip(" ,")
+        if not head or not tail:
+            continue
+        first = _direct_one(head, situation_fn)
+        if not first:
+            continue
+        action = normalize_command(first[-1])
+        free = action is not None and action.action in _FREE_TEXT and \
+            not (action.action == "ws_search" and action.parameters.get("open"))   # "the sheet Ravi sent": a name
+        if free and not _SEQUENTIAL.search(m.group(0).strip(" ,")):
+            continue                                    # "ask chatgpt to compare rust and go": one question
+        later = _predicted(first[-1], situation_fn)
+        rest = _direct_one(tail, later) or _split_steps(tail, later, depth + 1)
+        if rest:
+            return first + rest
+    return None
+
+
 def direct_tokens(utterance, situation_fn=None):
+    """
+    [tokens] for an utterance the rules alone fully understand, else None (ask the model).
+    Several complete commands joined by "and" / "then" become several tokens, in order (G5);
+    a sentence that is ONE command whose words contain "and" stays one.
+    """
+    text = " ".join(str(utterance or "").strip().rstrip(".?!").split())
+    low = text.lower()
+    if not low or len(low) > 300 or low.startswith(("browser ", "meet ", "email ", "calendar ")):
+        return None
+    if _STEP_JOIN.search(text):
+        steps = _split_steps(text, situation_fn)
+        if steps and len(steps) > 1:
+            return steps
+    return _direct_one(text, situation_fn)
+
+
+def _direct_one(utterance, situation_fn=None):
     """
     [token] for an utterance the rules alone fully understand, else None (ask the model).
     Contextual shapes look at the screen only when needed: Sheets maths only with a Sheet in
@@ -2144,6 +2460,9 @@ def direct_tokens(utterance, situation_fn=None):
     found = part_6_direct(low, text, situation_fn)
     if found:
         return found                                    # Part 6: forms, video, site search, shopping
+    found = part_6b_direct(low, text, situation_fn)
+    if found:
+        return found                                    # Part 6b: AI sites, WhatsApp files, Reddit / LinkedIn / GitHub
     if search_request(low, text):
         return [f"browser {text}"]                      # "click on the search bar and search for X"
     if low not in ("scroll down", "scroll up") and scroll_request(low):
@@ -2213,7 +2532,9 @@ def _bare_workspace(lowered, raw):
     if re.match(r"(?:open (?:my |the |our )?.+ " + kinds + r"$|open (?:my |the )?" + kinds + r" (?:about|called|named)|"
                 r"(?:create|make|start) (?:a |an )?new |(?:next|previous) slide$|start the slideshow|"
                 r"(?:go|jump) to cell |what(?:'s| is) the (?:total|sum|average) of |read row \d|"
-                r"search my (?:sheets|docs|drive|slides|files) |(?:add|take) a note |find (?:the |my )?pdf )", lowered):
+                r"search my (?:sheets|docs|drive|slides|files) |(?:add|take) a note |find (?:the |my )?pdf |"
+                r"(?:open|find|show me) (?:me )?(?:the |my |a )?(?:pdf|" + kinds[3:-1] + r") (?:that |which )?[a-z][a-z .'-]{0,40}? "
+                r"(?:sent|shared|gave|emailed)\b)", lowered):
         return part_4_action(lowered, raw, raw)
     return None
 
@@ -2762,6 +3083,25 @@ _NEVER_RETHINK = frozenset({"system", "file", "files", "shell", "info", "timer",
                             "diagnose", "plan", "trigger", "scene"})
 
 
+# G5: steps that put a page in front, and steps that act on the page in front.
+_OPENS_PAGE = frozenset({"ws_open", "ws_search", "ws_create", "open_url", "site_search", "page_result", "ai_ask",
+                         "social", "tab_switch", "email_search"})
+_ON_PAGE = frozenset({"sheet_calc", "sheet_row", "sheet_cell", "slides_nav", "slides_present", "page_read",
+                      "page_summarize", "page_ask", "page_click", "page_type", "page_scroll", "page_find", "video",
+                      "form_fill", "form_choose", "form_submit", "file_upload", "product_info", "shop_refine",
+                      "page_result", "page_results", "ai_read", "ws_share", "ws_download", "page_comments"})
+
+
+def _opens_page(action):
+    return (action.domain == "browser" and action.action in _OPENS_PAGE) or \
+        (action.domain == "message" and action.action == "open")
+
+
+def _needs_page(action):
+    return (action.domain == "browser" and action.action in _ON_PAGE) or \
+        (action.domain == "message" and action.target in ("current", "this", "recent"))
+
+
 def _is_guess(action):
     """The parser's own catch-all: 'browser <anything>' read as a click, at low confidence."""
     return action.domain == "browser" and action.action == "page_click" and action.confidence < 1.0
@@ -2989,8 +3329,9 @@ class AutomationRuntime:
 
         self._set_state("AUTOMATING")
         outcomes = {"ok": 0, "failed": 0, "tokens": []}
+        groups = plan_actions(merge_share_steps(merge_tab_steps(actions)))
         try:
-            for group in plan_actions(merge_share_steps(merge_tab_steps(actions))):
+            for index, group in enumerate(groups):
                 if len(group) == 1:
                     results = [await asyncio.to_thread(self.execute_action, group[0])]
                     if _worth_rethinking(group[0], results[0]) and id(group[0]) not in from_model:
@@ -3008,8 +3349,19 @@ class AutomationRuntime:
                         if getattr(result, "action", None):
                             outcomes["tokens"].append(result.action.key)
                     # A question stops the batch: the rest of the plan depended on the answer.
+                    # G5: behind a yes / no question the REST is parked, not lost — "yes" runs
+                    # it after the confirmed step; "no" drops it (as `run_steps` does).
                     if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):
+                        rest = [a.raw for g in groups[index + 1:] for a in g if a.raw]
+                        self.pending_plan = rest if result.status == Status.NEEDS_CONFIRMATION else []
                         return " ".join(spoken)
+                # G5: a later step that acts on the page this one was to open must not run on
+                # whatever page is in front instead ("total column C" on the wrong sheet).
+                failed = [r for r in results if r.status in (Status.FAILED, Status.NOT_FOUND, Status.UNSUPPORTED)]
+                later = [a for g in groups[index + 1:] for a in g]
+                if failed and len(group) == 1 and _opens_page(group[0]) and later and _needs_page(later[0]):
+                    spoken.append("I stopped there, since the next step needed that page.")
+                    return " ".join(spoken)
         finally:
             self._set_state("PROCESSING")
             self._emit(outcomes)
@@ -3073,6 +3425,11 @@ class AutomationRuntime:
             if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):
                 self.pending_plan = tokens if result.status == Status.NEEDS_CONFIRMATION else []
                 break
+            if result.status in (Status.FAILED, Status.NOT_FOUND, Status.UNSUPPORTED) and _opens_page(action) and tokens:
+                following = normalize_command(tokens[0], self.context)
+                if following is not None and _needs_page(following):
+                    spoken.append("I stopped there, since the next step needed that page.")
+                    break
         return spoken
 
     # ── confirmations ──

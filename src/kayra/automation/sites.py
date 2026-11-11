@@ -372,6 +372,12 @@ SITES = {
                           ("my orders",), "list"),
     "github notifications": _s("https://github.com/notifications", (), ("notifications",),
                                "list"),
+    "linkedin jobs": _s("https://www.linkedin.com/jobs/", ("linkedin job search", "jobs on linkedin"),
+                        ("jobs | linkedin",), "list", "https://www.linkedin.com/jobs/search/?keywords={q}"),
+    "linkedin notifications": _s("https://www.linkedin.com/notifications/", ("my linkedin notifications",),
+                                 ("notifications | linkedin",), "list"),
+    "linkedin messages": _s("https://www.linkedin.com/messaging/", ("my linkedin messages", "linkedin inbox"),
+                            ("messaging | linkedin",), "list"),
     "github pull requests": _s("https://github.com/pulls", ("my pull requests", "my prs"),
                                ("pull requests",), "list"),
 }
@@ -388,7 +394,8 @@ _DISPLAY = {"youtube": "YouTube", "youtube music": "YouTube Music", "github": "G
             "jiocinema": "JioCinema", "jiosaavn": "JioSaavn", "geeksforgeeks": "GeeksforGeeks",
             "espncricinfo": "ESPNcricinfo", "duckduckgo": "DuckDuckGo", "paypal": "PayPal",
             "bigbasket": "BigBasket", "hackerrank": "HackerRank", "codechef": "CodeChef",
-            "iitm portal": "IIT Madras", "iitm bs portal": "the IITM BS portal"}
+            "linkedin jobs": "LinkedIn Jobs", "linkedin notifications": "LinkedIn notifications",
+            "linkedin messages": "LinkedIn messages", "iitm portal": "IIT Madras", "iitm bs portal": "the IITM BS portal"}
 
 
 def display_name(name):

@@ -402,6 +402,10 @@ async function run(cmd, args) {
     case "page.form": return inPage(await targetTab(args), pageForm, [args.op || "list", args]);
     case "page.video": return inPage(await targetTab(args), pageVideo, [args.op || "state", args.value === undefined ? null : args.value]);
     case "page.product": return untilReady(args, pageProduct, [], (r) => r && r.found);
+    // ── 1.13.0: ask an AI site, send a file in WhatsApp, read social lists (Part 6b) ──
+    case "page.aiChat": return inPage(await targetTab(args), pageAiChat, [args.op || "state", args]);
+    case "chat.attach": return inPage(await targetTab(args), pageChatAttach, [args.op || "state", args]);
+    case "page.social": return untilReady(args, pageSocial, [args.kind || "posts", args.max || 10], (r) => r && r.items && r.items.length);
     case "page.find": return inPage(await targetTab(args), pageFind, [args.text]);
     case "page.controls": return inPage(await targetTab(args), pageControls, [args.limit || 60]);
     case "page.setMain": return inPage(await targetTab(args), (k, v) => { window[k] = v; return true; }, [args.key, args.value], "MAIN");
@@ -1676,6 +1680,235 @@ function pageProduct() {
   out.found = !!(out.name && (out.price || out.rating));
   out.url = location.href;
   return out;
+}
+
+// 1.13.0 (F4): ChatGPT, Claude and Gemini in a tab. ONE function for the three, by role
+// first: the prompt box is the visible editor whose name says prompt / message / ask, the
+// answers are the assistant turns, and "still writing" is a visible Stop button (or Claude's
+// data-is-streaming). ops: state | ask {text} | wait {after, waitMs, settleMs} | read.
+// `wait` waits INSIDE the page until there is a new answer that has stopped growing.
+async function pageAiChat(op, args) {
+  args = args || {};
+  const host = location.hostname;
+  const site = /chatgpt\.com$|chat\.openai\.com$/.test(host) ? "chatgpt" : /claude\.ai$/.test(host) ? "claude"
+    : /gemini\.google\.com$/.test(host) ? "gemini" : "";
+  const clean = (s) => String(s || "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && st.visibility !== "hidden" && st.display !== "none"; };
+  const nameOf = (el) => [el.getAttribute("aria-label"), el.getAttribute("placeholder"), el.getAttribute("data-placeholder"),
+    el.getAttribute("aria-placeholder"), el.getAttribute("title"), el.getAttribute("data-testid"), el.id].filter(Boolean).join(" ").toLowerCase();
+  const SITE_BOX = {chatgpt: "#prompt-textarea, [data-testid=prompt-textarea]",
+                    claude: "div.ProseMirror[contenteditable=true], [aria-label*='prompt' i][contenteditable=true]",
+                    gemini: "rich-textarea [contenteditable=true], .ql-editor[contenteditable=true]"};
+  const composer = () => {
+    const own = SITE_BOX[site] ? Array.from(document.querySelectorAll(SITE_BOX[site])).filter(visible) : [];
+    if (own.length) return own[own.length - 1];
+    const all = Array.from(document.querySelectorAll("textarea, [contenteditable=true], [contenteditable=''], [role=textbox]"))
+      .filter(visible).filter((el) => !el.closest("nav, aside, header"));
+    return all.find((el) => /prompt|message|ask|chat|reply|talk|anything/.test(nameOf(el))) || all[all.length - 1] || null;
+  };
+  const SITE_ANSWER = {chatgpt: "[data-message-author-role=assistant]",
+                       claude: "[data-is-streaming], .font-claude-response, [data-testid=assistant-message]",
+                       gemini: "model-response, message-content, [data-response-index]"};
+  const answers = () => {
+    const sel = SITE_ANSWER[site] || "[data-message-author-role=assistant], [data-role=assistant], .assistant-message";
+    return Array.from(document.querySelectorAll(sel)).filter((el) => !el.parentElement.closest(sel));
+  };
+  const textOf = (el) => {
+    const copy = el.cloneNode(true);
+    copy.querySelectorAll("pre").forEach((p) => p.replaceWith(document.createTextNode("\n[code on screen]\n")));
+    copy.querySelectorAll("button, [role=button], svg, style, script, .sr-only").forEach((b) => b.remove());
+    return clean(copy.innerText || copy.textContent).slice(0, 12000);
+  };
+  const stopButton = () => Array.from(document.querySelectorAll("button, [role=button]")).filter(visible)
+    .find((b) => /^stop\b|stop (generating|streaming|response)/.test(nameOf(b)) || b.getAttribute("data-testid") === "stop-button");
+  const busy = () => !!stopButton() || !!document.querySelector("[data-is-streaming=true]");
+  const signedOut = () => !composer() && Array.from(document.querySelectorAll("a, button")).filter(visible)
+    .some((b) => /^(log ?in|sign ?in)$/i.test((b.innerText || b.getAttribute("aria-label") || "").trim()));
+  const state = () => {
+    const list = answers(); const box = composer();
+    return {site, ready: !!box, signedOut: signedOut(), count: list.length, busy: busy(),
+            text: box ? clean(box.isContentEditable || !("value" in box) ? box.innerText : box.value) : "",
+            last: list.length ? textOf(list[list.length - 1]) : "", title: document.title};
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  if (op === "state") return state();
+  if (op === "read") { const s = state(); return {...s, found: s.count > 0}; }
+  if (op === "ask") {
+    const box = composer();
+    if (!box) return {...state(), sent: false, reason: signedOut() ? "signed out" : "no prompt box"};
+    const before = answers().length;
+    const want = clean(args.text || "");
+    box.focus();
+    const editable = box.isContentEditable || !("value" in box);
+    if (editable) {
+      const range = document.createRange(); range.selectNodeContents(box);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      document.execCommand("insertText", false, want);
+    } else {
+      const proto = box.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(box, want);
+      box.dispatchEvent(new Event("input", {bubbles: true}));
+    }
+    const typed = () => clean(editable ? box.innerText : box.value) === want;
+    if (!typed()) return {...state(), sent: false, reason: "could not type"};
+    // The send button turns on a moment after the text arrives: wait for it, never press a
+    // disabled one; Enter in the box is the fallback every one of these sites accepts.
+    let button = null;
+    for (let i = 0; i < 20 && !button; i++) {
+      button = Array.from(document.querySelectorAll("button, [role=button]")).filter(visible)
+        .find((b) => (b.getAttribute("data-testid") === "send-button" || /^send( prompt| message)?$|^submit$/.test(nameOf(b).trim()))
+                     && !b.disabled && b.getAttribute("aria-disabled") !== "true");
+      if (!button) await sleep(100);
+    }
+    if (button) button.click();
+    else {
+      const enter = {key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true};
+      box.dispatchEvent(new KeyboardEvent("keydown", enter));
+      box.dispatchEvent(new KeyboardEvent("keyup", enter));
+    }
+    // Sent = the box emptied or the reply started.
+    let sent = false;
+    for (let i = 0; i < 30 && !sent; i++) {
+      await sleep(100);
+      sent = !typed() || busy() || answers().length > before;
+    }
+    return {...state(), sent, before, pressed: button ? "button" : "enter"};
+  }
+  if (op === "wait") {
+    const after = Number(args.after || 0);
+    const limit = Math.min(Math.max(Number(args.waitMs || 15000), 500), 25000);
+    const settle = Math.min(Math.max(Number(args.settleMs || 1500), 300), 5000);
+    const start = Date.now(); let last = null, since = start;
+    while (Date.now() - start < limit) {
+      const list = answers();
+      const text = list.length > after ? textOf(list[list.length - 1]) : "";
+      if (text !== last) { last = text; since = Date.now(); }
+      if (text && !busy() && Date.now() - since >= settle) return {...state(), done: true};
+      await sleep(200);
+    }
+    return {...state(), done: false};
+  }
+  return {error: "unknown op"};
+}
+
+// 1.13.0 (F5): a file into the OPEN WhatsApp chat. `arm` opens the Attach menu when its file
+// inputs are not there yet, picks the input for the kind (photos / videos, else document) and
+// installs the same one-shot TRUSTED-Space hook as page.form: the real key Kayra presses is the
+// user gesture that lets input.click() open the chooser. `state` reads the preview WhatsApp
+// shows before sending; `send` presses the preview's own Send.
+async function pageChatAttach(op, args) {
+  args = args || {};
+  const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+  const nameOf = (el) => [el.getAttribute("aria-label"), el.getAttribute("title"), el.getAttribute("data-icon"),
+    (el.querySelector("[data-icon]") || {getAttribute: () => ""}).getAttribute("data-icon")].filter(Boolean).join(" ").toLowerCase();
+  const head = document.querySelector("#main header span[title], #main header [dir=auto]");
+  const chat = head ? (head.getAttribute("title") || head.textContent).trim() : "";
+  const preview = () => {
+    // The preview covers the conversation: a Send button that is NOT the composer's, plus the file names.
+    const sends = Array.from(document.querySelectorAll("[role=button], button, span[data-icon]"))
+      .filter(visible).filter((b) => /^send$|wds-ic-send|^send\b/.test(nameOf(b).trim()) && !b.closest("footer"));
+    const names = Array.from(document.querySelectorAll("[data-kayra-preview], [title]"))
+      .filter(visible).filter((e) => !e.closest("#pane-side, #side, header, footer"))
+      .map((e) => (e.getAttribute("title") || "").trim()).filter((t) => /\.[a-z0-9]{2,5}$/i.test(t));
+    return {open: sends.length > 0, files: Array.from(new Set(names)), send: sends[0] || null};
+  };
+  if (op === "state") { const p = preview(); return {chat, preview: p.open, files: p.files}; }
+  if (op === "send") {
+    const p = preview();
+    if (!p.send) return {chat, sent: false, reason: "no preview"};
+    const target = p.send.closest("[role=button], button") || p.send;
+    target.click();
+    for (let i = 0; i < 30 && preview().open; i++) await new Promise((r) => setTimeout(r, 100));
+    return {chat, sent: !preview().open};
+  }
+  if (op !== "arm") return {error: "unknown op"};
+  if (!document.querySelector("#main")) return {found: false, chat: "", reason: "no chat open"};
+  const inputs = () => Array.from(document.querySelectorAll("#main input[type=file], #app input[type=file], body input[type=file]"))
+    .filter((el) => !el.disabled);
+  if (!inputs().length) {
+    const attach = Array.from(document.querySelectorAll("#main [role=button], #main button, footer [role=button], footer button"))
+      .filter(visible).find((b) => /^attach\b|attach|plus|clip/.test(nameOf(b)));
+    if (!attach) return {found: false, chat, reason: "no attach button"};
+    attach.click();
+    for (let i = 0; i < 20 && !inputs().length; i++) await new Promise((r) => setTimeout(r, 100));
+  }
+  const list = inputs();
+  if (!list.length) return {found: false, chat, reason: "no file input"};
+  const media = (el) => /image|video/.test(el.accept || "");
+  const labelOf = (el) => ((el.closest("li, [role=button], [role=menuitem], div") || el).innerText || "").trim().toLowerCase();
+  const input = args.kind === "media" ? (list.find(media) || list[0])
+    : (list.find((el) => /document/.test(labelOf(el))) || list.find((el) => !media(el)) || list[0]);
+  const until = Date.now() + 8000;
+  const hook = (e) => {
+    if (!e.isTrusted || e.key !== " " || Date.now() > until) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    window.removeEventListener("keydown", hook, true);
+    input.click();
+  };
+  window.addEventListener("keydown", hook, true);
+  setTimeout(() => window.removeEventListener("keydown", hook, true), 8000);
+  return {found: true, armed: true, chat, kind: media(input) ? "media" : "document", accept: input.accept || ""};
+}
+
+// 1.13.0 (F6): the list on a Reddit / LinkedIn / GitHub page, as {title, meta, url}. Reddit's
+// posts are custom elements that carry their facts as attributes; LinkedIn and GitHub are read
+// by landmark and role with a generic fallback (articles / list items in <main>).
+function pageSocial(kind, max) {
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+  const host = location.hostname;
+  const items = [];
+  const push = (title, meta, url) => {
+    title = clean(title).slice(0, 220);
+    if (!title || items.some((i) => i.title === title)) return;
+    items.push({title, meta: clean(meta).slice(0, 160), url: url || ""});
+  };
+  if (/(^|\.)reddit\.com$/.test(host)) {
+    for (const p of document.querySelectorAll("shreddit-post")) {
+      if (p.hasAttribute("promoted") || p.getAttribute("post-type") === "ad") continue;
+      const score = p.getAttribute("score"); const comments = p.getAttribute("comment-count");
+      push(p.getAttribute("post-title"), [p.getAttribute("subreddit-prefixed-name"),
+        score ? `${score} points` : "", comments ? `${comments} comments` : ""].filter(Boolean).join(", "),
+        p.getAttribute("permalink") ? new URL(p.getAttribute("permalink"), location.origin || ("https://" + host)).href : "");
+      if (items.length >= max) break;
+    }
+    if (!items.length) {
+      for (const a of document.querySelectorAll(".thing:not(.promoted) a.title, article h3, a[slot=title]")) {
+        push(a.innerText, "", a.href || ""); if (items.length >= max) break;
+      }
+    }
+  } else if (/github\.com$/.test(host) && kind === "notifications") {
+    for (const row of document.querySelectorAll(".notifications-list-item, [data-notification-id]")) {
+      const t = row.querySelector(".markdown-title, a[href*='/notifications/'], a");
+      const repo = row.querySelector(".f6, .text-small, [data-testid=repository-name]");
+      push(t ? t.innerText : row.innerText.split("\n")[0], repo ? repo.innerText : "", t && t.href);
+      if (items.length >= max) break;
+    }
+  } else if (/linkedin\.com$/.test(host)) {
+    const sel = kind === "messages" ? ".msg-conversation-listitem, [data-view-name*='conversation'], li[class*='conversation']"
+      : kind === "notifications" ? "article, .nt-card, [data-view-name*='notification'], section li"
+      : "[data-urn*='activity'], .feed-shared-update-v2, [data-id*='activity'], main article";
+    for (const el of document.querySelectorAll(sel)) {
+      if (!visible(el) && items.length) continue;
+      const lines = (el.innerText || "").split("\n").map(clean).filter(Boolean);
+      if (!lines.length || /^(promoted|sponsored)$/i.test(lines[0])) continue;
+      if (kind === "messages") push(lines[0], lines.slice(1).find((l) => l.length > 3 && !/^\d{1,2}:\d{2}|^[A-Z][a-z]{2} \d/.test(l)) || "", "");
+      else { const body = lines.find((l) => l.length > 25) || lines[0]; push(body, body !== lines[0] ? lines[0] : "", ""); }
+      if (items.length >= max) break;
+    }
+  }
+  if (!items.length) {
+    const main = document.querySelector("main, [role=main]") || document.body;
+    for (const el of main.querySelectorAll("article, [role=article], li")) {
+      if (!visible(el) || el.closest("nav, header, footer, aside")) continue;
+      const first = (el.innerText || "").split("\n").map(clean).find((l) => l.length > 15);
+      const link = el.querySelector("a[href]");
+      if (first) push(first, "", link ? link.href : "");
+      if (items.length >= max) break;
+    }
+  }
+  return {site: host, kind, items, title: document.title, url: location.href};
 }
 
 function pageControls(limit) {

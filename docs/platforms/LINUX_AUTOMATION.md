@@ -327,6 +327,43 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — round 5, part 6 (slice 6b): ask ChatGPT / Claude / Gemini, WhatsApp files, Reddit / LinkedIn / GitHub, several steps (extension 1.13.0)
+
+- **F4** `browser.ai_ask` / `ai_read` — "ask ChatGPT what a monad is", "ask Claude to …", "what
+  does Gemini think of X", "ask ChatGPT in a new chat …", "read the whole answer". The open tab
+  of that site is reused (a follow-up stays in the conversation); the question is typed as said,
+  the send button waited for, and the answer waited for INSIDE the page (`page.aiChat wait`:
+  a new answer that has stopped growing and no Stop button). Long answers are cut at a sentence
+  ("the rest is on screen"); code is said to be on screen. A slow answer is announced once;
+  the wait is bounded (90 s). Signed out → said so, nothing typed. The understanding layer and
+  the planner may never route a request to an AI site (`interpreter._USER_ONLY`).
+- **F5** `message.send` to the OPEN chat ("reply saying …", "reply to Rahul saying …" — the old
+  parser sent "reply saying ok" to a contact called "reply") and `message.send_file` ("send my
+  resume to Ravi on WhatsApp", "send the last screenshot here"). Both ask first naming the
+  resolved chat (and the file); on yes the chat is re-checked, WhatsApp's Attach input is armed
+  with the D5 trusted-Space hook, the path goes into the chooser, and the preview's own Send is
+  pressed only when the preview shows that file. Images go as photos, the rest as documents.
+  A model can never propose a file send.
+- **F6** `browser.social` — "read my LinkedIn / GitHub / Reddit notifications", "read my
+  LinkedIn messages", "what's the top post on r/python this week", "what's trending on Reddit",
+  "open r/python", "open the github repo owner/name" (no owner → GitHub's repository search),
+  "search LinkedIn jobs for …" (site table: `linkedin jobs`, `linkedin notifications`,
+  `linkedin messages`). Read from the page (`page.social`), spoken, never sent to a model.
+- **G5** several steps in one sentence: `common.direct_tokens` splits "X and Y" / "X then Y"
+  when BOTH halves are complete commands, judging the later half against what the earlier one
+  will put in front ("open the budget sheet and total column C"); free-text first halves split
+  only at "then". A batch step that needs a yes now PARKS the rest (it was dropped); a failed
+  open stops the step that needed that page. `ws_open` / `ws_search` wait for the page. New
+  shapes: "total column C", "add up the amount column", "open the sheet Ravi sent last week".
+  The planner's catalog has the browser / message shapes.
+- The DMM preamble is unchanged: a 6b paragraph was tried and made the local model misread
+  "mute me"; every 6b phrasing in `test_dmm_browser.py` is rules-first anyway (110/110).
+- Tests: `test_browser_control.py` [22] (107 new), `test_browser_extension.py` [11] (17 new),
+  `test_dmm_browser.py` +15 cases.
+- **Not verified live**: no question was sent to the real ChatGPT / Claude / Gemini, no file
+  sent in a real WhatsApp chat, no live LinkedIn / Reddit / GitHub page read. Their markup was
+  taken from what those sites used in 2026 and may drift; each has a generic fallback.
+
 ### 2026-11-11 — round 5, part 6 (slice 6a): forms, the video, site search, shopping (extension 1.12.0)
 
 Decisions asked first and answered by the user: **D1** shopping = search and open only (no
