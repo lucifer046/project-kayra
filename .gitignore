@@ -101,3 +101,5 @@ graphify-out/
 # Agentic coding tool
 .claude/
 .agents/
+# Part 16: backups of memory and settings (personal data; never committed)
+backups/

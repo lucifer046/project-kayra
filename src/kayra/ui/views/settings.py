@@ -171,6 +171,11 @@ class SettingsView(View):
     VOICE = (
         ("ASSISTANT_VOICE", "Voice", "How Kayra sounds. Applies to the next sentence.",
          "voice", None),
+        ("ASSISTANT_SPEECH_RATE", "Speaking speed", "How fast Kayra talks; 1.1 is normal. Applies to the next "
+         "sentence. You can also say \u201cspeak a bit faster\u201d.", "choice",
+         ["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5"]),
+        ("VOICE_FOLLOWS_LANGUAGE", "Speak other languages in their own voice",
+         "A Hindi, Japanese or Mandarin sentence is spoken by a voice of that language.", "bool", None),
         ("INPUT_LANGUAGE", "Recognition language", "The language you speak to Kayra in.",
          "language", None),
     )
@@ -288,7 +293,20 @@ class SettingsView(View):
             self._controls[env_key] = (control, kind)
             if index:
                 card.body.addWidget(RowRule())      # a hairline, not a gap
-            card.body.addWidget(SettingRow(label, help_text, control))
+            shown = control
+            if kind == "voice":
+                # N3.5: hear a voice before saving it.
+                shown = QWidget()
+                line = QHBoxLayout(shown)
+                line.setContentsMargins(0, 0, 0, 0)
+                line.setSpacing(Space.sm)
+                line.addWidget(control, 1)
+                play = GhostButton("Play")
+                play.setToolTip("Hear this voice")
+                play.clicked.connect(lambda _=False, c=control: self.bridge.preview_voice(c.currentData() or c.currentText()))
+                line.addWidget(play)
+                self.voice_preview = play
+            card.body.addWidget(SettingRow(label, help_text, shown))
         if restart_note:
             note = Caption("Changes apply the next time Kayra starts."
                            if title != "Voice" else
@@ -1183,6 +1201,10 @@ class SettingsView(View):
             # And the voice: the running speech engine switches at the next sentence.
             if "ASSISTANT_VOICE" in updates:
                 self.bridge.apply_voice(updates["ASSISTANT_VOICE"])
+            if "ASSISTANT_SPEECH_RATE" in updates:
+                self.bridge.apply_speech_rate(updates["ASSISTANT_SPEECH_RATE"])
+            if "VOICE_FOLLOWS_LANGUAGE" in updates:
+                self.bridge.apply_follow_language(updates["VOICE_FOLLOWS_LANGUAGE"] == "True")
             self._refresh_key_status()
             if failed:
                 self.status.setText("Saved, but the key for " + ", ".join(failed)

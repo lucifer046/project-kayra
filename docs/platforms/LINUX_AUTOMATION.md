@@ -327,6 +327,21 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — parts 14–16: Kayra's voice, local models and keys, backups
+
+- **Voice**: "speak a bit faster" / "slower" / "at normal speed" / "set your speaking speed to 1.3"
+  (saved; Settings → Voice has the same control and a Play preview); Hindi, Japanese and Mandarin
+  sentences are spoken by a voice of that language (same gender), switchable in Settings.
+- **Local models**: "which model is loaded" (and whether it can see images), "load Qwen" (unloads
+  the other first — one 8–9B model fits the GPU), "unload the local model", "how fast is my local
+  model"; "check my API keys" (one tiny request per stored key — at boot only with
+  `KEY_HEALTH_ON_BOOT=on`).
+- **Backups**: "back up my Kayra data" (memory, details, what Kayra learned, settings — never keys;
+  `backups/`, 0600, ten kept), "restore my last backup" (asks; saves the current state first).
+- **Test hygiene**: `tests/run_all.py` now fails if any suite changes `data/`, `logs/`, `Reports/` or
+  `backups/`; the first sweep found none.
+- Tests: `tests/test_voice_models_backup.py` (new, 72), `test_dmm_browser.py` +7 (145/145).
+
 ### 2026-11-11 — round 5, parts 11–13: smooth scrolling, browser neighbours, around the call (extension 1.16.0)
 
 - **Smooth scrolling** in every page of the interface: wheel notches glide and accumulate, the

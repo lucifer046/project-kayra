@@ -50,6 +50,7 @@ import json
 import shutil
 import socket
 import subprocess
+import threading
 import webbrowser
 from urllib.parse import quote_plus
 
@@ -2171,6 +2172,15 @@ def _dispatch_extended(domain, verb, target, params, action):
     from kayra.automation import (web_macros as W, diagnostics as D, screen_ai as V,
                                   workflows as F, linux_system as S)
     W.new_command()                       # a fresh "which tab is active?" for this command
+    if domain == "voice":
+        return common.voice_rate(target)
+    if domain == "backup":
+        from kayra.automation import backup as B
+        return {"create": B.create, "list": B.list_backups, "restore": B.restore}[verb]()
+    if domain == "models":
+        from kayra.automation import local_models as M
+        return {"status": M.loaded_report, "unload": M.unload, "speed": M.speed_test,
+                "keys": M.key_health, "load": lambda: M.load(target)}[verb]()
     if domain == "learning":
         return _learning(verb, target)
     if domain == "inbox":
@@ -2539,6 +2549,13 @@ def start_services(speaker=None):
     started = {"bridge": browser_bridge.start(), "watcher": workflows.ensure_watcher(),
                "notifications": linux_system.start_notification_log(_inbox().on_notification),
                "status": status_file.start()}
+    # Part 15 (N2.4): KEY_HEALTH_ON_BOOT=on checks the stored keys once, in the background.
+    from kayra.automation import local_models
+    from kayra.core.config import env
+    if str(env("KEY_HEALTH_ON_BOOT", "off") or "off").strip().lower() in ("1", "on", "true", "yes"):
+        threading.Thread(target=local_models.boot_check, args=(common.announce,), daemon=True,
+                         name="kayra-key-check").start()
+        started["key_check"] = True
     return started
 
 

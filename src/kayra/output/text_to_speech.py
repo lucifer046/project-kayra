@@ -74,6 +74,48 @@ def voice_names(path):
     return _VOICE_NAMES[path]
 
 
+# ── Part 14 (§13 N4): speaking speed, and a voice that follows the language ──
+DEFAULT_SPEED = 1.1                 # what Kayra always spoke at; "normal speed"
+MIN_SPEED, MAX_SPEED = 0.7, 1.6
+# Kokoro voice ids start with a language letter. Scripts that say their language by the letters
+# themselves are detected per sentence; Latin-script languages are not guessed (English words
+# inside a Spanish sentence would flip voices back and forth).
+_SCRIPTS = (("hi", "h", ((0x0900, 0x097F),)),                       # Devanagari
+            ("ja", "j", ((0x3040, 0x30FF),)),                       # Hiragana, Katakana
+            ("cmn", "z", ((0x4E00, 0x9FFF),)))                      # CJK ideographs (after kana: Japanese uses both)
+
+
+def clamp_speed(value, default=DEFAULT_SPEED):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return round(min(MAX_SPEED, max(MIN_SPEED, value)), 2)
+
+
+def script_language(text):
+    """'hi' / 'ja' / 'cmn' when most letters of `text` are in that script, else None."""
+    letters = [ch for ch in str(text or "") if ch.isalpha()]
+    if not letters:
+        return None
+    for lang, _prefix, ranges in _SCRIPTS:
+        hits = sum(1 for ch in letters if any(lo <= ord(ch) <= hi for lo, hi in ranges))
+        if hits * 2 >= len(letters):
+            return lang
+    return None
+
+
+def voice_for_language(lang, current, names):
+    """The voice for `lang` in the same gender as `current` ('af_bella' -> 'hf_alpha'), or None."""
+    prefix = next((p for code, p, _r in _SCRIPTS if code == lang), None)
+    if not prefix:
+        return None
+    gender = current[1] if len(current) > 1 and current[1] in "fm" else "f"
+    same = [n for n in names if n.startswith(prefix + gender + "_")]
+    other = [n for n in names if n.startswith(prefix)]
+    return (same or other or [None])[0]
+
+
 def is_quantized_voice_model(path):
     """True for the slow int8 graph, by name or — for the historical `kokoro.onnx` — by size."""
     name = os.path.basename(str(path)).lower()
@@ -335,6 +377,11 @@ class DynamicVoiceEngine:
         chosen = str(env_vars.get("ASSISTANT_VOICE", "") or "").strip()
         if chosen and chosen in voice_names(voices_path):
             self.voice = chosen
+        # Part 14: the speaking speed (Settings → Voice, or "speak a bit faster"), and whether a
+        # Hindi / Japanese / Mandarin sentence is spoken by a voice of that language.
+        self.speed = clamp_speed(env_vars.get("ASSISTANT_SPEECH_RATE"))
+        self.follow_language = str(env_vars.get("VOICE_FOLLOWS_LANGUAGE", "on") or "on").strip().lower() \
+            not in ("0", "off", "false", "no")
 
         # First Kokoro inference pays the ONNX graph-optimization + weight-warm cost
         # (~0.6-1.5s on CPU). Doing it here, silently, on a background thread means the
@@ -382,7 +429,7 @@ class DynamicVoiceEngine:
         """Runs one throwaway synthesis so the first user-visible utterance is not the cold one."""
         try:
             t0 = time.perf_counter()
-            for _ in self.onnx.stream("Ready.", voice=self.voice, speed=1.1):
+            for _ in self.onnx.stream("Ready.", voice=self.voice, speed=getattr(self, "speed", DEFAULT_SPEED)):
                 break  # first chunk is enough to force the full graph warm-up
             self.warm_up_seconds = time.perf_counter() - t0
         except Exception:
@@ -409,7 +456,9 @@ class DynamicVoiceEngine:
                     # between sentences; reading it once here means a switch can never replace
                     # the engine underneath a generator that is mid-inference.
                     onnx = self.onnx
-                    for audio_samples, _rate in onnx.stream(text, voice=self.voice, speed=1.1):
+                    voice, lang = self.voice_and_language(text)
+                    for audio_samples, _rate in onnx.stream(text, voice=voice, lang=lang,
+                                                            speed=getattr(self, "speed", DEFAULT_SPEED)):
                         if epoch != self._epoch:
                             break  # Barge-in mid-sentence: abandon the rest of this sentence.
                         self._audio_queue.put((epoch, np.asarray(audio_samples, dtype=np.float32)))
@@ -647,6 +696,29 @@ class DynamicVoiceEngine:
         """
         with self._lock:
             self._interrupted = False
+
+    def preview(self, text, voice):
+        """N3.5: speak `text` once in `voice` without changing the voice in use. Non-blocking."""
+        once = self.__dict__.setdefault("_voice_once", {})
+        once[str(text)] = voice
+        self.speak(text)
+
+    def voice_and_language(self, text):
+        """(voice, Kokoro lang) for one sentence: the chosen voice in English; a voice of the
+        sentence's own language when it is written in Devanagari, kana or Han (and one exists)."""
+        voice = (self.__dict__.get("_voice_once") or {}).pop(str(text), None) or getattr(self, "voice", "af_bella")
+        if getattr(self, "follow_language", True):
+            lang = script_language(text)
+            if lang:
+                other = voice_for_language(lang, voice, voice_names(getattr(self, "_voices_path", "") or ""))
+                if other:
+                    return other, lang
+        return voice, "en-us" if voice[:1] in ("a", "") else "en-gb" if voice[:1] == "b" else "en-us"
+
+    def set_speed(self, rate):
+        """Applies from the next sentence. Returns the speed now in use."""
+        self.speed = clamp_speed(rate, getattr(self, "speed", DEFAULT_SPEED))
+        return self.speed
 
     def speak(self, text, blocking: bool = False):
         """

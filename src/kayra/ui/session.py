@@ -602,6 +602,33 @@ class KayraSession:
         engine.voice = voice
         return True
 
+    def apply_speech_rate(self, rate):
+        """Part 14: the running engine speaks at `rate` from the next sentence."""
+        engine = getattr(self._app, "tts_engine", None) if self._app else None
+        if engine is None or not hasattr(engine, "set_speed"):
+            return False
+        engine.set_speed(rate)
+        return True
+
+    def apply_follow_language(self, on):
+        engine = getattr(self._app, "tts_engine", None) if self._app else None
+        if engine is None:
+            return False
+        engine.follow_language = bool(on)
+        return True
+
+    PREVIEW_LINE = "Hi, I'm Kayra. This is how I sound."
+
+    def preview_voice(self, voice):
+        """N3.5: one sample line in `voice`, without changing the voice in use."""
+        engine = getattr(self._app, "tts_engine", None) if self._app else None
+        if engine is None or not voice or voice not in self.available_voices():
+            return False
+        if hasattr(engine, "preview"):
+            engine.preview(self.PREVIEW_LINE, voice)      # queued: the interface never waits on audio
+            return True
+        return False
+
     def provider_model_suggestions(self):
         from kayra.intelligence.llm_engine import PROVIDER_MODEL_SUGGESTIONS
         return {name: list(models) for name, models in PROVIDER_MODEL_SUGGESTIONS.items()}

@@ -49,6 +49,8 @@ LABELS = {
     "TTS_DEVICE_MODE": "TTS device",
     "INPUT_LANGUAGE": "Recognition language",
     "ASSISTANT_VOICE": "Voice",
+    "ASSISTANT_SPEECH_RATE": "Speaking speed",
+    "VOICE_FOLLOWS_LANGUAGE": "Voice follows the language",
     "ASSISTANT_NAME": "Assistant name",
     "USERNAME": "Your name",
     "FORCE_ONLINE": "Always use cloud models",

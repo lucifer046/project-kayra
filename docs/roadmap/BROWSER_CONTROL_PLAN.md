@@ -1,6 +1,6 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8–13 and the V9 / V11 fix rounds done (2026-11-11).**
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8–16 and the V9 / V11 fix rounds done (2026-11-11).**
 > See §10 for the parts and what is next (left: H2 phrasings + tone, H3 other apps, H4 multi-app sends, M4.2–M4.5, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
@@ -506,7 +506,28 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 11 | §11 S1 smooth scrolling (wheel glide that accumulates, touchpad 1:1 + momentum, keys, refresh-paced, reduced motion) + S3 measuring | **done 2026-11-11** (`updates/UPDATE_V17.md`). S2 GPU tile layer open |
 | 12 | §13 N1 browser neighbours: tab sessions, reading list, picture-in-picture, page screenshots (full page), tidy-tabs suggestion, open in another browser / profile | **done 2026-11-11** (extension 1.16.0) |
 | 13 | §12 M4: present a deck into the call, meeting notes + local summary, recording (asks), Zoom / Teams / Discord in the browser | **done 2026-11-11** (extension 1.16.0) |
+| 14 | §13 N4.1 speaking speed (voice + Settings, live), N4.2 a voice per language (Hindi / Japanese / Mandarin by script), N3.5 voice preview | **done 2026-11-11** (`updates/UPDATE_V18.md`) |
+| 15 | §13 N2.3 LM Studio by voice (what is loaded, load / unload, vision warning), N2.2 local speed test, N2.4 key health (on request; at boot only with `KEY_HEALTH_ON_BOOT=on`) | **done 2026-11-11** |
+| 16 | §13 N5.1 + N2.6 backup / restore without keys, N5.3 the test-hygiene sweep in `run_all.py` | **done 2026-11-11** (the sweep found no suite writing to `data/`, `logs/`, `Reports/`, `backups/`) |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | **7a/7b/7c done 2026-11-11** (§7a benchmark, H1 page agent, H1.1 recipes, H2 aliases + transparency; extension 1.14.0; `updates/UPDATE_V15.md`). Open: H2 phrasings / tone, H3, H4 |
+
+**Parts 14–16 — Kayra's voice, local models and keys, backups** (done 2026-11-11). Detail:
+`updates/UPDATE_V18.md`.
+- 14: `text_to_speech.clamp_speed` / `script_language` / `voice_for_language`; the engine's
+  `speed`, `follow_language`, `voice_and_language`, `set_speed`, `preview`. "speak a bit faster",
+  "speak at normal speed", "set your speaking speed to 1.3", "what's your speaking speed" reach the
+  engine through `common.SPEECH` (set by `app.bootstrap`; automation never imports the engine) and
+  are saved with `write_env_values` + `settings_log.record`. Settings → Voice: speed, "speak other
+  languages in their own voice", a Play button (queued, never blocks the UI).
+- 15: `automation/local_models.py` — `/api/v0/models` for state and type, `lms` for load / unload
+  (unload first: one 8–9B model fits), the cached local model id is forgotten after a switch;
+  `speed_test` local only; `key_health` = one `probe_provider` per stored key, only when asked or
+  with `KEY_HEALTH_ON_BOOT=on`.
+- 16: `automation/backup.py` + `paths.backups_dir()` (gitignored): `data/` + `.env` minus every
+  secret / `@keyring` line, 0600, ten kept; restore is CONFIRM, saves the current state first,
+  `data/` only (no `..` / absolute), settings merged without touching secrets. `run_all.py`
+  fingerprints `data/ logs/ Reports/ backups/` and fails the run on any change.
+- The understanding layer may not propose `models`, `voice` or `backup` actions.
 
 **Parts 11–13 — smooth scrolling, browser neighbours, around the call** (done 2026-11-11,
 extension 1.16.0). Detail: `updates/UPDATE_V17.md`.
@@ -1003,7 +1024,7 @@ staying out of the developer's `logs/`.
 
 ---
 
-## 13. Neighbouring features not covered elsewhere  *(N1 done 2026-11-11 — Part 12; N2–N5 open)*
+## 13. Neighbouring features not covered elsewhere  *(N1 Part 12; N2.2–N2.4, N2.6 Part 15/16; N3.5, N4.1, N4.2 Part 14; N5.1, N5.3 Part 16 — done 2026-11-11; N2.1, N2.5, N3 (but N3.5), N4.3, N5.2 open)*
 
 Ideas that sit next to what was built in V4 (cloud models, key storage, the redesigned and
 GPU-composited UI, tab Parts 2a/2b) and that no section above covers. Each is small on its own;

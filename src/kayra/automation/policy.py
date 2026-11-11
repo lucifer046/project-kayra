@@ -296,6 +296,8 @@ _CONFIRM_ACTIONS = {
     "learning.forget_all",
     # Part 13 (§12 M4.4): recording a meeting records other people — always asked.
     "meet.record",
+    # Part 16: a restore replaces memory and settings (the current state is backed up first).
+    "backup.restore",
 }
 
 # Actions that must never run from a voice command, whatever the phrasing.

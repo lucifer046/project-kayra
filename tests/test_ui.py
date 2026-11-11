@@ -270,6 +270,17 @@ class StubBridge(QObject):
     def current_voice(self):
         return "af_bella"
 
+    def apply_speech_rate(self, rate):
+        self.speech_rate = rate
+        return True
+
+    def apply_follow_language(self, on):
+        return True
+
+    def preview_voice(self, voice):
+        self.previewed = voice
+        return True
+
     def apply_voice(self, voice):
         self.applied_voice = voice
         return True

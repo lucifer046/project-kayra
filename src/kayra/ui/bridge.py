@@ -209,6 +209,24 @@ class KayraBridge(QObject):
         except Exception:
             return False
 
+    def apply_speech_rate(self, rate):
+        try:
+            return self._session.apply_speech_rate(rate)
+        except Exception:
+            return False
+
+    def apply_follow_language(self, on):
+        try:
+            return self._session.apply_follow_language(on)
+        except Exception:
+            return False
+
+    def preview_voice(self, voice):
+        try:
+            return self._session.preview_voice(voice)
+        except Exception:
+            return False
+
     def provider_model_suggestions(self):
         try:
             return self._session.provider_model_suggestions()

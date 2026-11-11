@@ -71,6 +71,8 @@ SUITES = [
     dict(file="test_browser_control.py", category="unit", feature="Browser control (round 5)",
          needs="none", writes="nothing", seconds=2,
          note="site registry, open anything/anywhere, web apps, extension versions; fake extension"),
+    dict(file="test_voice_models_backup.py", category="unit", feature="Voice, local models, backups (Parts 14-16)",
+         needs="none", writes="temp dir only", seconds=1, note="fake LM Studio, fake key probe; backups in a temp project"),
     dict(file="test_smooth_scroll.py", category="unit", feature="Smooth scrolling (§11 S1)",
          needs="none", writes="nothing", seconds=1, note="headless Qt; glides advanced frame by frame"),
     dict(file="test_chrome_profiles.py", category="unit", feature="Chrome profiles (Part 5P)",
@@ -271,6 +273,36 @@ def print_inventory(markdown=False):
                 print(f"  {'':<30} {entry['note']}")
 
 
+WATCHED = ("data", "logs", "Reports", "backups")
+
+
+def snapshot_tree(root=None):
+    """{relative path: (size, mtime_ns)} under the developer's data, logs, Reports and backups."""
+    root = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    found = {}
+    for top in WATCHED:
+        base = os.path.join(root, top)
+        for folder, _dirs, files in os.walk(base):
+            for name in files:
+                if name == "kayra.lock":
+                    continue                        # the running app's own lock, if it is up
+                path = os.path.join(folder, name)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                found[os.path.relpath(path, root)] = (stat.st_size, stat.st_mtime_ns)
+    return found
+
+
+def diff_tree(before, after):
+    """'added: …' / 'changed: …' / 'removed: …' lines."""
+    lines = [f"added:   {p}" for p in sorted(set(after) - set(before))]
+    lines += [f"changed: {p}" for p in sorted(set(after) & set(before)) if after[p] != before[p]]
+    lines += [f"removed: {p}" for p in sorted(set(before) - set(after))]
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Kayra's test suites by category.")
     parser.add_argument("--integration", action="store_true",
@@ -326,6 +358,11 @@ def main():
     audit_dir = tempfile.mkdtemp(prefix="kayra-test-audit-")
     os.environ.setdefault("KAYRA_AUDIT_LOG", os.path.join(audit_dir, "automation.log"))
 
+    # §13 N5.3 (Part 16): no suite may change the developer's own data, logs, reports or
+    # backups. The tree is fingerprinted before and after; a difference fails the run and names
+    # the files. (EnvironmentGuard protects a few files from inside a suite; this sees all of them.)
+    watched = snapshot_tree()
+
     results = []
     for entry in selected:
         extra = ["--live"] if (args.live and entry["file"] in
@@ -336,6 +373,11 @@ def main():
 
     totals = print_table(results)
     shutil.rmtree(audit_dir, ignore_errors=True)
+    touched = diff_tree(watched, snapshot_tree())
+    if touched:
+        print("\nThe run changed the developer's own files (a suite must use a temp dir):")
+        for line in touched[:30]:
+            print(f"    {line}")
 
     broken = [r for r in results
               if r["status"] != "ok" and not r["status"].startswith("n/a")]
@@ -346,7 +388,7 @@ def main():
             for line in (row.get("output") or "").splitlines():
                 if _FAIL.search(line) or "Traceback" in line or "Error" in line:
                     print(f"    {line.strip()[:150]}")
-    return 1 if (totals["failed"] or broken) else 0
+    return 1 if (totals["failed"] or broken or touched) else 0
 
 
 if __name__ == "__main__":

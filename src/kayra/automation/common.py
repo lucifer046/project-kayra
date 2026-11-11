@@ -831,6 +831,15 @@ def normalize_command(command, context=None):
     found = part_12_action(lowered, raw, raw)           # Part 12: browser neighbours
     if found is not None:
         return found
+    found = voice_action(lowered, raw)                  # Part 14: Kayra's speaking speed
+    if found is not None:
+        return found
+    found = models_action(lowered, raw, raw)            # Part 15: local models, keys
+    if found is not None:
+        return found
+    found = backup_action(lowered, raw)                 # Part 16: backups
+    if found is not None:
+        return found
     found = _bare_workspace(lowered, raw)
     if found is not None:
         return found
@@ -2462,6 +2471,113 @@ def profile_action(low, raw, text=None):
     return None
 
 
+# ── Part 14 (§13 N4): Kayra's own voice ──
+# The automation layer never imports the speech engine (it would load the voice model); the
+# app hands over a getter at boot (`SPEECH["engine"]`).
+SPEECH = {"engine": None}
+_RATE_RE = re.compile(r"(?:can you |please )?(?:speak|talk)(?: a (?:bit|little|tad))?(?: more)? (faster|slower|quicker|more slowly|more quickly)|"
+                      r"slow down (?:your (?:voice|speech|talking)|when you (?:speak|talk))|"
+                      r"(?:speak|talk) (?:at |with )?(?:a |your )?normal (?:speed|pace|rate)|reset your (?:speaking |talking )?speed|"
+                      r"(?:set|change) your (?:speaking|speech|talking|voice) (?:speed|rate) to (\d(?:\.\d{1,2})?)(?: ?x| times)?|"
+                      r"(?:speak|talk) at (\d(?:\.\d{1,2})?)(?: ?x| times)(?: speed)?|"
+                      r"what(?:'s| is) your (?:speaking|speech|talking) (?:speed|rate)")
+
+
+def voice_action(low, raw):
+    m = _RATE_RE.fullmatch(" ".join(low.strip(" .?!").split()))
+    if not m:
+        return None
+    if m.group(1):
+        target = "slower" if m.group(1) in ("slower", "more slowly") else "faster"
+    elif m.group(2) or m.group(3):
+        target = m.group(2) or m.group(3)
+    elif low.startswith("what"):
+        target = "query"
+    elif "slow down" in low:
+        target = "slower"
+    else:
+        target = "normal"
+    return Action("voice", "rate", target=target, raw=raw)
+
+
+def voice_rate(target):
+    """'speak a bit faster' (+0.1), 'slower', 'normal' (1.1), '1.3'; saved for the next start too."""
+    engine = SPEECH["engine"]() if SPEECH["engine"] else None
+    if engine is None or not hasattr(engine, "set_speed"):
+        return ActionResult.unsupported("My voice isn't running right now.")
+    now = float(getattr(engine, "speed", 1.1) or 1.1)
+    if target == "query":
+        return ActionResult.success(f"I'm speaking at {now:g} — {('normal' if abs(now - 1.1) < 0.01 else 'faster than normal' if now > 1.1 else 'slower than normal')}.")
+    wanted = {"faster": now + 0.1, "slower": now - 0.1, "normal": 1.1}.get(target)
+    if wanted is None:
+        try:
+            wanted = float(target)
+        except ValueError:
+            return ActionResult.failure("What speed? 1.1 is normal.")
+    new = engine.set_speed(wanted)
+    try:
+        from kayra.core.config import write_env_values
+        from kayra.core.settings_log import record
+        if write_env_values({"ASSISTANT_SPEECH_RATE": f"{new:g}"}):
+            record("ASSISTANT_SPEECH_RATE", f"{new:g}", f"{now:g}")
+    except Exception:
+        pass
+    if abs(new - now) < 1e-6:
+        edge = "fastest" if wanted > now else "slowest"
+        return ActionResult.success(f"That's already my {edge}." if target in ("faster", "slower") else f"I'm already at {new:g}.")
+    return ActionResult.success("Back to my normal speed." if target == "normal" else
+                                f"Okay — {'faster' if new > now else 'slower'} now ({new:g}).")
+
+
+# ── Part 15 (§13 N2): local models and keys ──
+_FAMILY = r"(?:qwen|gemma|llama|mistral|phi|deepseek|gpt[- ]?oss|granite|smol|olmo)"
+_MODEL_STATUS_RE = re.compile(r"(?:which|what) (?:local )?models? (?:is|are) (?:loaded|running)(?: in lm studio| locally)?|"
+                              r"what (?:local )?model are you (?:using|running|on)(?: locally)?|is (?:a|the|my) local model (?:loaded|running)")
+_MODEL_LOAD_RE = re.compile(r"load (?:the |my )?(.+?) model(?: in lm studio)?|load (.+?) in lm studio|"
+                            r"(?:switch|change) (?:the |my )?local model to (.+)|(?:use|switch to) (.+?) as (?:the|my) local model|"
+                            r"load (" + _FAMILY + r"[\w .:-]*)")
+_MODEL_UNLOAD_RE = re.compile(r"unload (?:the |my |all )?(?:local )?models?(?: in lm studio)?|free (?:up )?the gpu(?: memory)?")
+_MODEL_SPEED_RE = re.compile(r"how fast is (?:my |the )?local model|(?:test|check|benchmark) (?:the speed of )?(?:my |the )?local model(?:'s)?(?: speed)?")
+_KEYS_RE = re.compile(r"(?:check|test) (?:my |the )?(?:api |cloud |model )?keys|are my (?:api |cloud )?keys (?:working|ok|okay|valid|still working)")
+
+
+def models_action(low, raw, text=None):
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    if _MODEL_STATUS_RE.fullmatch(low):
+        return Action("models", "status", target="local", raw=raw)
+    if _MODEL_UNLOAD_RE.fullmatch(low):
+        return Action("models", "unload", target="local", raw=raw)
+    if _MODEL_SPEED_RE.fullmatch(low):
+        return Action("models", "speed", target="local", raw=raw)
+    if _KEYS_RE.fullmatch(low):
+        return Action("models", "keys", target="cloud", raw=raw)
+    m = _MODEL_LOAD_RE.fullmatch(low)
+    if m:
+        name = next(g for g in m.groups() if g).strip()
+        if name not in ("the", "a", "this", "more", "page") and not re.search(r"\b(?:page|tab|comments|results|more)\b", name):
+            return Action("models", "load", target=_said(text, name), raw=raw)
+    return None
+
+
+# ── Part 16 (§13 N5): backups ──
+_BACKUP_RE = re.compile(r"(?:back up|backup|make a backup of|save a backup of) (?:all )?(?:my |your )?(?:kayra )?(?:data|settings|memory|stuff|everything)"
+                        r"(?: and (?:my |your )?(?:settings|memory|data))?|make a (?:kayra )?backup|create a backup")
+_RESTORE_RE = re.compile(r"restore (?:my |the |from (?:my |the )?)?(?:last |latest |newest )?(?:kayra )?backup")
+_BACKUPS_RE = re.compile(r"(?:list|show|what are|what) (?:my )?(?:kayra )?backups(?: do i have)?|do i have (?:a|any) backups?")
+
+
+def backup_action(low, raw):
+    low = " ".join(low.strip(" .?!").split())
+    if _RESTORE_RE.fullmatch(low):
+        return Action("backup", "restore", target="latest", raw=raw)
+    if _BACKUPS_RE.fullmatch(low):
+        return Action("backup", "list", target="all", raw=raw)
+    if _BACKUP_RE.fullmatch(low):
+        return Action("backup", "create", target="all", raw=raw)
+    return None
+
+
 # ── Part 12 (§13 N1): browser neighbours ──
 _SESSION_SAVE_RE = re.compile(r"save (?:(?:these|my|the|all(?: these| my| the)?) )?(?:open )?tabs as (?:my |the )?(.+?)(?: tabs| session)?|"
                               r"save this (?:window|session) as (?:my |the )?(.+?)(?: tabs| session)?")
@@ -2836,6 +2952,12 @@ def _direct_one(utterance, situation_fn=None):
         return [f"message {text}"]                      # "read the last three messages of mota panda"
     if profile_action(low, f"browser {text}", text) is not None:
         return [f"browser {text}"]                      # Part 5P: a Chrome profile
+    if voice_action(low, text) is not None:
+        return [text]                                   # Part 14: "speak a bit faster"
+    if models_action(low, text, text) is not None:
+        return [text]                                   # Part 15: "which model is loaded", "load qwen"
+    if backup_action(low, text) is not None:
+        return [text]                                   # Part 16: "back up my Kayra data"
     if part_12_action(low, text, text) is not None:
         return [f"browser {text}"]                      # Part 12: sessions, reading list, PiP, screenshots
     found = part_7_direct(low, text)
@@ -3522,6 +3644,7 @@ _CONFIRM_PROMPTS = {
     "browser.video_subscribe": "Subscribe to this channel?",
     "learning.forget_all": "Forget everything I've learned about how you talk, and every page shortcut?",
     "meet.record": "Record your screen and the call's sound? Tell the others you're recording.",
+    "backup.restore": "Restore your last backup? It replaces my memory and settings; what you have now is saved first.",
 }
 
 

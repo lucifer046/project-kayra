@@ -19,8 +19,8 @@ this repository. Read this first; follow the links when you need depth.
 ## Pending work
 
 [`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) — the
-browser-control round, built **in parts** (§10 has the part table and what is next). Parts 1–13
-and 5P are done; see §10 for what remains (§11 S2, §13 N2–N5, H2 phrasings, H3 other apps, H4 multi-app, 5P P4). Do the next part only when
+browser-control round, built **in parts** (§10 has the part table and what is next). Parts 1–16
+and 5P are done; see §10 for what remains (§11 S2, the rest of §13, H2 phrasings, H3 other apps, H4 multi-app, 5P P4). Do the next part only when
 the user asks. The user also asked that every round proactively
 add the obvious neighbouring features and list them for veto.
 

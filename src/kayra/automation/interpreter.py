@@ -43,7 +43,7 @@ from kayra.automation import ai
 
 MAX_COMMANDS = 4
 TIMEOUT_S = 8.0
-NEVER_FROM_MODEL = frozenset({"shell", "plan", "trigger", "learning"})
+NEVER_FROM_MODEL = frozenset({"shell", "plan", "trigger", "learning", "models", "voice", "backup"})
 _POWER = frozenset({"shutdown", "restart", "sign_out", "sleep", "hibernate", "logout",
                     "reboot", "suspend"})
 ACTIVE = True       # the unit-test rigs switch this off so no suite ever reaches a model

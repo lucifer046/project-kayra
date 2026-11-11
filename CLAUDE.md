@@ -304,6 +304,11 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   Call controls go through `web_macros._activate_call` + `_labels` (Meet, Zoom, Teams, Discord).
   `meeting_notes.py` owns an on-demand thread, stopped on leave and at shutdown; summaries LOCAL only.
   Tab sessions / reading list live in the `learning` private store.
+- **Parts 14–16 (2026-11-11).** Speech speed / per-language voice live in the TTS engine; automation
+  reaches it only through `common.SPEECH` (set at boot). `local_models.py` reads LM Studio's
+  `/api/v0/models` and drives `lms`; key checks cost money, so never automatic by default.
+  `backup.py` never writes a secret into a backup. `run_all.py` FAILS if a suite touches
+  `data/ logs/ Reports/ backups/` — see `docs/reference/DEV_WORKFLOW.md`.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

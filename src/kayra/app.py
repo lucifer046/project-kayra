@@ -654,6 +654,13 @@ def bootstrap():
                     f"{k} {'on' if v else 'off'}" for k, v in started.items()), correlate=False)
             except Exception as exc:
                 logbus.warning(Subsystem.AUTO, f"Automation services did not start: {exc}")
+        # Part 14: "speak a bit faster" reaches the running voice through a getter — the
+        # automation layer never imports the speech engine.
+        try:
+            from kayra.automation import common as _speech_rules
+            _speech_rules.SPEECH["engine"] = lambda: tts_engine
+        except Exception:
+            pass
         # Rules before the classifier: an utterance the automation rules fully understand
         # skips the model (tuning pass V9). Linux only — it routes browser/Workspace commands.
         if hasattr(_hands, "situation"):

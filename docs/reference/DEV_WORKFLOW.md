@@ -273,3 +273,12 @@ silently replaces the GPU build with the CPU one, and nothing in the application
 - **Cleaning up a Kayra process by hand:** walk the PID tree from its ChromeDriver, never match
   on `chrome.exe`. Verified during this round — one orphaned run owned 8 processes while 6 other
   `chrome.exe` processes on the same machine belonged to the user. A name sweep kills all 14.
+
+
+## The hygiene sweep (Part 16, 2026-11-11)
+
+`tests/run_all.py` fingerprints every file under `data/`, `logs/`, `Reports/` and `backups/`
+(size + mtime, the running app's `kayra.lock` excepted) before the run and again after it. Any
+file added, changed or removed fails the run and is named. Route a suite's writes to a temp
+dir (`learning.DATA_DIR`, `backup.ROOT`, `web_macros.FILE_ROOTS`, `KAYRA_AUDIT_LOG`, …) — never
+"fix" the sweep. The first sweep (unit tier + the browser integration suites) found nothing.
