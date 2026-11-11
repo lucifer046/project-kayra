@@ -176,6 +176,16 @@ class Rig:
         # The understanding layer asks a model; never from a unit test unless one opts in.
         from kayra.automation import interpreter
         self._interp, interpreter.ACTIVE = interpreter.ACTIVE, False
+        # Part 7: the page agent asks a model (off unless a test opts in), and what Kayra learns
+        # goes to a temporary folder, never the developer's data/.
+        import tempfile
+        from kayra.automation import page_agent, learning
+        self._agent, page_agent.ACTIVE = page_agent.ACTIVE, False
+        self._learn_dir = tempfile.mkdtemp(prefix="kayra-learning-")
+        self._learn, learning.DATA_DIR = learning.DATA_DIR, self._learn_dir
+        learning.LAST.update(kind=None, app=None, said=None, at=0.0)
+        web_macros.LAST_PICK.update(said=None, chosen=None, others=[], at=0.0)
+        linux.RUNTIME.pending_choice = None
         return self
 
     def __exit__(self, *exc):
@@ -183,6 +193,11 @@ class Rig:
         web_macros.TOP_RESULTS = self._top
         from kayra.automation import interpreter
         interpreter.ACTIVE = self._interp
+        import shutil
+        from kayra.automation import page_agent, learning
+        page_agent.ACTIVE, learning.DATA_DIR = self._agent, self._learn
+        shutil.rmtree(self._learn_dir, ignore_errors=True)
+        linux.RUNTIME.pending_choice = None
         (linux.HYPR, linux.RUNNER, linux.SLEEP, linux.LAUNCH_TIMEOUT_S,
          linux.CLOSE_TIMEOUT_S) = self._saved
         linux.CONFIRMATIONS.cancel()

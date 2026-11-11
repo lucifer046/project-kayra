@@ -2122,6 +2122,32 @@ def _dispatch(action):
     return _dispatch_extended(domain, verb, target, params, action)
 
 
+def _agent():
+    from kayra.automation import page_agent
+    return page_agent
+
+
+def _learning(verb, target):
+    from kayra.automation import learning
+    if verb == "show":
+        return ActionResult.success(learning.describe())
+    if verb == "forget_last":
+        said = learning.forget_last()
+        return ActionResult.success(said) if said else ActionResult.not_found("There's nothing I just learned to forget.")
+    if verb == "forget_all":
+        count = learning.forget_all()
+        return ActionResult.success(f"Forgot everything I'd learned ({count} things)." if count else "There was nothing to forget.")
+    if verb == "forget_app":
+        count = learning.forget_app(target.lower().replace(" ", ""))
+        return ActionResult.success(f"Forgot {count} thing{'s' if count != 1 else ''} about {target}." if count
+                                    else f"I hadn't learned anything about {target}.")
+    if verb == "forget_recipe":
+        from kayra.automation import page_agent
+        return ActionResult.success(f"Forgot how to {target}.") if page_agent.forget_recipe(target) else \
+            ActionResult.not_found(f"I don't have a shortcut for {target}.")
+    return None
+
+
 def _profiles():
     from kayra.automation import chrome_profiles
     return chrome_profiles
@@ -2132,6 +2158,8 @@ def _dispatch_extended(domain, verb, target, params, action):
     from kayra.automation import (web_macros as W, diagnostics as D, screen_ai as V,
                                   workflows as F, linux_system as S)
     W.new_command()                       # a fresh "which tab is active?" for this command
+    if domain == "learning":
+        return _learning(verb, target)
     if domain == "browser":
         table = {"tabs_list": lambda: W.tabs_list(),
                  "tab_switch": lambda: W.tab_switch(target),
@@ -2237,7 +2265,10 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "chrome_profile": lambda: _profiles().open_profile(target, params.get("browser", ""),
                                                                     params.get("url", ""), params.get("email", "")),
                  "chrome_profiles": lambda: _profiles().list_profiles(params.get("browser", "")),
-                 "chrome_guest": lambda: _profiles().open_guest(params.get("browser", ""))}
+                 "chrome_guest": lambda: _profiles().open_guest(params.get("browser", "")),
+                 # ── Part 7: the page agent and its recipes ──
+                 "agent": lambda: _agent().run(target, params.get("resume"), action),
+                 "agent_recipes": lambda: _agent().list_recipes()}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
@@ -2286,6 +2317,8 @@ def _dispatch_extended(domain, verb, target, params, action):
             return W.wa_unread()
         if verb == "read":
             return W.wa_read(target, bool(params.get("today")), int(params.get("count") or 0))
+        if verb == "other":
+            return W.wa_other()
         if verb == "send_file":
             return W.wa_send_file(target, params.get("what", ""), params.get("confirmed_path"),
                                   params.get("confirmed_chat"), action)

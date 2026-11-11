@@ -330,6 +330,22 @@ LINKEDIN_NOTES = """<html><head><title>Notifications | LinkedIn</title></head><b
 </main></body></html>"""
 
 
+AGENT_PAGE = """<html><head><title>Flights</title></head><body>
+<nav><a href="#home">Home</a></nav>
+<main><h1>Find flights</h1>
+<label for=from>From</label><input id=from value="Chennai">
+<label for=to>To</label><input id=to>
+<select id=cls aria-label="Class"><option>Economy</option><option>Business</option></select>
+<label><input type=checkbox id=direct> Direct flights only</label>
+<input type=password aria-label="Password">
+<button id=go onclick="document.title='searched:' + document.getElementById('to').value">Search flights</button>
+<button aria-label="Close banner"><svg></svg></button>
+<div style="display:none"><button>Hidden thing</button></div>
+<p>Your login code is 482913. Do not share it.</p>
+<div id=list style="height:200px;overflow:auto"><div style="height:2000px">long list</div></div>
+</main></body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -784,6 +800,35 @@ def main():
               r["items"])
         r = at(RESULTS, "example.com", "pageSocial", "posts", 5)
         check("F6: any other page falls back to the articles / list items in <main>", isinstance(r["items"], list), r)
+
+        check.section("[12] Part 7 — the page agent's eyes (page.snapshot) and hands (page.act)")
+        d.get("data:text/html;base64," + base64.b64encode(AGENT_PAGE.encode()).decode())
+        snap = call("pageSnapshot", 120, 1500)
+        by = {i["name"]: i for i in snap["items"]}
+        check("H1: every visible control with its role and accessible name; hidden ones left out",
+              {"From", "To", "Class", "Direct flights only", "Search flights", "Close banner", "Home"} <= set(by)
+              and "Hidden thing" not in by and by["Search flights"]["role"] == "button" and by["To"]["role"] == "textbox"
+              and by["Class"]["options"] == ["Economy", "Business"], sorted(by))
+        check("H1: values are read; a password field is flagged and its value never returned",
+              by["From"]["value"] == "Chennai" and by["Password"]["sensitive"] and by["Password"].get("value") in (None, "(hidden)"),
+              (by["From"], by["Password"]))
+        check("H1: a code in the page text is masked", "482913" not in snap["text"] and "••••" in snap["text"], snap["text"][:200])
+        again = call("pageSnapshot", 120, 1500)
+        check("H1: ids are STABLE across snapshots", {i["name"]: i["id"] for i in again["items"]} ==
+              {i["name"]: i["id"] for i in snap["items"]})
+        act = lambda op, args: d.execute_script(f"return (async {function('pageAct')}).apply(null, arguments)", op, args)
+        r = act("type", {"id": by["To"]["id"], "text": "Goa"})
+        check("H1: type into a field by id", r["ok"] and d.execute_script("return document.getElementById('to').value") == "Goa", r)
+        r = act("type", {"id": by["Password"]["id"], "text": "x"})
+        check("H1: the page refuses a password field too", not r["ok"] and r["reason"] == "secret field", r)
+        r = act("select", {"id": by["Class"]["id"], "text": "business"})
+        check("H1: choose a drop-down option", r["ok"] and d.execute_script("return document.getElementById('cls').value") == "Business", r)
+        r = act("check", {"id": by["Direct flights only"]["id"], "state": True})
+        check("H1: tick a box", r["checked"] and d.execute_script("return document.getElementById('direct').checked"), r)
+        r = act("click", {"id": by["Search flights"]["id"]})
+        check("H1: click by id", r["ok"] and d.title == "searched:Goa", d.title)
+        check("H1: an id that does not exist is reported", act("click", {"id": 9999})["reason"] == "no such element")
+        check("H1: scroll moves the page or the long box in it", act("scroll", {"direction": "down"})["ok"] is True)
     finally:
         d.quit()
     return check.finish()

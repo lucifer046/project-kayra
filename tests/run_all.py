@@ -165,6 +165,9 @@ SUITES = [
     dict(file="test_gesture_live.py", category="manual", feature="Gesture, real hand",
          needs="a person and a camera", writes="nothing", seconds=300,
          note="SAFE by default; --real-mouse moves the pointer and asks first"),
+    dict(file="bench_page_agent.py", category="manual", feature="Page agent model benchmark (§7a)",
+         needs="Google Chrome and a local model server", writes="nothing", seconds=120,
+         note="30 one-step decisions per model; --loops adds whole runs; local models only"),
 ]
 
 CATEGORY_ORDER = ("unit", "integration", "hardware", "manual")

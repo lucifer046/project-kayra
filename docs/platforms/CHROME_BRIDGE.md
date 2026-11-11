@@ -141,6 +141,11 @@ anywhere else; one is never needed for an unpacked extension.
 | "what's the top post on r/python this week", "what's trending on Reddit", "open r/python", "open the github repo pallets/flask", "search LinkedIn jobs for data analyst" | Reddit / GitHub / LinkedIn by voice |
 | "open the budget sheet and total column C", "tick I agree and then submit this form" | several steps in one sentence, in order; a step that asks first holds the rest until you answer |
 | "open my Work Chrome", "open Chrome as Kiran", "open Chrome on ana at school dot edu", "open Gmail in my Study Chrome", "which Chrome profiles do I have", "open Chrome as a guest" | Chrome straight into that profile (no "Who's using Chrome?" picker), read from Chrome's own list every time; asks when two profiles fit. Works without the extension |
+| "on this page, find the cheapest flight to Goa", "figure out how to turn on dark mode here" | (1.14.0) the page agent: looks at the page, does it step by step with your local model, and **asks** before anything that sends, posts, deletes, submits or pays; never adds to a cart. What worked is remembered and repeated next time without the model |
+| "list my page shortcuts", "forget the shortcut for …" | what the page agent remembered |
+| (after "Do you mean A or B?") "the second one", "the core team one", "neither" | answers the question; a WhatsApp name you pick is remembered for next time |
+| "no, the other one" (right after Kayra opened a chat) | opens the other match and remembers |
+| "what have you learned about me", "forget that", "forget everything about WhatsApp", "forget everything you learned" | what Kayra learned, shown and forgotten (the last one asks first) |
 | "add this to cart", "buy it now", "checkout" | **refused** (decision D1, 2026-11-11): Kayra searches and opens products only; the cart and paying are yours |
 
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the

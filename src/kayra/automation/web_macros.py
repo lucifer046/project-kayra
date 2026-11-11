@@ -48,7 +48,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 13, 0)
+REQUIRED_VERSION = (1, 14, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -2676,8 +2676,28 @@ def _wa_search_close():
         return False
 
 
+LAST_PICK = {"said": None, "chosen": None, "others": [], "at": 0.0}     # for "no, the other one" (7c)
+PICK_TTL_S = 120
+
+
 def _wa_find(name):
-    """(chat dict, None) | (None, ActionResult). Visible list first, then WhatsApp's own search."""
+    """(chat dict, None) | (None, ActionResult). Visible list first, then WhatsApp's own search.
+    A name the user taught ("PR group" -> its real name, `automation.learning`) is looked up as
+    the real name."""
+    from kayra.automation import learning
+    said = name
+    taught = learning.alias_for("whatsapp", name)
+    if taught:
+        name = taught
+    found_row, problem = _wa_find_named(name)
+    if found_row is not None and not taught:
+        LAST_PICK.update(said=said, chosen=found_row["name"], others=found_row.pop("_others", []), at=CLOCK())
+    elif found_row is not None:
+        found_row.pop("_others", None)
+    return found_row, problem
+
+
+def _wa_find_named(name):
     from kayra.automation import semantic_match as S
     chats, problem = _wa_ready()
     if problem:
@@ -2716,7 +2736,8 @@ def _wa_find(name):
             if again.decision != S.NONE or found.decision == S.NONE:
                 found = again
     if found.decision == S.PICK:
-        return dict(found.best.data, _searched=searched), None
+        others = [c.name for c in found.top(3) if c.name != found.best.name][:2]
+        return dict(found.best.data, _searched=searched, _others=others), None
     if searched:
         # Nothing will be opened: close WhatsApp's search again, or every later chat list
         # (who messaged me, the next open) would only see this search's results.
@@ -2826,6 +2847,25 @@ def wa_open(name):
         return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
     unread = f" {chat['unread']} unread." if chat.get("unread") else ""
     return ActionResult.success(f"Opened {chat['name']}.{unread}")
+
+
+def wa_other():
+    """7c: "no, the other one" right after Kayra picked a chat by a loose name — the runner-up is
+    opened, and what was said now means IT (the wrong alias is dropped)."""
+    from kayra.automation import learning
+    if not LAST_PICK["chosen"] or CLOCK() - LAST_PICK["at"] > PICK_TTL_S or not LAST_PICK["others"]:
+        return ActionResult.not_found("Which chat do you mean? Say its name.")
+    said, wrong, other = LAST_PICK["said"], LAST_PICK["chosen"], LAST_PICK["others"][0]
+    chat, problem = _wa_find_named(other)
+    if problem:
+        return problem
+    chat.pop("_others", None)
+    if not _wa_open(chat):
+        return ActionResult.failure(f"I found {chat['name']} but couldn't open it.")
+    learning.demote("whatsapp", said, wrong)
+    learning.teach("whatsapp", said, chat["name"])
+    LAST_PICK.update(chosen=chat["name"], others=[wrong] + LAST_PICK["others"][1:], at=CLOCK())
+    return ActionResult.success(f"Opened {chat['name']} instead. Next time \"{said}\" means {chat['name']}.")
 
 
 def wa_unread():

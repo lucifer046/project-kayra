@@ -289,6 +289,12 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
 - **Part 5P (2026-11-11) — Chrome profiles.** `automation/chrome_profiles.py` reads `Local State`
   (folder from `platforms.browser_user_data_dirs()`) at run time, never at parse time; no
   profile data in code or config, ever — `tests/test_profile_privacy_guard.py` enforces it.
+- **Part 7 (2026-11-11, extension 1.14.0) — page agent.** `page_agent.run`: snapshot -> ONE JSON action
+  from the LOCAL model -> act, ≤ 8 steps; clicks judged by `policy.classify_action` + social verbs
+  (late CONFIRM naming the control); types only the user's words. Recipes replay by control NAME
+  with no model and self-heal. `learning.py`: aliases from answers to "which one?"
+  (`AutomationRuntime.pending_choice`). Rigs set `page_agent.ACTIVE=False` and `learning.DATA_DIR`
+  to a temp dir. §7a numbers: `docs/roadmap/BROWSER_CONTROL_PLAN.md` §7a.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

@@ -405,6 +405,9 @@ async function run(cmd, args) {
     // ── 1.13.0: ask an AI site, send a file in WhatsApp, read social lists (Part 6b) ──
     case "page.aiChat": return inPage(await targetTab(args), pageAiChat, [args.op || "state", args]);
     case "chat.attach": return inPage(await targetTab(args), pageChatAttach, [args.op || "state", args]);
+    // ── 1.14.0: the page agent's eyes and hands (Part 7, H1) ──
+    case "page.snapshot": return inPage(await targetTab(args), pageSnapshot, [args.max || 120, args.textMax || 1500]);
+    case "page.act": return inPage(await targetTab(args), pageAct, [args.op || "click", args]);
     case "page.social": return untilReady(args, pageSocial, [args.kind || "posts", args.max || 10], (r) => r && r.items && r.items.length);
     case "page.find": return inPage(await targetTab(args), pageFind, [args.text]);
     case "page.controls": return inPage(await targetTab(args), pageControls, [args.limit || 60]);
@@ -1909,6 +1912,129 @@ function pageSocial(kind, max) {
     }
   }
   return {site: host, kind, items, title: document.title, url: location.href};
+}
+
+// 1.14.0 (H1): what the page agent SEES. Every visible thing a person can act on, with a stable
+// id (`data-kayra-id`, kept across snapshots so "click 7" still means the same element), its role,
+// the name a screen reader announces, its value, and whether it is a secret field. Secret values
+// are never returned; codes near "OTP / code / PIN" in the text are masked. Plus a little of the
+// page's own text (headings first) so the model knows where it is.
+function pageSnapshot(max, textMax) {
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const visible = (el) => { const r = el.getBoundingClientRect(); const st = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && st.visibility !== "hidden" && st.display !== "none"; };
+  const SEL = "a[href],button,input,textarea,select,summary,[contenteditable=true],[contenteditable=''],[role=button],[role=link]," +
+    "[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=option],[role=switch],[role=textbox],[role=combobox]," +
+    "[role=searchbox],[role=listitem][tabindex],[role=row][tabindex],[role=gridcell][tabindex]";
+  const textOf = (id) => { const e = id && document.getElementById(id); return e ? e.innerText || e.textContent : ""; };
+  const nameOf = (el) => {
+    const lb = el.getAttribute("aria-labelledby");
+    let n = el.getAttribute("aria-label") || (lb && lb.split(/\s+/).map(textOf).join(" ")) || "";
+    if (!n && el.id) { const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`); if (l) n = l.innerText; }
+    if (!n) { const wrap = el.closest("label"); if (wrap && wrap !== el) n = wrap.innerText; }
+    n = n || el.getAttribute("title") || el.getAttribute("placeholder") || el.getAttribute("data-placeholder") ||
+      el.getAttribute("alt") || (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) ? "" : el.innerText) || el.value || el.name || "";
+    return clean(n).slice(0, 80);
+  };
+  const roleOf = (el) => el.getAttribute("role") || ({A: "link", BUTTON: "button", SELECT: "select", TEXTAREA: "textbox", SUMMARY: "button"}[el.tagName]
+    || (el.tagName === "INPUT" ? ({checkbox: "checkbox", radio: "radio", submit: "button", button: "button", search: "searchbox"}[(el.type || "").toLowerCase()] || "textbox") : "")
+    || (el.isContentEditable ? "textbox" : "element"));
+  const SECRET = /pass ?(word|code|phrase)|\bcvv\b|\bcvc\b|card ?(number|no)|\botp\b|one.time|\bpin\b|security code|aadhaa?r/i;
+  window.__kayraNext = window.__kayraNext || 1;
+  const items = [];
+  for (const el of document.querySelectorAll(SEL)) {
+    if (!visible(el) || el.closest("[aria-hidden=true]")) continue;
+    if (el.parentElement && el.parentElement.closest("a[href],button,[role=button],[role=link]") && !["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) continue;
+    let id = el.getAttribute("data-kayra-id");
+    if (!id) { id = String(window.__kayraNext++); el.setAttribute("data-kayra-id", id); }
+    const name = nameOf(el);
+    const sensitive = (el.type || "").toLowerCase() === "password" || /^cc-|one-time-code|password/.test(el.getAttribute("autocomplete") || "") || SECRET.test(name);
+    const value = ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) ? (el.type === "checkbox" || el.type === "radio" ? "" : el.value)
+      : el.isContentEditable ? el.innerText : "";
+    const item = {id: Number(id), role: roleOf(el), name};
+    if (value) item.value = sensitive ? "(hidden)" : clean(value).slice(0, 60);
+    if (sensitive) item.sensitive = true;
+    if (el.disabled || el.getAttribute("aria-disabled") === "true") item.disabled = true;
+    const checked = el.checked !== undefined && (el.type === "checkbox" || el.type === "radio") ? el.checked : el.getAttribute("aria-checked");
+    if (checked === true || checked === "true") item.checked = true;
+    if (el.tagName === "SELECT") item.options = Array.from(el.options).map((o) => clean(o.text)).slice(0, 12);
+    if (!name && !item.value && item.role !== "textbox") continue;
+    items.push(item);
+    if (items.length >= max) break;
+  }
+  const heads = Array.from(document.querySelectorAll("h1,h2,h3,[role=heading]")).filter(visible).map((h) => clean(h.innerText)).filter(Boolean).slice(0, 8);
+  const main = document.querySelector("main,[role=main]") || document.body;
+  let text = clean([heads.join(" | "), main.innerText].join("\n")).slice(0, textMax);
+  text = text.replace(/((?:otp|code|pin|password)[^.\n]{0,24}?)\b\d{4,8}\b/gi, "$1••••");
+  return {url: location.href, title: document.title, items, text};
+}
+
+// 1.14.0 (H1): the page agent's hands — ONE action on the element with that id. Secret fields
+// are refused here as well as in Kayra. ops: click | type {text, clear} | select {text} | check
+// {state} | press {key} | scroll {direction}.
+async function pageAct(op, args) {
+  args = args || {};
+  const el = args.id !== undefined && args.id !== null ? document.querySelector(`[data-kayra-id="${Number(args.id)}"]`) : null;
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  if (op === "scroll") {
+    const amount = Math.round(window.innerHeight * 0.8) * (args.direction === "up" ? -1 : 1);
+    const before = window.scrollY; window.scrollBy(0, amount);
+    if (window.scrollY === before) {
+      const box = Array.from(document.querySelectorAll("*")).find((b) => b.scrollHeight > b.clientHeight + 40 &&
+        /(auto|scroll)/.test(getComputedStyle(b).overflowY) && b.clientHeight > 150);
+      if (box) { const t = box.scrollTop; box.scrollTop += amount; return {ok: box.scrollTop !== t}; }
+    }
+    return {ok: window.scrollY !== before};
+  }
+  if (op === "press") {
+    const target = el || document.activeElement || document.body;
+    const key = String(args.key || "Enter");
+    const code = {Enter: 13, Escape: 27, Tab: 9, ArrowDown: 40, ArrowUp: 38}[key] || 0;
+    for (const type of ["keydown", "keyup"]) target.dispatchEvent(new KeyboardEvent(type, {key, code: key, keyCode: code, which: code, bubbles: true, cancelable: true}));
+    if (key === "Enter" && target.form && target.form.requestSubmit && target.tagName === "INPUT") { try { target.form.requestSubmit(); } catch (e) {} }
+    return {ok: true, key};
+  }
+  if (!el) return {ok: false, reason: "no such element"};
+  const name = clean(el.getAttribute("aria-label") || el.innerText || el.value || el.getAttribute("placeholder") || "").slice(0, 80);
+  const secret = (el.type || "").toLowerCase() === "password" || /^cc-|one-time-code|password/.test(el.getAttribute("autocomplete") || "") ||
+    /pass ?(word|code)|\bcvv\b|card ?number|\botp\b|\bpin\b/i.test(name + " " + (el.getAttribute("placeholder") || ""));
+  el.scrollIntoView({block: "center"});
+  if (op === "click") {
+    const r = el.getBoundingClientRect();
+    const opts = {bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"]) el.dispatchEvent(new (type.startsWith("pointer") ? PointerEvent : MouseEvent)(type, opts));
+    el.click();
+    return {ok: true, name};
+  }
+  if (op === "type") {
+    if (secret) return {ok: false, reason: "secret field", name};
+    el.focus();
+    if (el.isContentEditable || !("value" in el)) {
+      if (args.clear !== false) { const range = document.createRange(); range.selectNodeContents(el); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); }
+      document.execCommand("insertText", false, String(args.text || ""));
+    } else {
+      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(el, (args.clear === false ? el.value : "") + String(args.text || ""));
+      el.dispatchEvent(new Event("input", {bubbles: true}));
+      el.dispatchEvent(new Event("change", {bubbles: true}));
+    }
+    const now = el.isContentEditable || !("value" in el) ? el.innerText : el.value;
+    return {ok: clean(now).includes(clean(args.text || "")), name};
+  }
+  if (op === "select") {
+    if (el.tagName !== "SELECT") return {ok: false, reason: "not a drop-down", name};
+    const want = clean(args.text).toLowerCase();
+    const opt = Array.from(el.options).find((o) => clean(o.text).toLowerCase() === want) || Array.from(el.options).find((o) => clean(o.text).toLowerCase().includes(want));
+    if (!opt) return {ok: false, reason: "no option", options: Array.from(el.options).map((o) => clean(o.text)).slice(0, 12), name};
+    el.value = opt.value; el.dispatchEvent(new Event("change", {bubbles: true}));
+    return {ok: true, name, option: clean(opt.text)};
+  }
+  if (op === "check") {
+    const now = el.checked !== undefined ? el.checked : el.getAttribute("aria-checked") === "true";
+    if (now !== (args.state !== false)) el.click();
+    return {ok: true, name, checked: el.checked !== undefined ? el.checked : el.getAttribute("aria-checked") === "true"};
+  }
+  return {ok: false, reason: "unknown op"};
 }
 
 function pageControls(limit) {

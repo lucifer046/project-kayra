@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, the V9 / V11 fix rounds and 6 (6a + 6b) done (2026-11-11).**
-> See §10 for the parts and what is next (Part 7 next; 5P's P4 open; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c) and the V9 / V11 fix rounds done (2026-11-11).**
+> See §10 for the parts and what is next (left: H2 phrasings + tone, H3, H4, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -411,6 +411,26 @@ Studio id, and add `PAGE_AGENT_MODEL` (new) defaulting to the same.
 unloaded, and **`nomic-embed-text`** for the semantic matcher (H0.3).
 **Do not** load two 8–9B models at once on this GPU.
 
+**Measured 2026-11-11** (`tests/bench_page_agent.py`: 30 one-step decisions on Gmail / WhatsApp /
+Sheets / shop / form / settings / GitHub-shaped pages through the real `pageSnapshot`, prompt
+and parser; local only; one model on the GPU at a time — loading both fails on 8 GB):
+
+| Model | Valid JSON | Correct action | Median / worst s per step | Whole runs (`--loops`) |
+|---|---|---|---|---|
+| Qwen3.5-9B (before prompt tuning) | 28/30 | 21/30 | 2.26 / 3.36 | — |
+| gemma-4-e4b (before prompt tuning) | 22/30 | 17/30 | 0.69 / 1.79 | — |
+| **Qwen3.5-9B** (tuned, `/no_think`) | 30/30 | **30/30** | 1.40 / 2.38 | 2/2 |
+| **gemma-4-e4b** (tuned) | 30/30 | **27/30** | 0.70 / 0.95 | 2/2 |
+
+What the tuning was: rules + four worked examples in the agent prompt ("type, don't click a
+text box", "Enter after a search", "answer a question from the page"), a question hint,
+"already done — never repeat", the agent telling the model when a click / key changed nothing,
+Qwen's `/no_think` (latency halved), and choosing an already-chosen option = done. Both models
+clear the 90 % bar. **Default: the decision model (gemma) — no model swap on an 8 GB GPU;**
+set `PAGE_AGENT_MODEL=qwen/qwen3.5-9b` for accuracy when LM Studio runs Qwen for everything.
+Gemma's three misses: re-typing instead of pressing Enter / Send twice, and one question
+answered by acting.
+
 **Required before trusting it (part of H1):** a small benchmark — 30 scripted page-agent
 tasks against the fixture pages (WhatsApp/Gmail/Sheets shapes) measuring valid-JSON rate,
 correct-action rate and seconds per step, run for Qwen3.5-9B and gemma-4-e4b; record results
@@ -442,7 +462,7 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 - [x] F1 [x] F2 [~] F3 [x] F4 [x] F5 [x] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b, not tried on the live sites)*
 - [x] G1 [x] G2 [x] G3 [x] G4 [x] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
 - §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [ ] M2.2 [ ] M2.3 [ ] M3 [ ] M4  *(M1.2: Chrome's tab list opens, the user picks the tab)*
-- [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
+- [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [x] H1 [x] H1.1 [~] H2 [ ] H3 [ ] H4 [x] §7a model benchmark  *(H2: aliases + transparency done; learned phrasings and tone not — they would touch the cached classifier prompt)*
 
 ## 9. Known state at the time of writing
 
@@ -480,7 +500,30 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 5F | Fix round V11 after live use of Parts 4–5: scrolling inside web apps, one search action + close search, WhatsApp chats by loose name from anywhere, "recent chat", year ranges and recency for file names | **done 2026-11-11** (extension 1.11.0 after the second pass from the audit log; `updates/UPDATE_V11.md`; not yet re-tried on live Gmail / WhatsApp / Sheets) |
 | 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | **done 2026-11-11** (P1, P2, P3, P5; `updates/UPDATE_V14.md`). Open: P4 (the extension in several profiles), "always open Chrome as X" (a Settings key), spoken aliases (H2) |
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **done 2026-11-11** — 6a (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`); 6b (F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply + send a file, F6 Reddit/LinkedIn/GitHub, G5 several steps; extension 1.13.0; `updates/UPDATE_V13.md`) |
-| 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+| 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | **7a/7b/7c done 2026-11-11** (§7a benchmark, H1 page agent, H1.1 recipes, H2 aliases + transparency; extension 1.14.0; `updates/UPDATE_V15.md`). Open: H2 phrasings / tone, H3, H4 |
+
+**Part 7 — the page agent, recipes, learning** (done 2026-11-11, extension 1.14.0; 7a §7a + H1,
+7b H1.1, 7c H2 aliases). Detail: `updates/UPDATE_V15.md`.
+- 7a `page.snapshot` (stable `data-kayra-id`, role, accessible name, value, secret flag, masked
+  codes) and `page.act` (click / type / select / check / press / scroll; secret fields refused in
+  the page). `automation/page_agent.py`: observe -> decide (local model, one JSON action from a
+  closed set) -> act -> verify, ≤ 8 steps, loop and "nothing changed" detection. Clicks judged by
+  `policy.classify_action` + the agent's social verbs (CONFIRM, late, naming the control; cart /
+  pay DENY); Enter after typing into a message box CONFIRMs; it may TYPE only the user's words.
+  Triggers: "on this page, …", "figure out how to …", "browser agent …"; the understanding layer
+  may propose it. `PAGE_AGENT=off` disables it.
+- 7b recipes: a run whose every step worked is saved (`data/recipes.json`, 0600): host, the
+  request as a template with typed words as slots, steps by role + NAME. Replayed with no model;
+  a missing control hands over to the model from that step and the recipe is rewritten.
+  "list my page shortcuts", "forget the shortcut for …".
+- 7c learning (`automation/learning.py`, `data/aliases.json`, 0600): Kayra's "which one?" is
+  remembered for 2 min; the answer ("the second one", "the core team one") runs the action and,
+  for WhatsApp names, teaches the alias; "no, the other one" opens the runner-up and swaps the
+  alias; "what have you learned about me", "forget that", "forget everything about WhatsApp",
+  "forget everything you learned" (asks). The model never changes what was learned.
+- Not done: H2 learned phrasings as classifier hints and a tone note (both would touch the
+  cached DMM prompt), H3, H4. **Not tried on live sites** — whole runs were real Chrome + real
+  local model on fixture pages.
 
 **Part 5P — Chrome profiles** (done 2026-11-11; §14 P1, P2, P3, P5). Detail:
 `updates/UPDATE_V14.md`.

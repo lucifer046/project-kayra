@@ -327,6 +327,23 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — round 5, part 7: the page agent, recipes, learning what you mean (extension 1.14.0)
+
+- **Page agent** (`automation/page_agent.py`): "on this page, find the cheapest flight", "figure out
+  how to turn on dark mode", "browser agent …". Observe (`page.snapshot`) -> one JSON action from
+  the LOCAL model (`ai.agent_step`, `PAGE_AGENT_MODEL`) -> act (`page.act`) -> verify, ≤ 8 steps.
+  Every click goes through the spoken-click policy plus the agent's social verbs; risky ones ask by
+  name ("Should I click "Post" on this page?") and yes resumes the run; cart / pay are refused;
+  only the user's words are typed; secret fields refused twice; page text is data.
+- **§7a benchmark** (`tests/bench_page_agent.py`, manual): Qwen3.5-9B 30/30, gemma-4-e4b 27/30 after
+  prompt tuning (from 21 and 17); 1.40 s vs 0.70 s per step. The default stays the decision model.
+- **Recipes**: a fully working run is remembered by control NAMES with the typed words as slots and
+  replayed next time with no model; a renamed control hands over to the model and the recipe heals.
+- **Learning**: answers to "which one?" teach WhatsApp aliases; "no, the other one" corrects;
+  "what have you learned about me", "forget that", "forget everything about WhatsApp".
+- Tests: `test_browser_control.py` [23], `test_browser_extension.py` [12], `test_dmm_browser.py` +5
+  (120/120), the benchmark. Test rigs keep the agent off and learning in a temp folder.
+
 ### 2026-11-11 — round 5, part 5P: Chrome profiles
 
 - "open my Work Chrome", "open Chrome as Kiran", "open Chrome on <spoken email>", "open Gmail in

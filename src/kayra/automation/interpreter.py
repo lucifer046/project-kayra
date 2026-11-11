@@ -43,7 +43,7 @@ from kayra.automation import ai
 
 MAX_COMMANDS = 4
 TIMEOUT_S = 8.0
-NEVER_FROM_MODEL = frozenset({"shell", "plan", "trigger"})
+NEVER_FROM_MODEL = frozenset({"shell", "plan", "trigger", "learning"})
 _POWER = frozenset({"shutdown", "restart", "sign_out", "sleep", "hibernate", "logout",
                     "reboot", "suspend"})
 ACTIVE = True       # the unit-test rigs switch this off so no suite ever reaches a model
@@ -123,6 +123,8 @@ SITES & SHOPPING (search and open only — never add to a cart, buy or pay):
   browser search amazon for <product> under <price> | browser images of <thing> |
   browser sort by price low to high | browser show only under <price> | browser how much is this |
   browser what's the rating
+PAGE AGENT (only when a page is in front and NO other command fits; the task in the person's words):
+  browser agent <the task as the person said it>
 CHROME PROFILES (names come from Chrome itself; copy what was said): browser open my <name> chrome |
   browser open chrome as <name or email> | browser open <site> in my <name> chrome |
   browser which chrome profiles do i have | browser open chrome as a guest

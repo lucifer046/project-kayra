@@ -291,6 +291,9 @@ _CONFIRM_ACTIONS = {
     # detail at once; a subscription is public. Filling a form and uploading a file ask too,
     # LATE, naming the fields / the file (the handler resolves them first).
     "browser.form_submit", "browser.profile_clear", "browser.video_subscribe",
+    # Part 7: forgetting everything Kayra learned at once (aliases and page shortcuts).
+    # The page agent's own risky steps are LATE confirmations naming the control.
+    "learning.forget_all",
 }
 
 # Actions that must never run from a voice command, whatever the phrasing.

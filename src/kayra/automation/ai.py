@@ -102,7 +102,7 @@ def _local_text_model(base_url):
     return name
 
 
-def _local_chat(system, user, timeout, max_tokens, temperature=0.0):
+def _local_chat(system, user, timeout, max_tokens, temperature=0.0, model=None):
     """
     One non-streamed reply from the local server with THINKING OFF, or "" when there is no
     local model or it failed. The HTTP timeout is the bound: when it expires the connection is
@@ -110,7 +110,7 @@ def _local_chat(system, user, timeout, max_tokens, temperature=0.0):
     the user's back (a thread that is merely abandoned does).
     """
     base = _local_base()
-    model = _local_text_model(base)
+    model = model or _local_text_model(base)
     if not model:
         return ""
     try:
@@ -211,6 +211,23 @@ def fast(system, user, timeout=8.0, max_tokens=120):
         return complete(system, user, timeout)
     text = _local_chat(system, user, timeout, max_tokens)
     return text if text.strip() else complete(system, user, timeout)
+
+
+def agent_step(system, user, model=None, timeout=25.0, max_tokens=220):
+    """
+    ONE page-agent decision (Part 7, H1): a JSON action. The LOCAL model only — page contents
+    never go to a cloud model from here — with thinking off (a one-action reply does not need a
+    reasoning pass; BROWSER_CONTROL_PLAN §7a). `model` / `PAGE_AGENT_MODEL` picks the model
+    (default: the local decision model). A scripted TEXT_MODEL (tests) answers instead.
+    Returns the reply verbatim, or "".
+    """
+    if TEXT_MODEL is not None:
+        return complete(system, user, timeout)
+    chosen = model or _env("PAGE_AGENT_MODEL") or None
+    name = str(chosen or _local_text_model(_local_base()) or "").lower()
+    if "qwen" in name:
+        user = user + "\n/no_think"          # Qwen's own switch: reasoning_effort alone is not always honoured
+    return _local_chat(system, user, timeout, max_tokens, model=chosen)
 
 
 def summarize(system, user, fallback="", timeout=DEFAULT_TIMEOUT_S, max_chars=700, local_only=False):

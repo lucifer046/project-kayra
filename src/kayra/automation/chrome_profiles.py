@@ -296,7 +296,7 @@ def open_profile(said, browser_said="", url="", email=""):
         return _result("not_found", f"I don't see any {name} profiles on this computer.")
     profile, question = resolve(said, profiles, email=email)
     if question:
-        return _result("ambiguous", question, candidates=[p.name for p in profiles])
+        return _result("ambiguous", question, candidates=[p.name for p in profiles if label(p) in question])
     if profile is None:
         names = [p.name for p in profiles]
         listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]

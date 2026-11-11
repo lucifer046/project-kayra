@@ -19,6 +19,7 @@ order. Newest last.
 | [V12](UPDATE_V12.md) | 2026-11-11 | Forms with your saved details, drop-downs, ticks, dates, submit, file upload; video controls; search any site, sort and filter shops, product facts; shopping stops before the cart (Part 6a) | Feature, privacy |
 | [V13](UPDATE_V13.md) | 2026-11-11 | Ask ChatGPT / Claude / Gemini, WhatsApp replies and files, Reddit / LinkedIn / GitHub, several steps in one sentence (Part 6b) | Feature, safety |
 | [V14](UPDATE_V14.md) | 2026-11-11 | Open Chrome straight into a profile, read from Chrome itself: by name, account, email or domain (Part 5P) | Feature, privacy |
+| [V15](UPDATE_V15.md) | 2026-11-11 | The page agent (local model, asks before acting for you), recipes replayed without a model, learning what your names mean; §7a model benchmark (Part 7) | Feature, safety, measurement |
 
 ## Adding an update
 

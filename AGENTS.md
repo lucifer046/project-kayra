@@ -19,8 +19,8 @@ this repository. Read this first; follow the links when you need depth.
 ## Pending work
 
 [`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) — the
-browser-control round, built **in parts** (§10 has the part table and what is next). Parts 1–6
-are done; Part 5P (Chrome profiles) and Part 7 (page agent) remain. Do the next part only when
+browser-control round, built **in parts** (§10 has the part table and what is next). Parts 1–7
+and 5P are done; H2's learned phrasings / tone, H3, H4 and 5P's P4 remain. Do the next part only when
 the user asks. The user also asked that every round proactively
 add the obvious neighbouring features and list them for veto.
 

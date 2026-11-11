@@ -160,6 +160,12 @@ CASES = (
     ("open gmail in my study chrome", WEB, "browser.chrome_profile", "study"),
     ("which chrome profiles do I have", WEB, "browser.chrome_profiles", None),
     ("open chrome", WEB, "app.open", "chrome"),
+    # Part 7: the page agent and what Kayra learned
+    ("on this page, find the cheapest flight to goa", WEB, "browser.agent", None),
+    ("figure out how to turn on dark mode on this site", WEB, "browser.agent", None),
+    ("what have you learned about me", WEB, "learning.show", None),
+    ("list my page shortcuts", WEB, "browser.agent_recipes", None),
+    ("what did you learn in school today", WEB, "chat", None),
     ("what is chatgpt", WEB, "chat", None),
     ("is claude better than gemini", WEB, "chat", None),
     ("what's the price of gold today", WEB, "chat", None),

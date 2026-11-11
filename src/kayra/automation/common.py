@@ -822,6 +822,9 @@ def normalize_command(command, context=None):
     found = profile_action(lowered, raw, raw)           # Part 5P: "open my Work Chrome"
     if found is not None:
         return found
+    found = part_7_action(lowered, raw, raw)            # Part 7: the page agent, learning
+    if found is not None:
+        return found
     found = _bare_workspace(lowered, raw)
     if found is not None:
         return found
@@ -1280,6 +1283,9 @@ def _web_action(kind, payload, raw):
             return _web_action("message", payload, raw)      # "browser open X group in whatsapp"
         found = profile_action(low, raw, text)             # Part 5P: Chrome profiles
         if found is not None:
+            return found
+        found = part_7_action(low, raw, text)              # Part 7: the page agent, recipes
+        if found is not None and found.domain == "browser":
             return found
         found = part_6b_action(low, raw, text)             # Part 6b: AI sites, Reddit / LinkedIn / GitHub
         if found is not None:
@@ -2369,6 +2375,69 @@ def profile_action(low, raw, text=None):
     return None
 
 
+# ── Part 7: the page agent (H1), recipes (H1.1), what Kayra learned (H2) ──
+_AGENT_RE = re.compile(r"(?:browser |page )?agent[,:]? (.+)|(?:on|in) (?:this|the) (?:page|site|website|tab)[,:]? (.+)|"
+                       r"(?:please )?(?:figure out how to|work out how to) (.+?)(?: (?:on|in) (?:this|the) (?:page|site|website))?|"
+                       r"do (?:this|it|that) (?:for me )?on (?:this|the) (?:page|site)[,:]? (.+)")
+_RECIPES_RE = re.compile(r"(?:list|show(?: me)?|what are) (?:my |the |your )?(?:page )?(?:shortcuts|recipes)|"
+                         r"what (?:page )?(?:shortcuts|recipes) do you (?:know|have|remember)")
+_LEARNED_RE = re.compile(r"what (?:have|did) you learn(?:ed|t)?(?: about me| from me| so far)?|"
+                         r"show (?:me )?what you(?:'ve| have) learned|what do you remember about how i talk")
+_FORGET_LAST_RE = re.compile(r"forget (?:that|what you just learned|the last thing you learned)|unlearn that")
+_FORGET_ALL_RE = re.compile(r"forget (?:everything|all) (?:you(?:'ve| have)? learned|you know about how i talk)|"
+                            r"unlearn everything|reset (?:everything )?(?:what )?you(?:'ve| have)? learned")
+_FORGET_APP_RE = re.compile(r"forget (?:everything|all|what you(?:'ve| have)? learned) (?:about|for|on|in) (?:my )?([\w. ]+)")
+_FORGET_RECIPE_RE = re.compile(r"forget (?:the|my|your) (?:page )?(?:shortcut|recipe) (?:for|to) (.+)")
+_OTHER_ONE_RE = re.compile(r"(?:no,? )?(?:not that one|(?:open )?the other one|wrong (?:one|chat|group)|"
+                           r"i meant the other one|that's the wrong (?:one|chat|group))")
+
+
+def part_7_action(low, raw, text=None):
+    """The page agent, its recipes, and learning — or None."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    m = _AGENT_RE.fullmatch(low)
+    if m:
+        goal = next(g for g in m.groups() if g)
+        found = re.search(re.escape(goal), text, re.I)
+        return Action("browser", "agent", target=found.group(0) if found else goal, raw=raw)
+    if _RECIPES_RE.fullmatch(low):
+        return Action("browser", "agent_recipes", target="all", raw=raw)
+    if _LEARNED_RE.fullmatch(low):
+        return Action("learning", "show", target="all", raw=raw)
+    if _FORGET_LAST_RE.fullmatch(low):
+        return Action("learning", "forget_last", target="last", raw=raw)
+    if _FORGET_ALL_RE.fullmatch(low):
+        return Action("learning", "forget_all", target="all", raw=raw)
+    m = _FORGET_RECIPE_RE.fullmatch(low)
+    if m:
+        return Action("learning", "forget_recipe", target=m.group(1).strip(), raw=raw)
+    m = _FORGET_APP_RE.fullmatch(low)
+    if m and m.group(1).strip() not in ("me", "you"):
+        return Action("learning", "forget_app", target=m.group(1).strip().replace("whats app", "whatsapp"), raw=raw)
+    if _OTHER_ONE_RE.fullmatch(low):
+        return Action("message", "other", target="other", raw=raw)
+    return None
+
+
+def part_7_direct(low, text):
+    action = part_7_action(low, text, text)
+    if action is None:
+        return None
+    if action.key == "message.other":
+        try:
+            from kayra.automation import web_macros as W
+            fresh = W.LAST_PICK.get("chosen") and W.CLOCK() - W.LAST_PICK.get("at", 0) <= W.PICK_TTL_S
+        except Exception:
+            fresh = False
+        return [text] if fresh else None               # "no, the other one" only right after a pick
+    if action.key == "learning.forget_last":
+        from kayra.automation import learning
+        fresh = learning.LAST.get("kind") and learning.CLOCK() - learning.LAST.get("at", 0) <= learning.FORGET_WINDOW_S
+        return [text] if fresh else None               # otherwise "forget that" is conversation
+    return [text]
+
+
 # ── Rules before the classifier (tuning pass V9) ──
 # A whole utterance that the rules understand COMPLETELY and that can only mean one command is
 # routed straight to them, skipping the classifier model (~0.45 s on the local model, and its
@@ -2540,6 +2609,9 @@ def _direct_one(utterance, situation_fn=None):
         return [f"message {text}"]                      # "read the last three messages of mota panda"
     if profile_action(low, f"browser {text}", text) is not None:
         return [f"browser {text}"]                      # Part 5P: a Chrome profile
+    found = part_7_direct(low, text)
+    if found is not None or part_7_action(low, text, text) is not None:
+        return found                                    # Part 7: the agent, learning ("forget that" only when fresh)
     found = part_6_direct(low, text, situation_fn)
     if found:
         return found                                    # Part 6: forms, video, site search, shopping
@@ -3213,8 +3285,15 @@ _CONFIRM_PROMPTS = {
     "browser.form_submit": "Submit this form? Once it's sent I can't take it back.",
     "browser.profile_clear": "Forget every detail you gave me for forms?",
     "browser.video_subscribe": "Subscribe to this channel?",
+    "learning.forget_all": "Forget everything I've learned about how you talk, and every page shortcut?",
 }
 
+
+# Part 7c: answers to "which one?" — which actions offer a choice, and where the answer teaches.
+_CHOICE_TTL_S = 120
+_CHOICE_DOMAINS = frozenset({"message", "browser"})
+_CHOICE_LEARN = {"message.open": "whatsapp", "message.read": "whatsapp", "message.send": "whatsapp",
+                 "message.send_file": "whatsapp"}
 
 _TRUST_TTL_S = 3 * 3600          # "don't ask again" lasts for the call, at most three hours
 _TRUSTABLE = {"meet.share"}      # the ONLY confirmation that may be switched off by voice
@@ -3289,6 +3368,9 @@ class AutomationRuntime:
         # "automation" token was really conversation, and the app answers it as chat.
         self.situation_fn = None
         self.chat_handoff = False
+        # Part 7c: a "which one?" Kayra asked ({action, candidates, question, at}); the next answer
+        # that picks one runs the action on it and, for a chat name, teaches the alias.
+        self.pending_choice = None
         # Confirmations the user switched off by voice ("yes, don't ask again"): key -> expiry.
         # Only `_TRUSTABLE` keys, cleared when the call ends (meet.leave).
         self.trusted = {}
@@ -3371,6 +3453,10 @@ class AutomationRuntime:
             self.trusted.pop("meet.share", None)     # the call is over, so is the trust
         if result.status == Status.AMBIGUOUS:
             audit(AUDIT_AMBIGUOUS, action, candidates=result.detail.get("candidates"))
+            names = [str(c) for c in ((result.detail or {}).get("candidates") or []) if str(c).strip()]
+            if 1 < len(names) <= 6 and action.domain in _CHOICE_DOMAINS:
+                self.pending_choice = {"action": action, "candidates": names, "question": result.message,
+                                       "at": time.monotonic()}
         elif result.ok:
             audit(AUDIT_SUCCESS, action)
             self.context.note_action(action, True)
@@ -3517,9 +3603,52 @@ class AutomationRuntime:
 
     # ── confirmations ──
     def pending_confirmation(self):
-        return self.confirmations.prompt if self.confirmations.peek() is not None else None
+        if self.confirmations.peek() is not None:
+            return self.confirmations.prompt
+        choice = self.pending_choice
+        if choice and time.monotonic() - choice["at"] <= _CHOICE_TTL_S:
+            return choice["question"]
+        self.pending_choice = None
+        return None
+
+    def resolve_choice(self, reply):
+        """(True, sentence) when `reply` answers the pending "which one?", else (False, "").
+        An answer that is not a pick drops the question and goes on as a normal request."""
+        choice, self.pending_choice = self.pending_choice, None
+        if not choice or time.monotonic() - choice["at"] > _CHOICE_TTL_S:
+            return False, ""
+        low = " ".join(str(reply or "").lower().strip(" .!?").split())
+        if re.fullmatch(r"(?:neither|none|none of them|neither of them|cancel|never ?mind|no|nope)(?: of (?:them|those))?", low):
+            return True, "Alright."
+        names = choice["candidates"]
+        picked = None
+        m = re.fullmatch(r"(?:the )?(first|second|third|fourth|fifth|sixth|last|1st|2nd|3rd|4th|5th)(?: one)?|"
+                         r"(?:number |option )(\d)", low)
+        if m:
+            index = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "fourth": 3, "4th": 3,
+                     "fifth": 4, "5th": 4, "sixth": 5, "last": len(names) - 1}.get(m.group(1) or "", None)
+            index = int(m.group(2)) - 1 if m.group(2) else index
+            picked = names[index] if index is not None and 0 <= index < len(names) else None
+        else:
+            from kayra.automation.semantic_match import match, PICK
+            said = re.sub(r"^(?:i mean |i meant |the one called |it's |it is |yes,? )", "", low)
+            decision = match(said, names)
+            picked = decision.best.name if decision.decision == PICK else None
+        if picked is None:
+            return False, ""
+        action = choice["action"]
+        chosen = Action(action.domain, action.action, target=picked, parameters=dict(action.parameters), raw=action.raw)
+        result = self.execute_action(chosen)
+        if result.ok or result.status == Status.NEEDS_CONFIRMATION:
+            app = _CHOICE_LEARN.get(action.key)
+            if app and action.target and action.target not in ("current", "recent"):
+                from kayra.automation import learning
+                learning.teach(app, action.target, picked)
+        return True, result.message or "Done."
 
     def resolve_confirmation(self, reply):
+        if self.confirmations.peek() is None and self.pending_choice is not None:
+            return self.resolve_choice(reply)
         action = self.confirmations.peek()
         trust = False
         if action is not None and action.key in _TRUSTABLE:
