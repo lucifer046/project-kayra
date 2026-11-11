@@ -300,6 +300,10 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   late confirmation re-checked on yes; block / delete / leave are refused. `automation/inbox.py`
   never OPENS an app to read it; offers speak sender + app, never text. `SHARE_WARNING` is the
   backend hook for the whole-screen share question.
+- **Parts 11–13 (2026-11-11, extension 1.16.0).** `ui/smooth_scroll.py` on every scroll area (asserted).
+  Call controls go through `web_macros._activate_call` + `_labels` (Meet, Zoom, Teams, Discord).
+  `meeting_notes.py` owns an on-demand thread, stopped on leave and at shutdown; summaries LOCAL only.
+  Tab sessions / reading list live in the `learning` private store.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

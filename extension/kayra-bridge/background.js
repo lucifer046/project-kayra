@@ -409,6 +409,30 @@ async function run(cmd, args) {
     case "wa.do": return inPage(await targetTab(args), pageWa, [args.op || "last", args]);
     case "meet.do": return inPage(await targetTab(args), pageMeet, [args.op || "people", args]);
     // ── 1.14.0: the page agent's eyes and hands (Part 7, H1) ──
+    // ── 1.16.0: tab sessions, page screenshots (Part 12, N1) ──
+    case "windows.openUrls": {
+      const urls = (args.urls || []).filter((u) => /^https?:/.test(u)).slice(0, 40);
+      if (!urls.length) return {opened: 0};
+      const win = await chrome.windows.create({url: urls, focused: true});
+      return {opened: urls.length, windowId: win.id};
+    }
+    case "tabs.capture": {
+      // The visible part, or the whole page as viewport slices (Kayra stitches them). Chrome allows
+      // about two captures a second; the pacing lives HERE, so Kayra itself never sleeps.
+      const tab = await activeTab();
+      const shot = () => chrome.tabs.captureVisibleTab(tab.windowId, {format: "png"});
+      if (!args.full) return {images: [await shot()], offsets: [0]};
+      const geo = await inPage(tab, () => ({y: window.scrollY, h: document.documentElement.scrollHeight, vh: window.innerHeight}), []);
+      const images = [], offsets = [];
+      const slices = Math.min(Math.ceil(geo.h / geo.vh), args.max || 12);
+      for (let i = 0; i < slices; i++) {
+        const y = await inPage(tab, (top) => { window.scrollTo(0, top); return window.scrollY; }, [i * geo.vh]);
+        await new Promise((r) => setTimeout(r, i ? 550 : 150));
+        images.push(await shot()); offsets.push(y);
+      }
+      await inPage(tab, (top) => window.scrollTo(0, top), [geo.y]);
+      return {images, offsets, height: geo.h, viewport: geo.vh, truncated: Math.ceil(geo.h / geo.vh) > slices};
+    }
     case "page.snapshot": return inPage(await targetTab(args), pageSnapshot, [args.max || 120, args.textMax || 1500]);
     case "page.act": return inPage(await targetTab(args), pageAct, [args.op || "click", args]);
     case "page.social": return untilReady(args, pageSocial, [args.kind || "posts", args.max || 10], (r) => r && r.items && r.items.length);
@@ -1581,6 +1605,22 @@ async function pageVideo(op, value) {
     case "seekTo": v.currentTime = Math.min(Math.max(0, Number(value || 0)), isFinite(v.duration) ? v.duration - 0.5 : 1e9); return state();
     case "mute": v.muted = !!value; return state();
     case "blur": if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); return state();
+    case "pipArm": {
+      // 1.16.0 (N1.3): picture-in-picture needs a user gesture — the same one-shot TRUSTED-key hook
+      // as file uploads: Kayra's real Space opens it, and the Space itself is swallowed.
+      const until = Date.now() + 8000;
+      const hook = (e) => {
+        if (!e.isTrusted || e.key !== " " || Date.now() > until) return;
+        e.preventDefault(); e.stopImmediatePropagation();
+        window.removeEventListener("keydown", hook, true);
+        v.requestPictureInPicture().catch(() => {});
+      };
+      window.addEventListener("keydown", hook, true);
+      setTimeout(() => window.removeEventListener("keydown", hook, true), 8000);
+      return {...state(), armed: true};
+    }
+    case "pipState": return {...state(), pip: document.pictureInPictureElement === v};
+    case "pipExit": { if (document.pictureInPictureElement) { try { await document.exitPictureInPicture(); } catch (e) {} } return {...state(), pip: false}; }
     case "skipAd": {
       const skip = first(".ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, button[id^='skip-button'], .ytp-ad-skip-button-container button");
       if (skip) { skip.click(); return {skipped: true, ad: true}; }
@@ -2216,6 +2256,20 @@ async function pageMeet(op, args) {
     if (!send) return {ok: false, reason: "no send button"};
     send.click();
     return {ok: true};
+  }
+  if (op === "captions") {
+    // 1.16.0 (M4.3): the live captions on screen, as "speaker: text" lines (Meet's captions region).
+    const region = document.querySelector("[role=region][aria-label*='aption' i], [aria-label='Captions'], .a4cQT, [jsname=dsyhDe]");
+    if (!region || !visible(region)) return {ok: false, on: false, lines: []};
+    const lines = [];
+    const blocks = Array.from(region.querySelectorAll("[data-participant-id], .nMcdL, .TBMuR, :scope > div > div"));
+    for (const b of (blocks.length ? blocks : [region])) {
+      const who = b.querySelector("img[alt], .zs7s8d, .KcIKyf, [data-sender-name]");
+      const name = who ? clean(who.getAttribute("alt") || who.getAttribute("data-sender-name") || who.textContent) : "";
+      const text = clean((b.innerText || "").replace(name, ""));
+      if (text) lines.push(name ? `${name}: ${text}` : text);
+    }
+    return {ok: true, on: true, lines: Array.from(new Set(lines)).slice(-30)};
   }
   if (op === "pin") {
     const more = find(new RegExp("^more options for " + String(args.name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));

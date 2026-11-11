@@ -448,3 +448,16 @@ install, and a screen showing only the mode would display "GPU" while synthesis 
 With no live engine the card says "Would use", not "Active device": a prediction is never
 presented as a measurement. The GPU telemetry line is the only timer on the screen and it runs
 only while the screen is visible.
+
+
+## Smooth scrolling (Part 11, 2026-11-11)
+
+Every scroll area gets `kayra.ui.smooth_scroll.install_smooth_scroll` (`View` and the Chat
+transcript today; `tests/test_smooth_scroll.py` fails when a new `QScrollArea` is created without
+it). Wheel notches glide (exponential ease-out, τ 57 ms) toward a target that ACCUMULATES; touchpad
+pixel deltas are applied 1:1 and a lift with ≥ 2 samples above 120 px/s coasts (τ 0.33 s); keys that
+reach the area (a text field keeps Home/End) glide. The timer runs at the screen's refresh rate.
+Anything else that moves the bar (Chat following a reply, a drag) stops the glide and is adopted —
+never fought. Reduced motion = instant. With `KAYRA_UI_PROFILE=1` each glide frame is painted
+synchronously inside `profile.measure("scroll")`. The motion is now continuous; the frame cost is
+not lower — that is §11 S2 (GPU tiles), not built.

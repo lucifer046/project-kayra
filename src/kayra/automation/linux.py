@@ -2287,10 +2287,26 @@ def _dispatch_extended(domain, verb, target, params, action):
                  "chrome_guest": lambda: _profiles().open_guest(params.get("browser", "")),
                  # ── Part 7: the page agent and its recipes ──
                  "agent": lambda: _agent().run(target, params.get("resume"), action),
-                 "agent_recipes": lambda: _agent().list_recipes()}
+                 "agent_recipes": lambda: _agent().list_recipes(),
+                 # ── Part 12 ──
+                 "session_save": lambda: W.session_save(target), "session_open": lambda: W.session_open(target),
+                 "sessions_list": lambda: W.sessions_list(), "session_delete": lambda: W.session_delete(target),
+                 "reading_add": lambda: W.reading_add(), "reading_list": lambda: W.reading_list(),
+                 "reading_next": lambda: W.reading_next(), "reading_clear": lambda: W.reading_clear(),
+                 "video_pip": lambda: W.video_pip(target != "off"),
+                 "page_screenshot": lambda: W.page_screenshot(target == "full"),
+                 "tabs_tidy": lambda: W.tabs_tidy_report(),
+                 "open_elsewhere": lambda: W.open_elsewhere(target, params.get("profile", ""))}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
+        if verb == "present":
+            return W.meet_present(target)
+        if verb in ("notes", "summary"):
+            from kayra.automation import meeting_notes as N
+            return N.summarize() if verb == "summary" else N.start() if target == "on" else N.stop()
+        if verb in ("record", "record_stop"):
+            return V.record(verb == "record")
         if verb in ("people", "react", "pin", "message", "link"):
             return {"people": lambda: W.meet_people(), "react": lambda: W.meet_react(target),
                     "pin": lambda: W.meet_pin(target),
@@ -2527,7 +2543,11 @@ def start_services(speaker=None):
 
 
 def _stop_services():
-    from kayra.automation import browser_bridge, workflows, linux_system
+    from kayra.automation import browser_bridge, workflows, linux_system, meeting_notes
+    try:
+        meeting_notes.stop()                      # the notes of a call still going are saved, not lost
+    except Exception:
+        pass
     try:
         workflows.save_last_session()
     except Exception:

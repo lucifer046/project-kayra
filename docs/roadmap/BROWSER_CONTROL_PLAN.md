@@ -1,6 +1,6 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8, 9, 10 and the V9 / V11 fix rounds done (2026-11-11).**
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8–13 and the V9 / V11 fix rounds done (2026-11-11).**
 > See §10 for the parts and what is next (left: H2 phrasings + tone, H3 other apps, H4 multi-app sends, M4.2–M4.5, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
@@ -461,7 +461,7 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 - [x] E1 [x] E2 [x] E3 [x] E4 [~] E5 [~] E6 [~] E7 [x] E8  *(E5: no mark-all-read / attach; E6: no "move my 3 pm"; E7: admit only — see §10 Part 4)*
 - [x] F1 [x] F2 [~] F3 [x] F4 [x] F5 [x] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b, not tried on the live sites)*
 - [x] G1 [x] G2 [x] G3 [x] G4 [x] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
-- §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [x] M2.2 [x] M2.3 [~] M3 [~] M4  *(M3: no device switch; M4: only M4.1, by Calendar's own notifications)*  *(M1.2: Chrome's tab list opens, the user picks the tab)*
+- §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [x] M2.2 [x] M2.3 [~] M3 [x] M4  *(M3: no device switch; M4.1 by Calendar's own notifications, M4.2–M4.5 in Part 13)*  *(M1.2: Chrome's tab list opens, the user picks the tab)*
 - [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [x] H1 [x] H1.1 [~] H2 [~] H3 [~] H4 [x] §7a model benchmark  *(H3: WhatsApp done; Instagram / Telegram / Discord / Slack / LinkedIn go through the page agent, no site helpers yet. H4: inbox, reply-where-they-wrote, offers done; one request to several apps and reply reminders not)*  *(H2: aliases + transparency done; learned phrasings and tone not — they would touch the cached classifier prompt)*
 
 ## 9. Known state at the time of writing
@@ -503,7 +503,32 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 8 | H3 WhatsApp extras: mute / pin / archive / read, star, react, quote-reply, forward, calls; refused: block / delete / clear / leave | **done 2026-11-11** (extension 1.15.0; `updates/UPDATE_V16.md`) |
 | 9 | §12 M2.2 sensitive windows on a shared screen, M2.3 quiet while sharing, M3 in-call (people, reactions, pin, meeting chat, the link), M4.1 meeting reminders | **done 2026-11-11** (M3 device switch, M4.2–M4.5 open) |
 | 10 | H4 one inbox: "who messaged me anywhere", "reply to X" where X last wrote, spoken offers from notifications | **done 2026-11-11** (one request to several apps, reply reminders open) |
+| 11 | §11 S1 smooth scrolling (wheel glide that accumulates, touchpad 1:1 + momentum, keys, refresh-paced, reduced motion) + S3 measuring | **done 2026-11-11** (`updates/UPDATE_V17.md`). S2 GPU tile layer open |
+| 12 | §13 N1 browser neighbours: tab sessions, reading list, picture-in-picture, page screenshots (full page), tidy-tabs suggestion, open in another browser / profile | **done 2026-11-11** (extension 1.16.0) |
+| 13 | §12 M4: present a deck into the call, meeting notes + local summary, recording (asks), Zoom / Teams / Discord in the browser | **done 2026-11-11** (extension 1.16.0) |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | **7a/7b/7c done 2026-11-11** (§7a benchmark, H1 page agent, H1.1 recipes, H2 aliases + transparency; extension 1.14.0; `updates/UPDATE_V15.md`). Open: H2 phrasings / tone, H3, H4 |
+
+**Parts 11–13 — smooth scrolling, browser neighbours, around the call** (done 2026-11-11,
+extension 1.16.0). Detail: `updates/UPDATE_V17.md`.
+- 11 (§11 S1/S3) `ui/smooth_scroll.py` on every scroll area (`View`, the Chat transcript; a test
+  fails if a new `QScrollArea` lacks it): ease-out wheel glide whose target accumulates, touchpad
+  1:1 with momentum after a flick (≥ 2 samples), PageUp/Down/Home/End/arrows, a timer at the
+  screen's refresh rate, instant under reduced motion, programmatic moves (Chat following) win.
+  `KAYRA_UI_PROFILE=1` logs "scroll" frames. Measured offscreen: a notch is ~20 steps of ≤ 21 px
+  (was one 60 px jump); offscreen frame cost (~4 ms) does not reproduce the real window's — the
+  laptop's numbers come from the profile log. S2 (GPU tiles) not started.
+- 12 (§13 N1) sessions / reading list in Kayra's private store (no `readingList` permission);
+  `windows.openUrls`; `tabs.capture` (full page = slices paced in the extension, stitched with
+  Pillow); PiP behind the trusted-Space hook; `tabs_tidy_suggestion` in the existing watcher
+  (≥ 15 tabs and ≥ 3 duplicates, every 2 h, `TAB_TIDY_SUGGESTIONS`); "open this in Chromium / my
+  Work profile" (5P).
+- 13 (§12 M4) `_activate_call` + `_SITE_LABELS`: mic / camera / hand / share / stop / leave on Zoom,
+  Teams, Discord (share hook content script now matches them); `meet_present` = a plan (open deck ->
+  share this tab [asks] -> slideshow); `automation/meeting_notes.py` (captions every 3 s on one
+  on-demand thread, saved 0600 to Reports/meetings on stop / leave / shutdown, summary LOCAL only);
+  `meet.record` CONFIRM, `record_stop` not.
+- Known: the local model reads "what's a reading list in chrome" as a browser command (the guessed
+  click then goes to the understanding layer). **Not tried live.**
 
 **Parts 8–10 — WhatsApp extras, the call, one inbox** (done 2026-11-11, extension 1.15.0). Detail:
 `updates/UPDATE_V16.md`.
@@ -843,7 +868,7 @@ proper human-alike intelligence."
 
 ---
 
-## 11. UI: smooth, GPU-composited scrolling  *(planned 2026-11-10, not started)*
+## 11. UI: smooth, GPU-composited scrolling  *(S1 + S3 done 2026-11-11 — Part 11; S2 the GPU tile layer open)*
 
 Requested by the user after the GPU rendering pass ("the UI is very smooth now; scrolling
 still feels like CPU"). Measured before planning (offscreen, 1280x800 @ 2.25x): one scroll
@@ -978,7 +1003,7 @@ staying out of the developer's `logs/`.
 
 ---
 
-## 13. Neighbouring features not covered elsewhere  *(planned 2026-11-10, not started)*
+## 13. Neighbouring features not covered elsewhere  *(N1 done 2026-11-11 — Part 12; N2–N5 open)*
 
 Ideas that sit next to what was built in V4 (cloud models, key storage, the redesigned and
 GPU-composited UI, tab Parts 2a/2b) and that no section above covers. Each is small on its own;

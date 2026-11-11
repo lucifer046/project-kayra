@@ -1,4 +1,5 @@
-// Kayra Bridge — runs inside Google Meet's own page context (world: MAIN).
+// Kayra Bridge — runs inside the call page's own context (world: MAIN): Google Meet, and since
+// 1.16.0 Zoom, Teams and Discord in the browser (§12 M4.5) — the same getDisplayMedia path.
 //
 // When Kayra is asked to "share my entire screen", it sets window.__kayraShareSurface =
 // "monitor" (or "window" / "browser") and clicks Meet's share button. Meet then calls getDisplayMedia(); this wrapper

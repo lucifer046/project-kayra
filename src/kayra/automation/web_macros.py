@@ -21,6 +21,7 @@ extension refuses password and payment fields on its own side as well.
 
 import io
 import os
+import base64
 import re
 import csv
 import time
@@ -48,7 +49,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 15, 0)
+REQUIRED_VERSION = (1, 16, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -3010,6 +3011,63 @@ _MEET_LABELS = {
 }
 
 
+# §12 M4.5 (Part 13): Zoom, Teams and Discord in the browser — the same voice commands, their own
+# button names (as each site announces them), Meet's names as the fallback.
+CALL_HOSTS = (("meet.google.com", "meet"), ("app.zoom.us", "zoom"), ("zoom.us", "zoom"),
+              ("teams.microsoft.com", "teams"), ("teams.live.com", "teams"), ("discord.com", "discord"))
+_SITE_LABELS = {
+    "zoom": {("mic", False): ["Mute my microphone", "Mute"], ("mic", True): ["Unmute my microphone", "Unmute"],
+             ("camera", False): ["Stop my video", "Stop Video"], ("camera", True): ["Start my video", "Start Video"],
+             "share": ["Share Screen", "Share"], "stop_share": ["Stop Share", "Stop sharing"], "leave": ["Leave", "Leave meeting"],
+             ("hand", True): ["Raise Hand"], ("hand", False): ["Lower Hand"]},
+    "teams": {("mic", False): ["Mute mic", "Mute"], ("mic", True): ["Unmute mic", "Unmute"],
+              ("camera", False): ["Turn camera off"], ("camera", True): ["Turn camera on"],
+              "share": ["Share content", "Share"], "stop_share": ["Stop sharing", "Stop presenting"], "leave": ["Leave"],
+              ("hand", True): ["Raise"], ("hand", False): ["Lower hand", "Lower"]},
+    "discord": {("mic", False): ["Mute"], ("mic", True): ["Unmute"], ("camera", False): ["Turn Off Camera"],
+                ("camera", True): ["Turn On Camera"], "share": ["Share Your Screen"], "stop_share": ["Stop Streaming"],
+                "leave": ["Disconnect"]},
+}
+_CALL = {"site": "meet", "host": "meet.google.com"}
+_CALL_NAMES = {"meet": "Google Meet", "zoom": "Zoom", "teams": "Teams", "discord": "Discord"}
+
+
+def _activate_call():
+    """Brings the call tab forward — the active one when it is a call, else the first call tab —
+    and remembers which site it is. False when no call tab is open."""
+    tabs = []
+    try:
+        tabs = _call("tabs.list") or []
+    except browser_bridge.BridgeError:
+        pass
+    found = []
+    for tab in tabs:
+        host = _host(tab.get("url"))
+        site = next((name for h, name in CALL_HOSTS if host == h or host.endswith("." + h)), None)
+        if site:
+            found.append((not tab.get("active"), host, site))
+    if not found:
+        # The fake extensions of older tests list no tabs; Meet by name is the old behaviour.
+        try:
+            _call("tabs.activate", match="meet.google.com")
+            _CALL.update(site="meet", host="meet.google.com")
+            return True
+        except browser_bridge.BridgeError:
+            return False
+    _, host, site = sorted(found)[0]
+    try:
+        _call("tabs.activate", match=host)
+    except browser_bridge.BridgeError:
+        return False
+    _CALL.update(site=site, host=host)
+    return True
+
+
+def _labels(key):
+    own = _SITE_LABELS.get(_CALL["site"], {}).get(key, [])
+    return own + [l for l in _MEET_LABELS.get(key, []) if l not in own]
+
+
 def _click_first(labels):
     for label in labels:
         result = _call("page.click", text=label, nth=1) or {}
@@ -3039,31 +3097,37 @@ def meet_toggle(control, on):
     missing = _need_bridge()
     if missing:
         return missing
-    try:
-        _call("tabs.activate", match="meet.google.com")
-    except browser_bridge.BridgeError:
-        return ActionResult.not_found("You're not in a Google Meet call.")
+    if not _activate_call():
+        return ActionResult.not_found("You're not in a call.")
     if control in ("leave", "chat"):
-        labels = _MEET_LABELS[control]
+        labels = _labels(control)
     elif on is None:
-        labels = _MEET_LABELS[(control, False)] + _MEET_LABELS[(control, True)]
+        labels = _labels((control, False)) + _labels((control, True))
     else:
-        labels = _MEET_LABELS[(control, on)]
+        labels = _labels((control, on))
     clicked = _click_first(labels)
-    if clicked == "Leave call":
+    if clicked and clicked in _labels("leave"):
+        from kayra.automation import meeting_notes
+        if meeting_notes.active():
+            meeting_notes.stop()                  # leaving the call saves the notes taken in it
         _share_dnd(False)                      # leaving ends any share Kayra silenced for
         _SHARE_STATE["what"] = ""
     if not clicked:
         already = {True: "on", False: "off"}.get(on)
         return ActionResult.success(f"Your {control} is already {already}.") if already else \
             ActionResult.not_found(f"I can't find the {control} button.")
-    return ActionResult.success({"Turn off microphone": "You're muted.",
-                                 "Turn on microphone": "You're unmuted.",
-                                 "Turn off camera": "Camera off.", "Turn on camera": "Camera on.",
-                                 "Leave call": "You've left the call."}.get(clicked, "Done."))
+    if clicked in _labels("leave"):
+        return ActionResult.success("You've left the call.")
+    state = on if on is not None else (False if clicked in _labels((control, False)) else
+                                       True if clicked in _labels((control, True)) else None)
+    return ActionResult.success({("mic", False): "You're muted.", ("mic", True): "You're unmuted.",
+                                 ("camera", False): "Camera off.", ("camera", True): "Camera on.",
+                                 ("hand", True): "Hand raised.", ("hand", False): "Hand lowered.",
+                                 ("captions", True): "Captions on.", ("captions", False): "Captions off."}
+                                .get((control, state), "Done."))
 
 
-_PRESENTING = re.compile(r"stop presenting|you are presenting|stop sharing", re.I)
+_PRESENTING = re.compile(r"stop presenting|you are presenting|stop sharing|stop share|stop streaming", re.I)
 _SHARE_INDICATOR = re.compile(r"\bis sharing\b|sharing (?:your|a|this)|stop sharing", re.I)
 _SHARE_STATE = {"dnd": False, "what": ""}
 SHARE_WAIT_S = 12.0
@@ -3195,10 +3259,8 @@ def meet_share(surface="monitor", name="", audio=False, instead=False):
     missing = _need_bridge()
     if missing:
         return missing
-    try:
-        _call("tabs.activate", match="meet.google.com")
-    except browser_bridge.BridgeError:
-        return ActionResult.not_found("You're not in a Google Meet call.")
+    if not _activate_call():
+        return ActionResult.not_found("You're not in a call.")
     L = _L()
     what, request = "your entire screen", None
     if surface == "window" and name:
@@ -3224,7 +3286,7 @@ def meet_share(surface="monitor", name="", audio=False, instead=False):
         # stops the current share and starts the new one.
         if not instead and not audio and what == (_SHARE_STATE.get("what") or "your entire screen"):
             return ActionResult.success(f"You're already sharing {what}.")
-        _click_first(_MEET_LABELS["stop_share"])
+        _click_first(_labels("stop_share"))
         _until(lambda: not _presenting(), 3.0)
 
     helper = SHARE_HELPER.installed()
@@ -3246,9 +3308,10 @@ def meet_share(surface="monitor", name="", audio=False, instead=False):
         before = {w.address for w in L.list_windows(include_kayra=True)}
     except Exception:
         before = set()
-    if not _click_first(_MEET_LABELS["share"]):
+    if not _click_first(_labels("share")):
         SHARE_HELPER.clear()
-        return ActionResult.not_found("I can't find Meet's share button.")
+        return ActionResult.not_found(f"I can't find {_CALL_NAMES.get(_CALL['site'], 'the call')}'s share button."
+                                      if _CALL["site"] != "meet" else "I can't find Meet's share button.")
     outcome = _drive_pickers(before, auto_portal, press_chrome)
     SHARE_HELPER.clear()                            # answered or not, never a second time
     if outcome == "sharing":
@@ -3276,11 +3339,9 @@ _SCREEN_NAMES = {"#1": "first screen", "#2": "second screen", "#3": "third scree
 def meet_stop_share():
     if not BRIDGE.connected():
         return ActionResult.not_found("You're not sharing.")
-    try:
-        _call("tabs.activate", match="meet.google.com")
-    except browser_bridge.BridgeError:
-        return ActionResult.not_found("You're not in a Google Meet call.")
-    clicked = _click_first(_MEET_LABELS["stop_share"])
+    if not _activate_call():
+        return ActionResult.not_found("You're not in a call.")
+    clicked = _click_first(_labels("stop_share"))
     restored = _share_dnd(False)
     if not clicked:
         return ActionResult.not_found("You're not sharing.")
@@ -4508,3 +4569,297 @@ def reply_by_email(who, text):
         return ActionResult.failure("I opened the reply but couldn't type into it.")
     return ActionResult.success(f"{who}'s last message was an email. I've written the reply in Gmail — "
                                 "say \"email send\" when you're ready.")
+
+
+# ── §12 M4.2: present a Slides deck into the call ──
+def meet_present(name=""):
+    """'present my launch deck in the meeting': the deck opened (or the Slides tab in front), shared
+    into the call — the share question is asked as always — and the slideshow started. Runs as a
+    plan, so a 'no' to sharing stops the rest."""
+    stop = _need_bridge()
+    if stop:
+        return stop
+    if not _activate_call():
+        return ActionResult.not_found("You're not in a call.")
+    tokens = ([f"browser open my {name} deck"] if name else []) + ["meet share this tab", "browser start the slideshow"]
+    runtime = _L().RUNTIME
+    spoken = runtime.run_steps(tokens)
+    if runtime.pending_plan or runtime.pending_confirmation():
+        return ActionResult(Status.NEEDS_CONFIRMATION, " ".join(spoken[-1:]), {"steps": tokens})
+    return ActionResult.success(" ".join(spoken) or "Presenting.")
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 12 — BROWSER NEIGHBOURS (§13 N1): tab sessions, reading list,    │
+# │   picture-in-picture, page screenshots, tab tidying, another browser    │
+# └────────────────────────────────────────────────────────────────────────┘
+# Sessions and the reading list are titles + addresses in Kayra's private store (0600,
+# `automation.learning`), never page contents. The reading list is Kayra's own — Chrome's
+# readingList API would need a new extension permission (decision D5), and this needs none.
+SESSIONS = "tab_sessions.json"
+READING = "reading_list.json"
+
+
+def _store():
+    from kayra.automation import learning
+    return learning
+
+
+def _window_tabs():
+    tabs = _call("tabs.list") or []
+    active = next((t for t in tabs if t.get("active")), None)
+    window = (active or {}).get("windowId")
+    return [t for t in tabs if (window is None or t.get("windowId") == window)
+            and str(t.get("url") or "").startswith(("http://", "https://"))]
+
+
+def session_save(name):
+    """N1.1 'save these tabs as research' — the tabs of the window in front."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tabs = _window_tabs()
+    if not tabs:
+        return ActionResult.not_found("There are no web pages open in this window to save.")
+    L = _store()
+    data = L.load_json(SESSIONS, {})
+    key = " ".join(str(name).lower().split())
+    data[key] = {"name": name, "tabs": [{"title": _short(t.get("title"), 80), "url": t["url"]} for t in tabs[:40]],
+                 "at": time.time()}
+    L.save_json(SESSIONS, data)
+    return ActionResult.success(f"Saved {len(tabs)} tab{'s' if len(tabs) != 1 else ''} as {name}. "
+                                f"Say \"open my {name} tabs\" to bring them back.")
+
+
+def _session(name):
+    from kayra.automation import semantic_match as S
+    data = _store().load_json(SESSIONS, {})
+    if not data:
+        return None, ActionResult.not_found("You haven't saved any tab sessions yet. Say \"save these tabs as\" and a name.")
+    decision = S.match(name, [S.Candidate(v["name"], data=k) for k, v in data.items()])
+    if decision.decision == S.PICK:
+        return data[decision.best.data], None
+    if decision.decision == S.ASK:
+        a, b = [c.name for c in decision.top(2)]
+        return None, ActionResult(Status.AMBIGUOUS, f"Your {a} tabs or your {b} tabs?", {"candidates": [a, b]})
+    return None, ActionResult.not_found(f"I don't have tabs saved as {name}. You have: {_join([v['name'] for v in data.values()][:5])}.")
+
+
+def session_open(name):
+    """N1.1 'open my research tabs' — in a new window."""
+    stop = _bridge_at((1, 16, 0))
+    if stop:
+        return stop
+    session, problem = _session(name)
+    if problem:
+        return problem
+    result = _call("windows.openUrls", urls=[t["url"] for t in session["tabs"]]) or {}
+    return ActionResult.success(f"Opened your {session['name']} tabs ({result.get('opened', 0)}) in a new window.")
+
+
+def sessions_list():
+    data = _store().load_json(SESSIONS, {})
+    if not data:
+        return ActionResult.success("You haven't saved any tab sessions yet.")
+    return ActionResult.success("Saved tabs: " + _join([f"{v['name']} ({len(v['tabs'])})" for v in data.values()]) + ".")
+
+
+def session_delete(name):
+    session, problem = _session(name)
+    if problem:
+        return problem
+    L = _store()
+    data = L.load_json(SESSIONS, {})
+    data.pop(" ".join(session["name"].lower().split()), None)
+    L.save_json(SESSIONS, data)
+    return ActionResult.success(f"Deleted the {session['name']} tabs.")
+
+
+def reading_add():
+    """N1.2 'read this later'."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tab = _call("tabs.active") or {}
+    url = str(tab.get("url") or "")
+    if not url.startswith(("http://", "https://")):
+        return ActionResult.not_found("There's no web page in front to save for later.")
+    L = _store()
+    items = L.load_json(READING, [])
+    if any(i.get("url") == url and not i.get("read") for i in items):
+        return ActionResult.success("It's already on your reading list.")
+    items.append({"title": _short(tab.get("title"), 90), "url": url, "at": time.time(), "read": False})
+    L.save_json(READING, items[-200:])
+    waiting = len([i for i in items if not i.get("read")])
+    return ActionResult.success(f"Saved for later. {waiting} on your reading list.")
+
+
+def reading_list():
+    items = [i for i in _store().load_json(READING, []) if not i.get("read")]
+    if not items:
+        return ActionResult.success("Your reading list is empty.")
+    return ActionResult.success(f"{len(items)} to read: " + _join([i["title"] for i in items[:3]])
+                                + (", and more" if len(items) > 3 else "") + ". Say \"open the next one on my reading list\".")
+
+
+def reading_next():
+    """N1.2 'open the next one on my reading list' — the oldest unread, marked read."""
+    L = _store()
+    items = L.load_json(READING, [])
+    pending = [i for i in items if not i.get("read")]
+    if not pending:
+        return ActionResult.success("Your reading list is empty.")
+    item = pending[0]
+    item["read"] = True
+    L.save_json(READING, items)
+    result = open_in(item["url"], None, item["title"])
+    if result.ok:
+        result.message = f"Opening {item['title']}. {len(pending) - 1} left on your reading list."
+    return result
+
+
+def reading_clear():
+    L = _store()
+    items = L.load_json(READING, [])
+    left = [i for i in items if not i.get("read")]
+    L.save_json(READING, left)
+    return ActionResult.success(f"Cleared {len(items) - len(left)} read item{'s' if len(items) - len(left) != 1 else ''}; "
+                                f"{len(left)} still to read.")
+
+
+def video_pip(on=True):
+    """N1.3 'pop this video out' — picture-in-picture (a real key press is the user gesture)."""
+    stop = _bridge_at((1, 16, 0))
+    if stop:
+        return stop
+    if not on:
+        _call("page.video", op="pipExit")
+        return ActionResult.success("Closed picture-in-picture.")
+    armed = _call("page.video", op="pipArm") or {}
+    if not armed.get("video"):
+        return ActionResult.not_found("There's no video on this page.")
+    _focus_chrome()
+    _L().send_keys("space")
+    shown = _until(lambda: (_call("page.video", op="pipState") or {}).get("pip"), 3.0)
+    return ActionResult.success("The video is in its own small window now.") if shown else \
+        ActionResult.failure("Chrome didn't open picture-in-picture for this video.")
+
+
+def _screens_folder():
+    try:
+        return _L().screenshot_folder()
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), "Pictures")
+
+
+def page_screenshot(full=False):
+    """N1.5 'screenshot this page' / 'take a full page screenshot' — saved and copied."""
+    stop = _bridge_at((1, 16, 0))
+    if stop:
+        return stop
+    try:
+        shot = _call("tabs.capture", full=bool(full), timeout=30.0 if full else 10.0) or {}
+    except browser_bridge.BridgeError:
+        return ActionResult.failure("Chrome wouldn't capture this page.")
+    images = [base64.b64decode(str(i).split(",", 1)[-1]) for i in shot.get("images") or []]
+    if not images:
+        return ActionResult.failure("Chrome wouldn't capture this page.")
+    data, note = images[0], ""
+    if full and len(images) > 1:
+        try:
+            from PIL import Image
+            parts = [Image.open(io.BytesIO(b)) for b in images]
+            scale = parts[0].height / float(shot.get("viewport") or parts[0].height)
+            total = int(round(min(shot.get("height") or 0, (shot["offsets"][-1] + (shot.get("viewport") or 0))) * scale)) \
+                or sum(p.height for p in parts)
+            canvas = Image.new("RGB", (parts[0].width, total), "white")
+            for part, offset in zip(parts, shot["offsets"]):
+                canvas.paste(part, (0, int(round(offset * scale))))
+            buffer = io.BytesIO()
+            canvas.save(buffer, "PNG")
+            data = buffer.getvalue()
+            note = " (the first part of a very long page)" if shot.get("truncated") else ""
+        except ImportError:
+            note = " — only the visible part: the full page needs Pillow (python setup.py)"
+    folder = _screens_folder()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"kayra-page-{datetime.datetime.now():%Y-%m-%d-%H%M%S}.png")
+    with open(path, "wb") as handle:
+        handle.write(data)
+    L = _L()
+    copied = L._have("wl-copy") and L.RUNNER.run(["wl-copy", "--type", "image/png"], stdin_path=path)[0] == 0
+    where = folder.replace(os.path.expanduser("~"), "home")
+    return ActionResult.success(f"Saved {'the whole page' if full else 'this page'}{note} to {where}"
+                                + (" and copied it." if copied else "."), path=path)
+
+
+def _duplicates(tabs):
+    seen, dups = set(), 0
+    for t in tabs:
+        key = re.sub(r"#.*$", "", str(t.get("url") or "")).rstrip("/")
+        dups += key in seen
+        seen.add(key)
+    return dups
+
+
+def tabs_tidy_report():
+    """N1.6 'tidy my tabs' — how many, how many twice, what to say."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tabs = _call("tabs.list") or []
+    dups = _duplicates(tabs)
+    sleepy = len([t for t in tabs if t.get("discarded")])
+    parts = [f"You have {len(tabs)} tab{'s' if len(tabs) != 1 else ''} open"]
+    if dups:
+        parts.append(f"{dups} {'is a duplicate' if dups == 1 else 'are duplicates'} — say close duplicate tabs")
+    if len(tabs) >= 12:
+        parts.append("say free up memory in chrome to put the background ones to sleep")
+    if sleepy:
+        parts.append(f"{sleepy} already asleep")
+    return ActionResult.success(". ".join(parts[:1]) + (": " + "; ".join(parts[1:]) if parts[1:] else "") + ".")
+
+
+TIDY = {"at": 0.0, "checked": 0.0}
+TIDY_EVERY_S = 2 * 3600
+TIDY_CHECK_S = 600
+
+
+def tabs_tidy_suggestion(now=None):
+    """N1.6, unprompted (from the watcher): a sentence when tabs pile up, at most every two hours."""
+    now = time.time() if now is None else now
+    if now - TIDY["at"] < TIDY_EVERY_S or now - TIDY["checked"] < TIDY_CHECK_S or not BRIDGE.connected():
+        return None
+    TIDY["checked"] = now
+    try:
+        tabs = _call("tabs.list") or []
+    except browser_bridge.BridgeError:
+        return None
+    dups = _duplicates(tabs)
+    if len(tabs) < 15 or dups < 3:
+        return None
+    TIDY["at"] = now
+    return f"You have {len(tabs)} tabs open and {dups} are duplicates. Say close duplicate tabs if you like."
+
+
+_OTHER_BROWSERS = {"chromium": ("chromium",), "brave": ("brave", "brave-browser"), "firefox": ("firefox",),
+                   "edge": ("microsoft-edge-stable", "microsoft-edge"), "chrome": ("google-chrome-stable", "google-chrome")}
+
+
+def open_elsewhere(where, profile=""):
+    """N1.7 'open this in Chromium' / 'open this page in my Work profile'."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    url = str((_call("tabs.active") or {}).get("url") or "")
+    if not url.startswith(("http://", "https://")):
+        return ActionResult.not_found("There's no web page in front to open elsewhere.")
+    if profile:
+        from kayra.automation import chrome_profiles
+        return chrome_profiles.open_profile(profile, where or "chrome", url=url)
+    L = _L()
+    binary = next((b for b in _OTHER_BROWSERS.get(where, ()) if L._have(b)), None)
+    if not binary:
+        return ActionResult.not_found(f"{where.title()} isn't installed.")
+    L.RUNNER.spawn([binary, url])
+    return ActionResult.success(f"Opened this page in {where.title()}.")

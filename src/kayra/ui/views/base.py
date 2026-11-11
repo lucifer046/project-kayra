@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QSizePolicy
 
 from kayra.ui.theme import Space
 from kayra.ui.components.primitives import PageTitle, Subtitle
+from kayra.ui.smooth_scroll import install_smooth_scroll
 
 
 class View(QWidget):
@@ -55,6 +56,8 @@ class View(QWidget):
 
         self.scroll.setWidget(holder)
         outer.addWidget(self.scroll)
+        # §11 S1: every page's scrolling glides (wheel, touchpad momentum, keys).
+        install_smooth_scroll(self.scroll)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

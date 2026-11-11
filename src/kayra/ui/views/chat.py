@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLineEdit, QSizePolicy, QFrame,
 )
 
+from kayra.ui.smooth_scroll import install_smooth_scroll
 from kayra.ui.theme import Space, Size, repolish
 from kayra.ui.components.primitives import (
     Caption, AccentButton, EmptyState, IconButton,
@@ -160,6 +161,9 @@ class ChatView(View):
         self.transcript.addWidget(self._empty)
 
         self.transcript_scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+        # §11 S1: the transcript glides too; following a new reply moves the bar directly, which
+        # the glide adopts instead of fighting.
+        install_smooth_scroll(self.transcript_scroll)
         # A window resize re-wraps every bubble and changes the content height. Following has
         # to survive that, or the newest message drifts out of view whenever the window moves.
         self.transcript_scroll.viewport().installEventFilter(self)

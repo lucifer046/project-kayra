@@ -593,6 +593,15 @@ def stop_watcher():
     _WATCHER["thread"] = None
 
 
+def _setting_on(name, default="on"):
+    try:
+        from kayra.core.config import env
+        value = env(name, default)
+    except Exception:
+        value = default
+    return str(value or default).strip().lower() not in ("0", "off", "false", "no", "disabled")
+
+
 def _watch_loop():
     stop = _WATCHER["stop"]
     while not stop.wait(TICK_S):
@@ -601,6 +610,14 @@ def _watch_loop():
         except Exception:
             pass
         now = time.time()
+        if _setting_on("TAB_TIDY_SUGGESTIONS"):
+            try:
+                from kayra.automation import web_macros
+                line = web_macros.tabs_tidy_suggestion(now)      # §13 N1.6: at most every two hours
+                if line:
+                    announce(line)
+            except Exception:
+                pass
         if health_watch_enabled() and now - _WATCHER["health_at"] >= HEALTH_EVERY_S:
             _WATCHER["health_at"] = now
             try:

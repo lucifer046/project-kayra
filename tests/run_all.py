@@ -71,6 +71,8 @@ SUITES = [
     dict(file="test_browser_control.py", category="unit", feature="Browser control (round 5)",
          needs="none", writes="nothing", seconds=2,
          note="site registry, open anything/anywhere, web apps, extension versions; fake extension"),
+    dict(file="test_smooth_scroll.py", category="unit", feature="Smooth scrolling (§11 S1)",
+         needs="none", writes="nothing", seconds=1, note="headless Qt; glides advanced frame by frame"),
     dict(file="test_chrome_profiles.py", category="unit", feature="Chrome profiles (Part 5P)",
          needs="none", writes="temp dir only", seconds=1,
          note="made-up Local State; launches recorded, no browser starts"),

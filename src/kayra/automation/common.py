@@ -828,6 +828,9 @@ def normalize_command(command, context=None):
     found = part_9_10_action(lowered, raw, raw)         # Parts 9-10: in-call controls, one inbox
     if found is not None:
         return found
+    found = part_12_action(lowered, raw, raw)           # Part 12: browser neighbours
+    if found is not None:
+        return found
     found = _bare_workspace(lowered, raw)
     if found is not None:
         return found
@@ -1287,6 +1290,9 @@ def _web_action(kind, payload, raw):
         found = profile_action(low, raw, text)             # Part 5P: Chrome profiles
         if found is not None:
             return found
+        found = part_12_action(low, raw, text)             # Part 12: sessions, reading list, PiP, screenshots
+        if found is not None:
+            return found
         found = part_7_action(low, raw, text)              # Part 7: the page agent, recipes
         if found is not None and found.domain == "browser":
             return found
@@ -1434,6 +1440,9 @@ def _web_action(kind, payload, raw):
         if re.fullmatch(r"(?:admit|let in|accept)(?: them| everyone| all| the people waiting| people)?(?: in)?|"
                         r"let (?:them|everyone|people) in", low):
             return Action("meet", "admit", target="everyone", raw=raw)
+        early = part_9_10_action(low, raw, text)        # Part 13: present a deck, notes, recording
+        if early is not None and early.action in ("present", "notes", "summary", "record", "record_stop"):
+            return early
         if _SHARE_STATUS.search(low):
             return Action("meet", "share_status", target="current", raw=raw)
         request = share_request(low)
@@ -2453,6 +2462,68 @@ def profile_action(low, raw, text=None):
     return None
 
 
+# ── Part 12 (§13 N1): browser neighbours ──
+_SESSION_SAVE_RE = re.compile(r"save (?:(?:these|my|the|all(?: these| my| the)?) )?(?:open )?tabs as (?:my |the )?(.+?)(?: tabs| session)?|"
+                              r"save this (?:window|session) as (?:my |the )?(.+?)(?: tabs| session)?")
+_SESSION_OPEN_RE = re.compile(r"(?:open|restore|bring back|reopen) (?:my|the) (.+?) (?:tabs|tab session|session)")
+_SESSION_LIST_RE = re.compile(r"(?:list|show|what are) (?:me )?(?:my )?saved tabs|what (?:tab )?sessions do i have|"
+                              r"(?:list|show) (?:my )?tab sessions")
+_SESSION_DEL_RE = re.compile(r"(?:delete|forget|remove) (?:my |the )?(.+?) (?:saved )?(?:tabs|tab session|session)")
+_READ_ADD_RE = re.compile(r"read (?:this|it|this page) later|save (?:this|it|this page|this article) for later|"
+                          r"add (?:this|it|this page|this article) to (?:my )?reading list")
+_READ_LIST_RE = re.compile(r"what(?:'s| is) on my reading list|(?:show|read|list)(?: me)? my reading list|"
+                           r"what do i have to read")
+_READ_NEXT_RE = re.compile(r"open (?:the )?next (?:one|article|thing|page)(?: on| from| in) my reading list|open my reading list|"
+                           r"(?:open|show) (?:me )?something from my reading list")
+_READ_CLEAR_RE = re.compile(r"clear (?:the read (?:ones|items) (?:from|on) )?my reading list")
+_PIP_ON_RE = re.compile(r"pop (?:this|the|that) video out|(?:open |turn on |start )?picture in picture(?: mode)?|"
+                        r"put (?:this|the) video in (?:picture in picture|a (?:small|mini) window)|float (?:this|the) video")
+_PIP_OFF_RE = re.compile(r"(?:close|exit|stop|turn off) (?:the )?picture in picture|bring the video back")
+_SHOT_RE = re.compile(r"(?:take an? )?(full |whole |entire )?(?:page )?screenshot (?:of )?(?:this|the) (?:page|tab|website|site|article)|"
+                      r"screenshot the (whole|entire|full) page|(?:take an? )?(full)(?:-| )page screenshot")
+_TIDY_RE = re.compile(r"(?:tidy|clean) up my tabs|tidy my tabs|how many tabs (?:do i have|are) open|(?:check|sort out) my tabs")
+_ELSEWHERE_RE = re.compile(r"open (?:this|this page|it|this tab|this site|this link) in (chromium|brave|firefox|edge|chrome)|"
+                           r"open (?:this|this page|it|this tab) in my (.+?) (?:profile|chrome|browser)")
+
+
+def part_12_action(low, raw, text=None):
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    m = _SESSION_SAVE_RE.fullmatch(low)
+    if m:
+        return Action("browser", "session_save", target=_said(text, (m.group(1) or m.group(2)).strip()), raw=raw)
+    if _SESSION_LIST_RE.fullmatch(low):
+        return Action("browser", "sessions_list", target="all", raw=raw)
+    m = _SESSION_DEL_RE.fullmatch(low)
+    if m and m.group(1) not in ("all", "other", "duplicate", "those", "these"):
+        return Action("browser", "session_delete", target=_said(text, m.group(1).strip()), raw=raw)
+    m = _SESSION_OPEN_RE.fullmatch(low)
+    if m and not re.search(r"\b(?:new|all|other|closed|recent|recently|last|duplicate|\d+|two|three)\b", m.group(1)):
+        return Action("browser", "session_open", target=_said(text, m.group(1).strip()), raw=raw)
+    if _READ_ADD_RE.fullmatch(low):
+        return Action("browser", "reading_add", target="current", raw=raw)
+    if _READ_LIST_RE.fullmatch(low):
+        return Action("browser", "reading_list", target="all", raw=raw)
+    if _READ_NEXT_RE.fullmatch(low):
+        return Action("browser", "reading_next", target="next", raw=raw)
+    if _READ_CLEAR_RE.fullmatch(low):
+        return Action("browser", "reading_clear", target="read", raw=raw)
+    if _PIP_OFF_RE.fullmatch(low):
+        return Action("browser", "video_pip", target="off", raw=raw)
+    if _PIP_ON_RE.fullmatch(low):
+        return Action("browser", "video_pip", target="on", raw=raw)
+    m = _SHOT_RE.fullmatch(low)
+    if m:
+        return Action("browser", "page_screenshot", target="full" if any(m.groups()) else "visible", raw=raw)
+    if _TIDY_RE.fullmatch(low):
+        return Action("browser", "tabs_tidy", target="all", raw=raw)
+    m = _ELSEWHERE_RE.fullmatch(low)
+    if m:
+        return Action("browser", "open_elsewhere", target=m.group(1) or "chrome",
+                      parameters={"profile": _said(text, m.group(2).strip()) if m.group(2) else ""}, raw=raw)
+    return None
+
+
 # ── Part 9 (§12 M3) and Part 10 (H4) ──
 _CALLWORD = r"(?:call|meeting|meet)"
 _MEET_PEOPLE_RE = re.compile(r"who(?:'s| is| are)? (?:in|on|joined|attending) (?:the |this |my )?" + _CALLWORD +
@@ -2465,6 +2536,15 @@ _MEET_CHAT_RE = re.compile(r"(?:send|say|type|write|post)(?: in| to)? (?:the |th
                            r"tell everyone in (?:the |this )?" + _CALLWORD + r"(?: that)?[,:]? (.+)")
 _MEET_LINK_RE = re.compile(r"copy (?:the |this )?(?:meeting|call|meet) link|"
                            r"(?:send|share) (?:the |this )?(?:meeting|call|meet) link (?:to|with) (.+?)(?: on whatsapp)?")
+_MEET_PRESENT_RE = re.compile(r"(?:present|show|share) (?:my |the |this |our )?(.*?)(?: ?deck| ?slides| ?presentation)"
+                              r" (?:in|to|into|on) (?:the |this |my )?(?:meeting|call|meet)")
+_NOTES_ON_RE = re.compile(r"(?:take|start taking|keep|start) (?:meeting )?notes(?: (?:of|for|in|during) (?:this|the) (?:meeting|call))?|"
+                          r"(?:start|begin) (?:the )?meeting notes")
+_NOTES_OFF_RE = re.compile(r"stop (?:taking )?(?:the )?(?:meeting )?notes")
+_NOTES_SUM_RE = re.compile(r"summari[sz]e (?:this|the|that|my last|the last) (?:meeting|call)|"
+                           r"what (?:was|were) (?:decided|the action items)(?: in (?:the|this|that) (?:meeting|call))?|"
+                           r"(?:what are|give me|read) (?:the )?action items(?: from (?:the|this|that) (?:meeting|call))?")
+_RECORD_RE = re.compile(r"(start |stop )?record(?:ing)? (?:this|the) (?:meeting|call)")
 _INBOX_ALL_RE = re.compile(r"(?:who|anyone|anybody) (?:has )?(?:messaged|texted|written to|wrote to|pinged) me(?: on)? "
                            r"(?:anywhere|on any app|across (?:all )?(?:my )?apps|everywhere)|"
                            r"(?:any|check|read|show)(?: me)? (?:my |all my |the )?(?:new )?messages (?:anywhere|everywhere|on all (?:my )?apps|"
@@ -2494,6 +2574,20 @@ def part_9_10_action(low, raw, text=None):
     m = _MEET_PIN_RE.fullmatch(low)
     if m and m.group(1) not in ("this tab", "the tab", "it"):
         return Action("meet", "pin", target=_said(text, m.group(1).strip()), raw=raw)
+    m = _MEET_PRESENT_RE.fullmatch(low)
+    if m:
+        name = m.group(1).strip()
+        return Action("meet", "present", target="" if name in ("", "this", "it") else _said(text, name), raw=raw)
+    if _NOTES_OFF_RE.fullmatch(low):
+        return Action("meet", "notes", target="off", raw=raw)
+    if _NOTES_ON_RE.fullmatch(low):
+        return Action("meet", "notes", target="on", raw=raw)
+    if _NOTES_SUM_RE.fullmatch(low):
+        return Action("meet", "summary", target="last", raw=raw)
+    m = _RECORD_RE.fullmatch(low)
+    if m:
+        stopping = (m.group(1) or "").strip() == "stop"
+        return Action("meet", "record_stop" if stopping else "record", target="off" if stopping else "on", raw=raw)
     if _INBOX_ALL_RE.fullmatch(low):
         return Action("inbox", "all", target="all", raw=raw)
     m = _INBOX_OFFERS_RE.fullmatch(low)
@@ -2742,6 +2836,8 @@ def _direct_one(utterance, situation_fn=None):
         return [f"message {text}"]                      # "read the last three messages of mota panda"
     if profile_action(low, f"browser {text}", text) is not None:
         return [f"browser {text}"]                      # Part 5P: a Chrome profile
+    if part_12_action(low, text, text) is not None:
+        return [f"browser {text}"]                      # Part 12: sessions, reading list, PiP, screenshots
     found = part_7_direct(low, text)
     if found is not None or part_7_action(low, text, text) is not None:
         return found                                    # Part 7: the agent, learning ("forget that" only when fresh)
@@ -3425,6 +3521,7 @@ _CONFIRM_PROMPTS = {
     "browser.profile_clear": "Forget every detail you gave me for forms?",
     "browser.video_subscribe": "Subscribe to this channel?",
     "learning.forget_all": "Forget everything I've learned about how you talk, and every page shortcut?",
+    "meet.record": "Record your screen and the call's sound? Tell the others you're recording.",
 }
 
 

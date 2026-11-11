@@ -151,6 +151,13 @@ anywhere else; one is never needed for an unpacked extension.
 | "who's in the call", "send a heart", "pin Ana in the call", "copy the meeting link" | Meet, in the call |
 | "send in the meeting chat: running late", "send the meeting link to Rahul" | **ask first** |
 | "who messaged me anywhere", "reply to Rahul saying I'm on my way", "stop telling me about new messages" | one inbox across WhatsApp, Gmail and your desktop notifications; a reply goes to the app his last message came from |
+| "save these tabs as research", "open my research tabs", "what are my saved tabs" | (1.16.0) the window's tabs saved by name (titles and addresses only, on this computer) and reopened in a new window |
+| "read this later", "what's on my reading list", "open the next one on my reading list" | Kayra's own reading list |
+| "pop this video out", "close picture in picture" | picture-in-picture for the video in front |
+| "screenshot this page", "take a full page screenshot" | saved to your screenshots folder and copied |
+| "tidy my tabs", "open this in Chromium", "open this page in my Work profile" | tab count and duplicates; this page in another browser or Chrome profile |
+| "mute me", "share my screen", "leave the call" on Zoom, Teams or Discord in Chrome | each site's own buttons |
+| "present my launch deck in the meeting", "take notes of this meeting", "summarize this meeting", "record this meeting" | the deck shared and started (the share **asks**); captions kept and summarized by your local model; recording **asks** |
 | "add this to cart", "buy it now", "checkout" | **refused** (decision D1, 2026-11-11): Kayra searches and opens products only; the cart and paying are yours |
 
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the

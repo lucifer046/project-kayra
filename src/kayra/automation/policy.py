@@ -294,6 +294,8 @@ _CONFIRM_ACTIONS = {
     # Part 7: forgetting everything Kayra learned at once (aliases and page shortcuts).
     # The page agent's own risky steps are LATE confirmations naming the control.
     "learning.forget_all",
+    # Part 13 (§12 M4.4): recording a meeting records other people — always asked.
+    "meet.record",
 }
 
 # Actions that must never run from a voice command, whatever the phrasing.

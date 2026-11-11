@@ -408,6 +408,11 @@ MEET_CALL = """<html><head><meta charset=utf-8><title>Meet - abc-defg-hij</title
 </body></html>"""
 
 
+MEET_CAPTIONS = """<html><head><meta charset=utf-8><title>Meet</title></head><body>
+<div role=region aria-label="Captions"><div><div data-participant-id=1><img alt="Ana Rao"><span>Let's ship on Friday</span></div>
+<div data-participant-id=2><img alt="Ravi"><span>I'll write the notes</span></div></div></div></body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -925,6 +930,21 @@ def main():
         check("M3: More options for <name> -> Pin", r["ok"] and d.title == "pinned", (r, d.title))
         r = mt("chat", {"text": "running late"})
         check("M3: the in-call chat: opened, typed, sent", r["ok"] and d.title == "said:running late", (r, d.title))
+
+        check.section("[14] Parts 12–13 — Meet captions for notes, the picture-in-picture hook")
+        d.get("data:text/html;base64," + base64.b64encode(MEET_CAPTIONS.encode()).decode())
+        r = mt("captions")
+        check("M4.3: the captions are read as 'speaker: text' lines", r["on"] and r["lines"] ==
+              ["Ana Rao: Let's ship on Friday", "Ravi: I'll write the notes"], r)
+        d.get("data:text/html;base64," + base64.b64encode(VIDEO.encode()).decode())
+        d.execute_script("window.__pip = 0; HTMLVideoElement.prototype.requestPictureInPicture = function () { window.__pip++; return Promise.resolve(); };")
+        r = video("pipArm")
+        d.execute_script("window.dispatchEvent(new KeyboardEvent('keydown', {key: ' ', bubbles: true}))")
+        check("N1.3: arming does nothing by itself, and a SCRIPTED Space is ignored", r["armed"] and d.execute_script("return window.__pip") == 0)
+        ActionChains(d).send_keys(" ").perform()
+        check("N1.3: a REAL Space asks for picture-in-picture, once", d.execute_script("return window.__pip") == 1)
+        ActionChains(d).send_keys(" ").perform()
+        check("N1.3: ...and only once", d.execute_script("return window.__pip") == 1)
     finally:
         d.quit()
     return check.finish()

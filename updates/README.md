@@ -21,6 +21,7 @@ order. Newest last.
 | [V14](UPDATE_V14.md) | 2026-11-11 | Open Chrome straight into a profile, read from Chrome itself: by name, account, email or domain (Part 5P) | Feature, privacy |
 | [V15](UPDATE_V15.md) | 2026-11-11 | The page agent (local model, asks before acting for you), recipes replayed without a model, learning what your names mean; §7a model benchmark (Part 7) | Feature, safety, measurement |
 | [V16](UPDATE_V16.md) | 2026-11-11 | WhatsApp mute / pin / react / reply / forward / call, in-call Meet controls and a share warning, one inbox across apps (Parts 8–10) | Feature, safety, privacy |
+| [V17](UPDATE_V17.md) | 2026-11-11 | Smooth scrolling everywhere; tab sessions, reading list, PiP, page screenshots; Zoom/Teams/Discord, present a deck, meeting notes, recording (Parts 11–13) | Feature, UI, privacy |
 
 ## Adding an update
 

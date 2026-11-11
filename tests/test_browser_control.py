@@ -572,7 +572,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.15.0")
+        web_macros.BRIDGE = current = Bridge(version="1.16.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -1088,7 +1088,7 @@ def section_meetings():
     with WebRig(Bridge(version="1.4.0", tabs=[{"id": 1, "title": "x", "url": "https://x"}])) as rig:
         rig.do("meet share my screen")
         ok, said = linux.resolve_confirmation("yes")
-        check("no Meet tab -> 'You're not in a Google Meet call.'", "not in a Google Meet call" in said, said)
+        check("no call tab -> 'You're not in a call.' (Meet, Zoom, Teams, Discord since Part 13)", "not in a call" in said, said)
 
     js = open(os.path.join(ROOT, "extension", "kayra-bridge", "meet_main.js"), encoding="utf-8").read()
     check("the page hook adds system audio only when Kayra asked, once",
@@ -4239,6 +4239,262 @@ def section_parts_8_to_10():
         inbox.CLOCK = saved_state[1]
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PARTS 12–13 — BROWSER NEIGHBOURS (§13 N1), AROUND THE CALL (§12 M4)    │
+# └────────────────────────────────────────────────────────────────────────┘
+
+def _png(width=4, height=3, colour=(200, 30, 30)):
+    import io as _io
+    from PIL import Image
+    buffer = _io.BytesIO()
+    Image.new("RGB", (width, height), colour).save(buffer, "PNG")
+    import base64 as _b64
+    return "data:image/png;base64," + _b64.b64encode(buffer.getvalue()).decode()
+
+
+class NeighbourBridge(Bridge):
+    """1.16.0: two windows of tabs (with duplicates), window opening, tab capture, a video with PiP."""
+
+    def __init__(self, tabs=None):
+        super().__init__(version="1.16.0", tabs=tabs if tabs is not None else [
+            {"id": 1, "windowId": 7, "title": "Attention is all you need", "url": "https://arxiv.org/abs/1706.03762", "active": True},
+            {"id": 2, "windowId": 7, "title": "Transformers - Wikipedia", "url": "https://en.wikipedia.org/wiki/Transformer"},
+            {"id": 3, "windowId": 7, "title": "New Tab", "url": "chrome://newtab/"},
+            {"id": 4, "windowId": 9, "title": "Gmail", "url": "https://mail.google.com/"}])
+        self.windows, self.pip = [], False
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "tabs.list":
+            return [dict(t) for t in self.tabs]
+        if cmd == "tabs.active":
+            return dict(next(t for t in self.tabs if t.get("active")))
+        if cmd == "windows.openUrls":
+            self.calls.append((cmd, args))
+            self.windows.append(list(args["urls"]))
+            return {"opened": len(args["urls"])}
+        if cmd == "tabs.capture":
+            self.calls.append((cmd, args))
+            if args.get("full"):
+                return {"images": [_png(4, 3, (255, 0, 0)), _png(4, 3, (0, 0, 255))], "offsets": [0, 3], "height": 6,
+                        "viewport": 3, "truncated": False}
+            return {"images": [_png()], "offsets": [0]}
+        if cmd == "page.video":
+            self.calls.append((cmd, args))
+            op = args.get("op")
+            if op == "pipArm":
+                return {"video": True, "armed": True}
+            if op == "pipState":
+                return {"video": True, "pip": True}
+            if op == "pipExit":
+                self.pip = False
+                return {"video": True, "pip": False}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class CallSite(Bridge):
+    """A call open on Zoom / Teams / Discord in the browser; buttons by each site's own names."""
+
+    def __init__(self, url="https://app.zoom.us/wc/123/start", clickable=()):
+        super().__init__(version="1.16.0", tabs=[{"id": 5, "title": "Zoom Meeting", "url": url, "active": True}])
+        self.extra = set(clickable)
+        self.clicked = []
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "page.click":
+            self.calls.append((cmd, args))
+            if args["text"] in self.extra:
+                self.clicked.append(args["text"])
+                return {"clicked": True, "label": args["text"]}
+            return {"clicked": False}
+        if cmd in ("page.controls",):
+            return [{"name": n} for n in self.extra]
+        if cmd == "meet.do":
+            self.calls.append((cmd, args))
+            return {"ok": True, "on": True, "lines": list(getattr(self, "captions", []))}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_parts_12_13():
+    check.section("[25] Parts 12–13 — tab sessions, reading list, PiP, page screenshots, tidy tabs, "
+                  "another browser (§13 N1); Zoom/Teams/Discord, present a deck, meeting notes, recording (§12 M4)")
+    import tempfile
+    import shutil
+    from kayra.automation import meeting_notes, chrome_profiles
+    d = common.direct_tokens
+    nowhere = lambda: {}
+    for said, key, target in (
+            ("save these tabs as research", "browser.session_save", "research"),
+            ("open my research tabs", "browser.session_open", "research"),
+            ("what are my saved tabs", "browser.sessions_list", "all"),
+            ("forget my research tabs", "browser.session_delete", "research"),
+            ("read this later", "browser.reading_add", "current"),
+            ("what's on my reading list", "browser.reading_list", "all"),
+            ("open the next one on my reading list", "browser.reading_next", "next"),
+            ("pop this video out", "browser.video_pip", "on"),
+            ("close picture in picture", "browser.video_pip", "off"),
+            ("screenshot this page", "browser.page_screenshot", "visible"),
+            ("take a full page screenshot", "browser.page_screenshot", "full"),
+            ("tidy my tabs", "browser.tabs_tidy", "all"),
+            ("open this in chromium", "browser.open_elsewhere", "chromium"),
+            ("open this page in my work profile", "browser.open_elsewhere", "chrome"),
+            ("present my launch deck in the meeting", "meet.present", "launch"),
+            ("take notes of this meeting", "meet.notes", "on"),
+            ("stop taking notes", "meet.notes", "off"),
+            ("summarize this meeting", "meet.summary", "last"),
+            ("record this meeting", "meet.record", "on"),
+            ("stop recording the meeting", "meet.record_stop", "off")):
+        tokens = d(said, nowhere)
+        a = n(tokens[0]) if tokens else None
+        check(f"rules first: '{said}' -> {key} {target!r}", a is not None and a.key == key and a.target == target,
+              (tokens, a and (a.key, a.target)))
+    for said in ("open all youtube tabs", "take screenshot", "open the new tabs", "close all youtube tabs"):
+        a = n(said)
+        check(f"unchanged: '{said}'", a is None or not a.action.startswith(("session", "page_screenshot")), a and a.key)
+    check("recording a meeting asks; stopping it does not", policy_classify("record this meeting") == "CONFIRM"
+          and policy_classify("stop recording the meeting") == "ALLOW")
+
+    # ── N1.1 sessions, N1.2 reading list ──
+    with WebRig(NeighbourBridge()) as rig:
+        r = rig.do("browser save these tabs as research")
+        check("N1.1: the window in front's web pages are saved (not chrome:// pages, not the other window)",
+              r.ok and r.message.startswith("Saved 2 tabs as research."), r.message)
+        r = rig.do("browser open my research tabs")
+        check("N1.1: ...and come back in a new window", r.ok and rig.bridge.windows == [["https://arxiv.org/abs/1706.03762",
+              "https://en.wikipedia.org/wiki/Transformer"]], (r.message, rig.bridge.windows))
+        r = rig.do("browser open my reserch tabs")
+        check("N1.1: a near name still finds them", r.ok and len(rig.bridge.windows) == 2, r.message)
+        r = rig.do("browser what are my saved tabs")
+        check("N1.1: list", r.message == "Saved tabs: research (2).", r.message)
+        r = rig.do("browser forget my research tabs")
+        check("N1.1: forget", r.ok and rig.do("browser what are my saved tabs").message.startswith("You haven't"), r.message)
+        r = rig.do("browser read this later")
+        check("N1.2: read later", r.ok and "1 on your reading list" in r.message, r.message)
+        check("N1.2: twice is once", "already on your reading list" in rig.do("browser read this later").message)
+        r = rig.do("browser what's on my reading list")
+        check("N1.2: what's on it", "Attention is all you need" in r.message, r.message)
+        r = rig.do("browser open the next one on my reading list")
+        check("N1.2: the next one opens and is marked read", r.ok and "0 left" in r.message
+              and rig.bridge.opened()[-1][1]["url"] == "https://arxiv.org/abs/1706.03762", r.message)
+        check("N1.2: ...so the list is empty after", rig.do("browser what's on my reading list").message == "Your reading list is empty.")
+        r = rig.do("browser pop this video out")
+        keys = [a for a, _ in rig.runner.ran if a[:1] == ["wtype"]]
+        check("N1.3: picture-in-picture is armed, then a REAL Space opens it", r.ok and ["wtype", "-k", "space"] in keys
+              and any(a.get("op") == "pipArm" for c, a in rig.bridge.calls if c == "page.video"), (r.message, keys))
+        check("N1.3: close it", rig.do("browser close picture in picture").message == "Closed picture-in-picture.")
+        r = rig.do("browser tidy my tabs")
+        check("N1.6: 'tidy my tabs' says how many and what to do", r.ok and r.message.startswith("You have 4 tabs open"), r.message)
+    folder = tempfile.mkdtemp(prefix="kayra-shots-")
+    saved = web_macros._screens_folder
+    web_macros._screens_folder = lambda: folder
+    try:
+        with WebRig(NeighbourBridge()) as rig:
+            r = rig.do("browser screenshot this page")
+            files = os.listdir(folder)
+            check("N1.5: the page is saved as a PNG in the screenshots folder and copied",
+                  r.ok and len(files) == 1 and files[0].endswith(".png") and "copied" in r.message
+                  and any(a[:3] == ["wl-copy", "--type", "image/png"] for a, _ in rig.runner.ran), (r.message, files))
+            r = rig.do("browser take a full page screenshot")
+            from PIL import Image
+            newest = max((os.path.join(folder, f) for f in os.listdir(folder)), key=os.path.getmtime)
+            image = Image.open(newest)
+            check("N1.5: a full page is stitched from its slices, top to bottom",
+                  r.ok and image.size == (4, 6) and image.getpixel((0, 0)) == (255, 0, 0) and image.getpixel((0, 5)) == (0, 0, 255),
+                  (r.message, image.size))
+    finally:
+        web_macros._screens_folder = saved
+        shutil.rmtree(folder, ignore_errors=True)
+    many = [{"id": i, "windowId": 1, "title": f"t{i}", "url": f"https://x.example/{i % 12}", "active": i == 0} for i in range(16)]
+    with WebRig(NeighbourBridge(tabs=many)) as rig:
+        saved_tidy = dict(web_macros.TIDY)
+        web_macros.TIDY.update(at=0.0, checked=0.0)
+        try:
+            line = web_macros.tabs_tidy_suggestion(now=10_000.0)
+            check("N1.6: 16 tabs with 4 duplicates -> one unprompted suggestion", line ==
+                  "You have 16 tabs open and 4 are duplicates. Say close duplicate tabs if you like.", line)
+            check("N1.6: ...not again within two hours", web_macros.tabs_tidy_suggestion(now=10_000.0 + 3600) is None)
+        finally:
+            web_macros.TIDY.update(saved_tidy)
+    runner = RecordingRunner(ALL_TOOLS + ("chromium",))
+    with WebRig(NeighbourBridge(), runner=runner) as rig:
+        r = rig.do("browser open this in chromium")
+        check("N1.7: this page in another browser", r.ok and runner.spawned[-1] == ["chromium", "https://arxiv.org/abs/1706.03762"],
+              runner.spawned)
+        asked = []
+        saved_open = chrome_profiles.open_profile
+        chrome_profiles.open_profile = lambda said, browser="", url="", email="": (asked.append((said, browser, url)),
+                                                                                 web_macros.ActionResult.success("ok"))[1]
+        try:
+            rig.do("browser open this page in my work profile")
+        finally:
+            chrome_profiles.open_profile = saved_open
+        check("N1.7: ...or in another Chrome profile, through Part 5P", asked == [("work", "chrome", "https://arxiv.org/abs/1706.03762")],
+              asked)
+
+    # ── §12 M4.5: Zoom / Teams / Discord ──
+    with WebRig(CallSite(clickable={"Mute my microphone", "Share Screen", "Leave"})) as rig:
+        r = rig.do("meet mute")
+        check("M4.5: Zoom's own 'Mute my microphone', said as 'You're muted.'", r.message == "You're muted."
+              and rig.bridge.clicked == ["Mute my microphone"], (r.message, rig.bridge.clicked))
+        r = rig.do("meet leave")
+        check("M4.5: Zoom's Leave", rig.bridge.clicked[-1] == "Leave" and r.message == "You've left the call.", r.message)
+    with WebRig(CallSite(url="https://teams.microsoft.com/v2/", clickable={"Mute mic"})) as rig:
+        r = rig.do("meet mute")
+        check("M4.5: Teams' 'Mute mic'", rig.bridge.clicked == ["Mute mic"], rig.bridge.clicked)
+    with WebRig(CallSite(url="https://discord.com/channels/1/2", clickable={"Share Your Screen", "Stop Streaming"})) as rig:
+        r = rig.do("meet stop sharing")
+        check("M4.5: Discord's 'Stop Streaming'", rig.bridge.clicked == ["Stop Streaming"], (r.message, rig.bridge.clicked))
+    manifest = json.load(open(os.path.join(ROOT, "extension", "kayra-bridge", "manifest.json")))
+    check("M4.5: the share hook also runs in Zoom, Teams and Discord (no new permission)",
+          {"https://app.zoom.us/*", "https://teams.microsoft.com/*", "https://discord.com/*"} <= set(manifest["content_scripts"][0]["matches"])
+          and "readingList" not in manifest["permissions"], manifest["content_scripts"][0]["matches"])
+
+    # ── §12 M4.2: present a deck ──
+    with WebRig(Bridge(version="1.16.0")) as rig:
+        r = rig.do("meet present this deck in the meeting")
+        check("M4.2: presenting asks the share question first; the slideshow waits behind it",
+              r.status == Status.NEEDS_CONFIRMATION and "Share" in (linux.pending_confirmation() or "")
+              and linux.RUNTIME.pending_plan == ["browser start the slideshow"], (r.message, linux.RUNTIME.pending_plan))
+        ok, said = linux.resolve_confirmation("no")
+        check("M4.2: ...no shares nothing and drops the slideshow", "stopped the rest" in said and not linux.RUNTIME.pending_plan, said)
+
+    # ── §12 M4.3: notes ──
+    meeting_notes.STATE.update(lines=[], last="", path="")
+    meeting_notes.add_lines(["Ana: We should", "Ana: We should ship on Friday", "Ravi: I'll write the release notes"])
+    meeting_notes.add_lines(["Ravi: I'll write the release notes", "Ana: Great"])
+    check("M4.3: growing captions are kept once each, in order", meeting_notes.STATE["lines"] ==
+          ["Ana: We should ship on Friday", "Ravi: I'll write the release notes", "Ana: Great"], meeting_notes.STATE["lines"])
+    folder = tempfile.mkdtemp(prefix="kayra-meetings-")
+    saved = (meeting_notes._folder, meeting_notes.POLL_S)
+    meeting_notes._folder, meeting_notes.POLL_S = (lambda: folder), 3600.0
+    try:
+        bridge = CallSite(url="https://meet.google.com/abc-defg-hij", clickable={"Turn on captions"})
+        bridge.captions = ["Ana: Let's ship on Friday", "Ravi: I'll do the notes"]
+        with WebRig(bridge) as rig:
+            r = rig.do("take notes of this meeting")
+            check("M4.3: notes start, captions are turned on", r.ok and "Turn on captions" in rig.bridge.clicked
+                  and meeting_notes.active(), r.message)
+            r = rig.do("stop taking notes")
+            files = os.listdir(folder)
+            import stat as _stat
+            mode = _stat.S_IMODE(os.stat(os.path.join(folder, files[0])).st_mode) if files else 0
+            check("M4.3: stopping saves the captions to Reports/meetings, private (0600)",
+                  r.ok and not meeting_notes.active() and len(files) == 1 and mode == 0o600
+                  and "Let's ship on Friday" in open(os.path.join(folder, files[0])).read(), (r.message, files, oct(mode)))
+            with Models(text="You agreed to ship on Friday. Ravi will write the notes."):
+                r = rig.do("summarize this meeting")
+            check("M4.3: the summary comes from the model (local only) and is saved beside the notes",
+                  r.message == "You agreed to ship on Friday. Ravi will write the notes." and len(os.listdir(folder)) == 2, r.message)
+        with WebRig(CallSite(url="https://app.zoom.us/wc/1")) as rig:
+            r = rig.do("take notes of this meeting")
+            check("M4.3: notes are a Google Meet feature (Zoom says so)", r.status == Status.NOT_FOUND and not meeting_notes.active(),
+                  r.message)
+    finally:
+        meeting_notes._folder, meeting_notes.POLL_S = saved
+        if meeting_notes.active():
+            meeting_notes.stop(save=False)
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def policy_classify(token):
     from kayra.automation.policy import classify_action
     return str(getattr(classify_action(n(token))[0], "name", classify_action(n(token))[0])).upper()
@@ -4268,6 +4524,7 @@ def main():
         section_part_6b()
         section_part_7()
         section_parts_8_to_10()
+        section_parts_12_13()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

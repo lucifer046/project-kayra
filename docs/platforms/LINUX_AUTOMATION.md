@@ -327,6 +327,22 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — round 5, parts 11–13: smooth scrolling, browser neighbours, around the call (extension 1.16.0)
+
+- **Smooth scrolling** in every page of the interface: wheel notches glide and accumulate, the
+  touchpad follows the fingers and coasts after a flick, keys glide, paced at the display's refresh
+  rate; off under reduced motion. `KAYRA_UI_PROFILE=1` logs scroll frame times.
+- **Browser**: "save these tabs as research" / "open my research tabs", "read this later" / "open the
+  next one on my reading list", "pop this video out", "screenshot this page" / "take a full page
+  screenshot" (Pictures/Screenshots + clipboard), "tidy my tabs" (and an unprompted suggestion when
+  tabs pile up), "open this in Chromium" / "open this page in my Work profile".
+- **Calls**: mute / camera / hand / share / stop / leave also on Zoom, Teams and Discord in the
+  browser; "present my launch deck in the meeting"; "take notes of this meeting" / "stop taking
+  notes" / "summarize this meeting" (local model only; notes in Reports/meetings, 0600); "record this
+  meeting" (asks).
+- Tests: `test_smooth_scroll.py` (new, 22), `test_browser_control.py` [25], `test_browser_extension.py`
+  [14], `test_dmm_browser.py` +9 (138/138).
+
 ### 2026-11-11 — round 5, parts 8–10: WhatsApp extras, in the call, one inbox (extension 1.15.0)
 
 - **WhatsApp (H3)**: "mute the PR group for a week", "pin Mom", "archive this chat", "mark Rahul as
