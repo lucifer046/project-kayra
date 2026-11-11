@@ -2148,6 +2148,19 @@ def _learning(verb, target):
     return None
 
 
+def _share_warning(action):
+    from kayra.automation import web_macros
+    return web_macros.share_warning(action)
+
+
+common.SHARE_WARNING["fn"] = _share_warning      # a reference, not a side effect: nothing runs at import
+
+
+def _inbox():
+    from kayra.automation import inbox
+    return inbox
+
+
 def _profiles():
     from kayra.automation import chrome_profiles
     return chrome_profiles
@@ -2160,6 +2173,12 @@ def _dispatch_extended(domain, verb, target, params, action):
     W.new_command()                       # a fresh "which tab is active?" for this command
     if domain == "learning":
         return _learning(verb, target)
+    if domain == "inbox":
+        if verb == "all":
+            return _inbox().inbox_all()
+        if verb == "offers":
+            return _inbox().set_message_offers(target == "on")
+        return _inbox().reply_anywhere(target, params.get("text", ""), action)
     if domain == "browser":
         table = {"tabs_list": lambda: W.tabs_list(),
                  "tab_switch": lambda: W.tab_switch(target),
@@ -2272,6 +2291,11 @@ def _dispatch_extended(domain, verb, target, params, action):
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
+        if verb in ("people", "react", "pin", "message", "link"):
+            return {"people": lambda: W.meet_people(), "react": lambda: W.meet_react(target),
+                    "pin": lambda: W.meet_pin(target),
+                    "message": lambda: W.meet_chat(params.get("text", ""), bool(params.get("confirmed")), action),
+                    "link": lambda: W.meet_link(params.get("to", ""), action)}[verb]()
         if verb == "admit":
             return W.meet_admit(True)
         if verb == "join":
@@ -2319,6 +2343,11 @@ def _dispatch_extended(domain, verb, target, params, action):
             return W.wa_read(target, bool(params.get("today")), int(params.get("count") or 0))
         if verb == "other":
             return W.wa_other()
+        if verb == "manage":
+            return W.wa_manage(params.get("op", "mute"), target, params.get("span", ""))
+        if verb == "act":
+            return W.wa_message(params.get("op", "star"), target, params.get("text", ""), params.get("to", ""),
+                                params.get("confirmed"), action)
         if verb == "send_file":
             return W.wa_send_file(target, params.get("what", ""), params.get("confirmed_path"),
                                   params.get("confirmed_chat"), action)
@@ -2492,7 +2521,7 @@ def start_services(speaker=None):
     from kayra.automation import status_file, web_macros
     browser_bridge.BRIDGE.on_hello = web_macros.refresh_stale_extension
     started = {"bridge": browser_bridge.start(), "watcher": workflows.ensure_watcher(),
-               "notifications": linux_system.start_notification_log(),
+               "notifications": linux_system.start_notification_log(_inbox().on_notification),
                "status": status_file.start()}
     return started
 

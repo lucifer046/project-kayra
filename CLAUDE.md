@@ -295,6 +295,11 @@ strategy: `docs/platforms/CROSS_PLATFORM.md`; per-OS detail in `docs/platforms/`
   with no model and self-heal. `learning.py`: aliases from answers to "which one?"
   (`AutomationRuntime.pending_choice`). Rigs set `page_agent.ACTIVE=False` and `learning.DATA_DIR`
   to a temp dir. §7a numbers: `docs/roadmap/BROWSER_CONTROL_PLAN.md` §7a.
+- **Parts 8–10 (2026-11-11, extension 1.15.0).** `pageWa` / `pageMeet` act through the apps' own
+  menus by accessible name. Anything others SEE (react, reply, forward, call, meeting chat) is a
+  late confirmation re-checked on yes; block / delete / leave are refused. `automation/inbox.py`
+  never OPENS an app to read it; offers speak sender + app, never text. `SHARE_WARNING` is the
+  backend hook for the whole-screen share question.
 - **Hyprland 0.55+ dispatch is LUA.** `dispatch closewindow …` is answered with an error
   STRING, not a refused connection, so "got a reply" is not success. Always go through
   `platforms.hyprland.dispatch(lua, legacy)`, which tries `hl.dsp.*` first, falls back, and

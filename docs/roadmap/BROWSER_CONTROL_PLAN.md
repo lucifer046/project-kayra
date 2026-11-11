@@ -1,7 +1,7 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c) and the V9 / V11 fix rounds done (2026-11-11).**
-> See §10 for the parts and what is next (left: H2 phrasings + tone, H3, H4, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8, 9, 10 and the V9 / V11 fix rounds done (2026-11-11).**
+> See §10 for the parts and what is next (left: H2 phrasings + tone, H3 other apps, H4 multi-app sends, M4.2–M4.5, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -461,8 +461,8 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 - [x] E1 [x] E2 [x] E3 [x] E4 [~] E5 [~] E6 [~] E7 [x] E8  *(E5: no mark-all-read / attach; E6: no "move my 3 pm"; E7: admit only — see §10 Part 4)*
 - [x] F1 [x] F2 [~] F3 [x] F4 [x] F5 [x] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b, not tried on the live sites)*
 - [x] G1 [x] G2 [x] G3 [x] G4 [x] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
-- §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [ ] M2.2 [ ] M2.3 [ ] M3 [ ] M4  *(M1.2: Chrome's tab list opens, the user picks the tab)*
-- [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [x] H1 [x] H1.1 [~] H2 [ ] H3 [ ] H4 [x] §7a model benchmark  *(H2: aliases + transparency done; learned phrasings and tone not — they would touch the cached classifier prompt)*
+- §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [x] M2.2 [x] M2.3 [~] M3 [~] M4  *(M3: no device switch; M4: only M4.1, by Calendar's own notifications)*  *(M1.2: Chrome's tab list opens, the user picks the tab)*
+- [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [x] H1 [x] H1.1 [~] H2 [~] H3 [~] H4 [x] §7a model benchmark  *(H3: WhatsApp done; Instagram / Telegram / Discord / Slack / LinkedIn go through the page agent, no site helpers yet. H4: inbox, reply-where-they-wrote, offers done; one request to several apps and reply reminders not)*  *(H2: aliases + transparency done; learned phrasings and tone not — they would touch the cached classifier prompt)*
 
 ## 9. Known state at the time of writing
 
@@ -500,7 +500,30 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 | 5F | Fix round V11 after live use of Parts 4–5: scrolling inside web apps, one search action + close search, WhatsApp chats by loose name from anywhere, "recent chat", year ranges and recency for file names | **done 2026-11-11** (extension 1.11.0 after the second pass from the audit log; `updates/UPDATE_V11.md`; not yet re-tried on live Gmail / WhatsApp / Sheets) |
 | 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | **done 2026-11-11** (P1, P2, P3, P5; `updates/UPDATE_V14.md`). Open: P4 (the extension in several profiles), "always open Chrome as X" (a Settings key), spoken aliases (H2) |
 | 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **done 2026-11-11** — 6a (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`); 6b (F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply + send a file, F6 Reddit/LinkedIn/GitHub, G5 several steps; extension 1.13.0; `updates/UPDATE_V13.md`) |
+| 8 | H3 WhatsApp extras: mute / pin / archive / read, star, react, quote-reply, forward, calls; refused: block / delete / clear / leave | **done 2026-11-11** (extension 1.15.0; `updates/UPDATE_V16.md`) |
+| 9 | §12 M2.2 sensitive windows on a shared screen, M2.3 quiet while sharing, M3 in-call (people, reactions, pin, meeting chat, the link), M4.1 meeting reminders | **done 2026-11-11** (M3 device switch, M4.2–M4.5 open) |
+| 10 | H4 one inbox: "who messaged me anywhere", "reply to X" where X last wrote, spoken offers from notifications | **done 2026-11-11** (one request to several apps, reply reminders open) |
 | 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | **7a/7b/7c done 2026-11-11** (§7a benchmark, H1 page agent, H1.1 recipes, H2 aliases + transparency; extension 1.14.0; `updates/UPDATE_V15.md`). Open: H2 phrasings / tone, H3, H4 |
+
+**Parts 8–10 — WhatsApp extras, the call, one inbox** (done 2026-11-11, extension 1.15.0). Detail:
+`updates/UPDATE_V16.md`.
+- 8 (H3) `pageWa`: the chat row's / newest message's / header's own menus by name, a dialog's
+  choice + button (mute 8 h / 1 week / always), reactions, the forward picker, call buttons.
+  `wa_manage` (mute, pin, archive, read / unread — just happen, "already pinned" said),
+  `wa_message` (star happens; react, quote-reply, forward, call ASK naming chat + message; on yes
+  the chat must still be open and the message still the newest). Block / report / clear / delete
+  / leave are refused by voice.
+- 9 (§12) `pageMeet`: people, reactions, pin, the meeting chat (asks), copy / send the link (send =
+  WhatsApp, asks). M2.2 `sensitive_on_screen` adds "WhatsApp and Bitwarden are open on that
+  screen." to a whole-screen share question (`common.SHARE_WARNING`); M2.3 `workflows.in_call` is
+  true while Kayra's share is on; M4.1 from Calendar's own desktop notifications.
+- 10 (H4) `automation/inbox.py`: `inbox_all` (open WhatsApp, Gmail's tab title, the notification
+  log — never opens an app to look), `reply_anywhere` (newest notification naming them, else their
+  WhatsApp chat; email = opened + reply written, never sent), `on_notification` (sender + app only,
+  10 min per sender, 6 an hour, "stop telling me about new messages", `INBOX_ANNOUNCE`,
+  `MEETING_REMINDERS`).
+- **Not tried live** (WhatsApp's menu labels and Meet's reaction / pin names are from their 2026
+  accessible names; each falls back to "I couldn't find …").
 
 **Part 7 — the page agent, recipes, learning** (done 2026-11-11, extension 1.14.0; 7a §7a + H1,
 7b H1.1, 7c H2 aliases). Detail: `updates/UPDATE_V15.md`.

@@ -48,7 +48,7 @@ def _L():
     return linux
 
 
-REQUIRED_VERSION = (1, 14, 0)
+REQUIRED_VERSION = (1, 15, 0)
 UPDATE_HINT = ("Your Kayra Bridge extension is out of date. Open chrome://extensions and press "
                "the reload arrow on Kayra Bridge, then ask me again.")
 RELOADED_HINT = ("I've just updated the Kayra Bridge extension in Chrome. Give it a few seconds "
@@ -4167,3 +4167,344 @@ def social(op, site="", name="", period="", read=True):
     lead = f"Top posts on {where}: " if op == "posts" else f"Latest {_SOCIAL_NAME.get(site, '')} {noun}: ".replace("  ", " ")
     said = _say_items(items, 5)
     return ActionResult.success(lead + said + ("" if said.endswith((".", "?", "!")) else "."))
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 8 — WHATSAPP EXTRAS (H3): mute, pin, archive, read, star,        │
+# │   react, quote-reply, forward, calls                                    │
+# └────────────────────────────────────────────────────────────────────────┘
+# Personal, undoable housekeeping (mute, pin, archive, mark read, star) just happens. Anything the
+# other side SEES — a reaction, a reply, a forward, a call — ALWAYS asks first, naming the resolved
+# chat and the message; on yes the same chat must be open and the same message the newest one.
+# Blocking, reporting, clearing or deleting a chat and leaving a group are never done by voice.
+
+_WA_MENU = {"mute": (["Mute notifications", "Mute"], ["Mute", "OK"]),
+            "unmute": (["Unmute notifications", "Unmute"], ["Unmute", "OK"]),
+            "pin": (["Pin chat"], []), "unpin": (["Unpin chat"], []),
+            "archive": (["Archive chat"], []), "unarchive": (["Unarchive chat"], []),
+            "read": (["Mark as read"], []), "unread": (["Mark as unread"], [])}
+_WA_OPPOSITE = {"mute": "unmute notifications", "unmute": "mute notifications", "pin": "unpin chat",
+                "unpin": "pin chat", "archive": "unarchive chat", "unarchive": "archive chat",
+                "read": "mark as unread", "unread": "mark as read"}
+_WA_DONE = {"mute": "Muted {chat}{span}.", "unmute": "Unmuted {chat}.", "pin": "Pinned {chat}.", "unpin": "Unpinned {chat}.",
+            "archive": "Archived {chat}.", "unarchive": "Unarchived {chat}.", "read": "Marked {chat} as read.",
+            "unread": "Marked {chat} as unread."}
+_WA_ALREADY = {"mute": "{chat} is already muted.", "unmute": "{chat} isn't muted.", "pin": "{chat} is already pinned.",
+               "unpin": "{chat} isn't pinned.", "archive": "{chat} is already archived.", "unarchive": "{chat} isn't archived.",
+               "read": "{chat} is already read.", "unread": "{chat} is already marked unread."}
+_WA_REFUSED = ("I don't block, report, clear or delete chats, or leave groups, by voice. That one is yours to do "
+               "in WhatsApp.")
+
+
+def _wa(op, **args):
+    return _call("wa.do", op=op, match="web.whatsapp.com", timeout=12.0, **args) or {}
+
+
+def _wa_chat(name, open_it=True):
+    """(chat name, None) | (None, ActionResult). 'current' = the open chat."""
+    if name in ("", "current", "this", "it", "here", "this chat"):
+        _ensure_tab("web.whatsapp.com", WHATSAPP)
+        current = open_chat_name()
+        return (current, None) if current else (None, ActionResult.not_found("No chat is open in WhatsApp."))
+    row, problem = _wa_find(name)
+    if problem:
+        return None, problem
+    if open_it and not _wa_open(row):
+        return None, ActionResult.failure(f"I found {row['name']} but couldn't open it.")
+    return row["name"], None
+
+
+def wa_manage(op, chat="current", span=""):
+    """'mute the PR group for a week', 'pin Mom', 'archive this chat', 'mark Rahul as read'."""
+    stop = _bridge_at((1, 15, 0))
+    if stop:
+        return stop
+    if op == "refuse":
+        return ActionResult.unsupported(_WA_REFUSED)
+    name, problem = _wa_chat(chat, open_it=False)
+    if problem:
+        return problem
+    labels, press = _WA_MENU[op]
+    choose = {"8 hours": "8 hours", "a week": "1 week", "1 week": "1 week", "week": "1 week",
+              "always": "Always", "forever": "Always"}.get(span, "8 hours" if op == "mute" else "")
+    result = _wa("menu", scope="chat", name=name, labels=labels, choose=choose, press=press)
+    already = lambda r: any(str(i).lower().startswith(_WA_OPPOSITE[op]) for i in r.get("items") or [])
+    if not result.get("ok") and already(result):
+        return ActionResult.success(_WA_ALREADY[op].format(chat=name))
+    if not result.get("ok") and op in ("mute", "unmute") and open_chat_name() == name:
+        result = _wa("menu", scope="header", labels=labels, choose=choose, press=press)   # the row is not in view
+        if not result.get("ok") and already(result):
+            return ActionResult.success(_WA_ALREADY[op].format(chat=name))
+    if not result.get("ok"):
+        return ActionResult.failure(f"I couldn't find {labels[0]} for {name}.")
+    said = {"8 hours": " for 8 hours", "1 week": " for a week", "Always": " for good"}.get(choose, "")
+    return ActionResult.success(_WA_DONE[op].format(chat=name, span=said))
+
+
+_EMOJI = {"thumbs up": "👍", "like": "👍", "heart": "❤️", "love": "❤️", "laugh": "😂", "haha": "😂", "laughing": "😂",
+          "lol": "😂", "wow": "😮", "surprised": "😮", "sad": "😢", "cry": "😢", "crying": "😢", "pray": "🙏",
+          "thanks": "🙏", "folded hands": "🙏", "clap": "👏", "fire": "🔥", "party": "🎉", "ok": "👌"}
+
+
+def wa_message(op, chat="current", text="", target="", confirmed=None, action=None):
+    """star | react | reply | forward | call — on the newest message of a chat (or the chat itself).
+    Everything but star asks first; `confirmed` = {chat, message} the yes was about."""
+    stop = _bridge_at((1, 15, 0))
+    if stop:
+        return stop
+    if confirmed is None:
+        name, problem = _wa_chat(chat)
+        if problem:
+            return problem
+        last = {} if op == "call" else _wa("last")
+        if op != "call" and not last.get("found"):
+            return ActionResult.not_found(f"There's no message from someone else in {name} yet.")
+        quote = f"{last.get('from') or 'their'}{chr(39)}s \"{_short(last.get('text'), 60)}\"" if last else ""
+        if op == "star":
+            result = _wa("menu", scope="message", labels=["Star", "Star message"])
+            return ActionResult.success(f"Starred {quote} in {name}.") if result.get("ok") else \
+                ActionResult.failure("I couldn't find Star for that message.")
+        real_target = ""
+        if op == "forward":
+            row, problem = _wa_find(target)
+            if problem:
+                return problem
+            real_target = row["name"]
+        if action is None:
+            return ActionResult.failure("I need to ask before doing that.")
+        question = {"react": f"React {text} to {quote} in {name}?",
+                    "reply": f"Reply to {quote} in {name} with \"{_short(text, 100)}\"?",
+                    "forward": f"Forward {quote} from {name} to {real_target}?",
+                    "call": f"Start a WhatsApp {'video' if text == 'video' else 'voice'} call with {name}?"}[op]
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed": {"chat": name, "message": last.get("text", ""),
+                                                                         "target": real_target}}, raw=action.raw)
+        return ActionResult(Status.NEEDS_CONFIRMATION, question, {"confirm": approved})
+    name = confirmed["chat"]
+    _call("tabs.activate", match="web.whatsapp.com")
+    if open_chat_name() != name:
+        return ActionResult.failure(f"{name} is no longer the open chat, so I didn't do it.")
+    if op != "call" and _wa("last").get("text", "") != confirmed.get("message", ""):
+        return ActionResult.failure("A newer message arrived in the meantime, so I didn't do it. Ask me again.")
+    if op == "react":
+        result = _wa("react", emoji=text)
+        return ActionResult.success(f"Reacted {text}.") if result.get("ok") else \
+            ActionResult.failure("I couldn't open the reactions for that message.")
+    if op == "call":
+        result = _wa("call", kind="video" if text == "video" else "voice")
+        return ActionResult.success(f"Calling {name}.") if result.get("ok") else \
+            ActionResult.unsupported("I don't see a call button for this chat in WhatsApp Web.")
+    if op == "reply":
+        if not _wa("menu", scope="message", labels=["Reply"]).get("ok"):
+            return ActionResult.failure("I couldn't find Reply for that message.")
+        typed = (_call("page.type", field="type a message", text=text, clear=True) or {}).get("typed")
+        readback = (_call("chat.composer") or {}).get("text", "")
+        if not typed or " ".join(readback.split()) != " ".join(str(text).split()):
+            return ActionResult.failure("I couldn't type the reply exactly, so I didn't send it.")
+        if not _click_first(["Send"]):
+            _call("page.type", field="type a message", text="", submit=True)
+        return ActionResult.success(f"Replied in {name}.")
+    # forward
+    if not _wa("menu", scope="message", labels=["Forward", "Forward message"]).get("ok"):
+        return ActionResult.failure("I couldn't find Forward for that message.")
+    picked = _wa("forward", name=confirmed["target"])
+    if not picked.get("ok"):
+        return ActionResult.failure(f"I couldn't pick {confirmed['target']} in the forward list, so nothing was sent.")
+    sent = _wa("forwardSend")
+    return ActionResult.success(f"Forwarded to {confirmed['target']}.") if sent.get("ok") else \
+        ActionResult.failure("I couldn't press Send in the forward window; it's still open.")
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 9 — MEETINGS (§12): in-call controls (M3), what is on the screen │
+# │   you are about to share (M2.2)                                         │
+# └────────────────────────────────────────────────────────────────────────┘
+_SENSITIVE_APPS = (("whatsapp", "WhatsApp"), ("telegram", "Telegram"), ("signal", "Signal"), ("discord", "Discord"),
+                   ("slack", "Slack"), ("thunderbird", "Thunderbird"), ("gmail", "Gmail"), ("inbox", "your email"),
+                   ("bitwarden", "Bitwarden"), ("1password", "1Password"), ("keepass", "KeePass"), ("proton pass", "Proton Pass"),
+                   ("netbanking", "a bank"), ("bank", "a bank"), ("paypal", "PayPal"), ("paytm", "Paytm"),
+                   ("phonepe", "PhonePe"), ("instagram", "Instagram"), ("messenger", "Messenger"))
+
+
+def sensitive_on_screen(name=""):
+    """M2.2: the private apps visible on the monitor a whole-screen share would show — the windows
+    on that monitor's active workspace, matched by class and title. [] when nothing / unknown."""
+    L = _L()
+    monitor = _share_monitor(name)
+    if monitor is None:
+        return []
+    try:
+        clients = list(L.HYPR.clients())
+    except Exception:
+        return []
+    workspace = (monitor.get("activeWorkspace") or {}).get("id")
+    found = []
+    for c in clients:
+        on = (c.get("workspace") or {}).get("id") == workspace if workspace is not None else \
+            str(c.get("monitor", "")) in ("", str(monitor.get("id", "")), str(monitor.get("name", "")))
+        if not on or c.get("hidden"):
+            continue
+        text = f"{c.get('class', '')} {c.get('initialClass', '')} {c.get('title', '')}".lower()
+        for needle, label in _SENSITIVE_APPS:
+            if needle in text and label not in found:
+                found.append(label)
+    return found
+
+
+def share_warning(action):
+    """The sentence added to a whole-screen share question, or ''."""
+    if (action.target or "monitor") != "monitor":
+        return ""
+    found = sensitive_on_screen((action.parameters or {}).get("name") or "")
+    if not found:
+        return ""
+    names = _join(found[:3])
+    return f" {names} {'is' if len(found) == 1 else 'are'} open on that screen."
+
+
+def _meet(op, **args):
+    return _call("meet.do", op=op, match="meet.google.com", timeout=12.0, **args) or {}
+
+
+def _in_meet():
+    missing = _need_bridge() or _outdated((1, 15, 0))
+    if missing:
+        return missing
+    try:
+        _call("tabs.activate", match="meet.google.com")
+    except browser_bridge.BridgeError:
+        return ActionResult.not_found("You're not in a Google Meet call.")
+    return None
+
+
+def meet_people():
+    stop = _in_meet()
+    if stop:
+        return stop
+    people = _meet("people").get("people") or []
+    if not people:
+        return ActionResult.not_found("I can't see who's in the call.")
+    more = f", and {len(people) - 8} more" if len(people) > 8 else ""
+    return ActionResult.success(f"{len(people)} in the call: {_join(people[:8])}{more}.")
+
+
+_MEET_EMOJI = {"thumbs up": "👍", "like": "👍", "heart": "💖", "love": "💖", "clap": "👏", "applause": "👏",
+               "laugh": "😂", "haha": "😂", "wow": "😮", "surprised": "😮", "sad": "😢", "party": "🎉",
+               "celebrate": "🎉", "thinking": "🤔", "thumbs down": "👎"}
+
+
+def meet_react(word):
+    """M3: 'send a thumbs up', 'react with a heart' in the call. A reaction is a light, momentary
+    thing everyone sees — like raising a hand, it does not ask."""
+    stop = _in_meet()
+    if stop:
+        return stop
+    emoji = _MEET_EMOJI.get(word, word if word and not word.isascii() else "👍")
+    result = _meet("react", emoji=emoji, word=word if word.isascii() else "")
+    return ActionResult.success(f"Sent {emoji}.") if result.get("ok") else \
+        ActionResult.not_found("I can't find reactions in this call.")
+
+
+def meet_pin(name):
+    stop = _in_meet()
+    if stop:
+        return stop
+    result = _meet("pin", name=name)
+    if result.get("ok"):
+        return ActionResult.success(f"Pinned {name}.")
+    people = result.get("people") or []
+    return ActionResult.not_found(f"I don't see {name} in the call" + (f" — there's {_join(people[:5])}." if people else "."))
+
+
+def meet_chat(text, confirmed=False, action=None):
+    """M3: 'send in the meeting chat: running 5 minutes late' — everyone reads it, so it asks."""
+    stop = _in_meet()
+    if stop:
+        return stop
+    if not confirmed:
+        if action is None:
+            return ActionResult.failure("I need to ask before sending to the meeting chat.")
+        approved = Action(action.domain, action.action, target=action.target,
+                          parameters={**action.parameters, "confirmed": True}, raw=action.raw)
+        return ActionResult(Status.NEEDS_CONFIRMATION, f"Send \"{_short(text, 100)}\" to everyone in the meeting chat?",
+                            {"confirm": approved})
+    result = _meet("chat", text=text)
+    return ActionResult.success("Sent to the meeting chat.") if result.get("ok") else \
+        ActionResult.failure("I couldn't send it in the meeting chat.")
+
+
+def meet_link(to="", action=None):
+    """M3: 'copy the meeting link' (clipboard); 'send the meeting link to Rahul' (WhatsApp, asks)."""
+    missing = _need_bridge()
+    if missing:
+        return missing
+    tab = next((t for t in (_call("tabs.list") or []) if _host(t.get("url")) == "meet.google.com"
+                and re.search(r"/[a-z]{3}-[a-z]{4}-[a-z]{3}", str(t.get("url")))), None)
+    if tab is None:
+        return ActionResult.not_found("You're not in a Google Meet call.")
+    url = str(tab["url"]).split("?")[0]
+    if not to:
+        L = _L()
+        if L._have("wl-copy") and L._ok("wl-copy", "--", url):
+            return ActionResult.success("Copied the meeting link.")
+        return ActionResult.failure("I couldn't copy the link.")
+    return message_send(to, f"Join the meeting: {url}", None, action)
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PART 10 — ONE INBOX (H4)                                              │
+# └────────────────────────────────────────────────────────────────────────┘
+
+def open_tab_on(host):
+    """The open tab on `host`, or None — reading an inbox never OPENS an app the user didn't have open."""
+    if not BRIDGE.connected():
+        return None
+    try:
+        return next((t for t in (_call("tabs.list") or []) if _host(t.get("url")) == host), None)
+    except browser_bridge.BridgeError:
+        return None
+
+
+def whatsapp_unread():
+    """[(name, count)] from the open WhatsApp, [] when it isn't open (it is never opened for this)."""
+    if open_tab_on("web.whatsapp.com") is None or _version() < (1, 9, 0):
+        return []
+    try:
+        listing = _call("chat.list", match="web.whatsapp.com", max=60) or {}
+    except browser_bridge.BridgeError:
+        return []
+    return [(c["name"], int(c.get("unread") or 0)) for c in listing.get("chats") or [] if c.get("unread")]
+
+
+def whatsapp_rows():
+    if open_tab_on("web.whatsapp.com") is None or _version() < (1, 9, 0):
+        return []
+    try:
+        return (_call("chat.list", match="web.whatsapp.com", max=60) or {}).get("chats") or []
+    except browser_bridge.BridgeError:
+        return []
+
+
+def gmail_unread():
+    """The unread count in the open Gmail tab's title ('Inbox (3) - …'), or None."""
+    tab = open_tab_on("mail.google.com")
+    if tab is None:
+        return None
+    m = re.search(r"\((\d[\d,]*)\)", str(tab.get("title") or ""))
+    return int(m.group(1).replace(",", "")) if m else 0
+
+
+def reply_by_email(who, text):
+    """H4: his last message was an email — open the newest one from him and write the reply.
+    Never sent from here: 'email send' (which asks) does that."""
+    opened = email_open("first", 1, f"from:{who}")
+    if not opened.ok:
+        return opened
+    started = email_action("reply")
+    if not started.ok:
+        return started
+    typed = (_call("page.type", field="message body", text=text) or {}).get("typed")
+    if not typed:
+        return ActionResult.failure("I opened the reply but couldn't type into it.")
+    return ActionResult.success(f"{who}'s last message was an email. I've written the reply in Gmail — "
+                                "say \"email send\" when you're ready.")

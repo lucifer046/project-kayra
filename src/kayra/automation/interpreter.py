@@ -142,9 +142,16 @@ CALENDAR / MEET: calendar next meeting | calendar join my next meeting | calenda
   meet join <code the user said> | meet join new | meet mic off | meet camera off |
   meet share screen | meet share the <app> window | meet share this tab |
   meet share the <site> tab | meet share my second screen | meet share screen with audio |
-  meet share <app> instead | meet am i sharing | meet stop sharing | meet leave
+  meet share <app> instead | meet am i sharing | meet stop sharing | meet leave |
+  meet who's in the call | meet send a <heart | thumbs up | clap> | meet pin <name> in the call |
+  meet send in the meeting chat: <text> | meet copy the meeting link | meet send the meeting link to <chat>
 MESSAGES (WhatsApp): message <contact>: <text> | message open <chat or group> | message search for <name> | message open result <n> |
   message close this chat | message reply saying <text> | message reply to <chat> saying <text> |
+  message mute <chat or this chat> for <8 hours | a week | always> | message pin <chat> | message archive <chat> |
+  message mark <chat> as <read | unread> | message star the last message |
+  message react with a <thumbs up | heart | laugh> to the last message |
+  message reply to the last message saying <text> | message forward the last message to <chat> |
+  message <voice | video> call <chat> | who messaged me anywhere | reply to <name> saying <text> |
   message read <chat> | message read <chat> today | message read this | message who messaged me
 MEDIA & SYSTEM: play <song> | pause | resume | next track | previous track |
   system volume <0-100> | system mute | system brightness <0-100> | wifi on | wifi off |

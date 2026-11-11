@@ -825,6 +825,9 @@ def normalize_command(command, context=None):
     found = part_7_action(lowered, raw, raw)            # Part 7: the page agent, learning
     if found is not None:
         return found
+    found = part_9_10_action(lowered, raw, raw)         # Parts 9-10: in-call controls, one inbox
+    if found is not None:
+        return found
     found = _bare_workspace(lowered, raw)
     if found is not None:
         return found
@@ -1436,11 +1439,16 @@ def _web_action(kind, payload, raw):
         request = share_request(low)
         if request is not None:
             return _share_action(request, raw)
+        if re.fullmatch(r"(?:open|show) (?:the )?(?:meeting |call )?chat", low):
+            return Action("meet", "chat", target="current", parameters={"on": True}, raw=raw)
         if re.match(r"(?:join|start|open)\b", low):
             code = re.search(r"([a-z]{3}-[a-z]{4}-[a-z]{3})|(https?://meet\.google\.com/\S+)", low)
             return Action("meet", "join", target=code.group(0) if code else "new", raw=raw)
         if re.search(r"(share|present).*(stop|end)|(stop|end).*(shar|present)", low):
             return Action("meet", "stop_share", target="current", raw=raw)
+        found = part_9_10_action(low, raw, text)        # Part 9: people, reactions, pin, chat, link
+        if found is not None and found.domain == "meet":
+            return found
         for word, op in (("mic", "mic"), ("microphone", "mic"), ("mute", "mic"),
                          ("camera", "camera"), ("video", "camera"), ("caption", "captions"),
                          ("hand", "hand"), ("leave", "leave"), ("hang up", "leave"),
@@ -1521,7 +1529,8 @@ def _web_action(kind, payload, raw):
 
     if kind == "message":
         # ── Part 6b, F5: a reply in the open chat, a file to a chat — before every other shape ──
-        found = message_6b_action(re.sub(_WA_SUFFIX + r"$", "", low).strip(), raw, text)
+        bare_wa = re.sub(_WA_SUFFIX + r"$", "", low).strip()
+        found = message_8_action(bare_wa, raw, text) or message_6b_action(bare_wa, raw, text)
         if found is not None:
             return found
         # ── Part 5, H0.4: open / read / who messaged me, before the send shapes ──
@@ -2245,6 +2254,76 @@ def part_6b_action(low, raw, text=None):
     return None
 
 
+# ── Part 8 (H3): WhatsApp extras ──
+_THIS_CHAT = {"", "chat", "this", "it", "this chat", "the chat", "this group", "the group", "this conversation", "here"}
+_EMOJI_WORDS = r"(thumbs up|like|heart|love|laugh|laughing|haha|lol|wow|surprised|sad|cry|crying|pray|thanks|folded hands|clap|fire|party|ok|[\U0001F300-\U0001FAFF❤♥]️?)"
+_LAST_MSG = r"(?:the |that |this |her |his |their |[\w]+'s )?(?:last |latest |newest )?message"
+_WA_MANAGE_RE = re.compile(r"(mute|unmute|pin|unpin|archive|unarchive) (?:the |my |this |that )?(.*?)(?: chat| group| conversation)?"
+                           r"(?: for (8 hours|eight hours|a week|1 week|one week|always|forever|good))?")
+_WA_MARK_RE = re.compile(r"mark (?:the |my |this )?(.*?)(?: chat| group| conversation)? as (read|unread)")
+_WA_STAR_RE = re.compile(r"star (?:it|that|" + _LAST_MSG + r")(?: in (.+?))?")
+_WA_REACT_RE = re.compile(r"(?:react|respond)(?: with)?(?: an?)? " + _EMOJI_WORDS + r"(?: emoji)?(?: to " + _LAST_MSG + r")?(?: in (.+?))?|"
+                          r"(like|heart|love) " + _LAST_MSG + r"(?: in (.+?))?")
+_WA_QUOTE_RE = re.compile(r"(?:quote )?reply to " + _LAST_MSG + r"(?: in (.+?))?(?: saying| with|:) (.+)|quote reply(?: saying| with|:)? (.+)")
+_WA_FORWARD_RE = re.compile(r"forward " + _LAST_MSG + r"(?: from (.+?))? to (.+)")
+_WA_CALL_RE = re.compile(r"(?:start |make |place )?(?:an? )?(?:(voice|audio|video) )?call(?: to| with)? (.+?)|"
+                         r"(?:whats ?app )(voice |audio |video )?call (.+)")
+_WA_REFUSE_RE = re.compile(r"(?:block|unblock|report) .+|(?:delete|clear) (?:this |the |my )?(?:[\w' ]+ )?(?:chat|conversation)|"
+                           r"(?:exit|leave) (?:the |this )?(?:[\w' ]+ )?group")
+_SPAN = {"8 hours": "8 hours", "eight hours": "8 hours", "a week": "a week", "1 week": "a week", "one week": "a week",
+         "always": "always", "forever": "always", "good": "always"}
+
+
+def _said(text, words):
+    found = re.search(re.escape(words), text, re.I)
+    return found.group(0) if found else words
+
+
+def _chat_or_current(name, text):
+    name = (name or "").strip()
+    return "current" if name in _THIS_CHAT else _said(text, name)
+
+
+def message_8_action(low, raw, text):
+    """H3: mute / pin / archive / mark read, star, react, quote-reply, forward, call, refused ones."""
+    if _WA_REFUSE_RE.fullmatch(low):
+        return Action("message", "manage", target="refuse", parameters={"op": "refuse"}, raw=raw)
+    m = _WA_QUOTE_RE.fullmatch(low)
+    if m:
+        body = m.group(2) or m.group(3)
+        return Action("message", "act", target=_chat_or_current(m.group(1), text),
+                      parameters={"op": "reply", "text": _said(text, body.strip())}, raw=raw)
+    m = _WA_FORWARD_RE.fullmatch(low)
+    if m:
+        return Action("message", "act", target=_chat_or_current(m.group(1), text),
+                      parameters={"op": "forward", "to": _said(text, m.group(2).strip())}, raw=raw)
+    m = _WA_REACT_RE.fullmatch(low)
+    if m:
+        word = (m.group(1) or m.group(3) or "").strip()
+        from kayra.automation.web_macros import _EMOJI
+        emoji = _EMOJI.get(word, word if word and not word.isascii() else "👍")
+        return Action("message", "act", target=_chat_or_current(m.group(2) or m.group(4), text),
+                      parameters={"op": "react", "text": emoji}, raw=raw)
+    m = _WA_STAR_RE.fullmatch(low)
+    if m:
+        return Action("message", "act", target=_chat_or_current(m.group(1), text), parameters={"op": "star"}, raw=raw)
+    m = _WA_MARK_RE.fullmatch(low)
+    if m:
+        return Action("message", "manage", target=_chat_or_current(m.group(1), text), parameters={"op": m.group(2)}, raw=raw)
+    m = _WA_MANAGE_RE.fullmatch(low)
+    if m and not re.search(r"\b(?:tabs?|sound|audio|mic|microphone|volume|video|me|myself|notifications|everything|"
+                           r"all|computer|laptop|speakers?|music|spotify|window)\b", m.group(2) or ""):
+        return Action("message", "manage", target=_chat_or_current(m.group(2), text),
+                      parameters={"op": m.group(1), "span": _SPAN.get(m.group(3) or "", "")}, raw=raw)
+    m = _WA_CALL_RE.fullmatch(low)
+    if m:
+        kind = (m.group(1) or m.group(3) or "voice").strip().replace("audio", "voice")
+        who = (m.group(2) or m.group(4) or "").strip()
+        if who and who not in ("me", "back"):
+            return Action("message", "act", target=_chat_or_current(who, text), parameters={"op": "call", "text": kind}, raw=raw)
+    return None
+
+
 def message_6b_action(low, raw, text):
     """F5 inside the message kind: a reply in the open chat, or a file to a chat. None otherwise."""
     m = _SEND_FILE_HERE_RE.fullmatch(low)
@@ -2260,8 +2339,9 @@ def message_6b_action(low, raw, text):
     if m and m.group(1) not in ("this", "this chat", "them", "him", "her", "the chat", "it", "this message",
                                 "the last message", "the group", "this group"):
         body = re.search(re.escape(m.group(2)), text, re.I)
-        who = re.search(re.escape(m.group(1).strip()), text, re.I)
-        return Action("message", "send", target=who.group(0) if who else m.group(1).strip(),
+        named = re.sub(r"\s+(?:on|in|via) whats ?app$", "", m.group(1).strip())
+        who = re.search(re.escape(named), text, re.I)
+        return Action("message", "send", target=who.group(0) if who else named,
                       parameters={"text": body.group(0) if body else m.group(2), "app": "whatsapp"}, raw=raw)
     m = _REPLY_RE.fullmatch(low)
     if m:
@@ -2292,12 +2372,10 @@ def part_6b_direct(low, text, situation_fn=None):
     if not wa_front:
         return None
     bare = re.sub(_WA_SUFFIX + r"$", "", low).strip()
-    found = message_6b_action(bare, f"message {text}", text)
+    found = message_8_action(bare, f"message {text}", text) or message_6b_action(bare, f"message {text}", text)
     if found is None:
         return None
-    if found.action == "send" and found.target != "current" and not wa_said:
-        return None                     # "reply to Ravi saying …" with no app named: the model decides
-    return [f"message {text}"]
+    return [f"message {text}"]          # named WhatsApp, or WhatsApp is in front
 
 
 # ── Part 5P: Chrome profiles (BROWSER_CONTROL_PLAN §14) ──
@@ -2372,6 +2450,61 @@ def profile_action(low, raw, text=None):
     if m and _profile_name_ok(m.group(1), strict=not owned) and (owned or low.split()[1] == "the"
                                                                  or len(m.group(1).split()) <= 3):
         return act(m.group(1), m.group(2))
+    return None
+
+
+# ── Part 9 (§12 M3) and Part 10 (H4) ──
+_CALLWORD = r"(?:call|meeting|meet)"
+_MEET_PEOPLE_RE = re.compile(r"who(?:'s| is| are)? (?:in|on|joined|attending) (?:the |this |my )?" + _CALLWORD +
+                             r"|who(?:'s| has)? joined(?: the " + _CALLWORD + r")?|how many (?:people )?(?:are )?(?:in|on) (?:the |this )?" + _CALLWORD)
+_MEET_REACT_RE = re.compile(r"(?:send|give|do)(?: a| an)? (thumbs up|thumbs down|heart|love|clap|applause|laugh|haha|wow|surprised|sad|party|"
+                            r"celebrate|thinking)(?: emoji| reaction)?(?: in (?:the |this )?" + _CALLWORD + r")?|"
+                            r"react with (?:a |an )?(thumbs up|thumbs down|heart|clap|laugh|wow|sad|party)(?: in (?:the |this )?" + _CALLWORD + r")")
+_MEET_PIN_RE = re.compile(r"pin (.+?)(?:'s video| in (?:the |this )?" + _CALLWORD + r")")
+_MEET_CHAT_RE = re.compile(r"(?:send|say|type|write|post)(?: in| to)? (?:the |this )?(?:meeting|call|meet) chat(?: saying| that)?[,:]? (.+)|"
+                           r"tell everyone in (?:the |this )?" + _CALLWORD + r"(?: that)?[,:]? (.+)")
+_MEET_LINK_RE = re.compile(r"copy (?:the |this )?(?:meeting|call|meet) link|"
+                           r"(?:send|share) (?:the |this )?(?:meeting|call|meet) link (?:to|with) (.+?)(?: on whatsapp)?")
+_INBOX_ALL_RE = re.compile(r"(?:who|anyone|anybody) (?:has )?(?:messaged|texted|written to|wrote to|pinged) me(?: on)? "
+                           r"(?:anywhere|on any app|across (?:all )?(?:my )?apps|everywhere)|"
+                           r"(?:any|check|read|show)(?: me)? (?:my |all my |the )?(?:new )?messages (?:anywhere|everywhere|on all (?:my )?apps|"
+                           r"across (?:all )?(?:my )?apps)|check all my messages|(?:what did i miss|anything new) (?:anywhere|everywhere)|"
+                           r"my unified inbox|unified inbox")
+_INBOX_REPLY_RE = re.compile(r"(?:reply|respond|write back) to (.+?) (?:saying|with|that)[,:]? (.+)")
+_INBOX_OFFERS_RE = re.compile(r"(stop|don't|do not|no more) (?:telling|tell) me (?:about|when) (?:i get )?(?:new |a )?messages?(?: arrive)?|"
+                              r"(?:tell|let) me (?:know )?(?:about|when) (?:i get )?(?:new |a )?messages?(?: arrive)?(?: again)?|"
+                              r"(?:turn|switch) (on|off) message (?:alerts|announcements)")
+
+
+def part_9_10_action(low, raw, text=None):
+    """In-call Meet controls, the unified inbox and where to reply. None otherwise."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    if _MEET_PEOPLE_RE.fullmatch(low):
+        return Action("meet", "people", target="current", raw=raw)
+    m = _MEET_CHAT_RE.fullmatch(low)
+    if m:
+        return Action("meet", "message", target="current", parameters={"text": _said(text, (m.group(1) or m.group(2)).strip())}, raw=raw)
+    m = _MEET_LINK_RE.fullmatch(low)
+    if m:
+        return Action("meet", "link", target="current", parameters={"to": _said(text, m.group(1).strip()) if m.group(1) else ""}, raw=raw)
+    m = _MEET_REACT_RE.fullmatch(low)
+    if m:
+        return Action("meet", "react", target=m.group(1) or m.group(2), raw=raw)
+    m = _MEET_PIN_RE.fullmatch(low)
+    if m and m.group(1) not in ("this tab", "the tab", "it"):
+        return Action("meet", "pin", target=_said(text, m.group(1).strip()), raw=raw)
+    if _INBOX_ALL_RE.fullmatch(low):
+        return Action("inbox", "all", target="all", raw=raw)
+    m = _INBOX_OFFERS_RE.fullmatch(low)
+    if m:
+        off = bool(m.group(1)) or m.group(2) == "off"
+        return Action("inbox", "offers", target="off" if off else "on", raw=raw)
+    m = _INBOX_REPLY_RE.fullmatch(low)
+    if m and not re.search(r"\b(?:on|in|via) (?:whats ?app|gmail|email|mail)\b", low) and \
+            not re.fullmatch(_LAST_MSG + r"(?: in .+)?", m.group(1)) and m.group(1) not in _THIS_CHAT | {"them", "him", "her"}:
+        return Action("inbox", "reply", target=_said(text, m.group(1).strip()),
+                      parameters={"text": _said(text, m.group(2).strip())}, raw=raw)
     return None
 
 
@@ -2612,6 +2745,12 @@ def _direct_one(utterance, situation_fn=None):
     found = part_7_direct(low, text)
     if found is not None or part_7_action(low, text, text) is not None:
         return found                                    # Part 7: the agent, learning ("forget that" only when fresh)
+    found = part_9_10_action(low, text, text)
+    if found is not None and found.key in ("meet.react", "meet.pin") and not re.search(r"\b(?:call|meeting|meet)\b", low) \
+            and front_site(situation_fn) != "meet.google.com":
+        found = None                                    # "send a thumbs up" is a Meet reaction only in a call
+    if found is not None and not (found.key == "inbox.reply" and front_site(situation_fn) == "web.whatsapp.com"):
+        return [text]                                   # Parts 9-10 (a reply with WhatsApp in front stays WhatsApp's)
     found = part_6_direct(low, text, situation_fn)
     if found:
         return found                                    # Part 6: forms, video, site search, shopping
@@ -3314,11 +3453,20 @@ def _share_what(action):
     return "your entire screen"
 
 
+SHARE_WARNING = {"fn": None}          # set by the backend: (action) -> " WhatsApp is open on that screen." | ""
+
+
 def _confirm_prompt(action, reason):
     if action.key == "meet.share":
         # Says WHAT goes to everyone (M0.5): "Share the LM Studio window with everyone in the
         # call?" — a reflexive yes to "share monitor?" is how the whole desktop got shared.
-        return (f"Share {_share_what(action)} with everyone in the call? You can say "
+        warning = ""
+        if SHARE_WARNING["fn"] is not None:
+            try:
+                warning = SHARE_WARNING["fn"](action) or ""      # M2.2: "WhatsApp is open on that screen."
+            except Exception:
+                warning = ""
+        return (f"Share {_share_what(action)} with everyone in the call?{warning} You can say "
                 f"\"yes, don't ask again\" for the rest of this call.")
     prompt = _CONFIRM_PROMPTS.get(action.key)
     if prompt:

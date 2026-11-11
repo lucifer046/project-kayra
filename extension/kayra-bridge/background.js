@@ -405,6 +405,9 @@ async function run(cmd, args) {
     // ── 1.13.0: ask an AI site, send a file in WhatsApp, read social lists (Part 6b) ──
     case "page.aiChat": return inPage(await targetTab(args), pageAiChat, [args.op || "state", args]);
     case "chat.attach": return inPage(await targetTab(args), pageChatAttach, [args.op || "state", args]);
+    // ── 1.15.0: WhatsApp menus, reactions, forwarding, calls (Part 8, H3); Meet in-call (Part 9, M3) ──
+    case "wa.do": return inPage(await targetTab(args), pageWa, [args.op || "last", args]);
+    case "meet.do": return inPage(await targetTab(args), pageMeet, [args.op || "people", args]);
     // ── 1.14.0: the page agent's eyes and hands (Part 7, H1) ──
     case "page.snapshot": return inPage(await targetTab(args), pageSnapshot, [args.max || 120, args.textMax || 1500]);
     case "page.act": return inPage(await targetTab(args), pageAct, [args.op || "click", args]);
@@ -2035,6 +2038,195 @@ async function pageAct(op, args) {
     return {ok: true, name, checked: el.checked !== undefined ? el.checked : el.getAttribute("aria-checked") === "true"};
   }
   return {ok: false, reason: "unknown op"};
+}
+
+// 1.15.0 (H3): WhatsApp's own menus, by what they announce. ops:
+//   last                     the newest message in the open chat {from, text, out}
+//   menu {scope, name, labels, choose, press}
+//        scope "chat"    — the chat ROW's menu (Mute notifications, Pin chat, Archive chat, Mark as read…)
+//        scope "message" — the newest incoming (or any, `any`) message's menu (Reply, Forward, Star…)
+//        scope "header"  — the open chat's menu
+//        then optionally a dialog: tick `choose` ("8 hours") and press one of `press` ("Mute")
+//   react {emoji}            a reaction on the newest incoming message
+//   forward {name}           after menu Forward: select messages bar -> Forward -> pick `name`
+//   forwardSend              the forward dialog's Send
+//   call {kind}              the header's Voice call / Video call button
+async function pageWa(op, args) {
+  args = args || {};
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const low = (s) => clean(s).toLowerCase();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+  const nameOf = (el) => low([el.getAttribute("aria-label"), el.getAttribute("title"), el.getAttribute("data-icon"),
+    (el.querySelector("[data-icon]") || {getAttribute: () => ""}).getAttribute("data-icon"), el.childElementCount ? "" : el.textContent].filter(Boolean).join(" "));
+  const hover = (el) => { for (const t of ["pointerover", "pointerenter", "mouseover", "mouseenter", "mousemove"]) el.dispatchEvent(new MouseEvent(t, {bubbles: true})); };
+  const press = (el) => {
+    const r = el.getBoundingClientRect();
+    const o = {bubbles: true, cancelable: true, view: window, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+    for (const t of ["pointerdown", "mousedown", "pointerup", "mouseup"]) el.dispatchEvent(new (t.startsWith("pointer") ? PointerEvent : MouseEvent)(t, o));
+    el.click();
+  };
+  const until = async (fn, ms) => { const end = Date.now() + (ms || 1500); let v; while (!(v = fn()) && Date.now() < end) await sleep(80); return v; };
+  const head = document.querySelector("#main header span[title], #main header [dir=auto]");
+  const chat = head ? clean(head.getAttribute("title") || head.textContent) : "";
+  const bubbles = () => Array.from(document.querySelectorAll("#main [data-pre-plain-text]")).map((el) => {
+    const box = el.closest(".message-in, .message-out, [class*='message-in'], [class*='message-out'], [role=row]") || el;
+    const meta = el.getAttribute("data-pre-plain-text") || "";
+    const m = meta.match(/^\[([^,\]]+),\s*([^\]]+)\]\s*(.*?):\s*$/);
+    return {el, box, out: !!el.closest(".message-out, [class*='message-out']"), from: m ? m[3].trim() : "",
+            text: clean((el.querySelector(".selectable-text, [dir]") || el).innerText).slice(0, 300)};
+  });
+  const newest = (any) => { const list = bubbles().filter((b) => any || !b.out); return list[list.length - 1] || null; };
+  const menuItems = () => Array.from(document.querySelectorAll("[role=application] li, [role=menu] [role=menuitem], [role=menu] li, li[role=button], div[role=button][data-kayra-menu]"))
+    .filter(visible);
+  const itemName = (el) => clean(el.getAttribute("aria-label") || el.innerText || el.textContent);
+
+  if (op === "last") { const b = newest(!!args.any); return {chat, found: !!b, from: b ? b.from : "", text: b ? b.text : "", out: b ? b.out : false}; }
+  if (op === "menu") {
+    let trigger = null;
+    if (args.scope === "chat") {
+      const side = document.querySelector("#pane-side, [aria-label='Chat list'], [aria-label*='Chat list' i]");
+      const title = side && Array.from(side.querySelectorAll("span[title], div[title]")).find((e) => clean(e.getAttribute("title")) === clean(args.name));
+      if (!title) return {ok: false, reason: "chat not in the list"};
+      const row = title.closest("[role=listitem], [role=row]") || title.parentElement;
+      hover(row); await sleep(120);
+      trigger = Array.from(row.querySelectorAll("[role=button], button, span[data-icon]")).filter(visible)
+        .find((b) => /context menu|open chat|chevron|\bdown\b|more/.test(nameOf(b)));
+    } else if (args.scope === "message") {
+      const b = newest(!!args.any);
+      if (!b) return {ok: false, reason: "no message"};
+      hover(b.box); hover(b.el); await sleep(120);
+      trigger = Array.from(b.box.querySelectorAll("[role=button], button, span[data-icon]")).filter(visible)
+        .find((x) => /context menu|down-context|\bmenu\b|more/.test(nameOf(x)));
+    } else {
+      trigger = Array.from(document.querySelectorAll("#main header [role=button], #main header button")).filter(visible)
+        .find((b) => /\bmenu\b|more options/.test(nameOf(b)));
+    }
+    if (!trigger) return {ok: false, reason: "no menu button"};
+    press(trigger.closest("[role=button], button") || trigger);
+    const want = (args.labels || []).map(low);
+    const item = await until(() => menuItems().find((el) => want.some((w) => low(itemName(el)).startsWith(w))), 1500);
+    if (!item) return {ok: false, reason: "no such item", items: menuItems().map(itemName).filter(Boolean).slice(0, 12)};
+    const label = itemName(item);
+    press(item);
+    if (args.choose || (args.press && args.press.length)) {
+      const dialog = await until(() => Array.from(document.querySelectorAll("[role=dialog], [data-animate-modal-popup]")).find(visible), 1500);
+      if (!dialog) return {ok: true, item: label, dialog: false};
+      if (args.choose) {
+        const opt = Array.from(dialog.querySelectorAll("label, [role=radio], input[type=radio]"))
+          .find((el) => low(el.innerText || el.getAttribute("aria-label") || (el.labels && el.labels[0] && el.labels[0].innerText)).includes(low(args.choose)));
+        if (opt) press(opt);
+      }
+      const btn = Array.from(dialog.querySelectorAll("button, [role=button]")).filter(visible)
+        .find((b) => (args.press || []).map(low).includes(low(b.innerText || b.getAttribute("aria-label"))));
+      if (btn) press(btn);
+      return {ok: !!btn || !(args.press || []).length, item: label, dialog: true};
+    }
+    return {ok: true, item: label};
+  }
+  if (op === "react") {
+    const b = newest(false);
+    if (!b) return {ok: false, reason: "no message"};
+    hover(b.box); hover(b.el); await sleep(120);
+    const open = Array.from(b.box.querySelectorAll("[role=button], button")).filter(visible).find((x) => /\breact/.test(nameOf(x)));
+    if (open) press(open);
+    const emoji = String(args.emoji || "👍");
+    const pick = await until(() => Array.from(document.querySelectorAll("[role=dialog] [role=button], [role=dialog] button, [role=menu] [role=button], [aria-label*='reaction' i] [role=button], [role=button][aria-label]"))
+      .filter(visible).find((x) => (x.getAttribute("aria-label") || x.textContent || "").includes(emoji)), 1500);
+    if (!pick) return {ok: false, reason: "no reaction picker"};
+    press(pick);
+    return {ok: true, emoji, to: b.text};
+  }
+  if (op === "forward") {
+    const bar = await until(() => Array.from(document.querySelectorAll("#main [role=button], #main button, footer [role=button], [role=button]")).filter(visible)
+      .find((x) => /^forward\b|forward message/.test(nameOf(x)) && !x.closest("[role=application]")), 1500);
+    if (bar) press(bar);
+    const dialog = await until(() => Array.from(document.querySelectorAll("[role=dialog], [data-animate-modal-popup]")).find(visible), 2000);
+    if (!dialog) return {ok: false, reason: "no forward dialog"};
+    const box = dialog.querySelector("input, [contenteditable=true], [role=textbox]");
+    if (box) {
+      box.focus();
+      if (box.isContentEditable || !("value" in box)) document.execCommand("insertText", false, String(args.name || ""));
+      else { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(box, String(args.name || "")); box.dispatchEvent(new Event("input", {bubbles: true})); }
+    }
+    const row = await until(() => Array.from(dialog.querySelectorAll("span[title], div[title]")).filter(visible)
+      .find((e) => clean(e.getAttribute("title")) === clean(args.name)), 2500);
+    if (!row) return {ok: false, reason: "no such chat", shown: Array.from(dialog.querySelectorAll("span[title]")).map((e) => e.getAttribute("title")).slice(0, 6)};
+    press(row.closest("[role=listitem], [role=row], [role=checkbox], label") || row);
+    return {ok: true, picked: clean(args.name)};
+  }
+  if (op === "forwardSend") {
+    const dialog = Array.from(document.querySelectorAll("[role=dialog], [data-animate-modal-popup]")).find(visible) || document;
+    const send = Array.from(dialog.querySelectorAll("[role=button], button")).filter(visible).find((x) => /^send\b/.test(nameOf(x)));
+    if (!send) return {ok: false, reason: "no send button"};
+    press(send);
+    return {ok: true};
+  }
+  if (op === "call") {
+    const want = args.kind === "video" ? /video call/ : /voice call|audio call/;
+    const btn = Array.from(document.querySelectorAll("#main header [role=button], #main header button")).filter(visible).find((b) => want.test(nameOf(b)));
+    if (!btn) return {ok: false, reason: "no call button", chat};
+    press(btn);
+    return {ok: true, chat};
+  }
+  return {error: "unknown op"};
+}
+
+// 1.15.0 (M3): Google Meet in-call, by Meet's own accessible names. ops:
+//   people          who is in the call (the People panel, else the video tiles' names)
+//   react {emoji}   "Send a reaction" -> the emoji
+//   chat {text}     the in-call chat: open it, type, press Send (Kayra asks first)
+//   pin {name}      "More options for <name>" -> Pin
+async function pageMeet(op, args) {
+  args = args || {};
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+  const label = (el) => clean(el.getAttribute("aria-label") || el.getAttribute("data-tooltip") || el.innerText || "");
+  const buttons = () => Array.from(document.querySelectorAll("button, [role=button], [role=menuitem]")).filter(visible);
+  const find = (re) => buttons().find((b) => re.test(label(b)));
+  const until = async (fn, ms) => { const end = Date.now() + (ms || 1500); let v; while (!(v = fn()) && Date.now() < end) await sleep(80); return v; };
+  if (op === "people") {
+    let list = Array.from(document.querySelectorAll("[role=list][aria-label*='participant' i] [role=listitem], [aria-label='Participants'] [role=listitem]"));
+    if (!list.length) {
+      const open = find(/^(show everyone|people)\b/i);
+      if (open) { open.click(); list = await until(() => { const l = Array.from(document.querySelectorAll("[role=list][aria-label*='participant' i] [role=listitem], [aria-label='Participants'] [role=listitem]")); return l.length ? l : null; }, 2000) || []; }
+    }
+    let names = list.map((li) => clean(li.getAttribute("aria-label") || (li.innerText || "").split("\n")[0]));
+    if (!names.length) names = Array.from(document.querySelectorAll("[data-self-name], [data-participant-id] [data-tooltip], [data-participant-id] span"))
+      .map((e) => clean(e.getAttribute("data-self-name") || e.textContent)).filter((t) => t && t.length < 60);
+    return {ok: names.length > 0, people: Array.from(new Set(names.filter(Boolean))).slice(0, 40)};
+  }
+  if (op === "react") {
+    const open = find(/^send a reaction|^reactions?\b/i);
+    if (open && !find(new RegExp(String(args.emoji || "👍")))) { open.click(); await sleep(150); }
+    const emoji = await until(() => buttons().find((b) => label(b).includes(String(args.emoji || "👍")) || (args.word && new RegExp("\\b" + args.word + "\\b", "i").test(label(b)))), 1500);
+    if (!emoji) return {ok: false, reason: "no reactions here"};
+    emoji.click();
+    return {ok: true, emoji: label(emoji)};
+  }
+  if (op === "chat") {
+    let box = document.querySelector("textarea[aria-label*='message' i], [contenteditable=true][aria-label*='message' i]");
+    if (!box || !visible(box)) { const open = find(/^chat with everyone|^open chat|^chat\b/i); if (open) open.click(); box = await until(() => { const b = document.querySelector("textarea[aria-label*='message' i], [contenteditable=true][aria-label*='message' i]"); return b && visible(b) ? b : null; }, 2000); }
+    if (!box) return {ok: false, reason: "no chat box"};
+    box.focus();
+    if (box.tagName === "TEXTAREA") { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(box, String(args.text || "")); box.dispatchEvent(new Event("input", {bubbles: true})); }
+    else document.execCommand("insertText", false, String(args.text || ""));
+    const send = await until(() => buttons().find((b) => /^send( a)? message$|^send$/i.test(label(b)) && !b.disabled && b.getAttribute("aria-disabled") !== "true"), 1500);
+    if (!send) return {ok: false, reason: "no send button"};
+    send.click();
+    return {ok: true};
+  }
+  if (op === "pin") {
+    const more = find(new RegExp("^more options for " + String(args.name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+    if (!more) return {ok: false, reason: "no such person", people: buttons().map(label).filter((l) => /^more options for /i.test(l)).map((l) => l.slice(17)).slice(0, 10)};
+    more.click();
+    const pin = await until(() => buttons().find((b) => /^pin\b/i.test(label(b))), 1500);
+    if (!pin) return {ok: false, reason: "no pin item"};
+    pin.click();
+    return {ok: true, name: args.name};
+  }
+  return {error: "unknown op"};
 }
 
 function pageControls(limit) {

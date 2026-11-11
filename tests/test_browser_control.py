@@ -572,7 +572,7 @@ def section_tuning():
               web_macros.refresh_stale_extension() and ("runtime.reload", {}) in old.calls
               and not web_macros.refresh_stale_extension())
         web_macros._REFRESHED["done"] = False
-        web_macros.BRIDGE = current = Bridge(version="1.14.0")
+        web_macros.BRIDGE = current = Bridge(version="1.15.0")
         check("a current one is left alone",
               not web_macros.refresh_stale_extension() and not current.calls)
     finally:
@@ -3425,8 +3425,8 @@ def section_part_6b():
           d("reply saying I'm on my way", wa) == ["message reply saying I'm on my way"], d("reply saying I'm on my way", wa))
     check("...and goes to the classifier anywhere else (a reply may be an email)", d("reply saying I'm on my way", nowhere) is None)
     check("F5: 'send this pdf here' in front of WhatsApp", d("send this pdf here", wa) == ["message send this pdf here"])
-    check("F5: 'reply to Rahul saying hi' without WhatsApp named or in front is the classifier's call",
-          d("reply to Rahul saying hi", nowhere) is None)
+    check("F5/H4: 'reply to Rahul saying hi' with no app named or in front replies wherever Rahul last wrote (Part 10)",
+          n(d("reply to Rahul saying hi", nowhere)[0]).key == "inbox.reply")
     check("F4: a bare 'read the answer' is rules-first only with an AI site in front",
           d("read the answer", chatgpt) == ["browser read the answer"] and d("read the answer", nowhere) is None)
     check("F6: 'read the top posts' is rules-first only with Reddit in front",
@@ -3942,6 +3942,303 @@ def section_part_7():
               mode == 0o600 and learning._path(learning.ALIASES).startswith(tempfile.gettempdir()), oct(mode))
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │   PARTS 8–10 — WHATSAPP EXTRAS (H3), MEETINGS (§12 M2.2/M2.3/M3/M4.1),   │
+# │   ONE INBOX (H4)                                                         │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class WAExtras(WhatsApp11):
+    """WhatsApp at 1.15.0 with its menus: what each chat row / message / header menu offers."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.version = "1.15.0"
+        self.flags = {}                    # (chat, "pinned"/"muted"/…) -> True
+        self.done, self.forwarded, self.reacted, self.called = [], [], [], []
+        self.history["Rahul Sharma"] = [{"from": "Rahul Sharma", "text": "are you coming tonight?", "date": TODAY_MARK,
+                                         "time": "10:00", "out": False}]
+
+    def _last(self):
+        msgs = [m for m in self.history.get(self.open_chat, []) if not m.get("out")]
+        return msgs[-1] if msgs else None
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "wa.do":
+            self.calls.append((cmd, args))
+            op = args.get("op")
+            if op == "last":
+                m = self._last()
+                return {"chat": self.open_chat, "found": bool(m), "from": m["from"] if m else "", "text": m["text"] if m else "",
+                        "out": False}
+            if op == "menu":
+                want = args["labels"][0]
+                chat = args.get("name") or self.open_chat
+                kinds = {"Mute notifications": ("muted", True), "Unmute notifications": ("muted", False),
+                         "Pin chat": ("pinned", True), "Unpin chat": ("pinned", False),
+                         "Archive chat": ("archived", True), "Unarchive chat": ("archived", False),
+                         "Mark as read": ("read", True), "Mark as unread": ("read", False)}
+                if want in kinds:
+                    flag, value = kinds[want]
+                    if bool(self.flags.get((chat, flag), flag == "read")) == value:
+                        opposite = {v: k for k, v in kinds.items()}[(flag, not value)]
+                        return {"ok": False, "reason": "no such item", "items": [opposite, "Delete chat"]}
+                    self.flags[(chat, flag)] = value
+                    self.done.append((want, chat, args.get("choose")))
+                    return {"ok": True, "item": want}
+                if want in ("Reply", "Forward", "Star"):
+                    self.done.append((want, self.open_chat, None))
+                    return {"ok": bool(self._last()), "item": want}
+                return {"ok": False, "items": []}
+            if op == "react":
+                self.reacted.append(args["emoji"])
+                return {"ok": True}
+            if op == "forward":
+                self.forwarded.append(args["name"])
+                return {"ok": args["name"] in {c["name"] for c in self.chats}}
+            if op == "forwardSend":
+                return {"ok": True}
+            if op == "call":
+                self.called.append((self.open_chat, args["kind"]))
+                return {"ok": True, "chat": self.open_chat}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+class InCall(Bridge):
+    """A Meet call at 1.15.0: people, reactions, chat, pin."""
+
+    def __init__(self, people=("Ana Rao", "Ravi Kumar", "You")):
+        super().__init__(version="1.15.0", tabs=[
+            {"id": 3, "title": "Meet - abc-defg-hij", "url": "https://meet.google.com/abc-defg-hij?authuser=0", "active": True}])
+        self.people, self.sent, self.pinned, self.reactions = list(people), [], [], []
+
+    def call(self, cmd, timeout=10.0, **args):
+        if cmd == "meet.do":
+            self.calls.append((cmd, args))
+            op = args.get("op")
+            if op == "people":
+                return {"ok": True, "people": list(self.people)}
+            if op == "react":
+                self.reactions.append(args["emoji"])
+                return {"ok": True}
+            if op == "chat":
+                self.sent.append(args["text"])
+                return {"ok": True}
+            if op == "pin":
+                if args["name"] in self.people:
+                    self.pinned.append(args["name"])
+                    return {"ok": True}
+                return {"ok": False, "people": list(self.people)}
+        return super().call(cmd, timeout=timeout, **args)
+
+
+def section_parts_8_to_10():
+    check.section("[24] Parts 8–10 — WhatsApp extras (H3), in the call (§12), one inbox (H4)")
+    from kayra.automation import inbox, linux_system, workflows
+    from kayra.automation.policy import classify_action
+    d = common.direct_tokens
+    nowhere = lambda: {}
+    wa = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+    meet = lambda: {"app": "google-chrome", "tab_url": "https://meet.google.com/abc-defg-hij"}
+
+    # ── parsing ──
+    for said, screen, key, target, params in (
+            ("mute the PR group for a week", wa, "message.manage", "PR", {"op": "mute", "span": "a week"}),
+            ("mute this chat", wa, "message.manage", "current", {"op": "mute"}),
+            ("pin Mom on whatsapp", nowhere, "message.manage", "Mom", {"op": "pin"}),
+            ("archive this chat", wa, "message.manage", "current", {"op": "archive"}),
+            ("mark Rahul as read", wa, "message.manage", "Rahul", {"op": "read"}),
+            ("star the last message", wa, "message.act", "current", {"op": "star"}),
+            ("react with a thumbs up to the last message", wa, "message.act", "current", {"op": "react", "text": "👍"}),
+            ("like her last message", wa, "message.act", "current", {"op": "react", "text": "👍"}),
+            ("reply to the last message saying see you at 6", wa, "message.act", "current", {"op": "reply", "text": "see you at 6"}),
+            ("forward the last message to Rahul", wa, "message.act", "current", {"op": "forward", "to": "Rahul"}),
+            ("video call mom on whatsapp", nowhere, "message.act", "mom", {"op": "call", "text": "video"}),
+            ("block Rahul", wa, "message.manage", "refuse", {"op": "refuse"}),
+            ("delete this chat", wa, "message.manage", "refuse", {}),
+            ("who's in the call", nowhere, "meet.people", "current", {}),
+            ("send a heart in the meeting", nowhere, "meet.react", "heart", {}),
+            ("send a thumbs up", meet, "meet.react", "thumbs up", {}),
+            ("pin Ana in the call", nowhere, "meet.pin", "Ana", {}),
+            ("send in the meeting chat: running 5 min late", nowhere, "meet.message", "current", {"text": "running 5 min late"}),
+            ("copy the meeting link", nowhere, "meet.link", "current", {"to": ""}),
+            ("send the meeting link to Rahul", nowhere, "meet.link", "current", {"to": "Rahul"}),
+            ("who messaged me anywhere", nowhere, "inbox.all", "all", {}),
+            ("check all my messages", nowhere, "inbox.all", "all", {}),
+            ("reply to Rahul saying I'm on my way", nowhere, "inbox.reply", "Rahul", {"text": "I'm on my way"}),
+            ("stop telling me about new messages", nowhere, "inbox.offers", "off", {}),
+            ("tell me when I get a message", nowhere, "inbox.offers", "on", {})):
+        tokens = d(said, screen)
+        a = n(tokens[0]) if tokens else None
+        ok = a is not None and a.key == key and a.target == target and all(a.parameters.get(k) == v for k, v in params.items())
+        check(f"rules first: '{said}' -> {key} {target!r}", ok, (tokens, a and (a.key, a.target, a.parameters)))
+    for said, screen in (("mute the tab", wa), ("pin this tab", wa), ("mute my mic", wa), ("send a thumbs up", nowhere),
+                         ("call Rahul", nowhere)):
+        check(f"not WhatsApp / not Meet: '{said}'", not (d(said, screen) or [""])[0].startswith(("message ", "send a")), d(said, screen))
+    check("'reply to Rahul saying hi' with WhatsApp in front is WhatsApp's open-chat logic, not the inbox",
+          d("reply to Rahul saying hi", wa) == ["message reply to Rahul saying hi"], d("reply to Rahul saying hi", wa))
+    check("'message reply to Rahul on whatsapp saying hi' names Rahul (not 'Rahul on whatsapp')",
+          n("message reply to Rahul on whatsapp saying hi").target == "Rahul")
+    check("'meet open the chat' opens Meet's chat (it used to join a new meeting)", n("meet open the chat").key == "meet.chat")
+    check("the understanding layer cannot propose sending a file; a reaction still waits for the late yes",
+          interpreter.validate(["message send my resume to Ravi", "message react with a heart"], n, classify_action)
+          == ["message react with a heart"])
+
+    # ── Part 8: housekeeping just happens; what others see asks ──
+    with WebRig(WAExtras()) as rig:
+        r = rig.do("message mute the PR and Outreach Core Team 2026-27 group for a week")
+        check("H3: mute a chat for a week through its row menu (Mute -> 1 week -> Mute)",
+              r.ok and rig.bridge.done[-1] == ("Mute notifications", "PR and Outreach Core Team 2026-27", "1 week")
+              and r.message == "Muted PR and Outreach Core Team 2026-27 for a week.", (r.message, rig.bridge.done))
+        r = rig.do("message mute the PR and Outreach Core Team 2026-27 group")
+        check("H3: already muted -> said so (the menu offers Unmute)", r.ok and "already muted" in r.message, r.message)
+        rig.do("message open rahul sharma")
+        for token, said in (("message pin this chat", "Pinned Rahul Sharma."), ("message archive this chat", "Archived Rahul Sharma."),
+                            ("message mark this chat as unread", "Marked Rahul Sharma as unread.")):
+            r = rig.do(token)
+            check(f"H3: '{token}'", r.ok and r.message == said, r.message)
+        r = rig.do("message star the last message")
+        check("H3: star the newest message from them, said back", r.ok and "are you coming tonight" in r.message, r.message)
+        r = rig.do("message block rahul")
+        check("H3: blocking, deleting, clearing and leaving are never done by voice", r.status == Status.UNSUPPORTED
+              and "yours to do" in r.message, r.message)
+        r = rig.do("message react with a heart to the last message")
+        check("H3: a reaction ASKS, naming the message and the chat", r.status == Status.NEEDS_CONFIRMATION
+              and r.message == "React ❤️ to Rahul Sharma's \"are you coming tonight?\" in Rahul Sharma?"
+              and not rig.bridge.reacted, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("H3: ...yes reacts", rig.bridge.reacted == ["❤️"] and said == "Reacted ❤️.", said)
+        r = rig.do("message reply to the last message saying yes, at 7")
+        check("H3: a quote-reply asks first", r.status == Status.NEEDS_CONFIRMATION and "with \"yes, at 7\"" in r.message, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("H3: ...yes opens Reply on that message, types, sends",
+              ("Reply", "Rahul Sharma", None) in rig.bridge.done and rig.bridge.sent[-1] == "yes, at 7" and said == "Replied in Rahul Sharma.",
+              (said, rig.bridge.sent))
+        r = rig.do("message forward the last message to rahul verma")
+        check("H3: forward asks, naming the RESOLVED target chat", r.status == Status.NEEDS_CONFIRMATION
+              and r.message.endswith("to Rahul Verma?"), r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("H3: ...yes forwards to exactly that chat", rig.bridge.forwarded == ["Rahul Verma"] and said == "Forwarded to Rahul Verma.", said)
+        r = rig.do("message video call rahul sharma")
+        check("H3: a call asks first", r.status == Status.NEEDS_CONFIRMATION and r.message ==
+              "Start a WhatsApp video call with Rahul Sharma?" and not rig.bridge.called, r.message)
+        linux.resolve_confirmation("no")
+        check("H3: ...no rings nobody", not rig.bridge.called)
+        rig.do("message react with a thumbs up to the last message")
+        rig.bridge.history["Rahul Sharma"].append({"from": "Rahul Sharma", "text": "never mind", "date": TODAY_MARK,
+                                                   "time": "10:05", "out": False})
+        ok, said = linux.resolve_confirmation("yes")
+        check("H3: a newer message arrived before yes -> nothing reacted", rig.bridge.reacted == ["❤️"] and "newer message" in said, said)
+    with WebRig(WAExtras()) as rig:
+        rig.bridge.version = "1.14.0"
+        rig.do("message mute this chat")
+        check("H3: an extension older than 1.15.0 is updated, never sent wa.do", "wa.do" not in rig.bridge.cmds())
+
+    # ── Part 9: in the call ──
+    with WebRig(InCall()) as rig:
+        r = rig.do("who's in the call")
+        check("M3: who's in the call", r.ok and r.message == "3 in the call: Ana Rao, Ravi Kumar and You.", r.message)
+        r = rig.do("send a heart in the meeting")
+        check("M3: a reaction (no question — like raising a hand)", r.ok and rig.bridge.reactions == ["💖"], r.message)
+        r = rig.do("pin Ana Rao in the call")
+        check("M3: pin a person", r.ok and rig.bridge.pinned == ["Ana Rao"], r.message)
+        r = rig.do("pin Zed in the call")
+        check("M3: someone not in the call is said so, naming who is", not r.ok and "Ana Rao" in r.message, r.message)
+        r = rig.do("send in the meeting chat: running 5 min late")
+        check("M3: the meeting chat ASKS (everyone reads it)", r.status == Status.NEEDS_CONFIRMATION and not rig.bridge.sent, r.message)
+        ok, said = linux.resolve_confirmation("yes")
+        check("M3: ...yes sends it", rig.bridge.sent == ["running 5 min late"], said)
+        r = rig.do("copy the meeting link")
+        copied = [a for a in rig.runner.ran if a[0][:1] == ["wl-copy"]]
+        check("M3: copy the meeting link (without ?authuser…)", r.ok and copied and copied[-1][0][-1] ==
+              "https://meet.google.com/abc-defg-hij", copied)
+    with WebRig(Bridge(version="1.15.0", tabs=[{"id": 1, "title": "Gmail", "url": "https://mail.google.com/"}])) as rig:
+        r = rig.do("who's in the call")
+        check("M3: not in a call -> said so", r.status == Status.NOT_FOUND, r.message)
+
+    # M2.2 — what is on the screen about to be shared
+    monitors = [{"name": "eDP-1", "id": 0, "x": 0, "y": 0, "width": 2000, "height": 1200, "focused": True,
+                 "activeWorkspace": {"id": 1}},
+                {"name": "HDMI-A-1", "id": 1, "x": 2000, "y": 0, "width": 1920, "height": 1080, "focused": False,
+                 "activeWorkspace": {"id": 2}}]
+    hypr = FakeHyprland([client("0xa", "chrome-web.whatsapp.com__-Default", "WhatsApp", workspace=1),
+                         client("0xb", "Bitwarden", "Bitwarden", workspace=1),
+                         client("0xc", "code", "notes.py - Code", workspace=2)], monitors=monitors)
+    with WebRig(Bridge(), hypr=hypr) as rig:
+        r = rig.do("meet share my screen")
+        check("M2.2: sharing the whole screen names the private apps open on it",
+              r.status == Status.NEEDS_CONFIRMATION and "WhatsApp and Bitwarden are open on that screen." in r.message, r.message)
+        linux.resolve_confirmation("no")
+        r = rig.do("meet share my second screen")
+        check("M2.2: ...a screen with nothing private on it gets no warning",
+              r.status == Status.NEEDS_CONFIRMATION and "open on that screen" not in r.message, r.message)
+        linux.resolve_confirmation("no")
+        r = rig.do("meet share the code window")
+        check("M2.2: sharing ONE window never warns about other windows", "open on that screen" not in r.message, r.message)
+        linux.resolve_confirmation("no")
+    saved = dict(web_macros._SHARE_STATE)
+    web_macros._SHARE_STATE["what"] = "your entire screen"
+    try:
+        check("M2.3: while Kayra's share is on, unprompted speech waits (in_call is true)", workflows.in_call())
+    finally:
+        web_macros._SHARE_STATE.clear()
+        web_macros._SHARE_STATE.update(saved)
+
+    # ── Part 10: one inbox ──
+    saved_notes = list(linux_system._NOTES["items"])
+    saved_state = (dict(inbox.STATE), inbox.CLOCK)
+    linux_system._NOTES["items"].clear()
+    inbox.STATE.update(messages=None, offered={}, times=[])
+    before = len(common.ANNOUNCED)
+    try:
+        linux_system.note_notification("Telegram Desktop", "Ana Rao", "the slides are ready")
+        linux_system.note_notification("Slack", "Dev team", "build is green")
+        linux_system.note_notification("Google Chrome", "Ravi Kumar", "mail.google.com\nInternship offer")
+        with WebRig(WAExtras()) as rig:
+            rig.bridge.tabs.append({"id": 9, "title": "Inbox (3) - me - Gmail", "url": "https://mail.google.com/mail/u/0/"})
+            r = rig.do("who messaged me anywhere")
+            check("H4: one sentence across WhatsApp (open), Gmail (open) and the notification log",
+                  r.ok and r.message.startswith("WhatsApp: PR and Outreach Core Team 2026-27 (5) and Rahul Verma (2). Gmail: 3 unread.")
+                  and "Telegram: Ana Rao" in r.message and "Slack: Dev team" in r.message, r.message)
+            r = rig.do("reply to ana saying thanks")
+            check("H4: Ana last wrote on Telegram -> said honestly, nothing sent", r.status == Status.UNSUPPORTED
+                  and "came from Telegram" in r.message, r.message)
+            r = rig.do("reply to rahul verma saying on my way")
+            check("H4: Rahul's chat is in WhatsApp -> the normal WhatsApp send, which asks naming the chat",
+                  r.status == Status.NEEDS_CONFIRMATION and r.message == "Send \"on my way\" to Rahul Verma?", r.message)
+            linux.resolve_confirmation("no")
+            r = rig.do("reply to zed saying hi")
+            check("H4: nobody of that name anywhere -> asks which app", r.status == Status.NOT_FOUND and "which app" in r.message, r.message)
+        with WebRig(Bridge(version="1.15.0", tabs=[{"id": 1, "title": "Docs", "url": "https://docs.google.com/"}])) as rig:
+            linux_system._NOTES["items"].clear()
+            r = rig.do("who messaged me anywhere")
+            check("H4: nothing anywhere, and WhatsApp is NOT opened to look", r.ok and r.message.startswith("Nothing new")
+                  and "chat.list" not in rig.bridge.cmds() and not rig.bridge.opened(), r.message)
+        # notifications as they arrive
+        inbox.CLOCK = lambda: 1000.0
+        line = inbox.on_notification({"app": "Telegram Desktop", "summary": "Ana Rao", "body": "secret text", "at": 1000})
+        check("H4: a new message is offered by sender and app — never its text", line == "Ana Rao messaged on Telegram."
+              and common.ANNOUNCED[-1] == line and "secret" not in common.ANNOUNCED[-1])
+        check("H4: the same sender is not offered again within 10 minutes",
+              inbox.on_notification({"app": "Telegram Desktop", "summary": "Ana Rao", "body": "again"}) is None)
+        with WebRig(Bridge()) as rig:
+            rig.do("stop telling me about new messages")
+        check("H4: 'stop telling me about new messages' turns the offers off",
+              inbox.on_notification({"app": "Signal", "summary": "Meera", "body": "hi"}) is None)
+        line = inbox.on_notification({"app": "Google Chrome", "summary": "Standup", "body": "calendar.google.com\n10:00 – 10:15"})
+        check("M4.1: a calendar reminder offers to join (message offers being off does not silence meetings)",
+              line == "Standup is starting. Say \"join my next meeting\".", line)
+        inbox.STATE["messages"] = True
+        for i in range(10):
+            inbox.on_notification({"app": "Signal", "summary": f"Person {i}", "body": "x"})
+        check("H4: at most six offers an hour", len([a for a in common.ANNOUNCED[before:] if "messaged on" in a]) <= 6
+              and len(inbox.STATE["times"]) <= inbox.OFFERS_PER_HOUR)
+    finally:
+        linux_system._NOTES["items"][:] = saved_notes
+        inbox.STATE.clear()
+        inbox.STATE.update(saved_state[0])
+        inbox.CLOCK = saved_state[1]
+
+
 def policy_classify(token):
     from kayra.automation.policy import classify_action
     return str(getattr(classify_action(n(token))[0], "name", classify_action(n(token))[0])).upper()
@@ -3970,6 +4267,7 @@ def main():
         section_part_6()
         section_part_6b()
         section_part_7()
+        section_parts_8_to_10()
         real = os.path.join(ROOT, "logs", "automation.log")
         size_before = os.path.getsize(real) if os.path.exists(real) else None
         section_meetings()

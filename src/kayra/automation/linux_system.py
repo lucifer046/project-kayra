@@ -605,10 +605,12 @@ def shlex_quote(text):
 # 50 in RAM (never on disk). Started by `start_notification_log()`, stopped at shutdown —
 # the ONE child process Kayra keeps, and it is reaped by its own handle, never by name.
 
-_NOTES = {"process": None, "items": [], "lock": threading.Lock(), "read_at": 0.0}
+_NOTES = {"process": None, "items": [], "lock": threading.Lock(), "read_at": 0.0, "listener": None}
 
 
-def start_notification_log():
+def start_notification_log(listener=None):
+    """`listener(note)` hears every new notification (Parts 9-10: meeting reminders, message offers)."""
+    _NOTES["listener"] = listener
     L = _L()
     if _NOTES["process"] is not None or not L._have("dbus-monitor"):
         return False
@@ -659,9 +661,16 @@ def _note_from(strings):
     app, summary, body = strings[0], strings[2], strings[3]
     if app.lower() in ("kayra",):
         return
+    note = {"app": app, "summary": summary, "body": body, "at": time.time()}
     with _NOTES["lock"]:
-        _NOTES["items"].append({"app": app, "summary": summary, "body": body, "at": time.time()})
+        _NOTES["items"].append(note)
         del _NOTES["items"][:-50]
+    listener = _NOTES.get("listener")
+    if listener is not None:
+        try:
+            listener(dict(note))
+        except Exception:
+            pass
 
 
 def note_notification(app, summary, body=""):

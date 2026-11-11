@@ -327,6 +327,23 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — round 5, parts 8–10: WhatsApp extras, in the call, one inbox (extension 1.15.0)
+
+- **WhatsApp (H3)**: "mute the PR group for a week", "pin Mom", "archive this chat", "mark Rahul as
+  read", "star the last message" just happen ("already pinned" is said); "react with a heart to the
+  last message", "reply to the last message saying …", "forward the last message to Rahul",
+  "video call Mom on WhatsApp" ask first, naming the chat and the message, and re-check both on yes.
+  Block / report / clear / delete / leave are refused by voice.
+- **Meet (§12)**: "who's in the call", "send a heart", "pin Ana in the call", "send in the meeting
+  chat: …" (asks), "copy the meeting link", "send the meeting link to Rahul" (asks). A whole-screen
+  share question names private apps open on that screen; unprompted speech waits while Kayra's
+  share is on; Calendar's reminder notification becomes "Standup is starting. Say join my next meeting."
+- **One inbox (H4)**: "who messaged me anywhere" (open WhatsApp + Gmail's unread count + the
+  notification log; nothing is opened to look), "reply to Rahul saying …" in the app his last
+  message came from, "Ana messaged on Telegram." as messages arrive (sender and app only; "stop
+  telling me about new messages").
+- Tests: `test_browser_control.py` [24], `test_browser_extension.py` [13], `test_dmm_browser.py` +9 (129/129).
+
 ### 2026-11-11 — round 5, part 7: the page agent, recipes, learning what you mean (extension 1.14.0)
 
 - **Page agent** (`automation/page_agent.py`): "on this page, find the cheapest flight", "figure out

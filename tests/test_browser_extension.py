@@ -346,6 +346,68 @@ AGENT_PAGE = """<html><head><title>Flights</title></head><body>
 </main></body></html>"""
 
 
+WA_MENUS = """<html><head><meta charset=utf-8><title>WhatsApp</title></head><body><div id=app>
+<div id=pane-side aria-label="Chat list">
+ <div role=listitem><span title="Rahul Sharma">Rahul Sharma</span>
+  <div role=button aria-label="Open chat context menu" style="width:20px;height:20px" onclick="menu(['Archive chat','Mute notifications','Pin chat','Mark as unread'])">v</div></div>
+</div>
+<div id=main><header><span title="Rahul Sharma">Rahul Sharma</span>
+ <div role=button aria-label="Video call" onclick="document.title='video-call'">V</div>
+ <div role=button aria-label="Voice call" onclick="document.title='voice-call'">A</div>
+ <div role=button aria-label="Menu" onclick="menu(['Contact info','Mute notifications','Close chat'])">:</div></header>
+ <div class="message-in" role=row><div data-pre-plain-text="[10:00, 11/11/2026] Rahul Sharma: "><span class="selectable-text">are you coming tonight?</span></div>
+  <div role=button aria-label="Context menu" style="width:20px;height:20px" onclick="menu(['Reply','React','Forward','Star'])">v</div>
+  <div role=button aria-label="React" style="width:20px;height:20px" onclick="reactions()">:)</div></div>
+ <div class="message-out" role=row><div data-pre-plain-text="[10:01, 11/11/2026] You: "><span class="selectable-text">mine</span></div></div>
+ <footer><div contenteditable=true role=textbox aria-label="Type a message"></div></footer></div></div>
+<script>
+function menu(items) {
+  const old = document.getElementById('menu'); if (old) old.remove();
+  const m = document.createElement('div'); m.id = 'menu'; m.setAttribute('role', 'application');
+  m.innerHTML = '<ul>' + items.map((i) => '<li><div aria-label="' + i + '">' + i + '</div></li>').join('') + '</ul>';
+  document.body.appendChild(m);
+  m.querySelectorAll('li').forEach((li) => li.addEventListener('click', () => {
+    document.title = 'picked:' + li.innerText; m.remove();
+    if (li.innerText === 'Mute notifications') dialog();
+    if (li.innerText === 'Forward') { const b = document.createElement('div'); b.setAttribute('role', 'button');
+      b.setAttribute('aria-label', 'Forward'); b.textContent = 'fwd'; b.onclick = forwardDialog; document.getElementById('main').appendChild(b); }
+  }));
+}
+function dialog() {
+  const d = document.createElement('div'); d.setAttribute('role', 'dialog');
+  d.innerHTML = '<label><input type=radio name=t> 8 hours</label><label><input type=radio name=t id=wk> 1 week</label>' +
+                '<label><input type=radio name=t> Always</label><button>Cancel</button><button>Mute</button>';
+  d.querySelectorAll('button')[1].onclick = () => { document.title = 'muted:' + (document.getElementById('wk').checked ? 'week' : 'other'); d.remove(); };
+  document.body.appendChild(d);
+}
+function reactions() {
+  const d = document.createElement('div'); d.setAttribute('role', 'dialog');
+  d.innerHTML = '<div role=button aria-label="👍">👍</div><div role=button aria-label="❤️">❤️</div>';
+  d.querySelectorAll('[role=button]').forEach((b) => b.onclick = () => { document.title = 'reacted:' + b.textContent; d.remove(); });
+  document.body.appendChild(d);
+}
+function forwardDialog() {
+  const d = document.createElement('div'); d.setAttribute('role', 'dialog');
+  d.innerHTML = '<input aria-label="Search"><div role=listitem><span title="Mom">Mom</span></div>' +
+                '<div role=listitem><span title="Rahul Verma">Rahul Verma</span></div><div role=button aria-label="Send">send</div>';
+  d.querySelectorAll('[role=listitem]').forEach((r) => r.onclick = () => { document.title = 'to:' + r.innerText; });
+  d.querySelector('[aria-label=Send]').onclick = () => { document.title += '|sent'; d.remove(); };
+  document.body.appendChild(d);
+}
+</script></body></html>"""
+
+MEET_CALL = """<html><head><meta charset=utf-8><title>Meet - abc-defg-hij</title></head><body>
+<div role=list aria-label="Participants"><div role=listitem aria-label="Ana Rao">Ana Rao</div><div role=listitem aria-label="Ravi Kumar">Ravi Kumar</div></div>
+<button aria-label="Send a reaction" onclick="document.getElementById('emo').style.display='block'">R</button>
+<div id=emo style="display:none"><button aria-label="💖" onclick="document.title='reaction:heart'">h</button><button aria-label="👍">t</button></div>
+<button aria-label="More options for Ana Rao" onclick="document.getElementById('pinmenu').style.display='block'">...</button>
+<div id=pinmenu style="display:none"><div role=menuitem onclick="document.title='pinned'">Pin to screen</div></div>
+<button aria-label="Chat with everyone" onclick="document.getElementById('chat').style.display='block'">C</button>
+<div id=chat style="display:none"><textarea aria-label="Send a message"></textarea>
+<button aria-label="Send a message" onclick="document.title='said:' + document.querySelector('textarea').value">S</button></div>
+</body></html>"""
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     depth, opened = 0, SOURCE.index("{", start)
@@ -829,6 +891,40 @@ def main():
         check("H1: click by id", r["ok"] and d.title == "searched:Goa", d.title)
         check("H1: an id that does not exist is reported", act("click", {"id": 9999})["reason"] == "no such element")
         check("H1: scroll moves the page or the long box in it", act("scroll", {"direction": "down"})["ok"] is True)
+
+        check.section("[13] Parts 8–9 — WhatsApp menus, reactions, forwarding, calls; Meet in-call")
+        wa = lambda op, args=None: d.execute_script(f"return (async {function('pageWa')}).apply(null, arguments)", op, args or {})
+        d.get("data:text/html;base64," + base64.b64encode(WA_MENUS.encode()).decode())
+        r = wa("last")
+        check("H3: the newest message FROM THEM (not mine)", r["found"] and r["text"] == "are you coming tonight?"
+              and r["from"] == "Rahul Sharma" and not r["out"], r)
+        r = wa("menu", {"scope": "chat", "name": "Rahul Sharma", "labels": ["Mute notifications"], "choose": "1 week", "press": ["Mute"]})
+        check("H3: the chat row's menu -> Mute notifications -> 1 week -> Mute", r["ok"] and d.title == "muted:week", (r, d.title))
+        r = wa("menu", {"scope": "chat", "name": "Rahul Sharma", "labels": ["Unpin chat"]})
+        check("H3: an item the menu doesn't offer lists what it does (so 'already pinned' can be said)",
+              not r["ok"] and "Pin chat" in r["items"], r)
+        d.execute_script("const m = document.getElementById('menu'); if (m) m.remove();")
+        r = wa("menu", {"scope": "message", "labels": ["Star", "Star message"]})
+        check("H3: the newest message's own menu -> Star", r["ok"] and d.title == "picked:Star", (r, d.title))
+        r = wa("react", {"emoji": "❤️"})
+        check("H3: a reaction on the newest message", r["ok"] and d.title == "reacted:❤️", (r, d.title))
+        wa("menu", {"scope": "message", "labels": ["Forward"]})
+        r = wa("forward", {"name": "Rahul Verma"})
+        check("H3: forward: the Forward bar, the picker, the RIGHT chat", r["ok"] and d.title == "to:Rahul Verma", (r, d.title))
+        r = wa("forwardSend")
+        check("H3: ...and the picker's own Send", r["ok"] and d.title.endswith("|sent"), d.title)
+        r = wa("call", {"kind": "video"})
+        check("H3: the header's Video call button", r["ok"] and d.title == "video-call", d.title)
+        mt = lambda op, args=None: d.execute_script(f"return (async {function('pageMeet')}).apply(null, arguments)", op, args or {})
+        d.get("data:text/html;base64," + base64.b64encode(MEET_CALL.encode()).decode())
+        r = mt("people")
+        check("M3: who's in the call, from the People list", r["people"] == ["Ana Rao", "Ravi Kumar"], r)
+        r = mt("react", {"emoji": "💖"})
+        check("M3: Send a reaction -> the emoji", r["ok"] and d.title == "reaction:heart", (r, d.title))
+        r = mt("pin", {"name": "Ana Rao"})
+        check("M3: More options for <name> -> Pin", r["ok"] and d.title == "pinned", (r, d.title))
+        r = mt("chat", {"text": "running late"})
+        check("M3: the in-call chat: opened, typed, sent", r["ok"] and d.title == "said:running late", (r, d.title))
     finally:
         d.quit()
     return check.finish()

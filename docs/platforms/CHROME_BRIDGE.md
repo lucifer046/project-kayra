@@ -146,6 +146,11 @@ anywhere else; one is never needed for an unpacked extension.
 | (after "Do you mean A or B?") "the second one", "the core team one", "neither" | answers the question; a WhatsApp name you pick is remembered for next time |
 | "no, the other one" (right after Kayra opened a chat) | opens the other match and remembers |
 | "what have you learned about me", "forget that", "forget everything about WhatsApp", "forget everything you learned" | what Kayra learned, shown and forgotten (the last one asks first) |
+| "mute the PR group for a week", "pin Mom", "archive this chat", "mark Rahul as read", "star the last message" | (1.15.0) WhatsApp's own menus; done at once |
+| "react with a heart to the last message", "reply to the last message saying …", "forward the last message to Rahul", "video call Mom on WhatsApp" | **ask first**, naming the chat and the message; blocking, deleting, clearing and leaving are never done by voice |
+| "who's in the call", "send a heart", "pin Ana in the call", "copy the meeting link" | Meet, in the call |
+| "send in the meeting chat: running late", "send the meeting link to Rahul" | **ask first** |
+| "who messaged me anywhere", "reply to Rahul saying I'm on my way", "stop telling me about new messages" | one inbox across WhatsApp, Gmail and your desktop notifications; a reply goes to the app his last message came from |
 | "add this to cart", "buy it now", "checkout" | **refused** (decision D1, 2026-11-11): Kayra searches and opens products only; the cart and paying are yours |
 
 Without the extension, Gmail drafts, calendar events and navigation still open by URL; the

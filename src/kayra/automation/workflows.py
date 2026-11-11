@@ -693,7 +693,14 @@ def explain_last(text=""):
 
 
 def in_call():
-    """True when a call is likely running: a non-Kayra app is recording from the microphone."""
+    """True when a call is likely running: a non-Kayra app is recording from the microphone, or
+    Kayra started a screen share that is still on (M2.3 — nothing unprompted on a shared screen)."""
+    try:
+        from kayra.automation import web_macros
+        if web_macros._SHARE_STATE.get("what"):
+            return True
+    except Exception:
+        pass
     L = _L()
     code, text = L._run("pactl", "-f", "json", "list", "source-outputs", timeout=2.0)
     if code != 0:
