@@ -346,7 +346,7 @@ def install_dependencies(python_exe):
 
 IMPORT_GROUPS = [
     ("Core",       ["dotenv", "rich", "requests", "psutil"]),
-    ("LLM",        ["openai", "cohere"]),
+    ("LLM",        ["openai", "anthropic"]),
     ("Speech-out", ["kokoro_onnx", "sounddevice", "numpy"]),
     ("Speech-in",  ["selenium", "mtranslate"]),
     ("Search",     ["ddgs", "bs4"]),
@@ -1200,6 +1200,15 @@ def read_env(path):
     return values
 
 
+def _owner_only(path):
+    """`.env` holds API keys: readable by its owner only on POSIX (0600)."""
+    if os.name == "posix":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def ensure_env_file():
     """
     Creates `.env` from `.env.example` when it is absent.
@@ -1215,6 +1224,7 @@ def ensure_env_file():
         fail(".env.example is missing; cannot create a starter .env.")
         return False
     shutil.copyfile(ENV_EXAMPLE, ENV_FILE)
+    _owner_only(ENV_FILE)
     ok("Created .env from .env.example.")
     return True
 
@@ -1253,6 +1263,7 @@ def set_env_values(updates):
 
     with open(ENV_FILE, "w", encoding="utf-8") as handle:
         handle.write("\n".join(output).rstrip() + "\n")
+    _owner_only(ENV_FILE)
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1318,36 +1329,27 @@ def configure_models():
     if local_available:
         ok("Local LLM server detected. Kayra will route chat AND intent classification there.")
         info("No cloud API keys are required for this configuration.")
-        cloud_state = {"required": False, "cohere": bool(env.get("CohereAPIKey", "").strip()
-                                                         and "your_" not in env.get("CohereAPIKey", "")),
-                       "chat": _has_chat_key(env)}
+        cloud_state = {"required": False, "chat": _has_chat_key(env)}
         return local_available, cloud_state
 
     if force_online:
         info("Cloud routing is forced on.")
     else:
         warn("No local LLM server is running.")
-    info("Kayra will use the cloud path: Cohere for intent, Groq (or Gemini) for chat.")
+    info("Kayra will use the cloud path: Claude, then Groq, then Gemini — for both intent")
+    info("classification and conversation. ONE key is enough; more keys are fallbacks.")
 
     updates = {}
 
-    # Intent classification: Cohere only, no fallback. Without it every query degrades to
-    # plain conversation and no automation can ever be triggered.
-    if not _key_present(env, "CohereAPIKey"):
-        info("")
-        info("Cohere powers intent classification. Without it, Kayra can still chat but")
-        info("cannot run any commands. Free key: https://dashboard.cohere.com/api-keys")
-        value = ask_secret("Cohere API key (blank to skip)")
-        if value:
-            updates["CohereAPIKey"] = value
-    else:
-        ok("Cohere API key: SET")
-
-    # Chat generation: Groq primary, Gemini fallback. At least one is required.
     if not _has_chat_key(env):
         info("")
-        info("A chat model is required. Groq is the primary; Gemini is the fallback.")
-        info("Free keys: https://console.groq.com/keys  |  https://aistudio.google.com/apikey")
+        info("Claude Haiku is the fastest choice. It needs an API key from")
+        info("https://console.anthropic.com (pay-as-you-go; a claude.ai subscription does not")
+        info("include API access). Groq and Gemini have free keys:")
+        info("https://console.groq.com/keys  |  https://aistudio.google.com/apikey")
+        claude = ask_secret("Claude API key (blank to skip)")
+        if claude:
+            updates["CLAUDE_API_KEY"] = claude
         groq = ask_secret("Groq API key (blank to skip)")
         if groq:
             updates["GROQ_API_KEY"] = groq
@@ -1355,7 +1357,7 @@ def configure_models():
         if gemini:
             updates["GEMINI_API_KEY"] = gemini
     else:
-        ok("Chat API key: SET")
+        ok("Cloud model key: SET")
 
     # Real-time search and deep research use DuckDuckGo, which needs no credentials — so
     # nothing is asked for them.
@@ -1366,53 +1368,110 @@ def configure_models():
         ok(f"Saved {len(updates)} value(s) to .env.")
 
     env = read_env(ENV_FILE)
-    return False, {"required": True,
-                   "cohere": _key_present(env, "CohereAPIKey"),
-                   "chat": _has_chat_key(env)}
+    return False, {"required": True, "chat": _has_chat_key(env)}
 
 
 def _key_present(env, name):
     """True when a key is set to something that is not the placeholder from .env.example."""
     value = (env.get(name) or "").strip()
-    return bool(value) and "your_" not in value.lower() and value.lower() != "none"
+    return (bool(value) and "your_" not in value.lower() and "sk-ant-your" not in value.lower()
+            and value.lower() != "none")
 
 
 def _has_chat_key(env):
-    return _key_present(env, "GROQ_API_KEY") or _key_present(env, "GEMINI_API_KEY")
+    """Any cloud key: every provider both classifies intent and converses."""
+    return any(_key_present(env, name) for name in
+               ("CLAUDE_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"))
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                     7. MODEL ASSETS                                    │
 # └────────────────────────────────────────────────────────────────────────┘
 
+FAST_VOICE_FILE = "kokoro-v1.0.fp16.onnx"
+FAST_VOICE_URL = ("https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+                  "model-files-v1.0/kokoro-v1.0.fp16.onnx")
+FAST_VOICE_SHA256 = "c1610a859f3bdea01107e73e50100685af38fff88f5cd8e5c56df109ec880204"
+FAST_VOICE_BYTES = 177_464_787
+VOICE_MODEL_FILES = (FAST_VOICE_FILE, "kokoro-v1.0.onnx", "kokoro-v1.0.int8.onnx", "kokoro.onnx")
+VOICE_DATA_FILES = ("voices-v1.0.bin", "voices.bin")
+
+
+def _sha256(path):
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_fast_voice_model():
+    """
+    Fetches the half-precision Kokoro graph (177 MB) into models/. True when it is installed.
+    The file is written beside its target as `.part`, checked against a pinned SHA-256, and
+    only then renamed — so an interrupted download or a captive-portal page is never loaded.
+    """
+    import urllib.request
+    target = os.path.join(MODELS_DIR, FAST_VOICE_FILE)
+    partial = target + ".part"
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    try:
+        with urllib.request.urlopen(FAST_VOICE_URL, timeout=60) as response, \
+                open(partial, "wb") as handle:
+            shutil.copyfileobj(response, handle)
+        if _sha256(partial) != FAST_VOICE_SHA256:
+            raise ValueError("the download does not match the expected file")
+        os.replace(partial, target)
+    except Exception as exc:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        fail(f"Could not download {FAST_VOICE_FILE}: {type(exc).__name__}: {exc}")
+        info(f"    Download manually: {FAST_VOICE_URL}  ->  models/{FAST_VOICE_FILE}")
+        return False
+    ok(f"Downloaded {FAST_VOICE_FILE}.")
+    return True
+
+
 def check_models():
     """
-    Reports which speech model files are present.
+    Reports which speech model files are present, and offers the fast one when it is missing.
 
-    Nothing is downloaded automatically: these are hundreds of megabytes, and a setup script
-    that silently pulls that much data over someone's connection is not being helpful.
+    WHICH FILE IS FAST was measured on the reference laptop (2026-11-10) and is the opposite of
+    what this script said for months: the float graphs synthesize ~5x faster than real time on
+    a processor and ~25x on an NVIDIA GPU, while the quantized int8 graph runs at roughly real
+    time on either. `models/kokoro.onnx` as shipped in the repository IS that int8 file.
+
+    A 177 MB download is asked about, never taken silently.
     """
     step("Checking speech model assets")
-    if not os.path.isdir(MODELS_DIR):
-        warn(f"models/ does not exist ({MODELS_DIR}).")
+    present = [name for name in VOICE_MODEL_FILES
+               if os.path.isfile(os.path.join(MODELS_DIR, name))]
+    voices = any(os.path.isfile(os.path.join(MODELS_DIR, name)) for name in VOICE_DATA_FILES)
+
+    if voices and (FAST_VOICE_FILE in present or "kokoro-v1.0.onnx" in present):
+        ok("Fast Kokoro model present (float graph).")
+        return "fast"
+    if not voices:
+        fail("No Kokoro voice data (voices-v1.0.bin) found in models/.")
         _print_model_help()
         return "missing"
 
-    quantized = (os.path.join(MODELS_DIR, "kokoro-v1.0.int8.onnx"),
-                 os.path.join(MODELS_DIR, "voices-v1.0.bin"))
-    full = (os.path.join(MODELS_DIR, "kokoro.onnx"),
-            os.path.join(MODELS_DIR, "voices.bin"))
-
-    if all(os.path.exists(p) for p in quantized):
-        ok("Quantized Kokoro model present (fastest speech synthesis).")
+    if present:
+        ok("Quantized Kokoro model present.")
+        warn("It synthesizes at roughly real time. The half-precision model is about 5x "
+             "faster on the processor and 25x on an NVIDIA GPU.")
+    else:
+        warn("No Kokoro model found in models/.")
+    info(f"    {FAST_VOICE_FILE} is {FAST_VOICE_BYTES // 1_000_000} MB, from the kokoro-onnx "
+         "releases on GitHub.")
+    if ask_yes_no("Download it now for fast speech?", default=True) \
+            and download_fast_voice_model():
+        return "fast"
+    if present:
         return "quantized"
-    if all(os.path.exists(p) for p in full):
-        ok("Full-precision Kokoro model present.")
-        warn("The quantized model (kokoro-v1.0.int8.onnx + voices-v1.0.bin) synthesizes "
-             "several times faster at effectively identical quality.")
-        _print_model_help()
-        return "full"
-
     fail("No usable Kokoro voice model found in models/.")
     _print_model_help()
     return "missing"
@@ -1482,7 +1541,7 @@ def ensure_hand_model(python_exe):
 
 def _print_model_help():
     info("    Download from: https://github.com/thewh1teagle/kokoro-onnx/releases")
-    info("    Place kokoro-v1.0.int8.onnx and voices-v1.0.bin into models/")
+    info("    Place kokoro-v1.0.fp16.onnx and voices-v1.0.bin into models/")
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1592,6 +1651,44 @@ def _linux_automation_summary():
         return "missing " + ", ".join(missing)
     return ("ready (Hyprland)" if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
             else "ready (no window management outside Hyprland)")
+
+
+def offer_share_picker(python_exe):
+    """
+    Hyprland only: offer Kayra's screen-share picker, which lets "share the LM Studio window"
+    pick that window itself (BROWSER_CONTROL_PLAN §12, M1.1). It wraps whatever picker is
+    configured now, so manual sharing is unchanged; `python -m kayra.automation.share_picker
+    uninstall` puts the old line back. Asked, never done silently. Returns a status word.
+    """
+    if not sys.platform.startswith("linux") or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "n/a"
+    step("Checking screen sharing by name (Hyprland)")
+    env = dict(os.environ, PYTHONPATH=os.path.join(PROJECT_ROOT, "src"))
+
+    def helper(verb):
+        done = subprocess.run([python_exe, "-m", "kayra.automation.share_picker", verb],
+                              capture_output=True, text=True, env=env, cwd=PROJECT_ROOT)
+        return done.returncode, (done.stdout or "").strip()
+
+    code, state = helper("status")
+    if code != 0:
+        warn("Could not check the screen-share picker.")
+        return "unknown"
+    if state.startswith("installed"):
+        ok("Kayra's share picker is set: \"share the <app> window\" picks that window.")
+        return "installed"
+    if state.startswith("no-portal"):
+        info("xdg-desktop-portal-hyprland is not installed; screen sharing by name is unavailable.")
+        return "no-portal"
+    info("Kayra can pick the window you name when you share your screen in a call. It adds one")
+    info("line to ~/.config/hypr/xdph.conf (backed up; your current picker stays the fallback).")
+    if not ask_yes_no("Set it up now?", default=True):
+        info("    Skipped. Later: PYTHONPATH=src .venv/bin/python -m kayra.automation.share_picker install")
+        return "skipped"
+    code, text = helper("install")
+    for line in text.splitlines():
+        info(f"    {line}")
+    return "installed" if code == 0 else "failed"
 
 
 def check_platform(python_exe):
@@ -1921,7 +2018,6 @@ def main():
 
     env_ok = ensure_env_file()
     local_available, cloud = configure_models() if env_ok else (False, {"required": True,
-                                                                        "cohere": False,
                                                                         "chat": False})
     model_state = check_models()
     hand_model = ensure_hand_model(python_exe) if deps_ok else "no-mediapipe"
@@ -1930,13 +2026,12 @@ def main():
                             "cuda_reason": "dependencies were not installed",
                             "variant": None, "ready": "cpu"})
     platform_state = check_platform(python_exe)
+    if deps_ok:
+        offer_share_picker(python_exe)
 
-    cloud_ok = (not cloud["required"]) or (cloud["cohere"] and cloud["chat"])
+    cloud_ok = (not cloud["required"]) or cloud["chat"]
     if cloud["required"]:
-        parts = []
-        parts.append("Cohere SET" if cloud["cohere"] else "Cohere MISSING")
-        parts.append("chat SET" if cloud["chat"] else "chat MISSING")
-        cloud_text = ", ".join(parts)
+        cloud_text = "cloud key SET" if cloud["chat"] else "cloud key MISSING"
     else:
         cloud_text = "not required (local model in use)"
 
@@ -1957,7 +2052,7 @@ def main():
         "local_llm": "available" if local_available else "not running (cloud path)",
         "cloud": cloud_text,
         "cloud_ok": cloud_ok,
-        "models": {"quantized": "quantized (fast)", "full": "full precision",
+        "models": {"fast": "float graph (fast)", "quantized": "quantized (real-time speed)",
                    "missing": "MISSING"}[model_state],
         "models_ok": model_state != "missing",
         "tts_device": ("GPU ready (CUDAExecutionProvider verified)"

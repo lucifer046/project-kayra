@@ -34,7 +34,7 @@ import time
 import datetime
 import threading
 
-from kayra.automation import ai
+from kayra.automation import ai, interpreter
 from kayra.automation.common import announce, normalize_command
 from kayra.automation.policy import ActionResult, Risk, classify_action, recent_audit, Status
 
@@ -202,7 +202,14 @@ system bluetooth on|off | wifi on | system lock | pause | resume | next track | 
 browser <switch to X tab | close X tab | click on <label> | summarize this page> |
 meet <join CODE | mic off | camera off | share screen | leave> | email check | calendar today |
 scene <name> | set timer <duration> | reminder <time> <text> | diagnose <scope> |
-screen describe | take screenshot | google search <query> | battery | close tab | new tab"""
+screen describe | take screenshot | google search <query> | battery | close tab | new tab |
+browser open my <name> sheet | browser open the doc about <topic> | browser find the sheet <name> sent me |
+browser what's the total of column <C> | browser read row <n> | browser go to cell <B12> |
+browser search <amazon | flipkart | github | wikipedia | reddit | linkedin jobs> for <query> |
+browser open the first result | browser summarize this page | browser read my linkedin notifications |
+browser what's the top post on r/<subreddit> | browser open r/<subreddit> | browser open the github repo <owner/name> |
+message open <chat> | message read <chat> | email search for <text> | email compose |
+calendar next meeting | calendar join my next meeting"""
 
 MAX_PLAN_STEPS = 10
 
@@ -227,6 +234,8 @@ def plan_goal(goal):
         action = normalize_command(token)
         if action is None or action.domain in ("plan", "shell", "trigger"):
             continue
+        if not interpreter.from_model_ok(action):
+            continue                    # the user's own details, files and questions to AI sites
         if classify_action(action)[0] == Risk.DENY:
             continue
         clean.append(token)
@@ -476,13 +485,33 @@ def _snapshot():
             "online": diagnostics.default_gateway() is not None}
 
 
+_TRIGGER_CACHE = {"stamp": None, "data": []}
+
+
+def _load_triggers_cached():
+    """The trigger list, re-read from disk only when the file changed (mtime + size). The
+    watcher asks every 20 s; with no change that is one `stat`, not an open + JSON parse."""
+    try:
+        info = os.stat(_data(TRIGGER_FILE))
+        stamp = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        _TRIGGER_CACHE.update(stamp=None, data=[])
+        return []
+    if stamp != _TRIGGER_CACHE["stamp"]:
+        _TRIGGER_CACHE.update(stamp=stamp, data=_load(TRIGGER_FILE, []))
+    return json.loads(json.dumps(_TRIGGER_CACHE["data"]))      # callers mutate their copy
+
+
 def evaluate_triggers(now=None, snapshot=None):
     """Fires every trigger whose condition is met. Returns the spoken lines. Watcher-called."""
     now = now or time.time()
-    triggers = _load(TRIGGER_FILE, [])
+    triggers = _load_triggers_cached()
     if not triggers:
         return []
     snapshot = snapshot if snapshot is not None else _snapshot()
+    for trigger in triggers:
+        trigger.setdefault("state", {})        # the evaluator adds it; not a change by itself
+    before = json.dumps(triggers, sort_keys=True, default=str)
     fired, keep = [], []
     for trigger in triggers:
         met = _condition_met(trigger, now, snapshot)
@@ -494,7 +523,10 @@ def evaluate_triggers(now=None, snapshot=None):
                 keep.append(trigger)
         else:
             keep.append(trigger)
-    _save(TRIGGER_FILE, keep)
+    # Written only when something actually changed (a trigger fired, or its remembered state
+    # moved). This used to rewrite the file every 20 s for as long as any trigger existed.
+    if json.dumps(keep, sort_keys=True, default=str) != before:
+        _save(TRIGGER_FILE, keep)
     lines = []
     for trigger in fired:
         lines.append(_fire(trigger))
@@ -561,6 +593,15 @@ def stop_watcher():
     _WATCHER["thread"] = None
 
 
+def _setting_on(name, default="on"):
+    try:
+        from kayra.core.config import env
+        value = env(name, default)
+    except Exception:
+        value = default
+    return str(value or default).strip().lower() not in ("0", "off", "false", "no", "disabled")
+
+
 def _watch_loop():
     stop = _WATCHER["stop"]
     while not stop.wait(TICK_S):
@@ -569,6 +610,14 @@ def _watch_loop():
         except Exception:
             pass
         now = time.time()
+        if _setting_on("TAB_TIDY_SUGGESTIONS"):
+            try:
+                from kayra.automation import web_macros
+                line = web_macros.tabs_tidy_suggestion(now)      # §13 N1.6: at most every two hours
+                if line:
+                    announce(line)
+            except Exception:
+                pass
         if health_watch_enabled() and now - _WATCHER["health_at"] >= HEALTH_EVERY_S:
             _WATCHER["health_at"] = now
             try:
@@ -600,17 +649,25 @@ def briefing():
     L = _L()
     now = datetime.datetime.now()
     facts = [f"Time: {now:%A %d %B, %-I:%M %p}"]
-    sky = weather()
-    if sky:
-        facts.append(f"Weather: {sky}")
+    # The weather is a network call (up to 4 s); it runs while Chrome is being asked about the
+    # calendar and the inbox. Those two stay in sequence: they drive the same browser.
+    sky_box = []
+    sky_thread = threading.Thread(target=lambda: sky_box.append(weather()),
+                                  name="kayra-weather", daemon=True)
+    sky_thread.start()
+    browser_facts = []
     if web_macros.BRIDGE.connected():
         try:
             agenda = web_macros.calendar_agenda("today")
-            facts.append(f"Calendar: {agenda.message}")
+            browser_facts.append(f"Calendar: {agenda.message}")
             mail = web_macros.email_check()
-            facts.append(f"Email: {mail.message}")
+            browser_facts.append(f"Email: {mail.message}")
         except Exception:
             pass
+    sky_thread.join(5.0)
+    if sky_box and sky_box[0]:
+        facts.append(f"Weather: {sky_box[0]}")
+    facts.extend(browser_facts)
     facts.append(L.battery_sentence())
     findings = diagnostics.probe_crashes(days=1) + diagnostics.probe_disk()[:2]
     issues = [f.text for f in findings if f.level != diagnostics.OK]
@@ -653,7 +710,14 @@ def explain_last(text=""):
 
 
 def in_call():
-    """True when a call is likely running: a non-Kayra app is recording from the microphone."""
+    """True when a call is likely running: a non-Kayra app is recording from the microphone, or
+    Kayra started a screen share that is still on (M2.3 — nothing unprompted on a shared screen)."""
+    try:
+        from kayra.automation import web_macros
+        if web_macros._SHARE_STATE.get("what"):
+            return True
+    except Exception:
+        pass
     L = _L()
     code, text = L._run("pactl", "-f", "json", "list", "source-outputs", timeout=2.0)
     if code != 0:

@@ -28,7 +28,7 @@ It is also not a teardown. `confirm_shutdown` asks the user and then delegates t
 There is no second ordering here and there must never be.
 """
 
-from PySide6.QtWidgets import QMessageBox
+from kayra.ui.components.confirm import ConfirmDialog
 
 
 class KayraControls:
@@ -108,15 +108,11 @@ class KayraControls:
         second press during that window is the easiest way to re-enter a shutdown that is
         already half done.
         """
-        box = QMessageBox(self.parent_widget)
-        box.setWindowTitle("Shut down Kayra")
-        box.setText("Shut down Kayra?")
-        box.setInformativeText(
-            "Voice input, speech and every background service stop, and the window closes. "
-            "This does not shut down your computer.")
-        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
-        box.setDefaultButton(QMessageBox.Cancel)
-        if box.exec() != QMessageBox.Yes:
+        if not ConfirmDialog.ask(
+                self.parent_widget, "Shut down Kayra?",
+                "Voice input, speech and every background service stop, and the window "
+                "closes. This does not shut down your computer.",
+                confirm_label="Shut down", danger=True):
             return False
         self.bridge.shutdown(hard=True)
         return True

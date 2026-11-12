@@ -48,3 +48,7 @@ def automation_support(which=None, compositor=None):
 
 def battery_status(root=None):
     return None
+
+
+def browser_user_data_dirs():
+    return []

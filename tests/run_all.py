@@ -37,7 +37,9 @@ import re
 import sys
 import time
 import argparse
+import shutil
 import subprocess
+import tempfile
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(TESTS_DIR)
@@ -69,6 +71,13 @@ SUITES = [
     dict(file="test_browser_control.py", category="unit", feature="Browser control (round 5)",
          needs="none", writes="nothing", seconds=2,
          note="site registry, open anything/anywhere, web apps, extension versions; fake extension"),
+    dict(file="test_voice_models_backup.py", category="unit", feature="Voice, local models, backups (Parts 14-16)",
+         needs="none", writes="temp dir only", seconds=1, note="fake LM Studio, fake key probe; backups in a temp project"),
+    dict(file="test_smooth_scroll.py", category="unit", feature="Smooth scrolling (§11 S1)",
+         needs="none", writes="nothing", seconds=1, note="headless Qt; glides advanced frame by frame"),
+    dict(file="test_chrome_profiles.py", category="unit", feature="Chrome profiles (Part 5P)",
+         needs="none", writes="temp dir only", seconds=1,
+         note="made-up Local State; launches recorded, no browser starts"),
     dict(file="test_linux_automation.py", category="unit", feature="Linux automation",
          needs="none", writes="nothing", seconds=2,
          note="fake Hyprland + recording runner; argv/dispatch level, launches nothing"),
@@ -94,6 +103,8 @@ SUITES = [
          note="injected clock; no provider is ever called"),
     dict(file="test_memory_store.py", category="unit", feature="Memory management",
          needs="none", writes="temp store only", seconds=3),
+    dict(file="test_credentials.py", category="unit", feature="API key storage",
+         needs="none", writes="temp .env only", seconds=1),
     dict(file="test_logging.py", category="unit", feature="Structured logging",
          needs="none", writes="nothing", seconds=3),
     dict(file="test_stt_backend.py", category="unit", feature="STT backend switching",
@@ -136,6 +147,12 @@ SUITES = [
     dict(file="test_browser_extension.py", category="integration", feature="Chrome extension page functions",
          needs="Google Chrome", writes="nothing", seconds=15,
          note="headless throwaway Chrome; never your profile"),
+    dict(file="test_profile_privacy_guard.py", category="integration", feature="No profile data in the repo",
+         needs="Chrome profiles on this computer", writes="nothing", seconds=2,
+         note="reads your Chrome's Local State in memory; prints file names only, never values"),
+    dict(file="test_dmm_browser.py", category="integration", feature="Browser intents, rules first (local model)",
+         needs="a local model (LM Studio)", writes="nothing", seconds=30,
+         note="skips itself when only cloud models are configured"),
     dict(file="test_dmm_matrix.py", category="integration", feature="DMM intent boundaries",
          needs="a model provider", writes="nothing", seconds=180,
          note="follows local-first routing, so a local server changes what it measures"),
@@ -152,6 +169,9 @@ SUITES = [
     dict(file="test_gesture_live.py", category="manual", feature="Gesture, real hand",
          needs="a person and a camera", writes="nothing", seconds=300,
          note="SAFE by default; --real-mouse moves the pointer and asks first"),
+    dict(file="bench_page_agent.py", category="manual", feature="Page agent model benchmark (§7a)",
+         needs="Google Chrome and a local model server", writes="nothing", seconds=120,
+         note="30 one-step decisions per model; --loops adds whole runs; local models only"),
 ]
 
 CATEGORY_ORDER = ("unit", "integration", "hardware", "manual")
@@ -253,6 +273,36 @@ def print_inventory(markdown=False):
                 print(f"  {'':<30} {entry['note']}")
 
 
+WATCHED = ("data", "logs", "Reports", "backups")
+
+
+def snapshot_tree(root=None):
+    """{relative path: (size, mtime_ns)} under the developer's data, logs, Reports and backups."""
+    root = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    found = {}
+    for top in WATCHED:
+        base = os.path.join(root, top)
+        for folder, _dirs, files in os.walk(base):
+            for name in files:
+                if name == "kayra.lock":
+                    continue                        # the running app's own lock, if it is up
+                path = os.path.join(folder, name)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                found[os.path.relpath(path, root)] = (stat.st_size, stat.st_mtime_ns)
+    return found
+
+
+def diff_tree(before, after):
+    """'added: …' / 'changed: …' / 'removed: …' lines."""
+    lines = [f"added:   {p}" for p in sorted(set(after) - set(before))]
+    lines += [f"changed: {p}" for p in sorted(set(after) & set(before)) if after[p] != before[p]]
+    lines += [f"removed: {p}" for p in sorted(set(before) - set(after))]
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Kayra's test suites by category.")
     parser.add_argument("--integration", action="store_true",
@@ -303,6 +353,16 @@ def main():
     if "manual" not in categories:
         print("Manual suites are never run here — see --list for how to run them by hand.")
 
+    # The automation audit log of every suite goes to a temporary file, never into the
+    # developer's logs/automation.log (BROWSER_CONTROL_PLAN §12, M0.6). Inherited by children.
+    audit_dir = tempfile.mkdtemp(prefix="kayra-test-audit-")
+    os.environ.setdefault("KAYRA_AUDIT_LOG", os.path.join(audit_dir, "automation.log"))
+
+    # §13 N5.3 (Part 16): no suite may change the developer's own data, logs, reports or
+    # backups. The tree is fingerprinted before and after; a difference fails the run and names
+    # the files. (EnvironmentGuard protects a few files from inside a suite; this sees all of them.)
+    watched = snapshot_tree()
+
     results = []
     for entry in selected:
         extra = ["--live"] if (args.live and entry["file"] in
@@ -312,6 +372,12 @@ def main():
         results.append(run_suite(entry, python_exe, extra))
 
     totals = print_table(results)
+    shutil.rmtree(audit_dir, ignore_errors=True)
+    touched = diff_tree(watched, snapshot_tree())
+    if touched:
+        print("\nThe run changed the developer's own files (a suite must use a temp dir):")
+        for line in touched[:30]:
+            print(f"    {line}")
 
     broken = [r for r in results
               if r["status"] != "ok" and not r["status"].startswith("n/a")]
@@ -322,7 +388,7 @@ def main():
             for line in (row.get("output") or "").splitlines():
                 if _FAIL.search(line) or "Traceback" in line or "Error" in line:
                     print(f"    {line.strip()[:150]}")
-    return 1 if (totals["failed"] or broken) else 0
+    return 1 if (totals["failed"] or broken or touched) else 0
 
 
 if __name__ == "__main__":

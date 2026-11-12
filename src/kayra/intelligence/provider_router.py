@@ -10,7 +10,7 @@ THE PROBLEM THIS SOLVES
 Before this module, fallback logic was invented independently in two places inside
 `llm_engine.py` and the two disagreed about almost everything:
 
-  * `classify_intent` had ONE provider (Cohere) and no fallback at all. A rate limit was
+  * `classify_intent` had ONE provider and no fallback at all. A rate limit was
     answered with `sleep(5)`, `sleep(10)`, `sleep(15)` and then a degrade to conversation —
     thirty seconds of blocked user, ending in the assistant not doing what was asked, on a
     machine where two other perfectly good providers were already configured and idle.
@@ -23,18 +23,22 @@ the process. That last point is a correctness property, not tidiness: when two l
 "helpfully" retry, one user request becomes four provider calls, which on a rate-limited key
 is precisely the wrong response to a rate limit.
 
-THE HIERARCHY, AND WHY THE TWO ROUTES DIFFER
---------------------------------------------
-    DECISION (the DMM)   Cohere  ->  Groq  ->  Gemini
-    CHAT                 Groq    ->  Gemini
+THE HIERARCHY (2026-11-10: Claude added, Cohere removed)
+--------------------------------------------------------
+    DECISION (the DMM)   Claude  ->  Groq  ->  Gemini
+    CHAT                 Claude  ->  Groq  ->  Gemini
 
-They are deliberately not the same list. Cohere's Command-R is the model the DMM's few-shot
-contract was written and measured against, so it leads DECISION; it is not a conversational
-model for this assistant and never leads CHAT. Groq leads CHAT because it is the fastest
-first token available here, and it is the DMM's first fallback rather than its primary
-because the intent-boundary matrix was tuned against Cohere. Changing either order is a
-product decision, so it lives in one visible constant instead of being implied by the
-ordering of `if` statements in two functions.
+ONE ORDER FOR BOTH ROUTES, ON PURPOSE. Every provider here is a general model that can both
+classify and converse; what differs between the two routes is HOW a provider is called (a
+short, thinking-off, cached few-shot request for DECISION; a streamed reply for CHAT), never
+WHO is asked. So a single key is enough for everything: with only a Claude key Kayra uses
+only Claude, with only a Groq key only Groq. Claude leads because Haiku is the fastest
+first token and the cheapest call of the three; Groq is next for the same reason it used to
+lead chat; Gemini is the last fallback. A provider without a key is skipped silently.
+
+The two routes stay separate names because their cooldown evidence is shared but their log
+tags are not, and because a future product decision may still want them to differ — which
+then changes one constant here instead of the ordering of `if` statements in two functions.
 
 WHAT THIS MODULE DOES NOT DO
 ----------------------------
@@ -64,15 +68,15 @@ ROUTE_DECISION = "DECISION"
 ROUTE_CHAT = "CHAT"
 ROUTES = (ROUTE_DECISION, ROUTE_CHAT)
 
-COHERE = "Cohere"
+CLAUDE = "Claude"
 GROQ = "Groq"
 GEMINI = "Gemini"
 LOCAL = "Local"
 
 # THE hierarchy. One constant, read by everything, asserted by the test suite.
 ROUTE_CHAINS = {
-    ROUTE_DECISION: (COHERE, GROQ, GEMINI),
-    ROUTE_CHAT: (GROQ, GEMINI),
+    ROUTE_DECISION: (CLAUDE, GROQ, GEMINI),
+    ROUTE_CHAT: (CLAUDE, GROQ, GEMINI),
 }
 
 # The subsystem tag each route's lines carry, so a reader can tell a DMM fallback from a chat
@@ -115,9 +119,12 @@ FAILURE_KINDS = (
 
 # Kinds where trying ANOTHER provider is a sensible response to the failure.
 #
-# INVALID_REQUEST is the one that is not: the request itself is malformed, and sending exactly
-# the same malformed request to two more providers is three failures instead of one plus two
-# pointless round-trips. AUTH_FAILURE IS in the list — a missing Cohere key says nothing about
+# INVALID_REQUEST falls through too (2026-11-10). It used to stop the chain on the theory that
+# the same malformed request would fail everywhere — but no two providers here receive the same
+# request: Claude gets its own system field, cached blocks and thinking settings, Groq and
+# Gemini an OpenAI-shaped list. A 400 from one says nothing about the next, and stopping turned
+# one provider's refusal into "no model could answer" with two healthy fallbacks unasked.
+# AUTH_FAILURE IS in the list — a missing Claude key says nothing about
 # the Groq key — but it comes with the longest cooldown, because a bad credential does not fix
 # itself and retrying it every turn is the retry storm this module exists to prevent.
 FALLBACK_KINDS = frozenset({
@@ -127,6 +134,7 @@ FALLBACK_KINDS = frozenset({
     FailureKind.TIMEOUT,
     FailureKind.SERVER_ERROR,
     FailureKind.MODEL_UNAVAILABLE,
+    FailureKind.INVALID_REQUEST,
     FailureKind.UNKNOWN,
 })
 
@@ -145,45 +153,103 @@ DEFAULT_COOLDOWNS = {
     FailureKind.TIMEOUT: 30.0,
     FailureKind.SERVER_ERROR: 60.0,
     FailureKind.MODEL_UNAVAILABLE: 300.0,
-    FailureKind.INVALID_REQUEST: 0.0,      # not the provider's fault; do not stand it down
+    # Short: our request to THAT provider was refused, so it is skipped for a minute rather
+    # than asked the same thing every turn — but a fixed setting is tried again soon.
+    FailureKind.INVALID_REQUEST: 60.0,
     FailureKind.UNKNOWN: 20.0,
 }
 
-# Signals matched against the exception's TYPE NAME and its string form, most specific first.
-# Ordering matters: "rate limit exceeded" contains neither "429" nor "quota" on every provider,
-# and an authentication error's text sometimes contains the word "request".
+# THE HTTP STATUS DECIDES FIRST. Every SDK in use (openai, anthropic) puts the response's
+# status code on the exception, and the code is the provider's own, unambiguous verdict.
+#
+# Text matching is the FALLBACK, for exceptions that carry no status (transport failures,
+# timeouts, a provider's own wrapper). It used to be the only mechanism, and that was the bug
+# behind "every model is rate-limited" on fresh keys: the haystack was checked for "429" and
+# "quota" BEFORE anything else, so a retired model (404) or a plan with no access to a model
+# ("limit: 0") whose message happened to mention quota was reported as a rate limit, and a
+# request id or a token count containing "500" could read as a server error.
+_STATUS_KINDS = {
+    400: FailureKind.INVALID_REQUEST,
+    401: FailureKind.AUTH_FAILURE,
+    402: FailureKind.AUTH_FAILURE,       # billing: no credit on the account
+    403: FailureKind.AUTH_FAILURE,
+    404: FailureKind.MODEL_UNAVAILABLE,
+    408: FailureKind.TIMEOUT,
+    409: FailureKind.SERVER_ERROR,
+    413: FailureKind.INVALID_REQUEST,
+    422: FailureKind.INVALID_REQUEST,
+    429: FailureKind.RATE_LIMITED,
+    529: FailureKind.SERVER_ERROR,       # Anthropic "overloaded": transient, not the key's budget
+}
+
+# A 429 that is NOT a rate limit: the key's plan has no allowance for this model at all
+# (Gemini answers a model your tier cannot use with RESOURCE_EXHAUSTED and "limit: 0"), or the
+# account has no credit. Waiting a minute fixes neither, and calling it a rate limit is what
+# made a working key look broken. It is a model/plan problem, with that cooldown.
+_NO_ALLOWANCE = ("limit: 0", "limit:0", "free_tier", "free tier", "credit balance",
+                 "billing", "insufficient_quota", "plan does not", "not available on")
+
+# NO CREDIT ON THE ACCOUNT. Anthropic answers it with a 400 invalid_request_error ("Your credit
+# balance is too low to access the Anthropic API"), which read as "Claude refused the request"
+# and, because a 400 used to stop the chain, as "no model could answer". It is an ACCOUNT
+# problem: the key is fine, nothing about the next minute will change it, and the user must be
+# told in those words. Classified as AUTH_FAILURE (the account cannot be used; long cooldown).
+_NO_CREDIT = ("credit balance", "purchase credits", "plans & billing", "billing", "payment required",
+              "insufficient_quota", "insufficient funds")
+
+
+def is_no_credit(exc):
+    """True when a provider refused because the ACCOUNT has no credit, whatever the status."""
+    text = f"{exc}".lower()
+    return any(signal in text for signal in _NO_CREDIT)
+
+# Signals matched against the exception's TYPE NAME and its string form, most specific first —
+# used only when no HTTP status is available. Ordering matters: an authentication error's text
+# sometimes contains the word "request". Bare numbers are deliberately absent: "429" or "500"
+# inside a request id or a token count is not evidence of anything.
 _SIGNALS = (
     (FailureKind.RATE_LIMITED, (
-        "toomanyrequests", "ratelimit", "rate_limit", "rate limit", "429",
-        "quota", "resource_exhausted", "resource exhausted", "too many requests",
-        "insufficient_quota", "overloaded",
+        "toomanyrequests", "ratelimit", "rate_limit", "rate limit", "too many requests",
+        "resource_exhausted", "resource exhausted",
     )),
     (FailureKind.AUTH_FAILURE, (
         "unauthorized", "unauthenticated", "authenticationerror", "permissiondenied",
         "permission_denied", "forbidden", "invalid api key", "invalid_api_key",
-        "api key not", "401", "403",
+        "invalid x-api-key", "api key not",
     )),
     (FailureKind.TIMEOUT, (
         "timeout", "timedout", "timed out", "deadline exceeded", "readtimeout",
     )),
     (FailureKind.NETWORK_FAILURE, (
         "connectionerror", "connection error", "connection refused", "connection reset",
-        "name or service not known", "temporary failure in name resolution", "dns",
-        "apiconnectionerror", "ssl", "network", "unreachable",
+        "name or service not known", "temporary failure in name resolution",
+        "apiconnectionerror", "ssl", "network is unreachable", "unreachable",
     )),
     (FailureKind.MODEL_UNAVAILABLE, (
         "model_not_found", "model not found", "notfounderror", "decommissioned",
-        "does not exist", "unknown model", "404",
+        "does not exist", "unknown model", "no longer available",
     )),
     (FailureKind.SERVER_ERROR, (
         "internalservererror", "internal server error", "serviceunavailable",
-        "service unavailable", "bad gateway", "500", "502", "503", "504",
+        "service unavailable", "bad gateway", "overloaded",
     )),
     (FailureKind.INVALID_REQUEST, (
         "badrequesterror", "invalid_request", "invalid request", "unprocessable",
-        "400", "422", "context_length", "too many tokens", "maximum context",
+        "context_length", "too many tokens", "maximum context",
     )),
 )
+
+
+def _status_code(exc):
+    """The HTTP status a provider SDK attached to the exception, or None."""
+    for holder in (exc, getattr(exc, "response", None)):
+        if holder is None:
+            continue
+        for attr in ("status_code", "status", "http_status"):
+            value = getattr(holder, attr, None)
+            if isinstance(value, int) and 100 <= value <= 599:
+                return value
+    return None
 
 
 def classify_failure(exc):
@@ -195,18 +261,34 @@ def classify_failure(exc):
     that reflects what that key's budget is actually doing — the local default is the fallback
     for providers and SDKs that do not tell us.
 
-    Matching is on the exception's type name AND its string form. Type name first, because
-    `cohere.TooManyRequestsError` is unambiguous while its message on a trial key sometimes
-    is not.
+    The HTTP status decides when there is one (see `_STATUS_KINDS`); the exception's type name
+    and text decide only when there is not.
     """
     if exc is None:
         return FailureKind.UNKNOWN, None
 
     retry_after = _extract_retry_after(exc)
+    text = f"{type(exc).__name__} {exc}".lower()
 
-    haystack = f"{type(exc).__name__} {exc}".lower()
+    if is_no_credit(exc):
+        return FailureKind.AUTH_FAILURE, None
+
+    status = _status_code(exc)
+    if status is not None:
+        kind = _STATUS_KINDS.get(status)
+        if kind is None and status >= 500:
+            kind = FailureKind.SERVER_ERROR
+        if kind == FailureKind.RATE_LIMITED and any(s in text for s in _NO_ALLOWANCE):
+            # Not a budget that refills in a minute: no allowance at all. Never honour a
+            # Retry-After here — it would bring the same refusal back every few seconds.
+            return FailureKind.MODEL_UNAVAILABLE, None
+        if kind is not None:
+            return kind, retry_after
+
     for kind, signals in _SIGNALS:
-        if any(signal in haystack for signal in signals):
+        if any(signal in text for signal in signals):
+            if kind == FailureKind.RATE_LIMITED and any(s in text for s in _NO_ALLOWANCE):
+                return FailureKind.MODEL_UNAVAILABLE, None
             return kind, retry_after
     return FailureKind.UNKNOWN, retry_after
 
@@ -382,9 +464,20 @@ class ProviderRouter:
     def is_available(self, name):
         return self.configured(name) and self.cooldown_remaining(name) <= 0
 
-    def clear_cooldowns(self):
+    def clear_cooldowns(self, names=None):
+        """
+        Forgets cooldowns — all of them, or only `names`.
+
+        Called when a key is replaced in Settings: a provider stood down for 15 minutes over a
+        WRONG key must be tried again the moment the right one is saved, not when the old
+        verdict expires.
+        """
         with self._lock:
-            self._cooldown.clear()
+            if names is None:
+                self._cooldown.clear()
+            else:
+                for name in names:
+                    self._cooldown.pop(name, None)
 
     # ── Selection ─────────────────────────────────────────────────────
 
@@ -404,7 +497,7 @@ class ProviderRouter:
         return tuple(name for name in ROUTE_CHAINS.get(route, ()) if self.configured(name))
 
     def describe(self, route):
-        """`Cohere > Groq > Gemini`, or `none configured`. One line for the startup report."""
+        """`Claude > Groq > Gemini`, or `none configured`. One line for the startup report."""
         names = self.full_chain(route)
         return " > ".join(names) if names else "none configured"
 
@@ -487,7 +580,7 @@ class ProviderRouter:
 
         A provider callable returns an ITERATOR here rather than a value; it must not begin
         network work before the first `next()` for the pre-first-chunk rule to be meaningful,
-        which is what the OpenAI/Cohere streaming clients already do.
+        which is what the OpenAI and Anthropic streaming clients already do.
         """
         tag = ROUTE_TAG.get(route, Subsystem.LLM)
         attempts = []
@@ -541,7 +634,7 @@ class ProviderRouter:
         """
         Says, at DEBUG, why a configured provider is not in the chain.
 
-        DEBUG rather than INFO deliberately: once Cohere is in a 60-second cooldown, every
+        DEBUG rather than INFO deliberately: once a provider is in a 60-second cooldown, every
         turn in that minute would otherwise print a line about it, which is a minute of the
         terminal repeating something the user was already told once at WARNING.
         """

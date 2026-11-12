@@ -429,7 +429,7 @@ def RunShellCommand(command, timeout=None):
         print_info(output[:2000])
     if completed.returncode == 0:
         return ActionResult.success("Done.", returncode=0, output_chars=len(output))
-    return ActionResult.failure(f"That finished with an error.", returncode=completed.returncode)
+    return ActionResult.failure("That finished with an error.", returncode=completed.returncode)
 
 
 # ── Screenshot retention ──────────────────────────────────────────────────
@@ -810,6 +810,72 @@ def normalize_command(command, context=None):
             parameters["name"] = lowered
         return Action(domain, action, target="current", parameters=parameters, raw=raw)
 
+    # 1a. "open the third result" with no `browser` prefix is the page's result list (C3),
+    # never an app called "the third result".
+    hit = result_request(re.sub(r"^browser\s+", "", lowered))
+    if hit:
+        return Action("browser", "page_result", target=str(hit[0]),
+                      parameters={"nth": hit[0], "new_tab": hit[1]}, raw=raw)
+
+    # 1a''. Workspace phrasings without the `browser` prefix (Part 4): "open my budget sheet"
+    # is a file in Sheets, never an app called "my budget sheet".
+    found = profile_action(lowered, raw, raw)           # Part 5P: "open my Work Chrome"
+    if found is not None:
+        return found
+    found = part_7_action(lowered, raw, raw)            # Part 7: the page agent, learning
+    if found is not None:
+        return found
+    found = part_9_10_action(lowered, raw, raw)         # Parts 9-10: in-call controls, one inbox
+    if found is not None:
+        return found
+    found = part_12_action(lowered, raw, raw)           # Part 12: browser neighbours
+    if found is not None:
+        return found
+    found = voice_action(lowered, raw)                  # Part 14: Kayra's speaking speed
+    if found is not None:
+        return found
+    found = models_action(lowered, raw, raw)            # Part 15: local models, keys
+    if found is not None:
+        return found
+    found = backup_action(lowered, raw)                 # Part 16: backups
+    if found is not None:
+        return found
+    found = folder_action(lowered.strip(" .?!"), raw, context)   # L9: Drive folders, "open folder"
+    if found is not None:
+        return found
+    found = _all_tabs(lowered.strip(" .?!"), raw)              # "close all tabs" is never app "tabs"
+    if found is not None:
+        return found
+    found = _bare_workspace(lowered, raw)
+    if found is not None:
+        return found
+
+    # 1a-fix. Fix round V11: closing a search, a described search, a scroll with a place, and
+    # WhatsApp chats named with "in whatsapp" / "chat" — before the prefix rules misread them.
+    found = _bare_fix(lowered.strip(" .?!"), raw)
+    if found is not None:
+        return found
+    found = _bare_part_6(lowered.strip(" .?!"), raw)      # Part 6, when it can only be that
+    if found is not None:
+        return found
+    found = _bare_part_6b(lowered.strip(" .?!"), raw)     # Part 6b, when it can only be that
+    if found is not None:
+        return found
+
+    # 1a'. Part 3 phrasings the DMM may send without the `browser` prefix: they are about
+    # the page in front, never an app ("translate this page", "bookmark this page").
+    if _BARE_PAGE.match(lowered):
+        found = part_3_action(lowered, raw, raw)
+        if found is not None:
+            return found
+
+    # 1b. A request to share the screen, however it arrived ("share screen", "click on share
+    # screen", "start screen sharing"): ONE meet.share, never a click or a new meeting (M0.1).
+    if _BARE_SHARE.match(lowered):
+        request = share_request(lowered)
+        if request is not None:
+            return _share_action(request, raw)
+
     # 2. Prefix tokens, longest first.
     for prefix, (domain, action) in _PREFIX_TOKENS:
         if lowered.startswith(prefix):
@@ -903,21 +969,444 @@ def merge_tab_steps(actions):
     return out
 
 
+def merge_share_steps(actions):
+    """
+    "share the LM Studio window" sometimes arrives as `focus lm studio` + `meet share window`
+    (the audit log of 2026-11-10). Run literally, the focus takes Meet out of the front and
+    the share then picks the wrong thing. The name belongs to the share (M0.3): the focus is
+    dropped and the share is told which window.
+    """
+    out = []
+    for action in actions:
+        previous = out[-1] if out else None
+        if previous is not None and action.domain == "meet" and action.action == "share" \
+                and previous.domain in ("window", "app") and previous.action in ("focus", "switch") \
+                and not action.parameters.get("name") and action.target in ("monitor", "window"):
+            action.target = "window"
+            action.parameters["name"] = previous.target
+            out[-1] = action
+            continue
+        if action.domain == "meet" and action.action == "share":
+            # One utterance shares ONE thing: a second share in the same batch (the DMM said
+            # it twice in different words) keeps whichever named something specific.
+            earlier = next((a for a in out if a.domain == "meet" and a.action == "share"), None)
+            if earlier is not None:
+                if action.parameters.get("name") and not earlier.parameters.get("name"):
+                    out[out.index(earlier)] = action
+                continue
+        if _is_share_click(action) and any(a.domain == "meet" and a.action == "share" for a in out):
+            # L9 (audit log 2026-11-11): "share screen" also arrived as "click share"; the click ran
+            # after the share and found nothing ("I can't find share on this page"). The share
+            # already pressed it.
+            continue
+        out.append(action)
+    return out
+
+
+def _is_share_click(action):
+    return (action.domain == "mouse" and action.action == "click_text" or
+            action.domain == "browser" and action.action == "page_click") and \
+        re.fullmatch(r"(?:the )?(?:share|share screen|present|present now|share (?:my |the )?(?:screen|tab|window))"
+                     r"(?: button)?", str(action.target or "").lower().strip()) is not None
+
+
+# ── Screen sharing (BROWSER_CONTROL_PLAN §12, M0.1 / M1) ──
+# Every way of asking to share, read ONCE into {surface, name, audio}. `surface` is what
+# getDisplayMedia calls it: monitor | window | browser. `name` is the window, tab or monitor
+# the user named ("lm studio", "youtube", "#2"), or "".
+_SHARE_WORD = re.compile(r"\b(shar(?:e|ing)|screen ?share|screensharing|present(?:ing| now)?)\b")
+_SHARE_STOP = re.compile(r"\b(stop|end|quit|cancel|finish)\b.*\b(shar|present)|"
+                         r"\b(shar\w*|present\w*)\b.*\b(stop|off)\b$")
+_SHARE_STATUS = re.compile(r"^(?:am i|are we|is (?:my|the) screen|is anything|what am i)\b.*"
+                           r"\b(shar|present)|^(?:sharing|share) status$")
+_SCREEN_WORDS = r"(?:entire |whole |full |my |the |this )*(?:screen|desktop|display|monitor)"
+_MONITOR_ORDINAL = re.compile(
+    r"\b(?:my |the )?(first|second|third|other|external|left|right|main|primary|laptop|built ?in)"
+    r" (?:screen|monitor|display)\b|\b(?:screen|monitor|display) (\d)\b")
+
+
+def share_request(text):
+    """
+    'start screen sharing' -> {'surface': 'monitor', 'name': ''}
+    'share the lm studio window' -> {'surface': 'window', 'name': 'lm studio'}
+    'present this tab' / 'share the youtube tab' -> {'surface': 'browser', 'name': '' | 'youtube'}
+    'share my second screen' -> {'surface': 'monitor', 'name': '#2'}
+    None when the words are not a request to share (or are a request to STOP sharing).
+    """
+    low = " ".join(re.sub(r"[^\w\s#-]", " ", str(text or "").lower()).split())
+    if not low or not _SHARE_WORD.search(low) or _SHARE_STOP.search(low) or _SHARE_STATUS.search(low):
+        return None
+    audio = bool(re.search(r"\bwith (?:the )?(?:system )?(?:audio|sound)\b", low))
+    low = re.sub(r"\s*\bwith (?:the )?(?:system )?(?:audio|sound)\b", "", low)
+    instead = bool(re.search(r"\binstead\b", low))
+    low = re.sub(r"\s*\binstead\b", "", low).strip()
+    out = {"surface": "monitor", "name": "", "audio": audio, "instead": instead}
+    m = _MONITOR_ORDINAL.search(low)
+    if m:
+        word = m.group(1) or m.group(2)
+        out["name"] = {"first": "#1", "main": "#1", "primary": "#1", "laptop": "#1",
+                       "built in": "#1", "builtin": "#1", "second": "#2", "other": "#2",
+                       "external": "#2", "third": "#3", "left": "<", "right": ">"}.get(word, f"#{word}")
+        return out
+    # The thing being shared: whatever follows the share verb, minus the filler words.
+    m = re.search(r"\b(?:shar(?:e|ing)|present(?:ing)?|screen ?share)\b\s*(.*)$", low)
+    rest = m.group(1) if m else ""
+    rest = re.sub(r"^(?:screen\s+)?(?:of|on|in)\s+(?:this|the|my)\s+(?:meet|meeting|call)\s*", "", rest)
+    rest = re.sub(r"^(?:screen|now)\b\s*", "", rest)
+    rest = re.sub(r"\s*\b(?:in|on|to|with|into) (?:the |this |my )?(?:meet|meeting|call|google meet)\b.*$", "", rest)
+    rest = re.sub(r"^(?:and |then )?(?:share |present )?", "", rest).strip()
+    if re.search(r"\btab\b", rest):
+        name = re.sub(r"\btab\b.*$", "", rest).strip()
+        name = re.sub(r"^(?:the|my|a|this|that|current|chrome|browser)\b\s*", "", name).strip()
+        name = re.sub(r"^(?:the|my|a|this|that|current|chrome|browser)\b\s*", "", name).strip()
+        out.update(surface="browser", name=name)
+        return out
+    if re.search(r"\b(?:window|app|application)\b", rest):
+        name = re.sub(r"\s*\b(?:window|app|application)\b.*$", "", rest).strip()
+        name = re.sub(r"^(?:the|my|a|this|that|one|an)\b\s*", "", name).strip()
+        out.update(surface="window", name="" if name in ("this", "that", "a", "") else name)
+        return out
+    if not rest or re.fullmatch(_SCREEN_WORDS + r"?(?: now)?", rest) or rest in ("everything", "it"):
+        return out
+    if re.match(r"(?:with|to|for)\b", rest):
+        return out
+    # "share LM Studio" — a name with no surface word is a window.
+    out.update(surface="window", name=re.sub(r"^(?:the|my)\b\s*", "", rest).strip())
+    return out
+
+
+def _bare_present(action):
+    """A share request that only said "present" / "start presenting" — no screen, window or tab."""
+    raw = str(action.raw or "").lower()
+    return action.target == "monitor" and not action.parameters.get("name") and \
+        bool(re.search(r"\bpresent", raw)) and not re.search(r"screen|window|tab|monitor|display|desktop", raw)
+
+
+def _share_action(request, raw):
+    surface = request["surface"]
+    params = {"name": request["name"]}
+    if request.get("audio"):
+        params["audio"] = True
+    if request.get("instead"):
+        params["instead"] = True
+    return Action("meet", "share", target=surface, parameters=params, raw=raw)
+
+
+_BARE_PAGE = re.compile(
+    r"^(?:translate (?:this|the) (?:page|site|article)|bookmark (?:this|the current) (?:page|tab|site)|"
+    r"(?:read|show|summari[sz]e) (?:me )?(?:the )?(?:top |latest )?(?:comments|reviews)|"
+    r"(?:summari[sz]e|what is|what's) (?:this|the) (?:youtube )?video|what (?:does|do) (?:this|the) page say|"
+    r"what can i (?:do|say) here|(?:clear|delete) (?:my )?(?:browsing )?history|"
+    r"open (?:my |the )?(?:last|latest) download|what did i (?:just )?download|explain (?:the |this )?(?:selected|highlighted))")
+
+
+# A DMM token that is a share request but arrived without the `meet` prefix — "share screen",
+# "click on share screen", "start screen sharing", "present now" (M0.1). Only phrasings that
+# name a SCREEN surface or presenting are taken; "click on share" on a video page stays a click.
+_BARE_SHARE = re.compile(
+    r"^(?:(?:browser )?(?:click|press|tap|hit)(?: on)?(?: the)? |start |begin |please )?"
+    r"(?:(?:start|begin) )?(?:screen ?shar(?:e|ing)|screensharing|present(?:ing)?(?: now)?$|"
+    r"present(?:ing)? (?:my|the|this|a) (?:\w+ )*(?:screen|window|tab)\b|"
+    r"shar(?:e|ing) (?:(?:my|the|this|a|entire|whole|full|second|other)\s+)*"
+    r"(?:screen|desktop|display|monitor|window|tab)\b|shar(?:e|ing) \S.* (?:window|tab)\b)")
+
+
+_ORDINALS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7,
+    "eighth": 8, "ninth": 9, "tenth": 10,
+}
+
+
+def tab_position(text):
+    """
+    "the third tab" -> "#3", "the last tab" -> "#-1", "the second last tab" -> "#-2",
+    "tab 4" -> "#4", "the tab on the right" -> "+1", "the tab on the left" -> "-1".
+    None when the words name a site instead of a position.
+    """
+    low = " ".join(str(text or "").lower().replace("-", " ").split())
+    low = re.sub(r"^(?:the|my)\s+", "", low)
+    m = re.fullmatch(r"tab (?:on|to) the (right|left)|(right|left) tab", low)
+    if m:
+        return "+1" if (m.group(1) or m.group(2)) == "right" else "-1"
+    m = re.fullmatch(r"(?:(second|third) )?last(?: tab)?|(?:(second|third) to last)(?: tab)?", low)
+    if m:
+        back = m.group(1) or m.group(2)
+        return f"#-{_ORDINALS.get(back, 1)}"
+    word = re.sub(r"\s+tab$", "", low)
+    if word in _ORDINALS:
+        return f"#{_ORDINALS[word]}"
+    m = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th) tab|(\d{1,2})(?:st|nd|rd|th)|tab (?:number )?(\d{1,2})", low)
+    if m:
+        number = int(next(g for g in m.groups() if g))
+        if number > 0:
+            return f"#{number}"
+    return None
+
+
+# ── Fix round V11: scrolling, one search action, closing a search, WhatsApp by name ──
+# What may be scrolled. "side" = the list on the left (chats, labels); everything else is
+# whatever fills the middle of the view: the open mail, the chat, the page.
+_SCROLL_WHERE = {"chat list": "side", "chats": "side", "sidebar": "side", "side bar": "side", "list": "side",
+                 "menu": "side", "mail": "", "email": "", "message": "", "messages": "", "thread": "",
+                 "chat": "", "conversation": "", "group": "", "inbox": "", "page": "", "sheet": "",
+                 "spreadsheet": "", "doc": "", "document": "", "article": "", "screen": "", "window": "",
+                 "tab": "", "site": "", "website": "", "results": "", "feed": ""}
+_SCROLL_FILLER = frozenset("the this my to of in on a at it here now whole current open one that all way "
+                           "please page just bit little".split())
+_SCROLL_ENDS = ((r"\b(?:very )?(?:top|start|beginning|first message)\b", "top"),
+                (r"\b(?:very )?(?:bottom|end|last message|latest message)\b", "bottom"),
+                (r"\b(?:back )?up(?:wards?)?\b", "up"), (r"\bdown(?:wards?)?\b|\bfurther\b|\bmore\b", "down"))
+
+
+def scroll_request(low):
+    """
+    'scroll the mail to the bottom' -> {"direction": "bottom", "where": "", "amount": 1.0}.
+    None when the words name something to scroll TO ("scroll to pricing"): that is a search
+    of the page, handled by the older rule.
+    """
+    low = low.strip(" .?!")
+    m = re.fullmatch(r"(?:go|jump|take me|move|get)(?: back)? to the (top|bottom|end|start|beginning) of "
+                     r"(?:the|this|my) ([a-z ]+)", low)
+    if m and m.group(2) in _SCROLL_WHERE:
+        return {"direction": "top" if m.group(1) in ("top", "start", "beginning") else "bottom",
+                "where": _SCROLL_WHERE[m.group(2)], "amount": 1.0}
+    m = re.fullmatch(r"(?:please )?(?:can you )?(?:keep )?scroll(?:ing)?\b(.*)", low)
+    if not m:
+        return None
+    rest, direction, amount, where = f" {m.group(1)} ", None, 1.0, ""
+    for pattern, name in _SCROLL_ENDS:
+        if re.search(pattern, rest):
+            direction, rest = name, re.sub(pattern, " ", rest, count=1)
+            break
+    if " all the way " in rest and direction in ("up", "down"):
+        direction = "top" if direction == "up" else "bottom"
+    for pattern, factor in ((r"\ba (?:little |tiny |small )?bit\b|\ba little\b|\bslightly\b|\bslowly\b", 0.4),
+                            (r"\bhalf(?: a| the)?(?: page)?\b", 0.6), (r"\ba lot\b|\bfast(?:er)?\b|\btwo pages\b", 2.0)):
+        if re.search(pattern, rest):
+            amount, rest = factor, re.sub(pattern, " ", rest, count=1)
+            break
+    for name in sorted(_SCROLL_WHERE, key=len, reverse=True):
+        if re.search(rf"\b{name}\b", rest):
+            where, rest = _SCROLL_WHERE[name], re.sub(rf"\b{name}\b", " ", rest, count=1)
+            break
+    if any(word not in _SCROLL_FILLER for word in rest.split()):
+        return None
+    return {"direction": direction or "down", "where": where, "amount": amount}
+
+
+_SEARCH_BOX = r"(?:the |this |that )?search(?: bar| box| button| icon| field| option| input)?"
+_SEARCH_CLOSE_RE = re.compile(
+    r"(?:close|clear|cancel|exit|dismiss|hide|leave|stop|remove|delete|erase|empty|reset|get out of|come out of|go out of) "
+    r"(?:the |this |my |that )?(?:text (?:in|from|of) (?:the )?)?(?:[a-z]+ )?search(?:ing)?"
+    r"(?: bar| box| field| results?| panel| mode| input| text| query)*"
+    r"(?: (?:in|on|of|from) (?:the |my )?[a-z]+(?: web)?)?"
+    r"(?: and (?:go|step|get|take me) back(?: to (?:the |my )?(?:chats?|chat list|inbox|normal))?)?|"
+    r"(?:go|step|get|take me) back to (?:my |the )?(?:chats|chat list)")
+_WA_CLOSE_CHAT = re.compile(r"(?:close|exit|leave|get out of|come out of) (?:this |the |that |current |open )*"
+                            r"(?:whats ?app )?(?:chat|group|conversation)(?: (?:in|on) whats ?app)?")
+# L2: "send it" / "press send" — the text already typed in the open chat (or the open Gmail draft).
+_SEND_DRAFT = re.compile(r"(?:(?:ok(?:ay)?|yes|now|please|just|and|go ahead and),? )*"
+                         r"(?:send(?: it| this| that| now| it now)?|send (?:the |this |my )?(?:message|draft|text|reply)(?: now)?|"
+                         r"(?:press|click|hit|tap)(?: on)? (?:the )?(?:send|sand)(?: button)?)(?: please)?")
+_WA_NTH = re.compile(r"(?:the )?(first|second|third|fourth|fifth|top|1st|2nd|3rd|4th|5th) (?:search )?(?:result|one|chat|group)\b.*")
+
+
+def search_request(low, text=None):
+    """
+    The words to search for when the user describes the STEPS of a search — "click on the
+    search button and search for council details", "search for rahul in the search bar" — or
+    None. It is one action: find the search box, click it, type, submit. It used to be a
+    click on a button called "search button and search for council details".
+    """
+    low = low.strip(" .?!")
+    m = re.fullmatch(r"(?:click|tap|press|go to|open|focus|select|use)(?: on| in)? " + _SEARCH_BOX +
+                     r"(?:,| and| then)+ (?:search(?: for)?|type(?: in)?|write|enter|look for|look up|find) (.+?)"
+                     r"(?:(?:,| and| then)+ (?:press|hit|click|tap)(?: on)? (?:the )?(?:enter|search|go)(?: button| key)?)?", low) \
+        or re.fullmatch(r"(?:search(?: for)?|look for|look up|find) (.+?) (?:in|on|using|with|from|through) " + _SEARCH_BOX, low)
+    if not m:
+        return None
+    query = m.group(1).strip()
+    found = re.search(re.escape(query), text or "", re.I)
+    return found.group(0) if found else query
+
+
+_WA_SUFFIX = r"(?: (?:on|in|from) (?:my )?whats ?app(?: web)?)"
+_WA_NAMED_RE = re.compile(r"(?:(?:open|go to|show|show me|switch to|read|summari[sz]e|catch me up on|what(?:'s| is) new in|"
+                          r"search(?: for)?|find|look for|look up) .+" + _WA_SUFFIX +
+                          r"|search (?:my )?whats ?app for .+)(?: and open (?:it|that|the (?:chat|group|first one)))?")
+_WA_SEARCH = re.compile(r"(?:search|find|look for|look up)(?: (?:my )?whats ?app)?(?: for)? (?:the |my |our )?(.+?)"
+                        r"(?: chat| group| conversation)?" + _WA_SUFFIX + r"?"
+                        r"( and open (?:it|that|the (?:chat|group|first one)))?")
+_WA_READ_RECENT = re.compile(r"(?:read|summari[sz]e)(?: me)? (?:the |my )?(?:most )?(?:recent|latest|last|new|newest) chats?")
+_NUM = r"(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|couple of|few)"
+_WA_AGE = r"(?:last|latest|recent|most recent|newest|new|past|previous)"
+# "read the last three messages of mota panda", "open and read the latest 3 recent chats from X"
+_WA_LAST_N = re.compile(
+    r"(?:open (?:and|then) )?(?:read|show|tell|give|check|summari[sz]e|what (?:are|were))(?: me)?(?: out)? (?:the |my )?"
+    r"((?:" + _WA_AGE + r" |" + _NUM + r" )+)(?:chats?|messages?|texts?|msgs?) "
+    r"(?:of|from|in|by|with|on) (?:the |my |our )?(.+?)(?: chat| group| conversation)?" + _WA_SUFFIX + r"?")
+_WA_LAST_N_POSS = re.compile(
+    r"(?:open (?:and|then) )?(?:read|show|tell me|summari[sz]e)(?: me)?(?: out)? (.+?)(?:'s|s') "
+    r"((?:" + _WA_AGE + r" |" + _NUM + r" )+)(?:chats?|messages?|texts?|msgs?)" + _WA_SUFFIX + r"?")
+_WA_LAST_HERE = re.compile(r"(?:read|show|tell|give)(?: me)?(?: out)? (?:the |my )?((?:" + _WA_AGE + r" |" + _NUM + r" )+)"
+                           r"(?:chats?|messages?|texts?|msgs?)(?: here| in (?:this|the) (?:chat|group))?"
+                           # L5: "…and read the last three" — the noun is often left off
+                           r"|(?:read|show|tell|give)(?: me)?(?: out)? (?:the |my )?((?:" + _WA_AGE + r" )+"
+                           r"(?:" + _NUM + r"))")
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+                "nine": 9, "ten": 10, "couple of": 2, "few": 3}
+
+
+def last_messages_request(low):
+    """('mota panda', 3) for "read the last three messages of mota panda"; None otherwise.
+    count 0 = the words gave no number ("the latest messages from X")."""
+    low = low.strip(" .?!")
+    m = _WA_LAST_N.fullmatch(low)
+    name, words = (m.group(2), m.group(1)) if m else (None, None)
+    if not m:
+        m = _WA_LAST_N_POSS.fullmatch(low)
+        if not m:
+            return None
+        name, words = m.group(1), m.group(2)
+    name = re.sub(r"^(?:the|my|our)\s+", "", name.strip())
+    found = re.search(r"\d{1,2}|couple of|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|few)\b", words)
+    count = 0 if not found else int(found.group(0)) if found.group(0).isdigit() else _COUNT_WORDS[found.group(0)]
+    if not name or name in ("this", "it", "that", "here", "whatsapp", "whats app"):
+        name = "current" if count else "recent"      # no chat named: the open one / the newest
+    return name, min(count, 30)
+
+
+_WA_RECENT = re.compile(r"(?:the )?(?:most )?(?:recent|latest|last|newest|new)(?: one| chat| message| messages)?")
+
+
+def _bare_fix(lowered, raw):
+    """Shapes the DMM sends without a prefix and that the prefix rules get WRONG: "close the
+    search bar" (an app called "search bar"), "open graphics team group in whatsapp" (an app),
+    "scroll the mail to bottom" (nothing), "click on the search button and search for X"."""
+    if _SEARCH_CLOSE_RE.fullmatch(lowered):
+        return Action("browser", "search_close", target="search", raw=raw)
+    query = search_request(lowered, raw)
+    if query:
+        return Action("browser", "search_here", target=query, raw=raw)
+    if lowered.startswith(("scroll", "keep scroll", "please scroll")) or " of the " in lowered or " of this " in lowered:
+        request = scroll_request(lowered)
+        if request:
+            return Action("browser", "page_scroll", target=request["direction"], parameters=request, raw=raw)
+    if _WA_NAMED_RE.fullmatch(lowered) or _WA_READ_RECENT.fullmatch(lowered) or last_messages_request(lowered):
+        return _web_action("message", raw, raw)
+    if _WA_CLOSE_CHAT.fullmatch(lowered) and re.search(r"\b(?:chat|conversation|whats ?app)\b", lowered):
+        return Action("message", "close", target="current", raw=raw)     # "close the chat"
+    # "open the graphics team group": a Chrome tab group by that name, else WhatsApp's group.
+    if re.fullmatch(r"open (?:the |my |our )?.+ group", lowered) and "tab group" not in lowered:
+        return _part_2c_action(lowered, raw)
+    return _named_chat(lowered, raw)
+
+
+def _named_chat(low, raw):
+    """'open rahul chat' with nothing saying WhatsApp: a chat is a WhatsApp chat unless an app
+    or a site is really called that ("google chat")."""
+    m = re.fullmatch(r"(?:open|go to|show me|switch to) (?:the |my |our )?(.+?) (?:chat|conversation|dm)", low)
+    if m and m.group(1) not in _NOT_A_NAME and not (targets.website_url(f"{m.group(1)} chat")
+                                                    or _known_app(f"{m.group(1)} chat")):
+        return _web_action("message", re.sub(r"^browser\s+", "", raw, flags=re.I), raw)
+    return None
+
+
 def _web_action(kind, payload, raw):
     """'browser …', 'meet …', 'email …', 'calendar …', 'message …' -> a structured action."""
     text = (payload or "").strip()
     low = text.lower().strip(" .?!")
     if kind == "browser":
+        if _SEARCH_CLOSE_RE.fullmatch(low):
+            return Action("browser", "search_close", target="search", raw=raw)
+        if _WA_NAMED_RE.fullmatch(low) or _WA_READ_RECENT.fullmatch(low) or last_messages_request(low):
+            return _web_action("message", payload, raw)      # "browser open X group in whatsapp"
+        found = profile_action(low, raw, text)             # Part 5P: Chrome profiles
+        if found is not None:
+            return found
+        found = part_12_action(low, raw, text)             # Part 12: sessions, reading list, PiP, screenshots
+        if found is not None:
+            return found
+        found = part_7_action(low, raw, text)              # Part 7: the page agent, recipes
+        if found is not None and found.domain == "browser":
+            return found
+        found = part_6b_action(low, raw, text)             # Part 6b: AI sites, Reddit / LinkedIn / GitHub
+        if found is not None:
+            return found
+        found = _named_chat(low, raw)
+        if found is not None:
+            return found
+        found = part_6_action(low, raw, text)              # Part 6: forms, video, site search, shopping
+        if found is not None:
+            return found
+        query = search_request(low, text)
+        if query:
+            return Action("browser", "search_here", target=query, raw=raw)
+        request = scroll_request(low)
+        if request:
+            return Action("browser", "page_scroll", target=request["direction"], parameters=request, raw=raw)
         m = re.match(r"(?:list|show|what are)?\s*(?:my\s+)?(?:open\s+)?tabs$|what tabs", low)
         if m:
             return Action("browser", "tabs_list", target="all", raw=raw)
         m = re.match(r"close (?:all )?(?:the )?other tabs|close all tabs except (?:this|the current)(?: one| tab)?", low)
         if m:
             return Action("browser", "tabs_close_others", target="others", raw=raw)
+        # ── Part 2b ──
+        m = re.fullmatch(r"(un)?mute (?:all |every )?(?:the )?(?:other tabs|tabs except (?:this|the current)(?: one| tab)?|everything (?:else|except (?:this|the current)(?: one| tab)?))", low)
+        if m:
+            return Action("browser", "tabs_mute_others", target="others",
+                          parameters={"on": not m.group(1)}, raw=raw)
+        if re.fullmatch(r"what (?:tabs? )?did i (?:just )?close|(?:show |list )?(?:my )?recently closed(?: tabs)?|what did i close", low):
+            return Action("browser", "tabs_recently_closed", target="closed", raw=raw)
+        m = re.fullmatch(r"(?:reopen|restore|bring back) (?:the )?(.+?) tab(?: (?:that )?i (?:just )?closed)?", low)
+        if m and m.group(1) not in ("last", "closed", "last closed"):
+            return Action("browser", "tab_reopen", target=m.group(1), raw=raw)
+        if re.fullmatch(r"(?:free up|save|reduce) (?:some )?memory(?: in chrome| in the browser)?|(?:put|send) (?:the |my )?(?:background |other )?tabs to sleep|(?:discard|sleep) (?:the |my )?(?:background |other )?tabs", low):
+            return Action("browser", "tabs_discard", target="background", raw=raw)
+        m = re.fullmatch(r"(?:find|which is|where is|show me) (?:the |my )?tab (?:where i was |that )?(?:reading |looking )?(?:about|on|with|mentioning|has) (.+)", low)
+        if m:
+            return Action("browser", "tab_find", target=m.group(1), raw=raw)
+        if re.fullmatch(r"hard (?:reload|refresh)(?: (?:this|the) page)?|(?:reload|refresh) (?:this page |the page )?without (?:the )?cache", low):
+            return Action("browser", "page_reload", target="current", parameters={"hard": True}, raw=raw)
+        m = re.fullmatch(r"(?:set )?(?:the )?(?:page )?zoom (?:the page )?(?:to |at )?(\d{2,3})(?: ?%| percent)?", low)
+        if m:
+            return Action("browser", "page_zoom", target=m.group(1), raw=raw)
+        m = re.fullmatch(r"copy (?:the |this )?(?:page'?s? |tab'?s? )?(link|url|address|title)(?: of (?:this|the) (?:page|tab))?", low)
+        if m:
+            return Action("browser", "page_copy", target="title" if m.group(1) == "title" else "link", raw=raw)
+        # ── Part 4 ──
+        found = part_4_action(low, raw, text)
+        if found is not None:
+            return found
+        # ── Part 3 ──
+        found = part_3_action(low, raw, text)
+        if found is not None:
+            return found
+        # ── Part 2c ──
+        found = _part_2c_action(low, raw)
+        if found is not None:
+            return found
+        if re.fullmatch(r"close (?:all )?(?:the |my )?duplicate(?: tabs)?s?|close (?:the )?duplicates?(?: tabs)?|remove duplicate tabs", low):
+            return Action("browser", "tabs_close_duplicates", target="duplicates", raw=raw)
+        m = re.fullmatch(r"close (?:all )?(?:the |my )?(?:other )?tabs (?:to|on) the (right|left)", low)
+        if m:
+            return Action("browser", "tabs_close_side", target=m.group(1), raw=raw)
+        found = _all_tabs(low, raw)
+        if found is not None:
+            return found
+        m = re.fullmatch(r"close (.+)", low)
+        position = tab_position(m.group(1)) if m else None
+        if position:
+            return Action("browser", "tab_close", target=position, parameters={"all": False},
+                          raw=raw)
         m = re.match(r"close (all )?(?:the |my )?(.+?) tabs?$", low)
         if m:
             return Action("browser", "tab_close", target=m.group(2),
                           parameters={"all": bool(m.group(1))}, raw=raw)
+        m = re.fullmatch(r"(?:switch|go|jump|move|take me) (?:to|over to) (.+)", low)
+        position = tab_position(m.group(1)) if m else None
+        if position:
+            return Action("browser", "tab_switch", target=position, raw=raw)
         m = re.match(r"(?:switch|go|jump|take me) to (?:the |my )?(.+?)(?: tab)?$", low)
         if m and m.group(1) not in ("top", "bottom"):
             return Action("browser", "tab_switch", target=m.group(1), raw=raw)
@@ -983,14 +1472,29 @@ def _web_action(kind, payload, raw):
                       confidence=0.5, raw=raw)
 
     if kind == "meet":
+        if re.search(r"\bjoin\b.*\bnext (?:meeting|call|event)\b", low):
+            return Action("calendar", "next", target="next", parameters={"join": True}, raw=raw)
+        if re.fullmatch(r"(?:admit|let in|accept)(?: them| everyone| all| the people waiting| people)?(?: in)?|"
+                        r"let (?:them|everyone|people) in", low):
+            return Action("meet", "admit", target="everyone", raw=raw)
+        early = part_9_10_action(low, raw, text)        # Part 13: present a deck, notes, recording
+        if early is not None and early.action in ("present", "notes", "summary", "record", "record_stop"):
+            return early
+        if _SHARE_STATUS.search(low):
+            return Action("meet", "share_status", target="current", raw=raw)
+        request = share_request(low)
+        if request is not None:
+            return _share_action(request, raw)
+        if re.fullmatch(r"(?:open|show) (?:the )?(?:meeting |call )?chat", low):
+            return Action("meet", "chat", target="current", parameters={"on": True}, raw=raw)
         if re.match(r"(?:join|start|open)\b", low):
             code = re.search(r"([a-z]{3}-[a-z]{4}-[a-z]{3})|(https?://meet\.google\.com/\S+)", low)
             return Action("meet", "join", target=code.group(0) if code else "new", raw=raw)
         if re.search(r"(share|present).*(stop|end)|(stop|end).*(shar|present)", low):
             return Action("meet", "stop_share", target="current", raw=raw)
-        if re.search(r"share|present", low):
-            surface = ("window" if "window" in low else "browser" if "tab" in low else "monitor")
-            return Action("meet", "share", target=surface, raw=raw)
+        found = part_9_10_action(low, raw, text)        # Part 9: people, reactions, pin, chat, link
+        if found is not None and found.domain == "meet":
+            return found
         for word, op in (("mic", "mic"), ("microphone", "mic"), ("mute", "mic"),
                          ("camera", "camera"), ("video", "camera"), ("caption", "captions"),
                          ("hand", "hand"), ("leave", "leave"), ("hang up", "leave"),
@@ -1004,6 +1508,23 @@ def _web_action(kind, payload, raw):
         return Action("meet", "join", target="new", raw=raw)
 
     if kind == "email":
+        # ── Part 4, E5 ──
+        m = re.fullmatch(r"(?:show|open|find|list)?\s*(?:my |the )?unread(?: emails| mails| messages)?"
+                         r"(?: (?:from|in|since) (?:this|the past|the last|last) (week|month|day)| (?:from )?today)?", low)
+        if m and low not in ("unread",) and not low.startswith("open"):   # "open unread" opens one
+            span = {"week": "7d", "month": "30d", "day": "1d"}.get(m.group(1) or "", "1d" if "today" in low else "")
+            return Action("email", "search", target="is:unread" + (f" newer_than:{span}" if span else ""), raw=raw)
+        m = re.fullmatch(r"(?:search|find|look)(?: in| through)? (?:my |the )?(?:mail|mails|email|emails|inbox|gmail)?\s*"
+                         r"(?:for )?(.+)", low)
+        if m and re.match(r"(?:search|look)", low) or (m and re.match(r"find (?:the |my )?(?:mail|email)s? (?:about|with|for)", low)):
+            query = re.sub(r"^(?:the |my |mails? |emails? )?(?:about |with |for )?", "", m.group(1)).strip()
+            found = re.search(re.escape(query), text, re.I)
+            return Action("email", "search", target=found.group(0) if found else query, raw=raw)
+        if re.fullmatch(r"(?:compose|write|start)(?: a)?(?: new)?(?: blank)?(?: email| mail)?|new (?:email|mail)", low):
+            return Action("email", "compose", target="new", raw=raw)
+        m = re.fullmatch(r"(?:open|show|go to) (?:my |the )?(.+?) label|(?:open|show) (?:the )?label (.+)", low)
+        if m:
+            return Action("email", "label", target=(m.group(1) or m.group(2)).strip(), raw=raw)
         one = _which_email(low, implied=True)
         folder = re.match(r"(?:open|go to|show)?\s*(?:my |the )?(inbox|sent(?: mail)?|all mails?|starred|drafts?|"
                           r"spam|trash|bin|important|snoozed|scheduled)(?: folder| mails?| emails?)?$", low)
@@ -1039,14 +1560,70 @@ def _web_action(kind, payload, raw):
         return Action("email", "check", target="inbox", raw=raw)
 
     if kind == "calendar":
+        # ── Part 4, E6 ──
+        if re.search(r"\bjoin\b.*\bnext\b|\bnext (?:meeting|call|event)\b.*\bjoin\b", low):
+            return Action("calendar", "next", target="next", parameters={"join": True}, raw=raw)
+        if re.search(r"\b(?:next|upcoming) (?:meeting|event|call|appointment)\b|what'?s next\b", low):
+            return Action("calendar", "next", target="next", parameters={"join": False}, raw=raw)
+        day = re.search(r"\b(today|tomorrow|day after tomorrow|monday|tuesday|wednesday|thursday|friday|"
+                        r"saturday|sunday)\b", low)
         m = re.match(r"(?:add|create|schedule|book|new)(?: an?)?(?: event| meeting)?\s*(.*)$", low)
         if m:
             return Action("calendar", "add", target=m.group(1) or "event",
                           parameters={"text": text}, raw=raw)
-        return Action("calendar", "agenda", target="tomorrow" if "tomorrow" in low else "today",
-                      raw=raw)
+        return Action("calendar", "agenda", target=day.group(1) if day else "today", raw=raw)
 
     if kind == "message":
+        # ── Part 6b, F5: a reply in the open chat, a file to a chat — before every other shape ──
+        bare_wa = re.sub(_WA_SUFFIX + r"$", "", low).strip()
+        found = message_8_action(bare_wa, raw, text) or message_6b_action(bare_wa, raw, text)
+        if found is not None:
+            return found
+        # ── Part 5, H0.4: open / read / who messaged me, before the send shapes ──
+        if re.fullmatch(r"(?:who|anyone|anybody) (?:messaged|texted|wrote to|pinged) me(?: on whatsapp)?(?: today)?|"
+                        r"(?:any |show |read |list |check )?(?:my )?unread(?: chats| messages| whatsapp messages)?|"
+                        r"(?:do i have )?(?:any )?new messages(?: on whatsapp)?", low):
+            return Action("message", "unread", target="whatsapp", raw=raw)
+        if _WA_CLOSE_CHAT.fullmatch(low):
+            return Action("message", "close", target="current", raw=raw)
+        if _SEND_DRAFT.fullmatch(low):
+            return Action("message", "send_draft", target="current", raw=raw)
+        if re.fullmatch(r"(?:open|search|show|find|go to|check)(?: (?:it|that|the|a|chat|group|one))*", low):
+            return None          # a verb with no name is not a chat called "it", nor a message to "open"
+        asked = last_messages_request(low)
+        if asked:
+            return Action("message", "read", target=asked[0], parameters={"today": False, "count": asked[1]}, raw=raw)
+        m = _WA_LAST_HERE.fullmatch(low)
+        if m:                                    # "read the last three messages": the open chat
+            found = re.search(r"\d{1,2}|couple of|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|few)\b", m.group(1) or m.group(2))
+            count = 0 if not found else int(found.group(0)) if found.group(0).isdigit() else _COUNT_WORDS[found.group(0)]
+            return Action("message", "read", target="recent" if not count else "current",
+                          parameters={"today": False, "count": min(count, 30)}, raw=raw)
+        m = re.fullmatch(r"(?:open|click(?: on)?|select|go to|show me)(?: search)? result (?:number )?(\d{1,2})", low) \
+            or re.fullmatch(r"(?:open|click(?: on)?|select|go to|show me) " + _WA_NTH.pattern + _WA_SUFFIX + r"?", low)
+        if m:
+            word = m.group(1)
+            return Action("message", "open", target=f"#{_ORDINAL_N.get(word) or int(re.sub(r'[^0-9]', '', word) or 1)}", raw=raw)
+        m = _WA_SEARCH.fullmatch(low)
+        if m and ":" not in text and " saying " not in low:
+            return Action("message", "search", target=m.group(1).strip(),
+                          parameters={"open": bool(m.group(2))}, raw=raw)
+        m = re.fullmatch(r"(?:open|go to|show|switch to|show me|click(?: on)?) (?:the |my |our )?(.+?)"
+                         r"(?: chat| group| conversation| dm)?" + _WA_SUFFIX + r"?", low)
+        if m and ":" not in text and " saying " not in low:
+            name = re.sub(r"\s+(?:chat|group|conversation|dm)$", "", m.group(1)).strip()
+            if _WA_RECENT.fullmatch(name):
+                name = "recent"                  # "open the latest chat": the newest one
+            return Action("message", "open", target=name, raw=raw)
+        m = re.fullmatch(r"(?:read|summari[sz]e|catch me up on|what(?:'s| is) new in|what did (?:they|people|everyone) say in)"
+                         r" (?:the |my |our )?(.+?)(?: chat| group| conversation)?( today)?" + _WA_SUFFIX + r"?", low)
+        if m and ":" not in text:
+            name = m.group(1).strip()
+            name = "current" if name in ("this", "it", "this chat", "the chat", "messages", "the messages") else name
+            if _WA_RECENT.fullmatch(name):
+                name = "recent"                  # the open chat, else the one with the newest message
+            return Action("message", "read", target=name, parameters={"today": bool(m.group(2))}, raw=raw)
+        text = re.sub(r"^(?:tell|text|message|ping|whatsapp|send (?:a )?(?:message|text) to)\s+", "", text, flags=re.I)
         if ":" in text:
             who, _, body = text.partition(":")
         else:
@@ -1054,6 +1631,1742 @@ def _web_action(kind, payload, raw):
             who, body = (m.group(1), m.group(2)) if m else (text, "")
         return Action("message", "send", target=_strip(who, "to"),
                       parameters={"text": body.strip(), "app": "whatsapp"}, raw=raw)
+    return None
+
+
+# ── Part 4 (BROWSER_CONTROL_PLAN E1–E8, Google Workspace) ──
+WS_KINDS = {"sheet": "sheet", "sheets": "sheet", "spreadsheet": "sheet", "spreadsheets": "sheet",
+            "doc": "doc", "docs": "doc", "document": "doc", "documents": "doc",
+            "deck": "slides", "decks": "slides", "presentation": "slides", "presentations": "slides",
+            "slides": "slides", "slide deck": "slides", "form": "form", "forms": "form",
+            "file": "file", "files": "file", "pdf": "pdf", "pdfs": "pdf", "drive": "file"}
+_KIND_WORDS = r"(sheet|spreadsheet|doc|document|deck|presentation|slides|slide deck|form|file|pdf)"
+_NOT_A_NAME = {"", "google", "a", "an", "the", "my", "new", "this", "that", "blank", "empty",
+               "first", "last", "latest"}
+_CALC = {"total": "sum", "sum": "sum", "average": "avg", "mean": "avg", "avg": "avg",
+         "maximum": "max", "max": "max", "highest": "max", "biggest": "max", "largest": "max",
+         "minimum": "min", "min": "min", "lowest": "min", "smallest": "min", "count": "count"}
+
+
+def spoken_email(text):
+    """'ana at x dot com' / 'ana dot r at gmail dot com' / 'ana@x.com' -> the address, or ''."""
+    t = " ".join(str(text or "").lower().replace(" underscore ", "_").replace(" dash ", "-").split())
+    t = re.sub(r"\s+(?:at|@)\s+", "@", t)
+    t = re.sub(r"\s+(?:dot|\.)\s+", ".", t)
+    t = t.replace(" ", "")
+    return t if re.fullmatch(r"[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", t) else ""
+
+
+def part_4_action(low, raw, text=None):
+    """Google Workspace shapes (Sheets, Docs, Slides, Drive, Keep, Forms, Classroom), or None."""
+    text = text if text is not None else raw
+    low = low.strip(" .?!")
+    # E8 form responses first: "open the responses of my feedback form" is not a file called
+    # "responses of my feedback".
+    m = re.fullmatch(r"(?:open|show) (?:the )?responses (?:of|for|to|from) (?:my |the )?(.+?)(?: form)?|"
+                     r"(?:open|show) (?:my |the )?(.+?) form(?:'s)? responses", low)
+    if m:
+        return Action("browser", "form_responses", target=(m.group(1) or m.group(2)).strip(), raw=raw)
+    # G5: "open the sheet Ravi sent last week" — files shared BY someone are searched for their name.
+    m = re.fullmatch(r"(?:open|find|show me) (?:me )?(?:the |my |a )?(pdf|sheet|spreadsheet|doc|document|deck|presentation|file|form)"
+                     r" (?:that |which )?([a-z][a-z .'-]{0,40}?) (?:sent|shared|gave|emailed)(?: me| with me| to me)?"
+                     r"(?: (?:last week|this week|yesterday|today|recently|last month|earlier))?", low)
+    if m and m.group(2).strip() not in _NOT_A_NAME and m.group(2).strip() not in ("you", "i", "we"):
+        return Action("browser", "ws_search", target=m.group(2).strip(),
+                      parameters={"kind": WS_KINDS[m.group(1)], "open": True}, raw=raw)
+    # E1/E2/E3/E4 — open a file BY NAME ("open my budget sheet", "open the doc about the internship").
+    m = re.fullmatch(r"open (?:up )?(?:my |the |our )?(.+?) " + _KIND_WORDS, low)
+    if m and m.group(1).strip() not in _NOT_A_NAME and not re.match(r"(?:new|a new|blank|google)\b", m.group(1)):
+        name = re.sub(r"^(?:google )", "", m.group(1)).strip()
+        return Action("browser", "ws_open", target=name, parameters={"kind": WS_KINDS[m.group(2)]}, raw=raw)
+    m = re.fullmatch(r"open (?:my |the )?" + _KIND_WORDS + r" (?:about|called|named|titled|on|for|with) (.+)", low)
+    if m:
+        return Action("browser", "ws_open", target=re.sub(r"^(?:the|my|a) ", "", m.group(2).strip()),
+                      parameters={"kind": WS_KINDS[m.group(1)]}, raw=raw)
+    # search / find files
+    m = re.fullmatch(r"(?:search|look) (?:in |through )?(?:my |the )?(sheets|spreadsheets|docs|documents|slides|"
+                     r"presentations|decks|forms|drive|files|google drive) (?:for )?(.+)", low)
+    if m:
+        return Action("browser", "ws_search", target=m.group(2), parameters={"kind": WS_KINDS.get(m.group(1).replace("google ", ""), "file")}, raw=raw)
+    m = re.fullmatch(r"find (?:me )?(?:the |my |a )?(pdf|sheet|spreadsheet|doc|document|deck|presentation|file|form)"
+                     r"(?: that| which)? (.+?)(?: sent me| shared with me| shared| gave me| emailed me)?", low)
+    if m and m.group(1) and m.group(2).strip() not in _NOT_A_NAME and not re.match(r"(?:about|on) this page", m.group(2)):
+        query = re.sub(r"^(?:from|by|about|called|named) ", "", m.group(2).strip())
+        return Action("browser", "ws_search", target=query, parameters={"kind": WS_KINDS[m.group(1)], "open": True}, raw=raw)
+    # create
+    m = re.fullmatch(r"(?:create|make|start|open) (?:a |an )?(?:new |blank |empty )(?:google )?"
+                     r"(sheet|spreadsheet|doc|document|presentation|deck|slides|slide deck|form)"
+                     r"(?: (?:called|named|titled|for) (.+))?", low)
+    if m:
+        title = ""
+        if m.group(2):
+            found = re.search(re.escape(m.group(2)), text, re.I)
+            title = found.group(0) if found else m.group(2)
+        return Action("browser", "ws_create", target=WS_KINDS[m.group(1)], parameters={"title": title}, raw=raw)
+    # E1 Sheets — cell, calculations, rows.
+    m = re.fullmatch(r"(?:go|jump|move|take me) to (?:cell )?([a-z]{1,3}\s?\d{1,6})|(?:select|open) cell ([a-z]{1,3}\s?\d{1,6})", low)
+    if m:
+        return Action("browser", "sheet_cell", target=(m.group(1) or m.group(2)).replace(" ", "").upper(), raw=raw)
+    m = re.fullmatch(r"(?:what(?:'s| is)|tell me|give me|calculate|find) (?:the )?(total|sum|average|mean|avg|maximum|max|"
+                     r"highest|biggest|largest|minimum|min|lowest|smallest|count) (?:value )?(?:of|in|for) "
+                     r"(?:the )?(?:column )?(.+?)(?: column)?(?: in this sheet)?", low)
+    if m:
+        column, params = m.group(2).strip(), {"op": _CALC[m.group(1)]}
+        w = re.fullmatch(r"(.+?)(?: column)? (?:where|when|for rows where|if) (?:the )?(.+?) (?:is|=|equals|says) (.+)", column)
+        if w:
+            column, params["where"] = w.group(1).strip(), [w.group(2).strip(), w.group(3).strip()]
+        return Action("browser", "sheet_calc", target=column, parameters=params, raw=raw)
+    m = re.fullmatch(r"(total|sum(?: up)?|add up|average|count) (?:the )?(?:values (?:in|of) )?(?:column )?([a-z]{1,3}|.+? column)"
+                     r"(?: in this sheet)?", low)
+    if m:                                        # G5: "… and total column C" — the imperative shape
+        verb = m.group(1).split()[0].replace("add", "total")
+        return Action("browser", "sheet_calc", target=re.sub(r" column$", "", m.group(2)).strip(),
+                      parameters={"op": _CALC.get(verb, "sum")}, raw=raw)
+    if re.fullmatch(r"how many (?:rows|entries|records|lines|people|items)(?: are (?:there|in this sheet)| does this sheet have| in this sheet)?", low):
+        return Action("browser", "sheet_calc", target="rows", parameters={"op": "rows"}, raw=raw)
+    m = re.fullmatch(r"read (?:me )?(?:out )?row (?:number )?(\d{1,6})", low)
+    if m:
+        return Action("browser", "sheet_row", target=m.group(1), raw=raw)
+    m = re.fullmatch(r"read (?:me )?(?:out )?(?:the )?(?:column|row) (?:headers|headings|names)|what are the columns(?: in this sheet)?", low)
+    if m:
+        return Action("browser", "sheet_row", target="1", parameters={"headers": True}, raw=raw)
+    # E2 Docs — share (prefill only; you press Send).
+    m = re.fullmatch(r"share (?:it|this|this (?:doc|document|sheet|file|deck|presentation)) with (.+)", low)
+    if m and spoken_email(m.group(1)):
+        return Action("browser", "ws_share", target=spoken_email(m.group(1)), raw=raw)
+    # E3 Slides.
+    if re.fullmatch(r"(?:start|begin) (?:the )?(?:slideshow|slide show)|present (?:this|the|my) (?:deck|slides|presentation)|"
+                    r"(?:start|begin) presenting (?:the|this|my) (?:deck|slides|presentation)|play (?:the )?slideshow", low):
+        return Action("browser", "slides_present", target="current", raw=raw)
+    m = re.fullmatch(r"(next|previous|prev|last) slide|(?:go )?(back|forward) (?:a|one) slide|(end|exit|stop|close) (?:the )?"
+                     r"(?:slideshow|slide show|presentation)", low)
+    if m:
+        verb = "next" if (m.group(1) == "next" or m.group(2) == "forward") else \
+               "previous" if (m.group(1) or m.group(2)) else "end"
+        return Action("browser", "slides_nav", target=verb, raw=raw)
+    # E4 Drive.
+    if re.fullmatch(r"(?:open|show) (?:my )?recent (?:files|documents|docs)(?: in drive)?|what (?:files )?did i (?:open|work on) recently", low):
+        return Action("browser", "ws_recent", target="recent", raw=raw)
+    if re.fullmatch(r"download (?:this|the) (?:file|doc|document|sheet|pdf)", low):
+        return Action("browser", "ws_download", target="current", raw=raw)
+    # E8 Keep / Forms / Classroom.
+    m = re.fullmatch(r"(?:add|take|make|write|create) a (?:new )?(?:keep )?note(?: in keep)?(?: saying|:| that| to)? (.+)|"
+                     r"note down (.+)|keep note (.+)", low)
+    if m:
+        body = m.group(1) or m.group(2) or m.group(3)
+        found = re.search(re.escape(body), text, re.I)
+        return Action("browser", "keep_note", target="keep", parameters={"text": found.group(0) if found else body}, raw=raw)
+    if re.fullmatch(r"what (?:assignments|homework|work) (?:are|is) (?:due|pending)(?: in classroom)?|"
+                    r"(?:show|list|read) (?:my )?(?:pending |due )?(?:assignments|classroom work|homework)|what'?s due in classroom", low):
+        return Action("browser", "classroom_due", target="due", raw=raw)
+    return None
+
+
+# ── Part 6 (BROWSER_CONTROL_PLAN D1–D5 forms, F1 video, F2/F3 site search and shopping) ──
+# Decision D1 (2026-11-11): shopping is search and open ONLY — "add this to cart", "buy it",
+# "checkout" become a click the policy REFUSES (policy._SHOPPING_STOP). D2: the form profile
+# holds name, email, phone, postal address, college, roll number, date of birth and gender.
+_SHOP_STOP_SAID = re.compile(
+    r"(?:please )?(?:(add)(?: (?:this|it|that|the product|this product|this item|the item|one))? to (?:the |my )?"
+    r"(?:cart|bag|basket|trolley)|(buy)(?: (?:this|it|that|one))?(?: now| for me)?|(order) (?:this|it|that)(?: for me)?|"
+    r"(place) (?:the |my |an )?order|(?:proceed to |go to )?(check) ?out|(pay)(?: for (?:it|this))?(?: now)?|"
+    r"(?:go to|open|show me|view) (?:the |my )?(cart|bag|basket))")
+_SHOP_TARGET = {"add": "add to cart", "buy": "buy now", "order": "place order", "place": "place order",
+                "check": "checkout", "pay": "pay now", "cart": "go to cart", "bag": "go to cart",
+                "basket": "go to cart"}
+_FORM_FILL_RE = re.compile(
+    r"(?:auto ?fill|fill(?: in| out| up)?|complete) (?:this |the |that )?(?:form|page|fields?|application)"
+    r"(?: (?:with|using|from) (?:my )?(?:details|info|information|data|profile|saved details))?(?: for me)?|"
+    r"fill (?:in |out )?my (?:details|info|information|data)(?: (?:in|on|into) (?:this|the) (?:form|page))?|"
+    r"auto ?fill(?: (?:it|this|the form))?|put my details (?:in|into) (?:this|the) form")
+_SUBMIT_RE = re.compile(r"(?:submit|send) (?:this|the|my) (?:form|application|response|responses|answers)|"
+                        r"submit(?: it| this| now| the page)?|(?:press|click|hit)(?: on)? (?:the )?submit(?: button)?")
+_FIELD_WORDS = r"(?: drop ?down| dropdown| drop-down| field| menu| list| options?| question| box| select)"
+_CHOOSE_RE = re.compile(r"(?:select|choose|pick|set) (.+?) (?:in|from|for|as) (?:the |my )?(.+?)(" + _FIELD_WORDS + r")?")
+_KNOWN_FORM_FIELDS = re.compile(r"(?:gender|sex|country|state|city|course|branch|programme|program|year|semester|"
+                                r"category|department|degree|batch|section|title|salutation|nationality|religion|"
+                                r"blood group|size|colour|color|quantity|language|month|day)")
+_CHECK_RE = re.compile(r"(tick|check|untick|uncheck|un tick|un check|deselect|unselect|select|turn on|turn off|switch on|switch off)"
+                       r"(?: off)? (?:the |on |that )?(.+?)( (?:check ?box|box|tick ?box|radio button|toggle|switch|option))?")
+_DATE_RE = re.compile(r"(?:set|fill|enter|put|change|pick|choose) (?:in )?(?:the |my )?(.*?(?:date of birth|birth ?date|date|dob|"
+                      r"birthday|deadline)(?: of [a-z]+)?)(?: field| box)? (?:to|as|with|:) (.+)")
+_KEY_RE = re.compile(r"(?:press|hit|tap) (?:the )?(enter|return|tab|shift tab|escape|esc|space(?:bar)?|backspace|delete|"
+                     r"(?:up|down|left|right)(?: arrow)?|page up|page down|home|end)(?: key| button)?"
+                     r"(?: (\d+) times| (twice|thrice))?")
+_UPLOAD_RE = re.compile(r"(upload|attach|add|put|select|choose) (?:my |the |a |an |this )?(.+?)(?: file)?"
+                        r"( here| to (?:this|the) (?:page|form|site|email|mail|application|message)| in (?:this|the) (?:form|page)|"
+                        r" to it| in it| to the upload(?: box| field)?)?")
+_PROFILE_SET_RE = re.compile(
+    r"(?:remember|save|store|note|keep)(?: that)? my (.+?) (?:is|as|=|:) (.+)|"
+    r"(?:remember|save|store|note) (.+?) as my (.+)|"
+    r"(?:set|update|change) my (.+?) (?:to|as) (.+?) (?:for forms|in my (?:form )?profile)|"
+    r"my (.+?) is (.+?) (?:for forms|in my (?:form )?profile)")
+_PROFILE_SHOW_RE = re.compile(
+    r"what (?:details|info|information) (?:do you have|have you got|did i give you|have you saved)(?: for forms| about me| of mine)?|"
+    r"what(?:'s| is) in my (?:form )?profile|(show|read|tell me|list) (?:me )?my (?:form )?(?:profile|details for forms|form details|saved details)")
+_PROFILE_FORGET_RE = re.compile(
+    r"forget my (.+?)(?: from (?:my )?(?:form )?profile| for forms)?|"
+    r"(?:delete|remove|clear|erase) my (.+?) (?:from (?:my )?(?:form )?profile|for forms)|"
+    r"(?:delete|remove|clear|erase|forget) (?:my |the )?(?:form profile|form details|details for forms|saved form details)")
+_SECS = r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?)"
+_SEEK_FWD = re.compile(r"(?:skip|jump|go|fast ?forward|forward|move|seek)(?: ahead| forward)?(?: by)? " + _SECS +
+                       r"(?: ahead| forward)?(?: in (?:the|this) video)?")
+_SEEK_BACK = re.compile(r"(?:go back|rewind|skip back|jump back|move back|seek back|back)(?: by)? " + _SECS +
+                        r"(?: back)?(?: in (?:the|this) video)?|(?:go|skip|jump|move) " + _SECS + r" back(?:wards?)?")
+_SEEK_TO = re.compile(r"(?:go|jump|skip|seek|move) to (\d{1,2}):(\d{2})(?::(\d{2}))?(?: in (?:the|this) video)?|"
+                      r"(?:go|jump|skip|seek) to (\d+) minutes?(?: and (\d+) seconds?)?(?: in (?:the|this) video)?|"
+                      r"(?:restart|replay) (?:the |this )?video|start (?:the |this )?video (?:over|again)|"
+                      r"go (?:back )?to the (?:start|beginning) of (?:the|this) video")
+_SPEED_RE = re.compile(r"(?:set |change )?(?:the )?(?:playback |video )?speed (?:to )?(\d+(?:\.\d+)?|half|normal)(?: ?x| times)?|"
+                       r"play (?:it |this |the video )?(?:at )?(\d+(?:\.\d+)?) ?(?:x|times)(?: speed)?|(\d+(?:\.\d+)?) ?x speed|"
+                       r"(?:play (?:it |the video )?at )?(normal|regular|default) speed|"
+                       r"(?:speed up|play faster|faster) (?:the |this )?video|(?:the )?video faster|"
+                       r"slow (?:the |this )?video down|slow down (?:the |this )?video|play (?:it |the video )?slower")
+_CAPTIONS_RE = re.compile(r"(?:turn|switch) (on|off) (?:the )?(?:captions|subtitles|cc|closed captions)|"
+                          r"(?:turn|switch) (?:the )?(?:captions|subtitles|cc) (on|off)|(?:captions|subtitles) (on|off)|"
+                          r"(show|hide|enable|disable) (?:the )?(?:captions|subtitles)")
+_VIDEO_SIMPLE = (
+    (r"skip (?:the |this )?(?:ads?|advertisement|commercial)s?(?: now)?", "skipAd", None),
+    (r"(?:play )?(?:the )?next video|skip (?:this|the) video|play the next one", "next", None),
+    (r"like (?:this|the) video|(?:give (?:it|this video) a )(?:like|thumbs up)|thumbs up (?:this|the) video", "like", True),
+    (r"(?:unlike|remove (?:my |the )?like (?:from|on)) (?:this|the) video|unlike (?:it|this)", "like", False),
+    (r"(?:save|add|put) (?:this |it |the video |this video )?(?:to|in|on) (?:my )?watch later(?: list)?|watch (?:this|it) later", "watchLater", None),
+    (r"(?:make|put|turn) (?:the |this )?video (?:full ?screen|in full ?screen)|full ?screen (?:the |this )?video|"
+     r"video (?:in )?full ?screen|(?:watch|play) (?:it |this |the video )?in full ?screen", "fullscreen", None),
+    (r"(?:turn on |switch to |use |open )?(?:the )?(?:theat(?:er|re)|cinema) mode", "theater", None),
+    (r"(?:open |use |switch to )?(?:the )?mini ?player", "miniplayer", None),
+    (r"(?:pause|stop) (?:the |this )?video", "pause", None),
+    (r"(?:play|resume|continue|unpause) (?:the |this )?video", "play", None),
+    (r"mute (?:the |this )?video", "mute", True),
+    (r"unmute (?:the |this )?video", "mute", False),
+    (r"how (?:long is|much longer is) (?:this|the) video|how much (?:time )?is left(?: in (?:the|this) video)?|"
+     r"where am i in (?:the|this) video|what video is this|what(?:'s| is) (?:this|the) video called", "state", None),
+)
+_IMAGES_RE = re.compile(r"(?:show me |find |search for |search |get me |look up )?(?:images|pictures|pics|photos) of (?!my\b)(.+)")
+_SITE_SEARCH_RE = re.compile(r"search (?:on )?(.+?) for (.+)|(?:search|look up|look for|find|show me) (?:for )?(.+?) (?:on|in) "
+                             r"(?!this\b|the page\b|the site\b|this page\b|this site\b)(.+?)(?: website| site| dot com)?|"
+                             r"(.+?) search (?:for )?(.+)")
+_NOT_SEARCH_SITES = frozenset({"drive", "docs", "sheets", "slides", "forms", "gmail", "whatsapp web", "calendar",
+                               "keep", "classroom", "photos", "contacts"})
+_SORT_WORDS = ((r"low(?:est)? to high(?:est)?|cheapest|lowest price|price ascending|least expensive|low price", "price_asc"),
+               (r"high(?:est)? to low(?:est)?|most expensive|highest price|price descending|costliest", "price_desc"),
+               (r"(?:best|top|highest|customer) rat(?:ed|ing)s?|ratings?|reviews?|best reviewed", "rating"),
+               (r"newest|latest|new arrivals|most recent|recent", "newest"),
+               (r"popular(?:ity)?|best ?sell(?:ing|ers?)|relevance", "popular"))
+_SHOP_REFINE_RE = re.compile(
+    r"sort (?:it |them |the results |this |the products |by )?(?:by )?(.+)|"
+    r"(?:show|list)(?: me)? (?:the )?(cheapest|most expensive|best rated|top rated|newest|latest)(?: ones?| products?| items?| results?)?(?: first)?|"
+    r"(?:only )?(?:show|filter|keep)(?: me)?(?: only)?(?: (?:the )?(?:results|ones|products|items))?(?: that are| which are)?(?: priced)? "
+    r"((?:under|below|less than|over|above|more than|between|from) .+)")
+_PRODUCT_RE = re.compile(
+    r"how much (?:is|does) (?:this|it|that)(?: one)?(?: cost| product| item)?|"
+    r"what(?:'s| is) (?:the |its )?(?:price|cost|rating|star rating)(?: of (?:this|it|the) ?(?:product|item)?)?(?: here)?|"
+    r"(?:read|tell me|give me) (?:the |about )?(?:this |the )?product(?: details| info)?|"
+    r"(?:what|how) (?:are|is) (?:the |its )?(?:ratings?|reviews? score|stars?)(?: of this(?: product)?)?|"
+    r"is (?:this|it) (?:in stock|available)|what(?:'s| is) this product")
+_SHOP_HOSTS = re.compile(r"(?:^|\.)(?:amazon\.[a-z.]+|flipkart\.com|myntra\.com|meesho\.com|ajio\.com|nykaa\.com|"
+                         r"croma\.com|reliancedigital\.in|snapdeal\.com|tatacliq\.com|ebay\.[a-z.]+|bestbuy\.com|"
+                         r"walmart\.com|etsy\.com|decathlon\.in)$")
+_VIDEO_HOSTS = re.compile(r"(?:^|\.)(?:youtube\.com|youtu\.be|vimeo\.com|twitch\.tv|netflix\.com|primevideo\.com|"
+                          r"hotstar\.com|jiocinema\.com|dailymotion\.com|coursera\.org|udemy\.com|nptel\.ac\.in)$")
+_TIMES = {"twice": 2, "thrice": 3}
+
+
+def _num(text):
+    """'one point five' -> '1.5', 'ten' -> '10' (the speech recogniser writes both)."""
+    from kayra.automation.web_macros import spoken_numbers
+    out = spoken_numbers(text)
+    out = re.sub(r"(\d) (?:point|dot) (\d+)", r"\1.\2", out)
+    return re.sub(r"\b(\d+) thousand\b", lambda m: str(int(m.group(1)) * 1000), out)
+
+
+def _seconds(amount, unit):
+    value = float(amount)
+    return int(value * 60) if unit.startswith("m") else int(value)
+
+
+def price_filter(query):
+    """('earbuds', lo, hi) from 'earbuds under 2000' / 'between 500 and 1000' / 'over 2k rupees'."""
+    q = _num(query.lower())
+    money = r"(?:rs\.? ?|₹ ?|inr )?(\d[\d,]*)(k)?(?: ?rupees| ?rs\.?| ?inr| ?bucks)?"
+    amount = lambda m, i: int(m.group(i).replace(",", "")) * (1000 if m.group(i + 1) else 1)
+    lo = hi = 0
+    m = re.search(r"\s*\b(?:between|from) " + money + r" (?:and|to|-) " + money + r"\b", q)
+    if m:
+        lo, hi = amount(m, 1), amount(m, 3)
+    else:
+        m = re.search(r"\s*\b(?:under|below|less than|cheaper than|within|up ?to|max(?:imum)?|not more than) " + money, q)
+        if m:
+            hi = amount(m, 1)
+        else:
+            m = re.search(r"\s*\b(?:over|above|more than|at least|min(?:imum)?|starting (?:at|from)) " + money, q)
+            if m:
+                lo = amount(m, 1)
+    rest = (q[:m.start()] + q[m.end():]).strip() if m else query
+    return (rest if m else query), lo, hi
+
+
+def sort_request(text):
+    """'price low to high' -> 'price_asc', or ''."""
+    low = text.lower()
+    for words, key in _SORT_WORDS:
+        if re.search(r"\b(?:" + words + r")\b", low):
+            return key
+    return ""
+
+
+def _site_search_action(low, raw, text):
+    m = _IMAGES_RE.fullmatch(low)
+    if m:
+        found = re.search(re.escape(m.group(1)), text, re.I)
+        return Action("browser", "site_search", target=found.group(0) if found else m.group(1),
+                      parameters={"site": "images"}, raw=raw)
+    m = _SITE_SEARCH_RE.fullmatch(low)
+    tail = re.search(r",? (?:and )?(?:(?:sorted|sort|ordered) by .+|(?:cheapest|lowest price|best rated|newest) first|"
+                     r"(?:under|below|less than|between|over|above) .+)$", low)
+    if tail and not (m and targets.canonical_website((m.group(1) or m.group(4) or m.group(5) or "").strip())):
+        # "search for X on flipkart sorted by price": the clause after the site belongs to the query.
+        head = _SITE_SEARCH_RE.fullmatch(low[:tail.start()])
+        if head and (head.group(3) or head.group(1)):
+            low = (f"search {head.group(1)} for {head.group(2)}" if head.group(1)
+                   else f"search {head.group(4)} for {head.group(3)}") + low[tail.start():]
+            text = low
+            m = _SITE_SEARCH_RE.fullmatch(low)
+    if not m:
+        return None
+    name, query = (m.group(1), m.group(2)) if m.group(1) else (m.group(4), m.group(3)) if m.group(3) else (m.group(5), m.group(6))
+    site = targets.canonical_website(name.strip())
+    if not site or site in _NOT_SEARCH_SITES or site == "google" or (m.group(5) and site == "youtube"):
+        return None                    # "google search X" / "youtube search X" stay the tokens they were
+    from kayra.automation import sites
+    if site not in ("amazon", "flipkart") and not sites.search_url(site, "x"):
+        return None
+    found = re.search(re.escape(query.strip()), text, re.I)
+    query = found.group(0) if found else query.strip()
+    params = {"site": site}
+    query, where = _split_where(query)
+    if where:
+        params["where"] = where
+    sorted_by = re.search(r",?(?: and)? (?:sorted|sort|ordered|order) by (.+)$|,?(?: and)? (cheapest|lowest price|best rated|newest) first$", query, re.I)
+    if site in ("amazon", "flipkart"):
+        if sorted_by:
+            params["sort"] = sort_request(sorted_by.group(1) or sorted_by.group(2))
+            query = query[:sorted_by.start()].strip()
+        lead = re.match(r"(?:the )?(cheapest|best rated|top rated|newest|latest) ", query, re.I)
+        if lead:
+            params["sort"] = sort_request(lead.group(1))
+            query = query[lead.end():]
+        query, lo, hi = price_filter(query)
+        if lo:
+            params["lo"] = lo
+        if hi:
+            params["hi"] = hi
+    if not query.strip():
+        return None
+    return Action("browser", "site_search", target=query.strip(), parameters=params, raw=raw)
+
+
+def _video_action(low, raw):
+    num = _num(low)
+    for pattern, op, value in _VIDEO_SIMPLE:
+        if re.fullmatch(pattern, low):
+            params = {"op": op}
+            if value is not None:
+                params["value"] = value
+            key = "video_subscribe" if op == "subscribe" else "video"
+            return Action("browser", key, target=op, parameters=params, raw=raw)
+    if re.fullmatch(r"subscribe(?: to)?(?: (?:this|the|that) channel| them| him| her| this creator| to (?:this|the) channel)?", low):
+        return Action("browser", "video_subscribe", target="subscribe", parameters={"op": "subscribe"}, raw=raw)
+    m = _SEEK_FWD.fullmatch(num)
+    if m:
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": _seconds(m.group(1), m.group(2))}, raw=raw)
+    m = _SEEK_BACK.fullmatch(num)
+    if m:
+        amount, unit = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": -_seconds(amount, unit)}, raw=raw)
+    if re.fullmatch(r"rewind(?: (?:a bit|a little|the video))?|go back a (?:bit|little) in (?:the|this) video", low):
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": -10}, raw=raw)
+    if re.fullmatch(r"fast ?forward(?: (?:a bit|a little|the video))?", low):
+        return Action("browser", "video", target="seek", parameters={"op": "seek", "value": 10}, raw=raw)
+    m = _SEEK_TO.fullmatch(num)
+    if m:
+        if m.group(1):
+            secs = int(m.group(1)) * 60 + int(m.group(2)) if not m.group(3) else \
+                int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        elif m.group(4):
+            secs = int(m.group(4)) * 60 + int(m.group(5) or 0)
+        else:
+            secs = 0
+        return Action("browser", "video", target="seekTo", parameters={"op": "seekTo", "value": secs}, raw=raw)
+    m = _SPEED_RE.fullmatch(num)
+    if m:
+        said = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        if said:
+            value = {"half": 0.5, "normal": 1.0, "regular": 1.0, "default": 1.0}.get(said)
+            value = value if value is not None else float(said)
+        else:
+            value = "+0.25" if re.search(r"faster|speed up", low) else "-0.25"
+        return Action("browser", "video", target="rate", parameters={"op": "rate", "value": value}, raw=raw)
+    m = _CAPTIONS_RE.fullmatch(low)
+    if m:
+        word = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+        return Action("browser", "video", target="captions",
+                      parameters={"op": "captions", "value": word in ("on", "show", "enable")}, raw=raw)
+    return None
+
+
+def part_6_action(low, raw, text=None):
+    """Forms, the video, site search and shopping (Part 6), or None."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    # D1 — shopping stops before the cart: the click is built so the policy can refuse it.
+    m = _SHOP_STOP_SAID.fullmatch(low)
+    if m:
+        word = next(g for g in m.groups() if g)
+        return Action("browser", "page_click", target=_SHOP_TARGET[word], parameters={"nth": 1}, raw=raw)
+    # D3 the profile, D3 fill, D4 submit
+    m = _PROFILE_SET_RE.fullmatch(low)
+    if m:
+        from kayra.automation import form_profile as P
+        groups = m.groups()
+        words, value = next((groups[i], groups[i + 1]) for i in (0, 2, 4, 6) if groups[i])
+        if groups[2]:
+            words, value = groups[3], groups[2]          # "save X as my email"
+        key = P.key_for(words)
+        if key:
+            found = re.search(re.escape(value), text, re.I)
+            return Action("browser", "profile_set", target=key,
+                          parameters={"text": found.group(0) if found else value}, raw=raw)
+    m = _PROFILE_SHOW_RE.fullmatch(low)
+    if m:
+        return Action("browser", "profile_show", target="profile",
+                      parameters={"read": bool(m.group(1)) or "what" in low and "in my" in low}, raw=raw)
+    m = _PROFILE_FORGET_RE.fullmatch(low)
+    if m:
+        from kayra.automation import form_profile as P
+        words = m.group(1) or m.group(2)
+        if not words or re.fullmatch(r"(?:form )?(?:profile|details|form details|details for forms|saved details|everything)", words):
+            return Action("browser", "profile_clear", target="all", raw=raw)
+        key = P.key_for(words)
+        if key:
+            return Action("browser", "profile_forget", target=key, raw=raw)
+    if _FORM_FILL_RE.fullmatch(low):
+        return Action("browser", "form_fill", target="current", raw=raw)
+    if _SUBMIT_RE.fullmatch(low):
+        return Action("browser", "form_submit", target="current", raw=raw)
+    # D1 dates, ticks and drop-downs
+    m = _DATE_RE.fullmatch(low)
+    if m:
+        from kayra.automation import form_profile as P
+        if P.parse_date(_num(m.group(2))):
+            return Action("browser", "form_choose", target=P.parse_date(_num(m.group(2))),
+                          parameters={"field": m.group(1), "kind": "date", "option": P.parse_date(_num(m.group(2)))}, raw=raw)
+    m = _CHECK_RE.fullmatch(low)
+    if m:
+        verb, label, box = m.group(1), m.group(2), m.group(3)
+        if verb in ("tick", "untick", "un tick", "uncheck", "un check", "deselect", "unselect") or box:
+            if not (verb in ("select", "turn on", "turn off", "switch on", "switch off", "check") and not box):
+                state = verb in ("tick", "check", "select", "turn on", "switch on")
+                return Action("browser", "form_choose", target=label.strip(),
+                              parameters={"field": label.strip(), "kind": "check", "state": state}, raw=raw)
+    m = _CHOOSE_RE.fullmatch(low)
+    if m and not re.match(r"(?:all|everything|the (?:first|second|third|last) (?:result|one|tab))$", m.group(1)):
+        found = re.search(re.escape(m.group(1)), text, re.I)
+        return Action("browser", "form_choose", target=found.group(0) if found else m.group(1),
+                      parameters={"field": m.group(2).strip(), "kind": "select",
+                                  "said_field": bool(m.group(3)) or bool(_KNOWN_FORM_FIELDS.fullmatch(m.group(2).strip()))},
+                      raw=raw)
+    # D5 upload
+    m = _UPLOAD_RE.fullmatch(low)
+    if m and (m.group(1) in ("upload", "attach") or m.group(3)) and m.group(2) not in ("it", "this", "that", "a file", "file"):
+        what = re.sub(r"^(?:my|the|a|an|this)\s+", "", m.group(2)).strip()
+        if what and not re.match(r"(?:note|reminder|tab|bookmark|row|label|event)\b", what):
+            return Action("browser", "file_upload", target=what, raw=raw)
+    # D2 real keys into the page
+    m = _KEY_RE.fullmatch(_num(low))
+    if m:
+        count = int(m.group(2)) if m.group(2) else _TIMES.get(m.group(3) or "", 1)
+        return Action("browser", "page_key", target=m.group(1), parameters={"count": count}, raw=raw)
+    # F1 the video
+    found = _video_action(low, raw)
+    if found is not None:
+        return found
+    # F2/F3 site search, sort and filter results, the product
+    found = _site_search_action(low, raw, text)
+    if found is not None:
+        return found
+    m = _SHOP_REFINE_RE.fullmatch(_num(low))
+    if m:
+        said = m.group(1) or m.group(2) or ""
+        sort = sort_request(said) if said else ""
+        _, lo, hi = price_filter(m.group(3) or said)
+        if sort or lo or hi:
+            return Action("browser", "shop_refine", target=sort or "price",
+                          parameters={"sort": sort, "lo": lo, "hi": hi}, raw=raw)
+    if _PRODUCT_RE.fullmatch(low):
+        return Action("browser", "product_info", target="current", raw=raw)
+    return None
+
+
+def part_6_direct(low, text, situation_fn=None):
+    """['browser …'] when a Part 6 utterance is a complete command whatever is on screen (or is
+    one given what is in front); None when the classifier should decide."""
+    action = part_6_action(low, f"browser {text}", text)
+    if action is None:
+        return None
+    verb = action.action
+    host = front_site(situation_fn) if verb in ("video", "shop_refine", "product_info", "form_choose") else ""
+    if verb == "page_click":
+        return [f"browser {text}"]                         # shopping stop: refused, rules-first
+    if verb in ("form_fill", "form_submit", "profile_set", "profile_show", "profile_forget", "profile_clear",
+                "file_upload", "site_search", "video_subscribe"):
+        if verb == "form_submit" and not re.search(r"\bform|application|response|answers|submit button\b", low):
+            return None                                    # a bare "submit it": the model decides
+        if verb == "file_upload" and not re.match(r"(?:upload|attach)\b", low):
+            return None
+        return [f"browser {text}"]
+    if verb == "video":
+        explicit = re.search(r"\b(?:video|ads?|advertisement|captions|subtitles|watch later|theat(?:er|re) mode|"
+                             r"mini ?player|speed|\d(?:\.\d+)? ?x)\b", low)
+        return [f"browser {text}"] if explicit or _VIDEO_HOSTS.search(host or "") else None
+    if verb == "form_choose":
+        params = action.parameters
+        if params.get("kind") in ("check", "date") or params.get("said_field"):
+            return [f"browser {text}"]
+        return None
+    if verb in ("shop_refine", "product_info"):
+        return [f"browser {text}"] if _SHOP_HOSTS.search(host or "") else None
+    return None
+
+
+def _bare_part_6b(lowered, raw):
+    """A 6b shape the DMM sent without a prefix: an AI site, Reddit / LinkedIn / GitHub, or a
+    WhatsApp reply / file that names WhatsApp."""
+    tokens = part_6b_direct(lowered, raw.strip(), None)
+    if not tokens:
+        return None
+    return normalize_command(tokens[0])
+
+
+def _bare_part_6(lowered, raw):
+    """A Part 6 shape the DMM sent without the `browser` prefix, when it can only be that."""
+    text = raw.strip()
+    tokens = part_6_direct(lowered, text, None)
+    if tokens:
+        return part_6_action(lowered, raw, text)
+    return None
+
+
+# ── Part 6b: ask an AI site (F4), WhatsApp replies and files (F5), Reddit / LinkedIn / GitHub (F6) ──
+_BOT = r"(chat ?gpt|chat g p t|gpt|open ?ai|claude(?: ?\.? ?ai)?|(?:google )?gemini|bard)"
+_AI_BOT_KEY = (("claude", "claude"), ("gemini", "gemini"), ("bard", "gemini"), ("gpt", "chatgpt"),
+               ("g p t", "chatgpt"), ("open", "chatgpt"))
+_AI_ASK_RE = re.compile(r"(?:please |can you |could you |go and |go )?(?:ask|check with|consult|query) " + _BOT +
+                        r"( (?:in|with|on) a (?:new|fresh) chat)?(?: and ask(?: it)?)?[,:]? ?(.*)")
+_AI_NEW_RE = re.compile(r"(?:open|start|begin|make) (?:a )?(?:new|fresh) (?:chat|conversation) (?:in|on|with) " + _BOT +
+                        r"(?: and ask(?: it)?[,:]? (.+))?|(?:open|start) (?:a )?(?:new|fresh) " + _BOT + r" (?:chat|conversation)")
+_AI_SAYS_RE = re.compile(r"what (?:does|would|will) " + _BOT + r" (say|think) (?:about|of|on) (.+)")
+_AI_READ_RE = re.compile(r"(?:read|tell me|what(?:'s| is))(?: me| out)? (?:the |" + _BOT +
+                         r"(?:'s| s)? )(whole |full |entire |complete |last |latest )?(?:answer|reply|response)(?: again)?"
+                         r"|what did " + _BOT + r" (?:say|answer|reply)")
+
+
+def _ai_bot(word):
+    word = (word or "").lower()
+    return next((key for needle, key in _AI_BOT_KEY if needle in word), "chatgpt")
+
+
+def _ai_question(low, text, start):
+    """The question as the user said it (their capitals), from `start` in the lowered sentence."""
+    said = low[start:].strip(" ,:")
+    found = re.search(re.escape(said), text, re.I) if said else None
+    q = found.group(0) if found else said
+    q = re.sub(r"^(?:to|whether)\s+", "", q, flags=re.I)
+    if re.match(r"about\s+", q, re.I):
+        q = "Tell me " + q
+    return q.strip()
+
+
+_FILE_SAID = (r"(?:file|document|doc|pdf|photo|picture|pic|image|screenshot|screen shot|resume|cv|video|report|"
+              r"presentation|ppt|slides|notes|certificate|marksheet|mark sheet|invoice|receipt|ticket|letter|"
+              r"assignment|spreadsheet|zip|[\w-]+\.(?:pdf|docx?|pptx?|xlsx?|png|jpe?g|zip|txt|csv|mp4))")
+_SEND_FILE_RE = re.compile(r"(?:send|share|forward) (?:him |her |them )?((?:my|the|this|that|a|an|our|last|latest) (?:[\w.' -]+ )?"
+                           + _FILE_SAID + r")(?: file)? (?:to|with) (.+?)" + _WA_SUFFIX + r"?")
+_SEND_FILE_HERE_RE = re.compile(r"(?:send|share|attach|forward) ((?:my|the|this|that|a|an|our|last|latest) (?:[\w.' -]+ )?"
+                                + _FILE_SAID + r")(?: file)? (?:here|in this chat|to this chat|in (?:this|the) (?:group|conversation))")
+_REPLY_RE = re.compile(r"(?:reply|respond|answer|write back|text back)(?: to (?:this chat|this message|this group|this|them|"
+                       r"him|her|the chat|it|the last message|the group))?(?: (?:saying|with|that))?[,:]? (.+)|"
+                       r"(?:send|type and send|write) (?:a message )?(?:here|in this chat)(?: (?:saying|that))?[,:]? (.+)")
+_REPLY_TO_RE = re.compile(r"(?:reply|respond|write back) to (.+?) (?:saying|with|that|:) ?(.+)")
+
+_SOCIAL_SITE = r"(linked ?in|git ?hub|reddit)"
+_SOCIAL_WHAT = r"(notifications?|messages?|inbox|dms?|invitations?|connection requests?|feed|posts?)"
+_SOCIAL_READ_RE = re.compile(r"(?:read|check|show|tell me|what(?:'s| is| are)|any|do i have any|list)(?: me)?(?: in)? (?:my |the )?"
+                             r"(?:new |latest |unread |recent )?" + _SOCIAL_SITE + r" " + _SOCIAL_WHAT +
+                             r"|(?:read|check|show|what are|any)(?: me)? (?:my |the )?(?:new |latest |unread )?" + _SOCIAL_WHAT +
+                             r" (?:on|in|from) " + _SOCIAL_SITE)
+_SOCIAL_OPEN_RE = re.compile(r"(?:open|go to|show me) (?:my |the )?" + _SOCIAL_SITE + r" " + _SOCIAL_WHAT)
+_SUBREDDIT = r"(?:r ?/ ?|r slash |the )?([a-z0-9_]{2,21})(?: subreddit)?"
+_SUB_OPEN_RE = re.compile(r"(?:open|go to|show me|take me to) (?:r ?/ ?|r slash )([a-z0-9_]{2,21})|"
+                          r"(?:open|go to|show me|take me to) (?:the )?([a-z0-9_]{2,21}) subreddit")
+_TOP_RE = re.compile(r"(?:what(?:'s| is| are)|show me|read|tell me|read me) (?:the )?(top|best|hottest|most popular|trending|latest) "
+                     r"(post|posts)(?: (?:on|in|of|from) (r ?/ ?[a-z0-9_]{2,21}|r slash [a-z0-9_]{2,21}|(?:the )?[a-z0-9_]{2,21} subreddit|reddit))?"
+                     r"(?: (today|this week|this month|this year|of all time|all time|right now|this hour))?|"
+                     r"what(?:'s| is) trending on reddit(?: (today|this week))?")
+_REPO_RE = re.compile(r"open (?:the )?(?:github )?(?:repo|repository) ([\w.-]+(?: ?/ ?[\w.-]+)?)(?: on github)?|"
+                      r"open ([\w.-]+ ?/ ?[\w.-]+) on github|open (?:the )?([\w.-]+) (?:repo|repository) on github")
+_SOCIAL_KEY = {"notification": "notifications", "notifications": "notifications", "message": "messages",
+               "messages": "messages", "inbox": "messages", "dm": "messages", "dms": "messages",
+               "invitation": "invitations", "invitations": "invitations", "connection request": "invitations",
+               "connection requests": "invitations", "feed": "feed", "post": "posts", "posts": "posts"}
+
+
+def _site_key6(word):
+    return {"linkedin": "linkedin", "linked in": "linkedin", "github": "github", "git hub": "github",
+            "reddit": "reddit"}.get(word, word)
+
+
+def part_6b_action(low, raw, text=None):
+    """Ask an AI site, Reddit / LinkedIn / GitHub (browser kind), or None. F5 lives in the message kind."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    m = _AI_NEW_RE.fullmatch(low)
+    if m:
+        bot = _ai_bot(m.group(1) or m.group(3))
+        question = _ai_question(low, text, m.start(2)) if m.group(2) else ""
+        return Action("browser", "ai_ask", target=question or "new chat",
+                      parameters={"bot": bot, "question": question, "new": True}, raw=raw)
+    m = _AI_ASK_RE.fullmatch(low)
+    if m and (m.group(3) or "").strip(" ,:") and not re.fullmatch(r"(?:it|that|this|him|her|them)", m.group(3).strip()):
+        return Action("browser", "ai_ask", target=_ai_question(low, text, m.start(3)),
+                      parameters={"bot": _ai_bot(m.group(1)), "question": _ai_question(low, text, m.start(3)),
+                                  "new": bool(m.group(2))}, raw=raw)
+    m = _AI_SAYS_RE.fullmatch(low)
+    if m:
+        topic = _ai_question(low, text, m.start(3))
+        question = (f"What do you think of {topic}?" if m.group(2) == "think" else f"Tell me about {topic}")
+        return Action("browser", "ai_ask", target=question,
+                      parameters={"bot": _ai_bot(m.group(1)), "question": question, "new": False}, raw=raw)
+    m = _AI_READ_RE.fullmatch(low)
+    if m:
+        bot_word = m.group(1) or m.group(3)
+        return Action("browser", "ai_read", target=_ai_bot(bot_word) if bot_word else "current",
+                      parameters={"full": bool(m.group(2) and m.group(2).strip() in ("whole", "full", "entire", "complete"))},
+                      raw=raw)
+    # F6
+    m = _SUB_OPEN_RE.fullmatch(low)
+    if m:
+        return Action("browser", "social", target="subreddit",
+                      parameters={"site": "reddit", "name": m.group(1) or m.group(2), "read": False}, raw=raw)
+    m = _TOP_RE.fullmatch(low)
+    if m:
+        if m.group(5) is not None or "trending on reddit" in low:
+            return Action("browser", "social", target="top",
+                          parameters={"site": "reddit", "name": "", "period": m.group(5) or "today", "read": True}, raw=raw)
+        where = m.group(3) or ""
+        if where:
+            name = "" if where == "reddit" else re.sub(r"^(?:r ?/ ?|r slash |the )|\s*subreddit$", "", where).strip()
+            op = "top" if m.group(2) == "post" or m.group(1) in ("top", "best", "hottest", "most popular") else "posts"
+            if m.group(2) == "posts" and not m.group(4):
+                op = "posts" if name else "top"
+            period = (m.group(4) or "today").replace("right now", "today")
+            return Action("browser", "social", target=op,
+                          parameters={"site": "reddit", "name": name, "period": period, "read": True}, raw=raw)
+        return Action("browser", "social", target="posts",
+                      parameters={"site": "", "name": "", "period": "", "read": True}, raw=raw)   # the page in front
+    m = _SOCIAL_READ_RE.fullmatch(low)
+    if m:
+        site = _site_key6(m.group(1) or m.group(4))
+        what = _SOCIAL_KEY.get(m.group(2) or m.group(3), "notifications")
+        what = "top" if what == "posts" and site == "reddit" else what
+        return Action("browser", "social", target=what, parameters={"site": site, "name": "", "period": "", "read": True},
+                      raw=raw)
+    m = _SOCIAL_OPEN_RE.fullmatch(low)
+    if m:
+        site, what = _site_key6(m.group(1)), _SOCIAL_KEY.get(m.group(2), "notifications")
+        return Action("browser", "social", target=what, parameters={"site": site, "name": "", "period": "", "read": False},
+                      raw=raw)
+    m = _REPO_RE.fullmatch(low)
+    if m:
+        name = (m.group(1) or m.group(2) or m.group(3)).replace(" ", "")
+        found = re.search(re.escape(name), text.replace(" / ", "/").replace(" /", "/").replace("/ ", "/"), re.I)
+        return Action("browser", "social", target="repo",
+                      parameters={"site": "github", "name": found.group(0) if found else name, "read": False}, raw=raw)
+    m = re.fullmatch(r"(?:search|find|look for) (?:linked ?in )?jobs (?:for|as|of) (.+?) on linked ?in|"
+                     r"search linked ?in(?: for)? jobs? (?:for|as) (.+)|find (.+?) jobs on linked ?in", low)
+    if m:
+        query = (m.group(1) or m.group(2) or m.group(3)).strip()
+        found = re.search(re.escape(query), text, re.I)
+        return Action("browser", "site_search", target=found.group(0) if found else query,
+                      parameters={"site": "linkedin jobs"}, raw=raw)
+    return None
+
+
+# ── Part 8 (H3): WhatsApp extras ──
+_THIS_CHAT = {"", "chat", "this", "it", "this chat", "the chat", "this group", "the group", "this conversation", "here"}
+_EMOJI_WORDS = r"(thumbs up|like|heart|love|laugh|laughing|haha|lol|wow|surprised|sad|cry|crying|pray|thanks|folded hands|clap|fire|party|ok|[\U0001F300-\U0001FAFF❤♥]️?)"
+_LAST_MSG = r"(?:the |that |this |her |his |their |[\w]+'s )?(?:last |latest |newest )?message"
+_WA_MANAGE_RE = re.compile(r"(mute|unmute|pin|unpin|archive|unarchive) (?:the |my |this |that )?(.*?)(?: chat| group| conversation)?"
+                           r"(?: for (8 hours|eight hours|a week|1 week|one week|always|forever|good))?")
+_WA_MARK_RE = re.compile(r"mark (?:the |my |this )?(.*?)(?: chat| group| conversation)? as (read|unread)")
+_WA_STAR_RE = re.compile(r"star (?:it|that|" + _LAST_MSG + r")(?: in (.+?))?")
+_WA_REACT_RE = re.compile(r"(?:react|respond)(?: with)?(?: an?)? " + _EMOJI_WORDS + r"(?: emoji)?(?: to " + _LAST_MSG + r")?(?: in (.+?))?|"
+                          r"(like|heart|love) " + _LAST_MSG + r"(?: in (.+?))?")
+_WA_QUOTE_RE = re.compile(r"(?:quote )?reply to " + _LAST_MSG + r"(?: in (.+?))?(?: saying| with|:) (.+)|quote reply(?: saying| with|:)? (.+)")
+_WA_FORWARD_RE = re.compile(r"forward " + _LAST_MSG + r"(?: from (.+?))? to (.+)")
+_WA_CALL_RE = re.compile(r"(?:start |make |place )?(?:an? )?(?:(voice|audio|video) )?call(?: to| with)? (.+?)|"
+                         r"(?:whats ?app )(voice |audio |video )?call (.+)")
+_WA_REFUSE_RE = re.compile(r"(?:block|unblock|report) .+|(?:delete|clear) (?:this |the |my )?(?:[\w' ]+ )?(?:chat|conversation)|"
+                           r"(?:exit|leave) (?:the |this )?(?:[\w' ]+ )?group")
+_SPAN = {"8 hours": "8 hours", "eight hours": "8 hours", "a week": "a week", "1 week": "a week", "one week": "a week",
+         "always": "always", "forever": "always", "good": "always"}
+
+
+def _said(text, words):
+    found = re.search(re.escape(words), text, re.I)
+    return found.group(0) if found else words
+
+
+def _chat_or_current(name, text):
+    name = (name or "").strip()
+    return "current" if name in _THIS_CHAT else _said(text, name)
+
+
+def message_8_action(low, raw, text):
+    """H3: mute / pin / archive / mark read, star, react, quote-reply, forward, call, refused ones."""
+    if _WA_REFUSE_RE.fullmatch(low):
+        return Action("message", "manage", target="refuse", parameters={"op": "refuse"}, raw=raw)
+    m = _WA_QUOTE_RE.fullmatch(low)
+    if m:
+        body = m.group(2) or m.group(3)
+        return Action("message", "act", target=_chat_or_current(m.group(1), text),
+                      parameters={"op": "reply", "text": _said(text, body.strip())}, raw=raw)
+    m = _WA_FORWARD_RE.fullmatch(low)
+    if m:
+        return Action("message", "act", target=_chat_or_current(m.group(1), text),
+                      parameters={"op": "forward", "to": _said(text, m.group(2).strip())}, raw=raw)
+    m = _WA_REACT_RE.fullmatch(low)
+    if m:
+        word = (m.group(1) or m.group(3) or "").strip()
+        from kayra.automation.web_macros import _EMOJI
+        emoji = _EMOJI.get(word, word if word and not word.isascii() else "👍")
+        return Action("message", "act", target=_chat_or_current(m.group(2) or m.group(4), text),
+                      parameters={"op": "react", "text": emoji}, raw=raw)
+    m = _WA_STAR_RE.fullmatch(low)
+    if m:
+        return Action("message", "act", target=_chat_or_current(m.group(1), text), parameters={"op": "star"}, raw=raw)
+    m = _WA_MARK_RE.fullmatch(low)
+    if m:
+        return Action("message", "manage", target=_chat_or_current(m.group(1), text), parameters={"op": m.group(2)}, raw=raw)
+    m = _WA_MANAGE_RE.fullmatch(low)
+    if m and not re.search(r"\b(?:tabs?|sound|audio|mic|microphone|volume|video|me|myself|notifications|everything|"
+                           r"all|computer|laptop|speakers?|music|spotify|window)\b", m.group(2) or ""):
+        return Action("message", "manage", target=_chat_or_current(m.group(2), text),
+                      parameters={"op": m.group(1), "span": _SPAN.get(m.group(3) or "", "")}, raw=raw)
+    m = _WA_CALL_RE.fullmatch(low)
+    if m:
+        kind = (m.group(1) or m.group(3) or "voice").strip().replace("audio", "voice")
+        who = (m.group(2) or m.group(4) or "").strip()
+        if who and who not in ("me", "back"):
+            return Action("message", "act", target=_chat_or_current(who, text), parameters={"op": "call", "text": kind}, raw=raw)
+    return None
+
+
+def message_6b_action(low, raw, text):
+    """F5 inside the message kind: a reply in the open chat, or a file to a chat. None otherwise."""
+    m = _SEND_FILE_HERE_RE.fullmatch(low)
+    if m:
+        return Action("message", "send_file", target="current", parameters={"what": _what(m.group(1))}, raw=raw)
+    m = _SEND_FILE_RE.fullmatch(low)
+    if m and m.group(2).strip() not in ("me", "myself"):
+        who = m.group(2).strip()
+        found = re.search(re.escape(who), text, re.I)
+        return Action("message", "send_file", target=found.group(0) if found else who,
+                      parameters={"what": _what(m.group(1))}, raw=raw)
+    m = _REPLY_TO_RE.fullmatch(low)
+    if m and m.group(1) not in ("this", "this chat", "them", "him", "her", "the chat", "it", "this message",
+                                "the last message", "the group", "this group"):
+        body = re.search(re.escape(m.group(2)), text, re.I)
+        named = re.sub(r"\s+(?:on|in|via) whats ?app$", "", m.group(1).strip())
+        who = re.search(re.escape(named), text, re.I)
+        return Action("message", "send", target=who.group(0) if who else named,
+                      parameters={"text": body.group(0) if body else m.group(2), "app": "whatsapp"}, raw=raw)
+    m = _REPLY_RE.fullmatch(low)
+    if m:
+        said = (m.group(1) or m.group(2)).strip()
+        body = re.search(re.escape(said), text, re.I)
+        return Action("message", "send", target="current",
+                      parameters={"text": body.group(0) if body else said, "app": "whatsapp"}, raw=raw)
+    return None
+
+
+def _what(said):
+    return re.sub(r"^(?:my|the|this|that|a|an|our)\s+", "", said.strip()).strip()
+
+
+def part_6b_direct(low, text, situation_fn=None):
+    """['browser …' | 'message …'] for a 6b utterance that is complete as said, else None."""
+    action = part_6b_action(low, f"browser {text}", text)
+    if action is not None:
+        if action.action == "ai_read" and action.target == "current":
+            host = front_site(situation_fn)
+            return [f"browser {text}"] if host in ("chatgpt.com", "chat.openai.com", "claude.ai", "gemini.google.com") \
+                or "whole" in low or "full" in low or "entire" in low else None
+        if action.action == "social" and action.target == "posts" and not action.parameters.get("site"):
+            return [f"browser {text}"] if "reddit.com" in front_site(situation_fn) else None
+        return [f"browser {text}"]
+    wa_said = re.search(r"\bwhats ?app\b", low)
+    wa_front = front_site(situation_fn) == "web.whatsapp.com" if not wa_said else True
+    if not wa_front:
+        return None
+    bare = re.sub(_WA_SUFFIX + r"$", "", low).strip()
+    found = message_8_action(bare, f"message {text}", text) or message_6b_action(bare, f"message {text}", text)
+    if found is None:
+        return None
+    return [f"message {text}"]          # named WhatsApp, or WhatsApp is in front
+
+
+# ── Part 5P: Chrome profiles (BROWSER_CONTROL_PLAN §14) ──
+# The SHAPES only. Which profile a name means is decided at run time from Chrome's own
+# `Local State` (`automation.chrome_profiles`) — the parser never reads it, so no suite and no
+# parse touches the host's profiles.
+_PB = r"(google chrome|chrome|chromium|brave|microsoft edge|edge)"
+_PROFILE_NOT = re.compile(r"^(?:google|my|our|new|a new|the|incognito|private|a private|guest|full ?screen|dark mode|"
+                          r"another|the other|other)$|\b(?:window|tab|tabs|incognito|private mode|screen)\b")
+_PROFILE_LIST_RE = re.compile(r"(?:which|what) (?:" + _PB + r" )?profiles (?:do i have|are there|have i got)"
+                              r"(?: (?:in|on|for) " + _PB + r")?|(?:list|show|tell)(?: me)? (?:all )?(?:my |the )?"
+                              r"(?:" + _PB + r" )?profiles(?: (?:in|on|for) " + _PB + r")?")
+_PROFILE_AS_RE = re.compile(r"(?:open|launch|start|run) (?:up )?(?:google )?" + _PB + r" (as|with|for|on|in|using|under|"
+                            r"logged in as|signed in as|with the account) (my |the )?(.+?)(?: profile| account| user)?")
+_PROFILE_MY_RE = re.compile(r"(?:open|launch|start) (?:up )?(?:my |the )?(.+?)(?:'s|’s| s)? (?:google )?" + _PB +
+                            r"(?: profile| window| browser)?")
+_PROFILE_SWITCH_RE = re.compile(r"(?:switch|change|go) to (?:my |the )?(.+?) (?:" + _PB + r" )?profile|"
+                                r"use (?:my |the )?(.+?) (?:" + _PB + r" )?profile")
+_PROFILE_URL_RE = re.compile(r"(?:open|launch) (.+?) in (?:my |the )?(.+?)(?:'s|’s| s)? (?:google )?" + _PB +
+                             r"(?: profile| window)?|(?:open|launch) (.+?) in (?:google )?" + _PB +
+                             r" (?:as|with|on|for) (?:my |the )?(.+?)(?: profile| account)?")
+
+
+def _profile_name_ok(name, strict=True):
+    """A plausible profile name. `strict` (the user did not say "my" / "as"): a site's name is
+    the site ("open chrome with youtube"), never a profile."""
+    name = name.strip()
+    if not name or _PROFILE_NOT.search(name) or re.search(r"\b(?:in|on|with|at|using|into|and)$", name):
+        return False
+    return not (strict and targets.website_url(name) and not spoken_email(name))
+
+
+def profile_action(low, raw, text=None):
+    """'open my Work Chrome', 'open Chrome as Ravi', 'open Gmail in my Study Chrome', 'which Chrome
+    profiles do I have' -> a structured action, or None."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+
+    def act(name, browser, url=""):
+        found = re.search(re.escape(name.strip()), text, re.I)
+        said = found.group(0) if found else name.strip()
+        if said.lower() in ("guest", "a guest", "guest mode"):
+            return Action("browser", "chrome_guest", target="guest", parameters={"browser": browser}, raw=raw)
+        return Action("browser", "chrome_profile", target=said,
+                      parameters={"browser": browser, "url": url, "email": spoken_email(name)}, raw=raw)
+
+    m = _PROFILE_LIST_RE.fullmatch(low)
+    if m:
+        browser = next((g for g in m.groups() if g), "chrome")
+        return Action("browser", "chrome_profiles", target=browser, parameters={"browser": browser}, raw=raw)
+    m = re.fullmatch(r"(?:open|launch|start) (?:google )?" + _PB + r" (?:as|in) (?:a )?guest(?: mode)?", low)
+    if m:
+        return Action("browser", "chrome_guest", target="guest", parameters={"browser": m.group(1)}, raw=raw)
+    m = _PROFILE_URL_RE.fullmatch(low)
+    if m:
+        site, name, browser = (m.group(1), m.group(2), m.group(3)) if m.group(1) else (m.group(4), m.group(6), m.group(5))
+        url = targets.website_url(site.strip()) or ""
+        if url and _profile_name_ok(name):
+            return act(name, browser, url)
+    m = _PROFILE_AS_RE.fullmatch(low)
+    if m and _profile_name_ok(m.group(4), strict=not (m.group(2) in ("as", "logged in as", "signed in as",
+                                                                     "with the account", "under") or m.group(3))):
+        return act(m.group(4), m.group(1))
+    m = _PROFILE_SWITCH_RE.fullmatch(low)
+    if m:
+        name = m.group(1) or m.group(3)
+        browser = m.group(2) or m.group(4) or "chrome"
+        if _profile_name_ok(name):
+            return act(name, browser)
+    m = _PROFILE_MY_RE.fullmatch(low)
+    owned = len(low.split()) > 1 and low.split()[1] == "my" or bool(re.search(r"'s|’s", low))
+    if m and _profile_name_ok(m.group(1), strict=not owned) and (owned or low.split()[1] == "the"
+                                                                 or len(m.group(1).split()) <= 3):
+        return act(m.group(1), m.group(2))
+    return None
+
+
+# ── Part 14 (§13 N4): Kayra's own voice ──
+# The automation layer never imports the speech engine (it would load the voice model); the
+# app hands over a getter at boot (`SPEECH["engine"]`).
+SPEECH = {"engine": None}
+_RATE_RE = re.compile(r"(?:can you |please )?(?:speak|talk)(?: a (?:bit|little|tad))?(?: more)? (faster|slower|quicker|more slowly|more quickly)|"
+                      r"slow down (?:your (?:voice|speech|talking)|when you (?:speak|talk))|"
+                      r"(?:speak|talk) (?:at |with )?(?:a |your )?normal (?:speed|pace|rate)|reset your (?:speaking |talking )?speed|"
+                      r"(?:set|change) your (?:speaking|speech|talking|voice) (?:speed|rate) to (\d(?:\.\d{1,2})?)(?: ?x| times)?|"
+                      r"(?:speak|talk) at (\d(?:\.\d{1,2})?)(?: ?x| times)(?: speed)?|"
+                      r"what(?:'s| is) your (?:speaking|speech|talking) (?:speed|rate)")
+
+
+def voice_action(low, raw):
+    m = _RATE_RE.fullmatch(" ".join(low.strip(" .?!").split()))
+    if not m:
+        return None
+    if m.group(1):
+        target = "slower" if m.group(1) in ("slower", "more slowly") else "faster"
+    elif m.group(2) or m.group(3):
+        target = m.group(2) or m.group(3)
+    elif low.startswith("what"):
+        target = "query"
+    elif "slow down" in low:
+        target = "slower"
+    else:
+        target = "normal"
+    return Action("voice", "rate", target=target, raw=raw)
+
+
+def voice_rate(target):
+    """'speak a bit faster' (+0.1), 'slower', 'normal' (1.1), '1.3'; saved for the next start too."""
+    engine = SPEECH["engine"]() if SPEECH["engine"] else None
+    if engine is None or not hasattr(engine, "set_speed"):
+        return ActionResult.unsupported("My voice isn't running right now.")
+    now = float(getattr(engine, "speed", 1.1) or 1.1)
+    if target == "query":
+        return ActionResult.success(f"I'm speaking at {now:g} — {('normal' if abs(now - 1.1) < 0.01 else 'faster than normal' if now > 1.1 else 'slower than normal')}.")
+    wanted = {"faster": now + 0.1, "slower": now - 0.1, "normal": 1.1}.get(target)
+    if wanted is None:
+        try:
+            wanted = float(target)
+        except ValueError:
+            return ActionResult.failure("What speed? 1.1 is normal.")
+    new = engine.set_speed(wanted)
+    try:
+        from kayra.core.config import write_env_values
+        from kayra.core.settings_log import record
+        if write_env_values({"ASSISTANT_SPEECH_RATE": f"{new:g}"}):
+            record("ASSISTANT_SPEECH_RATE", f"{new:g}", f"{now:g}")
+    except Exception:
+        pass
+    if abs(new - now) < 1e-6:
+        edge = "fastest" if wanted > now else "slowest"
+        return ActionResult.success(f"That's already my {edge}." if target in ("faster", "slower") else f"I'm already at {new:g}.")
+    return ActionResult.success("Back to my normal speed." if target == "normal" else
+                                f"Okay — {'faster' if new > now else 'slower'} now ({new:g}).")
+
+
+# ── Part 15 (§13 N2): local models and keys ──
+_FAMILY = r"(?:qwen|gemma|llama|mistral|phi|deepseek|gpt[- ]?oss|granite|smol|olmo)"
+_MODEL_STATUS_RE = re.compile(r"(?:which|what) (?:local )?models? (?:is|are) (?:loaded|running)(?: in lm studio| locally)?|"
+                              r"what (?:local )?model are you (?:using|running|on)(?: locally)?|is (?:a|the|my) local model (?:loaded|running)")
+_MODEL_LOAD_RE = re.compile(r"load (?:the |my )?(.+?) model(?: in lm studio)?|load (.+?) in lm studio|"
+                            r"(?:switch|change) (?:the |my )?local model to (.+)|(?:use|switch to) (.+?) as (?:the|my) local model|"
+                            r"load (" + _FAMILY + r"[\w .:-]*)")
+_MODEL_UNLOAD_RE = re.compile(r"unload (?:the |my |all )?(?:local )?models?(?: in lm studio)?|free (?:up )?the gpu(?: memory)?")
+_MODEL_SPEED_RE = re.compile(r"how fast is (?:my |the )?local model|(?:test|check|benchmark) (?:the speed of )?(?:my |the )?local model(?:'s)?(?: speed)?")
+_KEYS_RE = re.compile(r"(?:check|test) (?:my |the )?(?:api |cloud |model )?keys|are my (?:api |cloud )?keys (?:working|ok|okay|valid|still working)")
+
+
+def models_action(low, raw, text=None):
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    if _MODEL_STATUS_RE.fullmatch(low):
+        return Action("models", "status", target="local", raw=raw)
+    if _MODEL_UNLOAD_RE.fullmatch(low):
+        return Action("models", "unload", target="local", raw=raw)
+    if _MODEL_SPEED_RE.fullmatch(low):
+        return Action("models", "speed", target="local", raw=raw)
+    if _KEYS_RE.fullmatch(low):
+        return Action("models", "keys", target="cloud", raw=raw)
+    m = _MODEL_LOAD_RE.fullmatch(low)
+    if m:
+        name = next(g for g in m.groups() if g).strip()
+        if name not in ("the", "a", "this", "more", "page") and not re.search(r"\b(?:page|tab|comments|results|more)\b", name):
+            return Action("models", "load", target=_said(text, name), raw=raw)
+    return None
+
+
+# ── Part 16 (§13 N5): backups ──
+_BACKUP_RE = re.compile(r"(?:back up|backup|make a backup of|save a backup of) (?:all )?(?:my |your )?(?:kayra )?(?:data|settings|memory|stuff|everything)"
+                        r"(?: and (?:my |your )?(?:settings|memory|data))?|make a (?:kayra )?backup|create a backup")
+_RESTORE_RE = re.compile(r"restore (?:my |the |from (?:my |the )?)?(?:last |latest |newest )?(?:kayra )?backup")
+_BACKUPS_RE = re.compile(r"(?:list|show|what are|what) (?:my )?(?:kayra )?backups(?: do i have)?|do i have (?:a|any) backups?")
+
+
+def backup_action(low, raw):
+    low = " ".join(low.strip(" .?!").split())
+    if _RESTORE_RE.fullmatch(low):
+        return Action("backup", "restore", target="latest", raw=raw)
+    if _BACKUPS_RE.fullmatch(low):
+        return Action("backup", "list", target="all", raw=raw)
+    if _BACKUP_RE.fullmatch(low):
+        return Action("backup", "create", target="all", raw=raw)
+    return None
+
+
+# ── Part 12 (§13 N1): browser neighbours ──
+_SESSION_SAVE_RE = re.compile(r"save (?:(?:these|my|the|all(?: these| my| the)?) )?(?:open )?tabs as (?:my |the )?(.+?)(?: tabs| session)?|"
+                              r"save this (?:window|session) as (?:my |the )?(.+?)(?: tabs| session)?")
+_SESSION_OPEN_RE = re.compile(r"(?:open|restore|bring back|reopen) (?:my|the) (.+?) (?:tabs|tab session|session)")
+_SESSION_LIST_RE = re.compile(r"(?:list|show|what are) (?:me )?(?:my )?saved tabs|what (?:tab )?sessions do i have|"
+                              r"(?:list|show) (?:my )?tab sessions")
+_SESSION_DEL_RE = re.compile(r"(?:delete|forget|remove) (?:my |the )?(.+?) (?:saved )?(?:tabs|tab session|session)")
+_READ_ADD_RE = re.compile(r"read (?:this|it|this page) later|save (?:this|it|this page|this article) for later|"
+                          r"add (?:this|it|this page|this article) to (?:my )?reading list")
+_READ_LIST_RE = re.compile(r"what(?:'s| is) on my reading list|(?:show|read|list)(?: me)? my reading list|"
+                           r"what do i have to read")
+_READ_NEXT_RE = re.compile(r"open (?:the )?next (?:one|article|thing|page)(?: on| from| in) my reading list|open my reading list|"
+                           r"(?:open|show) (?:me )?something from my reading list")
+_READ_CLEAR_RE = re.compile(r"clear (?:the read (?:ones|items) (?:from|on) )?my reading list")
+_PIP_ON_RE = re.compile(r"pop (?:this|the|that) video out|(?:open |turn on |start )?picture in picture(?: mode)?|"
+                        r"put (?:this|the) video in (?:picture in picture|a (?:small|mini) window)|float (?:this|the) video")
+_PIP_OFF_RE = re.compile(r"(?:close|exit|stop|turn off) (?:the )?picture in picture|bring the video back")
+_SHOT_RE = re.compile(r"(?:take an? )?(full |whole |entire )?(?:page )?screenshot (?:of )?(?:this|the) (?:page|tab|website|site|article)|"
+                      r"screenshot the (whole|entire|full) page|(?:take an? )?(full)(?:-| )page screenshot")
+_TIDY_RE = re.compile(r"(?:tidy|clean) up my tabs|tidy my tabs|how many tabs (?:do i have|are) open|(?:check|sort out) my tabs")
+_ELSEWHERE_RE = re.compile(r"open (?:this|this page|it|this tab|this site|this link) in (chromium|brave|firefox|edge|chrome)|"
+                           r"open (?:this|this page|it|this tab) in my (.+?) (?:profile|chrome|browser)")
+
+
+def part_12_action(low, raw, text=None):
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    m = _SESSION_SAVE_RE.fullmatch(low)
+    if m:
+        return Action("browser", "session_save", target=_said(text, (m.group(1) or m.group(2)).strip()), raw=raw)
+    if _SESSION_LIST_RE.fullmatch(low):
+        return Action("browser", "sessions_list", target="all", raw=raw)
+    m = _SESSION_DEL_RE.fullmatch(low)
+    if m and m.group(1) not in ("all", "other", "duplicate", "those", "these"):
+        return Action("browser", "session_delete", target=_said(text, m.group(1).strip()), raw=raw)
+    m = _SESSION_OPEN_RE.fullmatch(low)
+    if m and not re.search(r"\b(?:new|all|other|closed|recent|recently|last|duplicate|\d+|two|three)\b", m.group(1)):
+        return Action("browser", "session_open", target=_said(text, m.group(1).strip()), raw=raw)
+    if _READ_ADD_RE.fullmatch(low):
+        return Action("browser", "reading_add", target="current", raw=raw)
+    if _READ_LIST_RE.fullmatch(low):
+        return Action("browser", "reading_list", target="all", raw=raw)
+    if _READ_NEXT_RE.fullmatch(low):
+        return Action("browser", "reading_next", target="next", raw=raw)
+    if _READ_CLEAR_RE.fullmatch(low):
+        return Action("browser", "reading_clear", target="read", raw=raw)
+    if _PIP_OFF_RE.fullmatch(low):
+        return Action("browser", "video_pip", target="off", raw=raw)
+    if _PIP_ON_RE.fullmatch(low):
+        return Action("browser", "video_pip", target="on", raw=raw)
+    m = _SHOT_RE.fullmatch(low)
+    if m:
+        return Action("browser", "page_screenshot", target="full" if any(m.groups()) else "visible", raw=raw)
+    if _TIDY_RE.fullmatch(low):
+        return Action("browser", "tabs_tidy", target="all", raw=raw)
+    m = _ELSEWHERE_RE.fullmatch(low)
+    if m:
+        return Action("browser", "open_elsewhere", target=m.group(1) or "chrome",
+                      parameters={"profile": _said(text, m.group(2).strip()) if m.group(2) else ""}, raw=raw)
+    return None
+
+
+# ── Part 9 (§12 M3) and Part 10 (H4) ──
+_CALLWORD = r"(?:call|meeting|meet)"
+_MEET_PEOPLE_RE = re.compile(r"who(?:'s| is| are)? (?:in|on|joined|attending) (?:the |this |my )?" + _CALLWORD +
+                             r"|who(?:'s| has)? joined(?: the " + _CALLWORD + r")?|how many (?:people )?(?:are )?(?:in|on) (?:the |this )?" + _CALLWORD)
+_MEET_REACT_RE = re.compile(r"(?:send|give|do)(?: a| an)? (thumbs up|thumbs down|heart|love|clap|applause|laugh|haha|wow|surprised|sad|party|"
+                            r"celebrate|thinking)(?: emoji| reaction)?(?: in (?:the |this )?" + _CALLWORD + r")?|"
+                            r"react with (?:a |an )?(thumbs up|thumbs down|heart|clap|laugh|wow|sad|party)(?: in (?:the |this )?" + _CALLWORD + r")")
+_MEET_PIN_RE = re.compile(r"pin (.+?)(?:'s video| in (?:the |this )?" + _CALLWORD + r")")
+_MEET_CHAT_RE = re.compile(r"(?:send|say|type|write|post)(?: in| to)? (?:the |this )?(?:meeting|call|meet) chat(?: saying| that)?[,:]? (.+)|"
+                           r"tell everyone in (?:the |this )?" + _CALLWORD + r"(?: that)?[,:]? (.+)")
+_MEET_LINK_RE = re.compile(r"copy (?:the |this )?(?:meeting|call|meet) link|"
+                           r"(?:send|share) (?:the |this )?(?:meeting|call|meet) link (?:to|with) (.+?)(?: on whatsapp)?")
+_MEET_PRESENT_RE = re.compile(r"(?:present|show|share) (?:my |the |this |our )?(.*?)(?: ?deck| ?slides| ?presentation)"
+                              r" (?:in|to|into|on) (?:the |this |my )?(?:meeting|call|meet)")
+_NOTES_ON_RE = re.compile(r"(?:take|start taking|keep|start) (?:meeting )?notes(?: (?:of|for|in|during) (?:this|the) (?:meeting|call))?|"
+                          r"(?:start|begin) (?:the )?meeting notes")
+_NOTES_OFF_RE = re.compile(r"stop (?:taking )?(?:the )?(?:meeting )?notes")
+_NOTES_SUM_RE = re.compile(r"summari[sz]e (?:this|the|that|my last|the last) (?:meeting|call)|"
+                           r"what (?:was|were) (?:decided|the action items)(?: in (?:the|this|that) (?:meeting|call))?|"
+                           r"(?:what are|give me|read) (?:the )?action items(?: from (?:the|this|that) (?:meeting|call))?")
+_RECORD_RE = re.compile(r"(start |stop )?record(?:ing)? (?:this|the) (?:meeting|call)")
+_INBOX_ALL_RE = re.compile(r"(?:who|anyone|anybody) (?:has )?(?:messaged|texted|written to|wrote to|pinged) me(?: on)? "
+                           r"(?:anywhere|on any app|across (?:all )?(?:my )?apps|everywhere)|"
+                           r"(?:any|check|read|show)(?: me)? (?:my |all my |the )?(?:new )?messages (?:anywhere|everywhere|on all (?:my )?apps|"
+                           r"across (?:all )?(?:my )?apps)|check all my messages|(?:what did i miss|anything new) (?:anywhere|everywhere)|"
+                           r"my unified inbox|unified inbox")
+_INBOX_REPLY_RE = re.compile(r"(?:reply|respond|write back) to (.+?) (?:saying|with|that)[,:]? (.+)")
+_INBOX_OFFERS_RE = re.compile(r"(stop|don't|do not|no more) (?:telling|tell) me (?:about|when) (?:i get )?(?:new |a )?messages?(?: arrive)?|"
+                              r"(?:tell|let) me (?:know )?(?:about|when) (?:i get )?(?:new |a )?messages?(?: arrive)?(?: again)?|"
+                              r"(?:turn|switch) (on|off) message (?:alerts|announcements)")
+
+
+def part_9_10_action(low, raw, text=None):
+    """In-call Meet controls, the unified inbox and where to reply. None otherwise."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    if _MEET_PEOPLE_RE.fullmatch(low):
+        return Action("meet", "people", target="current", raw=raw)
+    m = _MEET_CHAT_RE.fullmatch(low)
+    if m:
+        return Action("meet", "message", target="current", parameters={"text": _said(text, (m.group(1) or m.group(2)).strip())}, raw=raw)
+    m = _MEET_LINK_RE.fullmatch(low)
+    if m:
+        return Action("meet", "link", target="current", parameters={"to": _said(text, m.group(1).strip()) if m.group(1) else ""}, raw=raw)
+    m = _MEET_REACT_RE.fullmatch(low)
+    if m:
+        return Action("meet", "react", target=m.group(1) or m.group(2), raw=raw)
+    m = _MEET_PIN_RE.fullmatch(low)
+    if m and m.group(1) not in ("this tab", "the tab", "it"):
+        return Action("meet", "pin", target=_said(text, m.group(1).strip()), raw=raw)
+    m = _MEET_PRESENT_RE.fullmatch(low)
+    if m:
+        name = m.group(1).strip()
+        return Action("meet", "present", target="" if name in ("", "this", "it") else _said(text, name), raw=raw)
+    if _NOTES_OFF_RE.fullmatch(low):
+        return Action("meet", "notes", target="off", raw=raw)
+    if _NOTES_ON_RE.fullmatch(low):
+        return Action("meet", "notes", target="on", raw=raw)
+    if _NOTES_SUM_RE.fullmatch(low):
+        return Action("meet", "summary", target="last", raw=raw)
+    m = _RECORD_RE.fullmatch(low)
+    if m:
+        stopping = (m.group(1) or "").strip() == "stop"
+        return Action("meet", "record_stop" if stopping else "record", target="off" if stopping else "on", raw=raw)
+    if _INBOX_ALL_RE.fullmatch(low):
+        return Action("inbox", "all", target="all", raw=raw)
+    m = _INBOX_OFFERS_RE.fullmatch(low)
+    if m:
+        off = bool(m.group(1)) or m.group(2) == "off"
+        return Action("inbox", "offers", target="off" if off else "on", raw=raw)
+    m = _INBOX_REPLY_RE.fullmatch(low)
+    if m and not re.search(r"\b(?:on|in|via) (?:whats ?app|gmail|email|mail)\b", low) and \
+            not re.fullmatch(_LAST_MSG + r"(?: in .+)?", m.group(1)) and m.group(1) not in _THIS_CHAT | {"them", "him", "her"}:
+        return Action("inbox", "reply", target=_said(text, m.group(1).strip()),
+                      parameters={"text": _said(text, m.group(2).strip())}, raw=raw)
+    return None
+
+
+# ── Part 7: the page agent (H1), recipes (H1.1), what Kayra learned (H2) ──
+_AGENT_RE = re.compile(r"(?:browser |page )?agent[,:]? (.+)|(?:on|in) (?:this|the) (?:page|site|website|tab)[,:]? (.+)|"
+                       r"(?:please )?(?:figure out how to|work out how to) (.+?)(?: (?:on|in) (?:this|the) (?:page|site|website))?|"
+                       r"do (?:this|it|that) (?:for me )?on (?:this|the) (?:page|site)[,:]? (.+)")
+_RECIPES_RE = re.compile(r"(?:list|show(?: me)?|what are) (?:my |the |your )?(?:page )?(?:shortcuts|recipes)|"
+                         r"what (?:page )?(?:shortcuts|recipes) do you (?:know|have|remember)")
+_LEARNED_RE = re.compile(r"what (?:have|did) you learn(?:ed|t)?(?: about me| from me| so far)?|"
+                         r"show (?:me )?what you(?:'ve| have) learned|what do you remember about how i talk")
+_FORGET_LAST_RE = re.compile(r"forget (?:that|what you just learned|the last thing you learned)|unlearn that")
+_FORGET_ALL_RE = re.compile(r"forget (?:everything|all) (?:you(?:'ve| have)? learned|you know about how i talk)|"
+                            r"unlearn everything|reset (?:everything )?(?:what )?you(?:'ve| have)? learned")
+_FORGET_APP_RE = re.compile(r"forget (?:everything|all|what you(?:'ve| have)? learned) (?:about|for|on|in) (?:my )?([\w. ]+)")
+_FORGET_RECIPE_RE = re.compile(r"forget (?:the|my|your) (?:page )?(?:shortcut|recipe) (?:for|to) (.+)")
+_OTHER_ONE_RE = re.compile(r"(?:no,? )?(?:not that one|(?:open )?the other one|wrong (?:one|chat|group)|"
+                           r"i meant the other one|that's the wrong (?:one|chat|group))")
+
+
+def part_7_action(low, raw, text=None):
+    """The page agent, its recipes, and learning — or None."""
+    text = text if text is not None else raw
+    low = " ".join(low.strip(" .?!").split())
+    m = _AGENT_RE.fullmatch(low)
+    if m:
+        goal = next(g for g in m.groups() if g)
+        found = re.search(re.escape(goal), text, re.I)
+        return Action("browser", "agent", target=found.group(0) if found else goal, raw=raw)
+    if _RECIPES_RE.fullmatch(low):
+        return Action("browser", "agent_recipes", target="all", raw=raw)
+    if _LEARNED_RE.fullmatch(low):
+        return Action("learning", "show", target="all", raw=raw)
+    if _FORGET_LAST_RE.fullmatch(low):
+        return Action("learning", "forget_last", target="last", raw=raw)
+    if _FORGET_ALL_RE.fullmatch(low):
+        return Action("learning", "forget_all", target="all", raw=raw)
+    m = _FORGET_RECIPE_RE.fullmatch(low)
+    if m:
+        return Action("learning", "forget_recipe", target=m.group(1).strip(), raw=raw)
+    m = _FORGET_APP_RE.fullmatch(low)
+    if m and m.group(1).strip() not in ("me", "you"):
+        return Action("learning", "forget_app", target=m.group(1).strip().replace("whats app", "whatsapp"), raw=raw)
+    if _OTHER_ONE_RE.fullmatch(low):
+        return Action("message", "other", target="other", raw=raw)
+    return None
+
+
+def part_7_direct(low, text):
+    action = part_7_action(low, text, text)
+    if action is None:
+        return None
+    if action.key == "message.other":
+        try:
+            from kayra.automation import web_macros as W
+            fresh = W.LAST_PICK.get("chosen") and W.CLOCK() - W.LAST_PICK.get("at", 0) <= W.PICK_TTL_S
+        except Exception:
+            fresh = False
+        return [text] if fresh else None               # "no, the other one" only right after a pick
+    if action.key == "learning.forget_last":
+        from kayra.automation import learning
+        fresh = learning.LAST.get("kind") and learning.CLOCK() - learning.LAST.get("at", 0) <= learning.FORGET_WINDOW_S
+        return [text] if fresh else None               # otherwise "forget that" is conversation
+    return [text]
+
+
+# ── Rules before the classifier (tuning pass V9) ──
+# A whole utterance that the rules understand COMPLETELY and that can only mean one command is
+# routed straight to them, skipping the classifier model (~0.45 s on the local model, and its
+# occasional misreads: "create a new doc" went to the essay writer, "close it" to Ctrl+W).
+# Only these actions qualify; anything open-ended ("search for X", a bare "highlight X") still
+# goes to the model, which can tell a web question from a page command.
+_DIRECT_BROWSER = frozenset({
+    "page_result", "page_results", "page_find_step", "page_find_clear", "tabs_close_unpinned",
+    "groups_list", "tabs_group", "group_add", "group_rename", "group_color", "group_collapse",
+    "group_ungroup", "group_close", "tab_detach", "windows_merge", "page_ask", "page_comments",
+    "video_summary", "page_translate", "selection_explain", "selection_translate", "bookmark_add",
+    "bookmarks_search", "bookmark_delete", "history_clear", "history_list", "downloads_list",
+    "download_open", "download_show", "download_control", "page_help", "ws_open", "ws_search",
+    "ws_create", "ws_share", "slides_present", "ws_recent", "ws_download", "keep_note",
+    "form_responses", "classroom_due", "tabs_close_duplicates", "tabs_close_side",
+    "tabs_mute_others", "tabs_recently_closed", "tabs_discard", "tab_find", "search_close",
+})
+_NEEDS_SHEET = frozenset({"sheet_cell", "sheet_calc", "sheet_row"})
+_NEEDS_SLIDES = frozenset({"slides_nav"})
+
+
+def _known_app(name):
+    try:
+        from kayra.automation import linux_apps
+        return linux_apps.resolve(name) is not None
+    except Exception:
+        return False
+
+
+def front_site(situation_fn):
+    """The site in front: a web-app window's site, or Chrome's active tab when Chrome is in
+    front. '' when something else is (Chrome's active tab is NOT a site in front then)."""
+    try:
+        sit = (situation_fn() if situation_fn else {}) or {}
+    except Exception:
+        return ""
+    if sit.get("site"):
+        return str(sit["site"])
+    app = str(sit.get("app") or "").lower()
+    if any(b in app for b in ("chrome", "chromium", "brave", "edge")) and sit.get("tab_url"):
+        host = re.sub(r"^[a-z]+://", "", str(sit["tab_url"]).lower()).split("/")[0]
+        return host[4:] if host.startswith("www.") else host
+    return ""
+
+
+def _tab_url(situation_fn):
+    try:
+        return str(((situation_fn() if situation_fn else {}) or {}).get("tab_url") or "")
+    except Exception:
+        return ""
+
+
+# ── G5: several steps in one sentence ──
+# "open the budget sheet and total column C", "tick I agree and then submit this form". Each
+# half must be a COMPLETE command on its own, and the later half is judged against what the
+# earlier one will have put in front ("total column C" needs a Sheet; the open makes one).
+# A first step that carries free text (a question to an AI site, a message, a search) is only
+# split at "then" / "after that": its own words may contain "and".
+_STEP_JOIN = re.compile(r",? (?:and then|and after that|then|after that|and)(?= )", re.I)
+_SEQUENTIAL = re.compile(r"(?:and then|and after that|then|after that)$", re.I)
+_FREE_TEXT = frozenset({"ai_ask", "site_search", "search_here", "ws_search", "keep_note", "page_ask", "send",
+                        "page_find", "email_search", "search"})
+MAX_STEPS = 4
+
+
+def _predicted(token, situation_fn):
+    """The screen a step will leave in front, for judging the step after it."""
+    try:
+        action = normalize_command(token)
+    except Exception:
+        action = None
+    if action is None:
+        return situation_fn
+    chrome = lambda url: (lambda: {"app": "google-chrome", "tab_url": url})
+    p = action.parameters or {}
+    if action.domain == "message":
+        return lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+    if action.domain == "browser":
+        kind = p.get("kind")
+        if action.action in ("ws_open", "ws_search", "ws_create") and (kind or action.target) in ("sheet", "doc", "slides"):
+            page = {"sheet": "spreadsheets", "doc": "document", "slides": "presentation"}[kind or action.target]
+            return chrome(f"https://docs.google.com/{page}/d/predicted/edit")
+        if action.action == "site_search" and p.get("site") in ("amazon", "flipkart", "youtube"):
+            return chrome({"amazon": "https://www.amazon.in/s?k=x", "flipkart": "https://www.flipkart.com/search?q=x",
+                           "youtube": "https://www.youtube.com/results?search_query=x"}[p["site"]])
+        if action.action in ("ai_ask", "ai_read"):
+            return chrome({"claude": "https://claude.ai/", "gemini": "https://gemini.google.com/app"}
+                          .get(p.get("bot") or action.target, "https://chatgpt.com/"))
+        if action.action == "social":
+            return chrome({"reddit": "https://www.reddit.com/", "linkedin": "https://www.linkedin.com/",
+                           "github": "https://github.com/"}.get(p.get("site"), "https://example.com/"))
+        if action.action in ("page_result", "open_url"):
+            return chrome(str(p.get("url") or "https://example.com/"))
+    return situation_fn
+
+
+def _split_steps(text, situation_fn, depth=0):
+    """[tokens] when `text` is two or more complete commands joined by and / then, else None."""
+    if depth >= MAX_STEPS - 1:
+        return None
+    for m in _STEP_JOIN.finditer(text):
+        head, tail = text[:m.start()].strip(" ,"), text[m.end():].strip(" ,")
+        if not head or not tail:
+            continue
+        first = _direct_one(head, situation_fn)
+        if not first:
+            continue
+        action = normalize_command(first[-1])
+        free = action is not None and action.action in _FREE_TEXT and \
+            not (action.action == "ws_search" and action.parameters.get("open"))   # "the sheet Ravi sent": a name
+        if free and not _SEQUENTIAL.search(m.group(0).strip(" ,")):
+            continue                                    # "ask chatgpt to compare rust and go": one question
+        later = _predicted(first[-1], situation_fn)
+        rest = _direct_one(tail, later) or _split_steps(tail, later, depth + 1)
+        if rest:
+            return first + rest
+    return None
+
+
+_WA_FRONT = lambda: {"site": "web.whatsapp.com", "app": "chrome-web.whatsapp.com__-default"}
+
+
+# ── What "open email" means (the user, 2026-11-11) ──
+# "open email" opens Gmail and nothing else; "open the latest email" opens that one email; only
+# "… and read it" / "read my latest email" reads it out. The model used to turn "open email"
+# into "open the latest email + read it". Decided here, before any model.
+_MAIL = r"(?:e-?mails?|mails?|gmail|g mail|inbox|mailbox)"
+_NEWEST = r"(?:latest|newest|last|most recent|recent|new|top)"
+_POLITE = r"(?:(?:please|can you|could you|just|kayra)\s+)*"
+_EMAIL_INBOX = re.compile(_POLITE + r"(?:open(?: up)?|show(?: me)?|go to|take me to|check|bring up)"
+                          r" (?:my |the )?" + _MAIL + r"(?: inbox| app| account)?(?: please)?")
+_EMAIL_OPEN_NEWEST = re.compile(_POLITE + r"(?:open|show(?: me)?|bring up) (?:my |the )?" + _NEWEST
+                                + r" (?:e-?mail|mail|message in (?:my )?(?:inbox|gmail))(?: please)?")
+_EMAIL_READ_NEWEST = re.compile(
+    _POLITE + r"(?:(?:open (?:and|&) read|read(?: out)?|read me)(?: me)? (?:my |the )?" + _NEWEST
+    + r" (?:e-?mail|mail)(?: out| aloud| to me)?"
+    r"|(?:open|show(?: me)?) (?:my |the )?(?:" + _NEWEST + r" )?(?:e-?mail|mail) (?:and|then|and then) read"
+    r"(?: me)? (?:it|that|it out|it aloud|it to me|that out|that one|out))(?: please)?")
+
+
+def email_words(low):
+    """[token] for the three email shapes above, else None."""
+    low = " ".join(str(low or "").lower().strip(" .?!").split())
+    if _EMAIL_READ_NEWEST.fullmatch(low):
+        return ["email read latest"]                     # open it AND read it out
+    if _EMAIL_OPEN_NEWEST.fullmatch(low):
+        return ["email open latest"]                     # open it; say whose it is, no reading
+    if _EMAIL_INBOX.fullmatch(low):
+        return ["email check"]                           # the inbox only
+    return None
+
+
+def split_compound(command, situation_fn=None):
+    """
+    L5 (audit log 2026-11-11): the model sometimes hands over TWO commands as one token —
+    "message open megha sharma chat and read the last three messages" became a chat called
+    "megha sharma chat and read the last three messages". A token whose words are two or more
+    COMPLETE commands joined by and / then is split, by the same rules as a spoken sentence
+    (G5); anything else — a message that merely contains "and" — stays one token.
+    """
+    text = " ".join(str(command or "").split())
+    if not _STEP_JOIN.search(text):
+        return [text]
+    domain, _, rest = text.partition(" ")
+    situation = situation_fn
+    if domain == "message":
+        text, situation = rest, _WA_FRONT          # the steps of a message token happen in WhatsApp
+    elif domain in ("browser", "email", "meet", "calendar"):
+        text = rest
+    try:
+        steps = _split_steps(text, situation)
+    except Exception:
+        steps = None
+    return steps if steps and len(steps) > 1 else [" ".join(str(command or "").split())]
+
+
+def direct_tokens(utterance, situation_fn=None):
+    """
+    [tokens] for an utterance the rules alone fully understand, else None (ask the model).
+    Several complete commands joined by "and" / "then" become several tokens, in order (G5);
+    a sentence that is ONE command whose words contain "and" stays one.
+    """
+    text = " ".join(str(utterance or "").strip().rstrip(".?!").split())
+    low = text.lower()
+    if not low or len(low) > 300 or low.startswith(("browser ", "meet ", "email ", "calendar ")):
+        return None
+    if _STEP_JOIN.search(text):
+        steps = _split_steps(text, situation_fn)
+        if steps and len(steps) > 1:
+            return steps
+    return _direct_one(text, situation_fn)
+
+
+def _direct_one(utterance, situation_fn=None):
+    """
+    [token] for an utterance the rules alone fully understand, else None (ask the model).
+    Contextual shapes look at the screen only when needed: Sheets maths only with a Sheet in
+    front ("what's the total of 25 and 30" is a sum question, not column "25 and 30"), slide
+    steps only with Slides in front, "close it" only while Kayra remembers a tab.
+    """
+    text = " ".join(str(utterance or "").strip().rstrip(".?!").split())
+    low = text.lower()
+    if not low or len(low) > 160:
+        return None
+    if low.startswith(("browser ", "meet ", "email ", "calendar ")):
+        return None                                     # already a token; let it through
+    # Meet sharing in its bare forms ("share my screen", "share the LM Studio window").
+    if _BARE_SHARE.match(low) and share_request(low) is not None:
+        return [f"meet {text}"]
+    if re.fullmatch(r"(?:let them in|admit (?:everyone|all|them)|let (?:everyone|people) in)", low):
+        return ["meet admit everyone"]
+    # Gmail and Calendar phrasings that cannot be anything else.
+    found = email_words(low)
+    if found:
+        return found                                    # "open email" opens the inbox, nothing more
+    if front_site(situation_fn) in ("docs.google.com", "drive.google.com"):
+        # The log of 2026-11-11: "search for sundarbans house" with Google Sheets in front went
+        # to the model, which searched Google DOCS. The page in front decides: its own search.
+        m = re.fullmatch(r"(?:search|find|look)(?: for| up)? (?:the |my )?(.+?)", low)
+        if m and not re.search(r"\b(?:in|on) (?:google|youtube|the web|amazon|flipkart|gmail|my (?:mail|email))\b|"
+                               r"\b(?:docs|sheets|slides|drive|documents|spreadsheets|files)\b", m.group(1)):
+            return [f"browser search for {text[m.start(1):m.end(1)]}"]
+    if re.fullmatch(r"(?:search|look) (?:in |through )?(?:my )?(?:mail|email|emails|inbox|gmail) for .+", low):
+        return [f"email {text}"]
+    if re.fullmatch(r"(?:compose|write|start) (?:a )?new (?:email|mail)|new email", low):
+        return ["email compose"]
+    if re.fullmatch(r"(?:join|start) (?:my |the )?next (?:meeting|call)", low):
+        return ["calendar join my next meeting"]
+    if re.fullmatch(r"what'?s? (?:is )?(?:my |the )?next (?:meeting|event|call)(?: on my calendar)?|"
+                    r"when is my next (?:meeting|event|call)", low):
+        return ["calendar next meeting"]
+    # Fix round V11: shapes that are a complete command whatever is in front.
+    if _WA_NAMED_RE.fullmatch(low) or _WA_READ_RECENT.fullmatch(low):
+        return [f"message {text}"]                      # "open graphics team group in whatsapp"
+    if last_messages_request(low) and not re.search(r"\b(?:e-?mails?|mails?|gmail|inbox)\b", low):
+        return [f"message {text}"]                      # "read the last three messages of mota panda"
+    if profile_action(low, f"browser {text}", text) is not None:
+        return [f"browser {text}"]                      # Part 5P: a Chrome profile
+    if voice_action(low, text) is not None:
+        return [text]                                   # Part 14: "speak a bit faster"
+    if models_action(low, text, text) is not None:
+        return [text]                                   # Part 15: "which model is loaded", "load qwen"
+    if backup_action(low, text) is not None:
+        return [text]                                   # Part 16: "back up my Kayra data"
+    if part_12_action(low, text, text) is not None:
+        return [f"browser {text}"]                      # Part 12: sessions, reading list, PiP, screenshots
+    found = part_7_direct(low, text)
+    if found is not None or part_7_action(low, text, text) is not None:
+        return found                                    # Part 7: the agent, learning ("forget that" only when fresh)
+    found = part_9_10_action(low, text, text)
+    if found is not None and found.key in ("meet.react", "meet.pin") and not re.search(r"\b(?:call|meeting|meet)\b", low) \
+            and front_site(situation_fn) != "meet.google.com":
+        found = None                                    # "send a thumbs up" is a Meet reaction only in a call
+    if found is not None and not (found.key == "inbox.reply" and front_site(situation_fn) == "web.whatsapp.com"):
+        return [text]                                   # Parts 9-10 (a reply with WhatsApp in front stays WhatsApp's)
+    found = part_6_direct(low, text, situation_fn)
+    if found:
+        return found                                    # Part 6: forms, video, site search, shopping
+    found = part_6b_direct(low, text, situation_fn)
+    if found:
+        return found                                    # Part 6b: AI sites, WhatsApp files, Reddit / LinkedIn / GitHub
+    if search_request(low, text):
+        return [f"browser {text}"]                      # "click on the search bar and search for X"
+    if low not in ("scroll down", "scroll up") and scroll_request(low):
+        return [f"browser {text}"]                      # "scroll the mail to the bottom"
+    # H0.2 — the app in front. With WhatsApp in front, "open X", "click on X", "go to X chat"
+    # are a CHAT (the bug report: "open XYZ chat" -> "no app called XYZ chat"), "read it" is the
+    # open chat, and "who messaged me" is WhatsApp's unread list.
+    if _SEND_DRAFT.fullmatch(low):
+        site = front_site(situation_fn)
+        if site == "web.whatsapp.com":
+            return ["message send the draft"]               # L2: what is typed in the open chat
+        if site == "mail.google.com":
+            return ["email send"]
+    if front_site(situation_fn) == "web.whatsapp.com":
+        if _WA_CLOSE_CHAT.fullmatch(low):
+            return ["message close this chat"]              # "close the group" is the open chat here
+        if _WA_LAST_HERE.fullmatch(low):
+            return [f"message {text}"]                      # "read the last three messages"
+        m = re.fullmatch(r"(?:open|click(?: on)?|select|go to|show me) " + _WA_NTH.pattern, low)
+        if m:
+            return [f"message open result {_ORDINAL_N.get(m.group(1)) or int(m.group(1)[0])}"]
+        if _WA_SEARCH.fullmatch(low) and _bare_workspace(low, text) is None and not re.search(
+                r"\b(?:google|youtube|web|internet|online|gmail|mail|drive|docs|sheets|amazon|flipkart|maps)\b", low):
+            return [f"message {text}"]                      # "search for general panchayat [and open it]"
+        m = re.fullmatch(r"(?:open|go to|click(?: on)?|switch to|show me) (?:the |my |our )?(.+?)"
+                         r"( chat| group| conversation)?", low)
+        if m and not re.match(r"(?:new tab|settings|a new|chrome|whatsapp)\b", m.group(1)) \
+                and _bare_workspace(low, text) is None:      # "open the budget sheet" is still a Sheet
+            name = m.group(1)
+            said_chat = bool(m.group(2))
+            # "open youtube" in front of WhatsApp is still YouTube: a known site or app is a
+            # chat only when the user said "chat" / "group".
+            if said_chat or not (targets.website_url(name) or _known_app(name)):
+                found = re.search(re.escape(name), text, re.I)
+                return [f"message open {found.group(0) if found else name}"]
+        if re.fullmatch(r"(?:read|summari[sz]e) (?:it|this|this chat|the messages|the chat)|what did (?:they|people) say", low):
+            return ["message read this"]
+        if re.fullmatch(r"(?:read|summari[sz]e|what are|tell me) (?:me )?(?:the |my )?(?:most )?(?:recent|latest|last|new|newest) "
+                        r"(?:chat|messages?)", low):
+            return ["message read the recent chat"]
+        if re.fullmatch(r"(?:who|anyone) (?:messaged|texted|wrote to) me(?: today)?|(?:any |show |read )?unread(?: chats| messages)?", low):
+            return ["message who messaged me"]
+    # "close it" / "go back to it": only while a tab is remembered (G1).
+    if re.fullmatch(r"(?:close|go back to|switch back to|switch to) (?:it|that tab|that one)", low):
+        try:
+            from kayra.automation import web_macros
+            fresh = web_macros.LAST_TAB.get("id") is not None and \
+                web_macros.CLOCK() - web_macros.LAST_TAB.get("at", 0) <= web_macros.LAST_TAB_TTL_S
+        except Exception:
+            fresh = False
+        return [f"browser {text}"] if fresh else None
+    # The WHOLE browser parser (Parts 1–4): only actions on the allow-list below go rules-first;
+    # its last-resort "click on <words>" guess never does.
+    action = _web_action("browser", text, f"browser {text}")
+    if action is None or action.domain != "browser":
+        return None
+    if action.action in ("ws_open", "ws_search") and action.parameters.get("kind") in ("file", "pdf") \
+            and not re.search(r"\b(?:google )?drive\b", low):
+        return None                     # "open the report file" may be a LOCAL file: ask the model
+    if action.action in _NEEDS_SHEET:
+        return [f"browser {text}"] if "docs.google.com/spreadsheets/" in _tab_url(situation_fn) else None
+    if action.action in _NEEDS_SLIDES:
+        return [f"browser {text}"] if "docs.google.com/presentation/" in _tab_url(situation_fn) else None
+    if action.action == "page_find" and re.search(r"\bon (?:this|the) page\b|\bin this (?:doc|document|sheet)\b", low):
+        return [f"browser {text}"]
+    return [f"browser {text}"] if action.action in _DIRECT_BROWSER else None
+
+
+def _bare_workspace(lowered, raw):
+    """'open my budget sheet', 'create a new doc called X', 'next slide' without a prefix."""
+    # Bare: Google file kinds only — "open the report file / pdf" stays a LOCAL file.
+    kinds = r"(?:sheet|spreadsheet|doc|document|deck|presentation|slides|slide deck|form)"
+    if re.match(r"(?:open (?:my |the |our )?.+ " + kinds + r"$|open (?:my |the )?" + kinds + r" (?:about|called|named)|"
+                r"(?:create|make|start) (?:a |an )?new |(?:next|previous) slide$|start the slideshow|"
+                r"(?:go|jump) to cell |what(?:'s| is) the (?:total|sum|average) of |read row \d|"
+                r"search my (?:sheets|docs|drive|slides|files) |(?:add|take) a note |find (?:the |my )?pdf |"
+                r"(?:open|find|show me) (?:me )?(?:the |my |a )?(?:pdf|" + kinds[3:-1] + r") (?:that |which )?[a-z][a-z .'-]{0,40}? "
+                r"(?:sent|shared|gave|emailed)\b)", lowered):
+        return part_4_action(lowered, raw, raw)
+    return None
+
+
+# ── Part 3 (BROWSER_CONTROL_PLAN C5, C6, C8–C11, G1, G2, G4) ──
+LANGUAGES = {"english": "en", "hindi": "hi", "spanish": "es", "french": "fr", "german": "de",
+             "tamil": "ta", "telugu": "te", "bengali": "bn", "bangla": "bn", "marathi": "mr",
+             "gujarati": "gu", "kannada": "kn", "malayalam": "ml", "punjabi": "pa", "urdu": "ur",
+             "japanese": "ja", "chinese": "zh-CN", "korean": "ko", "arabic": "ar",
+             "russian": "ru", "portuguese": "pt", "italian": "it", "nepali": "ne",
+             "odia": "or", "sanskrit": "sa", "indonesian": "id", "turkish": "tr", "dutch": "nl"}
+_PAGE = r"(?:this|the) (?:page|article|site|website|post|doc|document)"
+_IT = r"(?:it|that|that tab|this one|that one|that page)"
+
+
+def part_3_action(low, raw, text=None):
+    """The Part 3 shapes (questions, comments, video, translate, bookmarks, history,
+    downloads, "it", search here, what can I do here), or None."""
+    text = text if text is not None else raw
+    low = low.strip(" .?!")
+    # C5 — a question about the page.
+    m = re.fullmatch(r"what (?:does|do) " + _PAGE + r" (?:say|tell me|mention) (?:about|on|regarding) (.+)", low) \
+        or re.fullmatch(r"(?:ask|question) " + _PAGE + r"[:,]? (.+)", low) \
+        or re.fullmatch(r"according to " + _PAGE + r",? (.+)", low) \
+        or re.fullmatch(r"(?:does|did) " + _PAGE + r" (?:say|mention|talk about) (.+)", low)
+    if m:
+        return Action("browser", "page_ask", target="current", parameters={"question": low}, raw=raw)
+    # C6 — comments, reviews, a video.
+    m = re.fullmatch(r"(read|show|list|summari[sz]e|what are|what do people say in|what are people saying in)"
+                     r"(?: me)?(?: the)?(?: top| best| latest| first)? (comments|reviews|replies|feedback)"
+                     r"(?: (?:on|of|under|for|about) (?:this|the) (?:video|page|post|product|article|item))?", low) \
+        or re.fullmatch(r"what (?:do|are) (?:people|users|buyers|viewers) (?:say(?:ing)?|think(?:ing)?)"
+                        r"(?: about (?:this|it|the (?:video|product|post)))?", low)
+    if m:
+        verb = m.group(1) if m.lastindex else "what do"
+        return Action("browser", "page_comments", target="current",
+                      parameters={"summarize": not str(verb).startswith(("read", "show", "list"))}, raw=raw)
+    if re.fullmatch(r"(?:summari[sz]e|tldr|recap|give me the gist of|what is|what's|explain) (?:this|the|that) "
+                    r"(?:youtube )?video(?: about| for me)?|what is (?:this|the) video about", low):
+        return Action("browser", "video_summary", target="current", raw=raw)
+    # C8 — translate, explain the selection.
+    m = re.fullmatch(r"translate (?:this|the) (?:page|site|website|article|tab)(?: (?:to|into|in) (\w+))?", low)
+    if m:
+        return Action("browser", "page_translate", target=(m.group(1) or "english"), raw=raw)
+    m = re.fullmatch(r"translate (?:the |this |my )?(?:selected|highlighted|selection)(?: text| words| part)?"
+                     r"(?: (?:to|into|in) (\w+))?", low)
+    if m:
+        return Action("browser", "selection_translate", target=(m.group(1) or "english"), raw=raw)
+    if re.fullmatch(r"(?:explain|what does|what do|simplify|define) (?:the |this |my )?(?:selected|highlighted|selection)"
+                    r"(?: text| words| part| line)?(?: mean)?(?: to me| for me)?|explain what i (?:selected|highlighted)", low):
+        return Action("browser", "selection_explain", target="current", raw=raw)
+    # C9 — bookmarks.
+    m = re.fullmatch(r"(?:bookmark|save) (?:this|the current) (?:page|tab|site|article)(?: as a bookmark)?"
+                     r"(?: (?:in|into|under|to) (?:the |my )?(.+?)(?: folder)?)?|add (?:this|the) (?:page|tab|site) "
+                     r"to (?:my )?bookmarks(?: (?:in|under|into) (?:the |my )?(.+?)(?: folder)?)?|bookmark (?:this|it)", low)
+    if m:
+        folder = (m.group(1) or m.group(2) or "") if m.lastindex else ""
+        return Action("browser", "bookmark_add", target="current", parameters={"folder": folder}, raw=raw)
+    m = re.fullmatch(r"(?:delete|remove) (?:the |my |this )?bookmarks? (?:for |called |named |of )?(.+)", low)
+    if m:
+        return Action("browser", "bookmark_delete", target=m.group(1), raw=raw)
+    m = re.fullmatch(r"(?:search|find|look for|look in|search in) (?:in )?(?:my )?bookmarks (?:for |about )?(.+)|"
+                     r"(?:what|which|show me|list) (?:my )?bookmarks (?:do i have )?(?:for|about|on) (.+)", low)
+    if m:
+        return Action("browser", "bookmarks_search", target=(m.group(1) or m.group(2)), raw=raw)
+    # C10 — history.
+    m = re.fullmatch(r"(?:clear|delete|erase|wipe|remove) (?:my |the )?(?:browsing |browser |search )?history"
+                     r"(?: (?:from|for|of))? ?(today|the last hour|the past hour|last hour|this hour|the last 15 minutes)?|"
+                     r"(?:clear|delete|erase|wipe) (today'?s|the last hour'?s|this hour'?s) (?:browsing )?history|"
+                     r"(?:clear|delete|erase|wipe|remove) (?:the |my )?(last hour|past hour|last 15 minutes|today) of "
+                     r"(?:my )?(?:browsing |browser )?history", low)
+    if m:
+        span = (m.group(1) or m.group(2) or m.group(3) or "today").replace("'s", "")
+        span = "15m" if "15" in span else ("hour" if "hour" in span else "today")
+        return Action("browser", "history_clear", target=span, raw=raw)
+    m = re.fullmatch(r"(?:what (?:sites |pages )?did i (?:visit|browse|open|look at|read)|show (?:me )?my (?:recent |browsing )?history|"
+                     r"what (?:sites|pages) did i (?:visit|open))(?: (today|yesterday|this week))?", low)
+    if m:
+        return Action("browser", "history_list", target=m.group(1) or "today",
+                      parameters={"days": {"yesterday": 2, "this week": 7}.get(m.group(1) or "", 1)}, raw=raw)
+    # C11 — downloads.
+    if re.fullmatch(r"(?:what did i (?:just )?download|(?:show|list|read) (?:me )?(?:my |the )?(?:recent |last )?downloads|"
+                    r"what'?s downloading|is (?:my|the) download (?:done|finished|complete)|(?:how is|how's) (?:my|the) download(?: going)?)", low):
+        return Action("browser", "downloads_list", target="recent", raw=raw)
+    if re.fullmatch(r"open (?:my |the )?(?:last|latest|most recent|recent|newest) (?:download|downloaded file|file i downloaded)|"
+                    r"open (?:what|the file) i (?:just )?downloaded", low):
+        return Action("browser", "download_open", target="latest", raw=raw)
+    if re.fullmatch(r"(?:show|reveal|open) (?:my |the )?(?:last |latest )?download(?:ed file)? in (?:the |its )?folder|"
+                    r"show (?:it|that) in (?:the |its )?folder|(?:open|show) (?:my |the )?downloads? folder", low):
+        return Action("browser", "download_show", target="latest", raw=raw)
+    m = re.fullmatch(r"(pause|resume|continue|cancel|stop) (?:the |my |this )?(?:current )?download(?:ing)?", low)
+    if m:
+        verb = {"continue": "resume", "stop": "cancel"}.get(m.group(1), m.group(1))
+        return Action("browser", "download_control", target=verb, raw=raw)
+    # G1 — "it": the tab Kayra last opened or switched to.
+    m = re.fullmatch(r"(close|switch (?:back )?to|go (?:back )?to|bring (?:back|up)|show me|read|summari[sz]e) " + _IT, low)
+    if m:
+        verb = m.group(1)
+        action = ("tab_close" if verb == "close" else "page_read" if verb == "read"
+                  else "page_summarize" if verb.startswith("summari") else "tab_switch")
+        return Action("browser", action, target="it", raw=raw)
+    # G2 — search where you are.
+    m = re.fullmatch(r"search (?:for )?(.+?) (?:here|on this (?:site|page|website)|in this (?:sheet|spreadsheet|doc|document|"
+                     r"site|page|tab|inbox|mail|drive|channel|repo|repository))", low) \
+        or re.fullmatch(r"search (?:this|the) (?:sheet|spreadsheet|doc|document|site|website|page|inbox|mail|drive|channel|"
+                        r"repo|repository|tab)? ?for (.+)", low) \
+        or re.fullmatch(r"search (?:for )?(.+)", low)
+    if m:
+        query = m.group(1)
+        found = re.search(re.escape(query), text, re.I)
+        return Action("browser", "search_here", target=found.group(0) if found else query, raw=raw)
+    # G4 — what can I do here?
+    if re.fullmatch(r"what (?:can|could) i (?:do|say|ask(?: you)?) (?:here|on this (?:page|site|website)|with this (?:page|site))|"
+                    r"what (?:can|could) you do (?:here|on this (?:page|site))|help(?: me)? (?:here|with this (?:page|site))|"
+                    r"what are my options here", low):
+        return Action("browser", "page_help", target="current", raw=raw)
+    return None
+
+
+# ── Part 2c (BROWSER_CONTROL_PLAN B2, B4, B5, C3, C4) ──
+GROUP_COLORS = {"grey": "grey", "gray": "grey", "blue": "blue", "red": "red", "yellow": "yellow",
+                "green": "green", "pink": "pink", "purple": "purple", "violet": "purple",
+                "cyan": "cyan", "teal": "cyan", "orange": "orange"}
+_RESULT_NOUNS = r"(?:search )?(?:result|video|link|product|repo|repository|post|item|listing|article|hit)s?"
+_RESULT_ORDINAL = (r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|top|"
+                   r"\d{1,2}(?:st|nd|rd|th)?)")
+_RESULT_RE = re.compile(
+    r"(?:open|click(?: on)?|go to|show me|play|visit|take me to) (?:the )?" + _RESULT_ORDINAL +
+    r" " + _RESULT_NOUNS + r"(?: on (?:this|the) page)?( in (?:a )?new tab)?|"
+    r"(?:open|click(?: on)?|go to) " + r"(?:search )?(?:result|video|link) (?:number )?(\d{1,2})"
+    r"( in (?:a )?new tab)?")
+_ORDINAL_N = {"first": 1, "top": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+              "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "last": -1}
+
+
+def result_request(low):
+    """'open the third result' -> (3, new_tab=False); 'play the last video' -> (-1, False)."""
+    m = _RESULT_RE.fullmatch(low.strip(" .?!"))
+    if not m:
+        return None
+    word = m.group(1) or m.group(3)
+    nth = _ORDINAL_N.get(word) or int(re.sub(r"\D", "", word) or 0)
+    return (nth, bool(m.group(2) or m.group(4))) if nth else None
+
+
+def _group_name(text):
+    name = re.sub(r"^(?:the|my|this|that)\s+", "", text.strip())
+    name = re.sub(r"\s+(?:tab )?group$", "", name).strip()
+    return "current" if name in ("", "this", "current", "this tab's", "the current") else name
+
+
+def _part_2c_action(low, raw):
+    """The Part 2c shapes, or None. Called before the older tab rules in `_web_action`."""
+    # C3 — the Nth result of a search / list page.
+    hit = result_request(low)
+    if hit:
+        return Action("browser", "page_result", target=str(hit[0]),
+                      parameters={"nth": hit[0], "new_tab": hit[1]}, raw=raw)
+    if re.fullmatch(r"(?:what are|read(?: me)?|list|show me) (?:the )?(?:search )?(?:results|videos)(?: on (?:this|the) page)?", low):
+        return Action("browser", "page_results", target="current", raw=raw)
+    # C4 — find with highlight, and step through it.
+    m = re.fullmatch(r"(?:find|highlight|search for|look for) (.+?) (?:on|in) (?:this |the )?page", low) \
+        or re.fullmatch(r"highlight (?:all |every )?(?:the )?(?:word |words )?(.+)", low)
+    if m:
+        return Action("browser", "page_find", target=m.group(1).strip("'\""), raw=raw)
+    if re.fullmatch(r"(?:go to (?:the )?)?(?:next|find next) (?:match|result|one|occurrence|highlight)|find next", low):
+        return Action("browser", "page_find_step", target="next", parameters={"step": 1}, raw=raw)
+    if re.fullmatch(r"(?:go to (?:the )?)?(?:previous|prev|last|find previous) (?:match|one|occurrence|highlight)|find previous", low):
+        return Action("browser", "page_find_step", target="previous", parameters={"step": -1}, raw=raw)
+    if re.fullmatch(r"(?:clear|remove|hide) (?:the |all )?(?:highlights?|highlighting|matches)|stop (?:finding|highlighting)|clear (?:the )?(?:find|search)", low):
+        return Action("browser", "page_find_clear", target="current", raw=raw)
+    # B2 — everything except the pinned tabs.
+    if re.fullmatch(r"close (?:all |every )?(?:the )?(?:tabs )?(?:but|except(?: for)?|other than) (?:the )?pinned(?: ones| tabs)?|close (?:all |every )?(?:the )?unpinned tabs?", low):
+        return Action("browser", "tabs_close_unpinned", target="unpinned", raw=raw)
+    # B4 — tab groups.
+    if re.fullmatch(r"(?:list|show|what are|what) (?:my |the )?(?:tab )?groups(?: do i have)?|what tab groups do i have", low):
+        return Action("browser", "groups_list", target="all", raw=raw)
+    m = re.fullmatch(r"(?:group|put|gather|collect) (?:all )?(?:of )?(?:my |the |these )?(.+?) tabs(?: (?:together|in(?:to)? (?:a|one) group))?(?: (?:as|into|in|called|named|under) (?:a group called |the )?(.+?)(?: group)?)?", low)
+    if m and m.group(1) not in ("other", "all", "these", "my", "the"):
+        return Action("browser", "tabs_group", target=m.group(1),
+                      parameters={"title": (m.group(2) or "").strip()}, raw=raw)
+    m = re.fullmatch(r"(?:add|move|put) (?:this|the current) tab (?:to|into|in) (?:the |my )?(.+?)(?: tab)? group", low)
+    if m:
+        return Action("browser", "group_add", target=_group_name(m.group(1)), raw=raw)
+    m = re.fullmatch(r"(?:rename|call|name) (?:the |my |this )?(.*?)(?:tab )?group (?:to |as )?(.+)", low)
+    if m:
+        return Action("browser", "group_rename", target=_group_name(m.group(1)),
+                      parameters={"title": m.group(2).strip()}, raw=raw)
+    m = re.fullmatch(r"(?:make|colou?r|change|turn|set) (?:the |my |this )?(.*?)(?:tab )?group(?:'?s? colou?r)? (?:to |as )?(\w+)", low)
+    if m and m.group(2) in GROUP_COLORS:
+        return Action("browser", "group_color", target=_group_name(m.group(1)),
+                      parameters={"color": GROUP_COLORS[m.group(2)]}, raw=raw)
+    m = re.fullmatch(r"(collapse|fold|close up|minimi[sz]e|expand|unfold|open up|open) (all (?:the |my )?(?:tab )?groups|(?:the |my |this )?(.*?)(?:tab )?group)", low)
+    if m:
+        collapse = m.group(1) in ("collapse", "fold", "close up", "minimise", "minimize")
+        target = "all" if m.group(2).startswith("all") else _group_name(m.group(3) or "")
+        # "open the graphics team group": a tab group when one has that name, else WhatsApp's.
+        or_chat = m.group(1) == "open" and target not in ("all", "current") and "tab group" not in low
+        return Action("browser", "group_collapse", target=target,
+                      parameters={"collapsed": collapse, "or_chat": or_chat}, raw=raw)
+    m = re.fullmatch(r"ungroup (?:all(?: (?:the |my )?(?:tab )?groups)?|everything)", low)
+    if m:
+        return Action("browser", "group_ungroup", target="all", raw=raw)
+    m = re.fullmatch(r"ungroup (?:the |my |this )?(.*?)(?:tab|tabs|tab group|group)?", low)
+    if m:
+        return Action("browser", "group_ungroup", target=_group_name(m.group(1) or ""), raw=raw)
+    m = re.fullmatch(r"close (?:the |my |this )?(.+?) (?:tab )?group", low)
+    if m:
+        return Action("browser", "group_close", target=_group_name(m.group(1)), raw=raw)
+    # B5 — windows.
+    m = re.fullmatch(r"(?:move|send|put|pop|open) (?:this|the current) tab (?:out )?(?:in(?:to)?|to|as) (?:a |its own |a new |a separate )+window(?: on the other (?:screen|monitor|display))?|pop (?:this|the current) tab out|(?:move|send) (?:this|the current) tab to the other (?:screen|monitor|display)", low)
+    if m:
+        return Action("browser", "tab_detach", target="current",
+                      parameters={"monitor": bool(re.search(r"other (?:screen|monitor|display)", low))},
+                      raw=raw)
+    if re.fullmatch(r"(?:merge|combine|join) (?:all )?(?:my |the )?(?:chrome |browser )?windows(?: together| into one)?|(?:put|move|bring) all (?:my |the )?tabs (?:into|in) (?:one|this|a single) window", low):
+        return Action("browser", "windows_merge", target="all", raw=raw)
     return None
 
 
@@ -1385,14 +3698,106 @@ _NEVER_RETHINK = frozenset({"system", "file", "files", "shell", "info", "timer",
                             "diagnose", "plan", "trigger", "scene"})
 
 
+# G5: steps that put a page in front, and steps that act on the page in front.
+_OPENS_PAGE = frozenset({"ws_open", "ws_search", "ws_create", "open_url", "site_search", "page_result", "ai_ask",
+                         "social", "tab_switch", "email_search"})
+_ON_PAGE = frozenset({"sheet_calc", "sheet_row", "sheet_cell", "slides_nav", "slides_present", "page_read",
+                      "page_summarize", "page_ask", "page_click", "page_type", "page_scroll", "page_find", "video",
+                      "form_fill", "form_choose", "form_submit", "file_upload", "product_info", "shop_refine",
+                      "page_result", "page_results", "ai_read", "ws_share", "ws_download", "page_comments"})
+
+
+def _opens_page(action):
+    # L7: "app.open" too — a failed "open details 2026-27" (no such app; the model then tried
+    # the file and missed) was followed by "open the first result" on whatever list was there.
+    return (action.domain == "browser" and action.action in _OPENS_PAGE) or \
+        (action.domain == "message" and action.action == "open") or action.key == "app.open"
+
+
+def _needs_page(action):
+    return (action.domain == "browser" and action.action in _ON_PAGE) or \
+        (action.domain == "message" and action.target in ("current", "this", "recent"))
+
+
+# L8: these open a page WITHOUT waiting for it (the tab is created and the call returns). A
+# step after them would act on whatever page was there before.
+_OPENS_UNWAITED = frozenset({"browser.open_url", "browser.search_web", "browser.search_youtube"})
+
+
+def _settle_page(action, result):
+    """After an open that does not wait, wait for that page before the next step runs."""
+    if action is None or result is None or not result.ok or action.key not in _OPENS_UNWAITED:
+        return
+    detail = result.detail or {}
+    if not detail.get("url"):
+        return
+    try:
+        from kayra.automation import web_macros
+        web_macros.wait_page(detail["url"], detail.get("tab"))
+    except Exception:
+        pass
+
+
+# ── L9 (audit log 2026-11-11): "folder" said where a local folder is not meant ──
+_DRIVE_WHERE = r" (?:in|on|from) (?:my |the )?(?:google )?drive"
+_DRIVE_ITEM = re.compile(r"(?:browser )?(?:open|show(?: me)?|go to|find)(?: up)? (?:the |my )?"
+                         r"(folder (?:called |named )?)?(.+?)( folder)?" + _DRIVE_WHERE)
+
+
+def is_placeholder(value):
+    """True for a model's template slot copied literally: "(contact)", "<text>", "[app name]"."""
+    return bool(re.fullmatch(r"\s*[\(<\[\{]\s*[a-z _-]{1,24}\s*[\)>\]\}]\s*", str(value or ""), re.I))
+
+
+def _all_tabs(low, raw):
+    """
+    The audit log of 2026-11-11: "close all tabs" became app.close_all "tabs" (nothing found) and
+    then browser.tab_close "all" — which closes the tabs whose NAME contains "all". Every tab in
+    the window is `tabs_close_unpinned` (pinned tabs stay; more than three asks first).
+    """
+    low = re.sub(r"^browser ", "", low)
+    if re.fullmatch(r"close (?:all|every|all of)(?: the| my)? (?:open )?(?:browser |chrome )?tabs?"
+                    r"(?: in (?:this|the) window)?(?: please)?", low):
+        return Action("browser", "tabs_close_unpinned", target="unpinned", raw=raw)
+    if re.fullmatch(r"close (?:all )?(?:the )?other tabs|close all (?:the )?tabs except (?:this|the current)(?: one| tab)?", low):
+        return Action("browser", "tabs_close_others", target="others", raw=raw)
+    return None
+
+
+def folder_action(low, raw, context=None):
+    """
+    "open the images folder in Google Drive" -> a Drive FOLDER (was ~/… "couldn't find images in
+    google drive"); "open X in Google Drive" -> that Drive item of any kind; "open folder <name>
+    group/chat" -> the WhatsApp group (the model put "folder" in front of a group's name);
+    a bare "open folder" -> the home folder in the file manager (was "no app called folder").
+    """
+    m = _DRIVE_ITEM.fullmatch(low)
+    if m and m.group(2).strip() not in ("it", "this", "that", "a", "the"):
+        name = re.sub(r"^(?:the|my) ", "", m.group(2).strip())
+        kind = "folder" if (m.group(1) or m.group(3)) else "file"
+        return Action("browser", "ws_open", target=name, parameters={"kind": kind}, raw=raw)
+    m = re.fullmatch(r"open (?:the )?folder (.+? (?:group|chat))", low)
+    if m:
+        return normalize_command(f"open {m.group(1)}", context)
+    if re.fullmatch(r"(?:open|show(?: me)?)(?: a| the| my)? (?:folder|folders|file manager|files app)", low):
+        return Action("file", "open_folder", target="home", raw=raw)
+    return None
+
+
 def _is_guess(action):
     """The parser's own catch-all: 'browser <anything>' read as a click, at low confidence."""
     return action.domain == "browser" and action.action == "page_click" and action.confidence < 1.0
 
 
+# L3: an identical lookup this soon after it found nothing is not run again.
+REPEAT_MISS_S = 3.0
+
+
 def _worth_rethinking(action, result):
+    # "X isn't open" is a complete, honest answer to "close X": a model asked to rethink it
+    # closed something ELSE (the chat inside WhatsApp, for "close WhatsApp").
     return (result is not None and result.status in _RETHINK_STATUSES
-            and action.domain not in _NEVER_RETHINK)
+            and action.domain not in _NEVER_RETHINK and action.key not in ("app.close", "message.close"))
 
 
 _CONFIRM_PROMPTS = {
@@ -1407,10 +3812,56 @@ _CONFIRM_PROMPTS = {
     "file.delete": "That will delete it. Should I go ahead?",
     "app.kill": "That will force-close it and you may lose unsaved work. Should I go ahead?",
     "window.close_all": "That will close every open window. Should I go ahead?",
+    # Part 6
+    "browser.form_submit": "Submit this form? Once it's sent I can't take it back.",
+    "browser.profile_clear": "Forget every detail you gave me for forms?",
+    "browser.video_subscribe": "Subscribe to this channel?",
+    "learning.forget_all": "Forget everything I've learned about how you talk, and every page shortcut?",
+    "meet.record": "Record your screen and the call's sound? Tell the others you're recording.",
+    "backup.restore": "Restore your last backup? It replaces my memory and settings; what you have now is saved first.",
 }
 
 
+# Part 7c: answers to "which one?" — which actions offer a choice, and where the answer teaches.
+_CHOICE_TTL_S = 120
+_CHOICE_DOMAINS = frozenset({"message", "browser"})
+_CHOICE_LEARN = {"message.open": "whatsapp", "message.read": "whatsapp", "message.send": "whatsapp",
+                 "message.send_file": "whatsapp"}
+
+_TRUST_TTL_S = 3 * 3600          # "don't ask again" lasts for the call, at most three hours
+_TRUSTABLE = {"meet.share"}      # the ONLY confirmation that may be switched off by voice
+_DONT_ASK = re.compile(r"[\s,.!]*\b(?:and )?(?:(?:don'?t|do not|never|no need to) ask(?: me)?"
+                       r"(?: again| that again| for this call| this call)*|stop asking(?: me)?)\b.*$")
+
+
+def _share_what(action):
+    name = (action.parameters or {}).get("name") or ""
+    surface = action.target or "monitor"
+    if surface == "window":
+        return f"the {name} window" if name else "a window"
+    if surface == "browser":
+        return f"the {name} tab" if name else "a Chrome tab"
+    if name:
+        return {"#1": "your first screen", "#2": "your second screen", "#3": "your third screen",
+                "<": "your left screen", ">": "your right screen"}.get(name, f"the {name} screen")
+    return "your entire screen"
+
+
+SHARE_WARNING = {"fn": None}          # set by the backend: (action) -> " WhatsApp is open on that screen." | ""
+
+
 def _confirm_prompt(action, reason):
+    if action.key == "meet.share":
+        # Says WHAT goes to everyone (M0.5): "Share the LM Studio window with everyone in the
+        # call?" — a reflexive yes to "share monitor?" is how the whole desktop got shared.
+        warning = ""
+        if SHARE_WARNING["fn"] is not None:
+            try:
+                warning = SHARE_WARNING["fn"](action) or ""      # M2.2: "WhatsApp is open on that screen."
+            except Exception:
+                warning = ""
+        return (f"Share {_share_what(action)} with everyone in the call?{warning} You can say "
+                f"\"yes, don't ask again\" for the rest of this call.")
     prompt = _CONFIRM_PROMPTS.get(action.key)
     if prompt:
         return prompt
@@ -1459,6 +3910,23 @@ class AutomationRuntime:
         # "automation" token was really conversation, and the app answers it as chat.
         self.situation_fn = None
         self.chat_handoff = False
+        # Part 7c: a "which one?" Kayra asked ({action, candidates, question, at}); the next answer
+        # that picks one runs the action on it and, for a chat name, teaches the alias.
+        self.pending_choice = None
+        # Confirmations the user switched off by voice ("yes, don't ask again"): key -> expiry.
+        # Only `_TRUSTABLE` keys, cleared when the call ends (meet.leave).
+        self.trusted = {}
+        # L3: the last lookup that found nothing, so an identical request seconds later (a
+        # model re-proposing it, a doubled token) is answered without running it again.
+        self._last_miss = None
+        self._in_batch = False                  # the repeat guard applies within ONE request
+
+    def _slides_in_front(self):
+        try:
+            tab = (self.situation_fn() if self.situation_fn else {}) or {}
+        except Exception:
+            return False
+        return "docs.google.com/presentation/" in str(tab.get("tab_url") or "")
 
     def take_chat_handoff(self):
         """True once after a request the understanding layer judged to be conversation."""
@@ -1485,6 +3953,10 @@ class AutomationRuntime:
     def execute_action(self, action, skip_policy=False):
         if action is None:
             return ActionResult.unsupported("I didn't understand that one.")
+        if is_placeholder(action.target) and action.key != "message.send":   # that one means 'the draft' (L2)
+            # A model's template slot copied literally ("close (app name)", the log of
+            # 2026-11-11): there is nothing real to act on, and nothing to look up.
+            return ActionResult.failure("I didn't catch which one. Say its name.")
         audit(AUDIT_STARTED, action)
 
         if not skip_policy:
@@ -1493,24 +3965,58 @@ class AutomationRuntime:
                 audit(AUDIT_BLOCKED, action, reason=reason)
                 spoken = self._refusal(action)
                 return ActionResult.blocked(spoken or f"I won't do that — {reason}.")
+            if action.key == "meet.share" and _bare_present(action) and self._slides_in_front():
+                # "start presenting" with a Slides deck in front means the SLIDESHOW (Part 4,
+                # E3), decided before the share question is ever asked.
+                action = Action("browser", "slides_present", target="current", raw=action.raw)
+                verdict, reason = classify_action(action)
+            if verdict == Risk.CONFIRM and self.trusted.get(action.key, 0) > time.monotonic():
+                verdict = Risk.ALLOW                 # the user said "don't ask again" this call
             if verdict == Risk.CONFIRM:
                 prompt = _confirm_prompt(action, reason)
                 self.confirmations.request(action, prompt)
                 audit(AUDIT_CONFIRM, action, reason=reason)
                 return ActionResult(Status.NEEDS_CONFIRMATION, prompt, {"reason": reason}, action)
 
+        signature = (action.key, str(action.target), repr(sorted((action.parameters or {}).items())))
+        miss = self._last_miss
+        if self._in_batch and miss is not None and miss[0] == signature \
+                and time.monotonic() - miss[1] <= REPEAT_MISS_S:
+            # Nothing happened the first time (NOT_FOUND), and nothing could have changed in a
+            # second: running it again only doubles the wait and the spoken "not found".
+            self._last_miss = None
+            return miss[2]
         try:
             result = self._dispatch(action)
         except Exception as e:
             audit(AUDIT_FAILED, action, error=str(e))
             return ActionResult.failure("That didn't work.", error=str(e))
+        self._last_miss = (signature, time.monotonic(), result) \
+            if result is not None and result.status == Status.NOT_FOUND else None
 
         if result is None:
             result = ActionResult.unsupported("I don't know how to do that yet.")
         result.action = action
 
+        # A handler may find out only while acting that the request is bigger than it sounded
+        # ("close all YouTube tabs" -> 7 tabs, B2). It then returns NEEDS_CONFIRMATION with the
+        # exact action to run on "yes" (`detail["confirm"]`, already narrowed to what it found);
+        # nothing has happened yet. Registered here, like a policy confirmation.
+        if result.status == Status.NEEDS_CONFIRMATION and isinstance(
+                (result.detail or {}).get("confirm"), Action):
+            pending = result.detail["confirm"]
+            self.confirmations.request(pending, result.message)
+            audit(AUDIT_CONFIRM, pending, reason="larger than it sounded")
+            return result
+
+        if action.key == "meet.leave" and result.ok:
+            self.trusted.pop("meet.share", None)     # the call is over, so is the trust
         if result.status == Status.AMBIGUOUS:
             audit(AUDIT_AMBIGUOUS, action, candidates=result.detail.get("candidates"))
+            names = [str(c) for c in ((result.detail or {}).get("candidates") or []) if str(c).strip()]
+            if 1 < len(names) <= 6 and action.domain in _CHOICE_DOMAINS:
+                self.pending_choice = {"action": action, "candidates": names, "question": result.message,
+                                       "at": time.monotonic()}
         elif result.ok:
             audit(AUDIT_SUCCESS, action)
             self.context.note_action(action, True)
@@ -1522,6 +4028,14 @@ class AutomationRuntime:
     async def translate_and_execute(self, commands):
         if not commands:
             return ""
+        commands = [part for command in commands for part in split_compound(command, self.situation_fn)]
+        self._last_miss, self._in_batch = None, True
+        try:
+            return await self._translate_and_execute(commands)
+        finally:
+            self._in_batch, self._last_miss = False, None
+
+    async def _translate_and_execute(self, commands):
         actions, unmapped = [], []
         from_model = set()          # ids of actions the understanding layer proposed
         spoken = []
@@ -1550,14 +4064,25 @@ class AutomationRuntime:
         if not actions:
             return "" if self.chat_handoff else ("I'm not sure how to do that." if unmapped else "")
 
+        # L3: the same command twice in one batch (a doubled token) runs once.
+        unique, seen = [], set()
+        for action in actions:
+            key = (action.key, str(action.target), repr(sorted((action.parameters or {}).items())))
+            if key not in seen:
+                seen.add(key)
+                unique.append(action)
+        actions = unique
         self._set_state("AUTOMATING")
         outcomes = {"ok": 0, "failed": 0, "tokens": []}
+        groups = plan_actions(merge_share_steps(merge_tab_steps(actions)))
         try:
-            for group in plan_actions(merge_tab_steps(actions)):
+            for index, group in enumerate(groups):
                 if len(group) == 1:
                     results = [await asyncio.to_thread(self.execute_action, group[0])]
                     if _worth_rethinking(group[0], results[0]) and id(group[0]) not in from_model:
                         results = await asyncio.to_thread(self._rethink, group[0], results[0])
+                    if index + 1 < len(groups):
+                        await asyncio.to_thread(_settle_page, group[0], results[-1])
                 else:
                     results = await asyncio.gather(
                         *(asyncio.to_thread(self.execute_action, a) for a in group))
@@ -1571,8 +4096,19 @@ class AutomationRuntime:
                         if getattr(result, "action", None):
                             outcomes["tokens"].append(result.action.key)
                     # A question stops the batch: the rest of the plan depended on the answer.
+                    # G5: behind a yes / no question the REST is parked, not lost — "yes" runs
+                    # it after the confirmed step; "no" drops it (as `run_steps` does).
                     if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):
+                        rest = [a.raw for g in groups[index + 1:] for a in g if a.raw]
+                        self.pending_plan = rest if result.status == Status.NEEDS_CONFIRMATION else []
                         return " ".join(spoken)
+                # G5: a later step that acts on the page this one was to open must not run on
+                # whatever page is in front instead ("total column C" on the wrong sheet).
+                failed = [r for r in results if r.status in (Status.FAILED, Status.NOT_FOUND, Status.UNSUPPORTED)]
+                later = [a for g in groups[index + 1:] for a in g]
+                if failed and len(group) == 1 and _opens_page(group[0]) and later and _needs_page(later[0]):
+                    spoken.append("I stopped there, since the next step needed that page.")
+                    return " ".join(spoken)
         finally:
             self._set_state("PROCESSING")
             self._emit(outcomes)
@@ -1603,6 +4139,8 @@ class AutomationRuntime:
             proposed = normalize_command(token, self.context)
             if proposed is None:
                 continue
+            if (proposed.key, proposed.target, proposed.parameters) == (action.key, action.target, action.parameters):
+                continue       # the model proposed the SAME thing: it just failed, do not run it twice
             outcome = self.execute_action(proposed)
             out.append(outcome)
             if outcome.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS) or not outcome.ok:
@@ -1629,24 +4167,83 @@ class AutomationRuntime:
             result = self.execute_action(action)
             if _worth_rethinking(action, result) and (result.detail or {}).get("web_fallback"):
                 result = self._rethink(action, result)[-1]
+            if tokens:
+                _settle_page(action, result)
             if result.message:
                 spoken.append(result.message)
             if result.status in (Status.NEEDS_CONFIRMATION, Status.AMBIGUOUS):
                 self.pending_plan = tokens if result.status == Status.NEEDS_CONFIRMATION else []
                 break
+            if result.status in (Status.FAILED, Status.NOT_FOUND, Status.UNSUPPORTED) and _opens_page(action) and tokens:
+                following = normalize_command(tokens[0], self.context)
+                if following is not None and _needs_page(following):
+                    spoken.append("I stopped there, since the next step needed that page.")
+                    break
         return spoken
 
     # ── confirmations ──
     def pending_confirmation(self):
-        return self.confirmations.prompt if self.confirmations.peek() is not None else None
+        if self.confirmations.peek() is not None:
+            return self.confirmations.prompt
+        choice = self.pending_choice
+        if choice and time.monotonic() - choice["at"] <= _CHOICE_TTL_S:
+            return choice["question"]
+        self.pending_choice = None
+        return None
+
+    def resolve_choice(self, reply):
+        """(True, sentence) when `reply` answers the pending "which one?", else (False, "").
+        An answer that is not a pick drops the question and goes on as a normal request."""
+        choice, self.pending_choice = self.pending_choice, None
+        if not choice or time.monotonic() - choice["at"] > _CHOICE_TTL_S:
+            return False, ""
+        low = " ".join(str(reply or "").lower().strip(" .!?").split())
+        if re.fullmatch(r"(?:neither|none|none of them|neither of them|cancel|never ?mind|no|nope)(?: of (?:them|those))?", low):
+            return True, "Alright."
+        names = choice["candidates"]
+        picked = None
+        m = re.fullmatch(r"(?:the )?(first|second|third|fourth|fifth|sixth|last|1st|2nd|3rd|4th|5th)(?: one)?|"
+                         r"(?:number |option )(\d)", low)
+        if m:
+            index = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "fourth": 3, "4th": 3,
+                     "fifth": 4, "5th": 4, "sixth": 5, "last": len(names) - 1}.get(m.group(1) or "", None)
+            index = int(m.group(2)) - 1 if m.group(2) else index
+            picked = names[index] if index is not None and 0 <= index < len(names) else None
+        else:
+            from kayra.automation.semantic_match import match, PICK
+            said = re.sub(r"^(?:i mean |i meant |the one called |it's |it is |yes,? )", "", low)
+            decision = match(said, names)
+            picked = decision.best.name if decision.decision == PICK else None
+        if picked is None:
+            return False, ""
+        action = choice["action"]
+        chosen = Action(action.domain, action.action, target=picked, parameters=dict(action.parameters), raw=action.raw)
+        result = self.execute_action(chosen)
+        if result.ok or result.status == Status.NEEDS_CONFIRMATION:
+            app = _CHOICE_LEARN.get(action.key)
+            if app and action.target and action.target not in ("current", "recent"):
+                from kayra.automation import learning
+                learning.teach(app, action.target, picked)
+        return True, result.message or "Done."
 
     def resolve_confirmation(self, reply):
+        if self.confirmations.peek() is None and self.pending_choice is not None:
+            return self.resolve_choice(reply)
+        action = self.confirmations.peek()
+        trust = False
+        if action is not None and action.key in _TRUSTABLE:
+            bare = _DONT_ASK.sub("", str(reply or "").lower()).strip(" ,.!")
+            if bare != str(reply or "").lower().strip(" ,.!") and read_confirmation_reply(bare or "yes"):
+                trust, reply = True, bare or "yes"
         verdict = read_confirmation_reply(reply)
+        if verdict is None and action is not None:
+            verdict = self._restated(action, reply)
         if verdict is None:
             return False, ""
-        action = self.confirmations.peek()
         if action is None:
             return False, ""
+        if trust and verdict is True:
+            self.trusted[action.key] = time.monotonic() + _TRUST_TTL_S
         if verdict is False:
             self.confirmations.cancel()
             audit(AUDIT_BLOCKED, action, reason="declined by user")
@@ -1660,10 +4257,37 @@ class AutomationRuntime:
             return True, "That request expired. Ask me again if you still want it."
         result = self.execute_action(approved, skip_policy=True)
         spoken = [result.message or "Done."]
+        if trust:
+            spoken.append("I won't ask again before sharing during this call.")
         if self.pending_plan:
             rest, self.pending_plan = self.pending_plan, []
             spoken += self.run_steps(rest)
         return True, " ".join(spoken)
+
+    def _restated(self, action, reply):
+        """
+        L9 (audit log 2026-11-11): Kayra asked "delete this email?", the user answered "yes,
+        delete it" — not a bare yes, so it went back to the classifier as a NEW delete, which asked
+        again, and the email was never deleted. A reply that says yes and then restates the same
+        request, or simply restates it ("delete it"), is a yes. True, or None (not an answer).
+        """
+        text = " ".join(re.sub(r"[.,!?;:]+", " ", str(reply or "").lower()).split())
+        m = re.match(r"(?:(?:yes|yeah|yep|ok|okay|sure|please|go ahead)\s+)+(.+)$", text)
+        rest = m.group(1) if m else text
+        if not rest or re.search(r"\b(?:no|not|don'?t|cancel|stop|never)\b", rest):
+            return None
+        verb = action.action.split("_")[0]
+        if m and rest.split()[0] == verb:
+            return True                          # "yes, delete it" / "yes delete this email"
+        try:
+            again = normalize_command(rest, self.context)
+            if again is None:
+                again = normalize_command(f"{action.domain} {rest}", self.context)
+        except Exception:
+            again = None
+        if again is not None and again.key == action.key:
+            return True                          # "delete it" while "delete it?" is pending
+        return None
 
     def shutdown(self):
         cancelled = self.timers.shutdown()

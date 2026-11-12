@@ -36,6 +36,7 @@ DESIGN RULES (load-bearing)
 import os
 import re
 import time
+import logging
 import shlex
 import threading
 from collections import deque
@@ -279,9 +280,24 @@ _CONFIRM_ACTIONS = {
     # Round 3 (2026-11-10): things that spend, send, publish, remove or close a lot.
     "system.update_system", "system.install", "system.uninstall", "system.wifi_forget",
     "system.close_except", "system.close_hog",
-    "browser.tabs_close_others", "email.send", "message.send", "calendar.add",
+    "browser.tabs_close_others", "browser.tabs_close_side", "email.send", "calendar.add",
+    # message.send is NOT here since Part 5: the handler resolves and opens the chat FIRST and
+    # then always asks with the chat's real name ("Send 'x' to Rahul Sharma?"); asking here as
+    # well would ask twice, the first time about words, not a chat. It never sends without that
+    # yes — asserted in tests/test_browser_control.py [19].
     "meet.share",                # your whole screen goes to everyone in the call
     "diagnose.fix", "dev.git_commit", "email.delete", "email.spam",
+    # Part 6 (2026-11-11): a submitted form cannot be taken back; forgetting every saved form
+    # detail at once; a subscription is public. Filling a form and uploading a file ask too,
+    # LATE, naming the fields / the file (the handler resolves them first).
+    "browser.form_submit", "browser.profile_clear", "browser.video_subscribe",
+    # Part 7: forgetting everything Kayra learned at once (aliases and page shortcuts).
+    # The page agent's own risky steps are LATE confirmations naming the control.
+    "learning.forget_all",
+    # Part 13 (§12 M4.4): recording a meeting records other people — always asked.
+    "meet.record",
+    # Part 16: a restore replaces memory and settings (the current state is backed up first).
+    "backup.restore",
 }
 
 # Actions that must never run from a voice command, whatever the phrasing.
@@ -306,6 +322,17 @@ _RISKY_CLICK = re.compile(
     r"permanently|send|pay|purchase|buy|order|checkout|transfer|confirm|submit|publish|"
     r"post|sign out|log out|logout|shut ?down|restart|reboot|factory|overwrite|replace all|"
     r"revoke|unsubscribe|block|ban|kick)\b", re.IGNORECASE)
+
+
+# Decision D1 (2026-11-11): shopping is SEARCH AND OPEN only. A click on a cart, buy, order,
+# checkout or pay control is refused outright — not confirmed: the user chose that Kayra never
+# does it, so there is nothing to say yes to.
+_SHOPPING_STOP = re.compile(
+    r"\b(add(?: (?:this|it|item))? to (?:the |my )?(?:cart|bag|basket|trolley)|buy (?:it |this )?now|buy (?:this|it)|"
+    r"proceed to (?:checkout|buy|pay)|check ?out|place (?:your |the |an )?order|order now|pay now|make (?:a )?payment|"
+    r"go to (?:the |my )?(?:cart|bag|basket)|view (?:the |my )?(?:cart|bag|basket)|one[- ]click buy)\b", re.IGNORECASE)
+SHOPPING_REFUSAL = ("I only search and open products. Adding to a cart, checking out and paying "
+                    "are for you to do")
 
 
 def classify_action(action: Action):
@@ -337,6 +364,10 @@ def classify_action(action: Action):
 
     if key in _CONFIRM_ACTIONS:
         return Risk.CONFIRM, f"{key} is irreversible or affects the whole session"
+
+    if ((action.domain == "mouse" and action.action.endswith("_text")) or
+            action.key == "browser.page_click") and _SHOPPING_STOP.search(str(action.target or "")):
+        return Risk.DENY, SHOPPING_REFUSAL
 
     # A click is only as safe as the button it lands on. Clicking a word found on screen is
     # confirmed when the word is the kind of button that destroys, spends or sends.
@@ -876,7 +907,20 @@ def read_confirmation_reply(text: str):
         return True
     if cleaned in _NEGATIVE:
         return False
+    # L9 (audit log 2026-11-11): "yes yes", "yes go ahead", "okay sure, do it" — every word an
+    # agreeing word, with a real yes among them — is a yes. Any other word makes it a new
+    # command, exactly as before ("yes, and also open chrome").
+    words = cleaned.split()
+    if set(words) <= _AGREEING and set(words) & _CORE_YES and not set(words) & _NEGATIVE_WORDS:
+        return True
     return None
+
+
+_CORE_YES = frozenset({"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "proceed", "confirm",
+                       "confirmed", "affirmative", "absolutely", "definitely"})
+_AGREEING = _CORE_YES | frozenset({"please", "go", "ahead", "do", "it", "for", "of", "course", "right",
+                                   "now", "that's", "fine", "correct", "kayra"})
+_NEGATIVE_WORDS = frozenset({"no", "not", "don't", "dont", "cancel", "stop", "never", "nope", "nah"})
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1005,6 +1049,28 @@ _audit_lock = threading.Lock()
 _SENSITIVE_PARAMS = {"text", "content", "clipboard", "password", "command_output"}
 
 
+def _audit_logger():
+    """
+    `logs/automation.log`, unless KAYRA_AUDIT_LOG says otherwise: a path (the test runner
+    points every suite at a temporary file) or "off" (no file; the in-memory ring still
+    records). The unit tier used to append six `meet.*` lines to the developer's own log on
+    every run, which made the real audit trail unreadable (BROWSER_CONTROL_PLAN §12, M0.6).
+    """
+    override = os.environ.get("KAYRA_AUDIT_LOG", "").strip()
+    if not override:
+        return setup_logger("kayra.automation", "automation.log")
+    if override.lower() in ("off", "none", "0"):
+        return False
+    logger = logging.getLogger("kayra.automation.redirected")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.FileHandler(override, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
 def audit(event: str, action=None, **fields):
     """
     Records one automation decision.
@@ -1031,7 +1097,9 @@ def audit(event: str, action=None, **fields):
 
     try:
         if _logger is None:
-            _logger = setup_logger("kayra.automation", "automation.log")
+            _logger = _audit_logger()
+        if _logger is False:
+            return entry
         payload = " ".join(f"{k}={v!r}" for k, v in entry.items() if k not in ("event", "ts"))
         _logger.info("%s %s", event, payload)
     except Exception:

@@ -3,7 +3,8 @@
 | Folder / file | For | Contents |
 |---|---|---|
 | [`../AGENTS.md`](../AGENTS.md) | AI agents, new contributors | rules, layout, conventions, workflow — **start here** |
-| [`../CLAUDE.md`](../CLAUDE.md) | anyone changing a subsystem | every gotcha with the bug that taught it (long; search it) |
+| [`../CLAUDE.md`](../CLAUDE.md) | AI agents, every session | the short always-needed context and the index of the references below |
+| [`reference/`](reference/) | anyone changing a subsystem | per-subsystem gotchas, each with the bug that taught it (voice loop, intelligence, automation, UI, proactive, gesture, setup & hardware, runtime/memory/logging, dev workflow) |
 | [`architecture/OVERVIEW.md`](architecture/OVERVIEW.md) | everyone | the 5-minute map and platform support table |
 | [`architecture/SYSTEM_DESIGN.md`](architecture/SYSTEM_DESIGN.md) | contributors | how the components interact and the invariants |
 | [`architecture/EXECUTION_FLOW.md`](architecture/EXECUTION_FLOW.md) | contributors | launch, boot, one turn, background loops, shutdown |

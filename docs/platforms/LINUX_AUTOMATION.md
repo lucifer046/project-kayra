@@ -327,6 +327,490 @@ And the ones that depend on something outside Kayra:
 
 ## Changelog
 
+### 2026-11-11 — after V21: "open email", the extension's profile, close all tabs (V22, extension 1.16.1)
+
+- `common.email_words` (rules-first): "open email" = inbox (`email check`, "Gmail is open. You have
+  N unread"); "open the latest email" = `email open latest`; "… and read it" / "read my latest
+  email" = `email read latest`.
+- `chrome_profiles.with_extension` / `last_used`; `web_macros._wake_chrome` starts a closed Chrome
+  in the profile that has the Kayra extension, and names that profile when Chrome is open in
+  another one.
+- `common._all_tabs`: "close all tabs" = `tabs_close_unpinned` (was `tab_close "all"` = tabs whose
+  name contains "all"); "close all other tabs" = `tabs_close_others`.
+- `common.is_placeholder` checked in `execute_action` (all actions but `message.send`, which means
+  the draft) and in `interpreter.validate`.
+- `web_macros.site_tabs` matches the site's PATH too (Docs ≠ Sheets on docs.google.com).
+- With Docs/Sheets/Drive in front, "search for X" = that page's search (`search_here`).
+- Extension 1.16.1: `gmailOpen` matches a sender/subject ignoring spaces, or by every spoken word;
+  `email_open` falls back to Gmail's search and opens the first result.
+- Tests: `test_browser_control.py` [30] +25, `test_browser_extension.py` +2; unit tier 6062/0.
+
+### 2026-11-11 — Part 17 L9: the small fixes (V21)
+
+- "open (the) X folder in (Google) Drive" / "open folder X in my drive" -> `browser.ws_open` kind
+  `folder` (Drive search `type:folder`); "open X in Google Drive" -> any Drive item
+  (`common.folder_action`). Was a local `file.open_folder`.
+- "open folder <name> group/chat" -> that group (tab group, else WhatsApp); bare "open folder"
+  -> the home folder in the file manager.
+- `sites.py`: "google chat" (chat.google.com; never the bare word "chat").
+- `merge_share_steps`: a "click share" after a screen share in the same request is dropped.
+- Confirmations: "yes yes", "yes go ahead", "okay sure do it" are yes (`policy.read_confirmation_reply`);
+  "yes, delete it" and a plain restatement ("delete it") answer the pending question
+  (`AutomationRuntime._restated`) instead of asking again.
+- "open the latest email" with no Gmail tab: Gmail opens without waiting for the full page; the
+  email opens as soon as the list can be read (15 s budget). The 9 s in the log is not measured
+  against this yet.
+- Tests: `tests/test_browser_control.py` [30] +25; unit tier 6037/0; extension suite 158/0.
+
+### 2026-11-11 — Part 17: fixes from the audit-log review (V20)
+
+Found in `logs/automation.log` (sessions 00:08–02:24, 14:23–14:52); plan §15 L1–L8.
+
+- **L1** Chrome closed: `web_macros._need_bridge` starts it and waits for the extension
+  (`CHROME_WAKE_S` 12 s) instead of saying "browser set up". Chrome open without the extension
+  still gets the setup hint; Chrome is never started twice.
+- **L2** "send it" / "press send" / "click send button" with WhatsApp in front ->
+  `message.send_draft`: reads the open chat and its typed text, asks 'Send "…" to <chat>?',
+  re-checks both on yes. Gmail in front -> `email send`. A `(contact)` / `<text>` placeholder from
+  a model is never a chat name (`web_macros.is_placeholder`, `interpreter._PLACEHOLDER`); a model
+  may not propose `send_draft`.
+- **L3** WhatsApp search not usable on the first try -> closed and retried inside the same
+  request (was: "no such chat" in 50 ms, then the same request worked a second later); honest
+  "couldn't use WhatsApp's search" when it never works. One request runs an identical command
+  once (`translate_and_execute` de-duplicates; a NOT_FOUND is not re-run within 3 s).
+- **L4** `semantic_match.GENERIC`: a chat matched only on "team"/"club"/… is no match; "P.R." /
+  "p r" -> "pr".
+- **L5** `common.split_compound`: a model token holding two complete commands ("message open X
+  chat and read the last three messages") is split; "read the last three" needs no noun.
+- **L6** `app.close` of a site with no window ("close Google Drive") closes its tab(s)
+  (`web_macros.close_site_tabs`, asks above 3); "close the WhatsApp group" with no tab group
+  closes the WhatsApp tab.
+- **L7** Workspace files: the list already on screen is read first; at most two page loads (the
+  kind said, then Drive = every kind) in ONE new tab — the user's page is never navigated away;
+  "202627" = 2026-27; singular = plural; "google/sheets/docs/drive" are not part of a name; a
+  failed `app.open` stops a following "open the first result".
+- **L8** `common._settle_page`: after `open_url` / web or YouTube search, the next step waits
+  for that tab to show the site (`web_macros.wait_page`), never a fixed sleep.
+- Tests: `tests/test_browser_control.py` section [30] (+48); unit tier 6012/0;
+  `test_browser_extension.py` 158/0. Not yet tried live.
+
+### 2026-11-11 — parts 14–16: Kayra's voice, local models and keys, backups
+
+- **Voice**: "speak a bit faster" / "slower" / "at normal speed" / "set your speaking speed to 1.3"
+  (saved; Settings → Voice has the same control and a Play preview); Hindi, Japanese and Mandarin
+  sentences are spoken by a voice of that language (same gender), switchable in Settings.
+- **Local models**: "which model is loaded" (and whether it can see images), "load Qwen" (unloads
+  the other first — one 8–9B model fits the GPU), "unload the local model", "how fast is my local
+  model"; "check my API keys" (one tiny request per stored key — at boot only with
+  `KEY_HEALTH_ON_BOOT=on`).
+- **Backups**: "back up my Kayra data" (memory, details, what Kayra learned, settings — never keys;
+  `backups/`, 0600, ten kept), "restore my last backup" (asks; saves the current state first).
+- **Test hygiene**: `tests/run_all.py` now fails if any suite changes `data/`, `logs/`, `Reports/` or
+  `backups/`; the first sweep found none.
+- Tests: `tests/test_voice_models_backup.py` (new, 72), `test_dmm_browser.py` +7 (145/145).
+
+### 2026-11-11 — round 5, parts 11–13: smooth scrolling, browser neighbours, around the call (extension 1.16.0)
+
+- **Smooth scrolling** in every page of the interface: wheel notches glide and accumulate, the
+  touchpad follows the fingers and coasts after a flick, keys glide, paced at the display's refresh
+  rate; off under reduced motion. `KAYRA_UI_PROFILE=1` logs scroll frame times.
+- **Browser**: "save these tabs as research" / "open my research tabs", "read this later" / "open the
+  next one on my reading list", "pop this video out", "screenshot this page" / "take a full page
+  screenshot" (Pictures/Screenshots + clipboard), "tidy my tabs" (and an unprompted suggestion when
+  tabs pile up), "open this in Chromium" / "open this page in my Work profile".
+- **Calls**: mute / camera / hand / share / stop / leave also on Zoom, Teams and Discord in the
+  browser; "present my launch deck in the meeting"; "take notes of this meeting" / "stop taking
+  notes" / "summarize this meeting" (local model only; notes in Reports/meetings, 0600); "record this
+  meeting" (asks).
+- Tests: `test_smooth_scroll.py` (new, 22), `test_browser_control.py` [25], `test_browser_extension.py`
+  [14], `test_dmm_browser.py` +9 (138/138).
+
+### 2026-11-11 — round 5, parts 8–10: WhatsApp extras, in the call, one inbox (extension 1.15.0)
+
+- **WhatsApp (H3)**: "mute the PR group for a week", "pin Mom", "archive this chat", "mark Rahul as
+  read", "star the last message" just happen ("already pinned" is said); "react with a heart to the
+  last message", "reply to the last message saying …", "forward the last message to Rahul",
+  "video call Mom on WhatsApp" ask first, naming the chat and the message, and re-check both on yes.
+  Block / report / clear / delete / leave are refused by voice.
+- **Meet (§12)**: "who's in the call", "send a heart", "pin Ana in the call", "send in the meeting
+  chat: …" (asks), "copy the meeting link", "send the meeting link to Rahul" (asks). A whole-screen
+  share question names private apps open on that screen; unprompted speech waits while Kayra's
+  share is on; Calendar's reminder notification becomes "Standup is starting. Say join my next meeting."
+- **One inbox (H4)**: "who messaged me anywhere" (open WhatsApp + Gmail's unread count + the
+  notification log; nothing is opened to look), "reply to Rahul saying …" in the app his last
+  message came from, "Ana messaged on Telegram." as messages arrive (sender and app only; "stop
+  telling me about new messages").
+- Tests: `test_browser_control.py` [24], `test_browser_extension.py` [13], `test_dmm_browser.py` +9 (129/129).
+
+### 2026-11-11 — round 5, part 7: the page agent, recipes, learning what you mean (extension 1.14.0)
+
+- **Page agent** (`automation/page_agent.py`): "on this page, find the cheapest flight", "figure out
+  how to turn on dark mode", "browser agent …". Observe (`page.snapshot`) -> one JSON action from
+  the LOCAL model (`ai.agent_step`, `PAGE_AGENT_MODEL`) -> act (`page.act`) -> verify, ≤ 8 steps.
+  Every click goes through the spoken-click policy plus the agent's social verbs; risky ones ask by
+  name ("Should I click "Post" on this page?") and yes resumes the run; cart / pay are refused;
+  only the user's words are typed; secret fields refused twice; page text is data.
+- **§7a benchmark** (`tests/bench_page_agent.py`, manual): Qwen3.5-9B 30/30, gemma-4-e4b 27/30 after
+  prompt tuning (from 21 and 17); 1.40 s vs 0.70 s per step. The default stays the decision model.
+- **Recipes**: a fully working run is remembered by control NAMES with the typed words as slots and
+  replayed next time with no model; a renamed control hands over to the model and the recipe heals.
+- **Learning**: answers to "which one?" teach WhatsApp aliases; "no, the other one" corrects;
+  "what have you learned about me", "forget that", "forget everything about WhatsApp".
+- Tests: `test_browser_control.py` [23], `test_browser_extension.py` [12], `test_dmm_browser.py` +5
+  (120/120), the benchmark. Test rigs keep the agent off and learning in a temp folder.
+
+### 2026-11-11 — round 5, part 5P: Chrome profiles
+
+- "open my Work Chrome", "open Chrome as Kiran", "open Chrome on <spoken email>", "open Gmail in
+  my Study Chrome", "switch to my Study 2 profile", "which Chrome profiles do I have", "open
+  Chrome as a guest" (also Chromium / Brave / Edge). Profiles are read from the browser's own
+  `Local State` every time (re-parsed when it changes), so renaming a profile in Chrome needs
+  nothing else. `automation/chrome_profiles.py`; the folder comes from
+  `platforms.browser_user_data_dirs()`.
+- Launch: `<binary> --profile-directory=<folder> [url]` (argv through `RUNNER`), the new window
+  focused. Ambiguous names ask once ("Which one: Work (…), Study (…) or Study 2 (…)?"); unknown
+  names list the profiles; an unreadable file says so.
+- Privacy: names and emails are matched on this computer only; nothing is logged in full or
+  sent to a model. `tests/test_profile_privacy_guard.py` checks the repository never contains
+  them.
+- Tests: `tests/test_chrome_profiles.py` (100), `test_dmm_browser.py` +5 (115/115 locally).
+- **Not done**: the extension in more than one profile (P4), "always open Chrome as X".
+
+### 2026-11-11 — round 5, part 6 (slice 6b): ask ChatGPT / Claude / Gemini, WhatsApp files, Reddit / LinkedIn / GitHub, several steps (extension 1.13.0)
+
+- **F4** `browser.ai_ask` / `ai_read` — "ask ChatGPT what a monad is", "ask Claude to …", "what
+  does Gemini think of X", "ask ChatGPT in a new chat …", "read the whole answer". The open tab
+  of that site is reused (a follow-up stays in the conversation); the question is typed as said,
+  the send button waited for, and the answer waited for INSIDE the page (`page.aiChat wait`:
+  a new answer that has stopped growing and no Stop button). Long answers are cut at a sentence
+  ("the rest is on screen"); code is said to be on screen. A slow answer is announced once;
+  the wait is bounded (90 s). Signed out → said so, nothing typed. The understanding layer and
+  the planner may never route a request to an AI site (`interpreter._USER_ONLY`).
+- **F5** `message.send` to the OPEN chat ("reply saying …", "reply to Rahul saying …" — the old
+  parser sent "reply saying ok" to a contact called "reply") and `message.send_file` ("send my
+  resume to Ravi on WhatsApp", "send the last screenshot here"). Both ask first naming the
+  resolved chat (and the file); on yes the chat is re-checked, WhatsApp's Attach input is armed
+  with the D5 trusted-Space hook, the path goes into the chooser, and the preview's own Send is
+  pressed only when the preview shows that file. Images go as photos, the rest as documents.
+  A model can never propose a file send.
+- **F6** `browser.social` — "read my LinkedIn / GitHub / Reddit notifications", "read my
+  LinkedIn messages", "what's the top post on r/python this week", "what's trending on Reddit",
+  "open r/python", "open the github repo owner/name" (no owner → GitHub's repository search),
+  "search LinkedIn jobs for …" (site table: `linkedin jobs`, `linkedin notifications`,
+  `linkedin messages`). Read from the page (`page.social`), spoken, never sent to a model.
+- **G5** several steps in one sentence: `common.direct_tokens` splits "X and Y" / "X then Y"
+  when BOTH halves are complete commands, judging the later half against what the earlier one
+  will put in front ("open the budget sheet and total column C"); free-text first halves split
+  only at "then". A batch step that needs a yes now PARKS the rest (it was dropped); a failed
+  open stops the step that needed that page. `ws_open` / `ws_search` wait for the page. New
+  shapes: "total column C", "add up the amount column", "open the sheet Ravi sent last week".
+  The planner's catalog has the browser / message shapes.
+- The DMM preamble is unchanged: a 6b paragraph was tried and made the local model misread
+  "mute me"; every 6b phrasing in `test_dmm_browser.py` is rules-first anyway (110/110).
+- Tests: `test_browser_control.py` [22] (107 new), `test_browser_extension.py` [11] (17 new),
+  `test_dmm_browser.py` +15 cases.
+- **Not verified live**: no question was sent to the real ChatGPT / Claude / Gemini, no file
+  sent in a real WhatsApp chat, no live LinkedIn / Reddit / GitHub page read. Their markup was
+  taken from what those sites used in 2026 and may drift; each has a generic fallback.
+
+### 2026-11-11 — round 5, part 6 (slice 6a): forms, the video, site search, shopping (extension 1.12.0)
+
+Decisions asked first and answered by the user: **D1** shopping = search and open only (no
+add-to-cart, no cart page, no checkout); **D2** the form profile may hold name, email, phone,
+postal address, college, roll number, date of birth and gender.
+
+- **D1 fields**: `form_choose` — drop-downs (native and Google Forms' `role=listbox`), radio
+  options, check boxes, date fields; "set the country to India" falls back from the text box to
+  the drop-down. **D2**: `page_key` (real keys via wtype). **D3**: `automation/form_profile.py`
+  (0600 file, validation, spoken emails / numbers / dates, local field matching by autocomplete,
+  type and label; someone-else fields and secret fields never) and `form_fill` (a late
+  confirmation naming the fields; the pending action holds field numbers and keys, not values;
+  never submits; says what is still empty). **D4** `form_submit` (CONFIRM; an invalid form is
+  not reported as sent; a pay/order button is never pressed). **D5** `file_upload` (newest
+  matching file, late confirmation naming it, a one-shot trusted-key hook in the page so a real
+  Space opens the chooser, Ctrl+L + path + Enter, the name read back).
+- **F1** `video` / `video_subscribe` — speed (absolute and a quarter step), seek and jump,
+  captions, skip ad, next, like / unlike, watch later, full screen / theatre / mini player
+  (YouTube's own keys after the page releases focus), play / pause / mute, "how much is left".
+- **F2** `site_search` — "search <site> for X", "X on <site>", "images of X"; Amazon and
+  Flipkart price ranges ("under 2000", "between 500 and 1000", "2k", "two thousand") and sort.
+  "google search …" and "youtube search …" are unchanged. **F3** `shop_refine` (re-sort /
+  filter the results in front) and `product_info` (schema.org Product, Amazon and Flipkart
+  markup, Open Graph).
+- **Policy**: `policy._SHOPPING_STOP` DENIES cart / buy / checkout / order / pay clicks (also
+  OCR clicks); `browser.form_submit`, `browser.profile_clear`, `browser.video_subscribe` are
+  CONFIRM. `interpreter._USER_ONLY`: the model can never set / forget / submit details or
+  choose an upload.
+- **Rules first**: `common.part_6_direct` — complete shapes skip the classifier; the
+  context-dependent ones (seek, product, sort) only with a video or a shop in front.
+- Tests: `test_browser_control.py` [21] (185 new), `test_browser_extension.py` [10] (37 new),
+  `test_dmm_browser.py` +16 cases (95/95 on the local model, 78 rules-first).
+- **Not done (slice 6b)**: F4 ask ChatGPT / Claude / Gemini, F5 WhatsApp extras (reply to the
+  open chat, send a file), F6 LinkedIn / Reddit pages, G5 multi-step requests.
+- **Not verified live**: no real form was filled or submitted, no file uploaded through the
+  real portal chooser, no live YouTube / Amazon / Flipkart page used.
+
+### 2026-11-11 — fix round V11, third pass from the audit log (01:19–01:23)
+
+- **"close WhatsApp" closed the chat.** `app.close whatsapp` answered "WhatsApp isn't open"
+  (its web-app window runs in Chrome's "Profile 1", so its class is not the entry's
+  `StartupWMClass` `…__-Default`); the understanding layer then turned that into `message
+  close`. Fixes: `linux._shows_site` — a web app's windows are matched by SITE, any profile
+  (this also removes the 8 s wait on every "open whatsapp", which never saw its window);
+  with no window, the site's TAB is closed through the bridge; `app.close` / `message.close`
+  are never rethought by a model; `wa_close` never opens WhatsApp.
+- **"open and read the last three latest recent chats of mota panda"** reached the classifier,
+  which answered with its own example (`message read core team today`).
+  `common.last_messages_request` is rules-first: (name, count) from "the last N messages /
+  chats of|from|in X", "X's last N messages"; `wa_read(name, count=N)` reads exactly N, as
+  they are. "read the last three messages" with WhatsApp in front is the open chat. Mail words
+  ("emails from Ravi") are excluded.
+- **A name heard wrong** ("public relation and outreach coding"): when WhatsApp's own search
+  showed chats for one of the words but none matched well, the closest two are offered
+  instead of "not found".
+- `message open` with no name became a message to someone called "open" (the log's
+  `message.send target='open'`): now not parsed.
+- Tests: `test_browser_control.py` [20], the cases marked LOG (733 checks in the suite).
+
+### 2026-11-11 — fix round V11, second pass from the audit log (extension 1.11.0)
+
+`logs/automation.log` 01:00–01:05: every `message.open` for a chat that was not on screen
+failed in ~40 ms, ran a SECOND time ~1 s later, and sometimes succeeded then.
+
+- **Cause.** `_wa_find` typed into WhatsApp's search and read the chat list in the same
+  instant, before WhatsApp had filtered it (`_ready` returned at once: the stale list was
+  "non-empty"). The retry sometimes saw the first attempt's results. Fix: `chat.search`
+  (`pageChatSearch`) types and waits INSIDE the page until the list has changed and held still
+  for 350 ms, or says "nothing found" and holds still, or 1.6 s pass with the same list.
+  A stale "nothing found" from the previous search is not trusted (found by the Chrome test).
+- **Search again by words.** The whole name, then its two longest words: "general punchayat"
+  finds "General Panchayat" through "general".
+- **The search is always closed** after a lookup — found (`_wa_open`) or not — through
+  `_wa_search_close` (`page.searchClose`, then `chat.search ""` when text is left).
+- **Replace, never append.** `page.search` / `chat.search` select the box's own content with a
+  Range (no dependence on the window having focus), delete, insert, and read the value back
+  (`exact`); a page that refused gets the real keyboard (Ctrl+A, type).
+- **`search_close` is verified.** `page.searchClose` is async and returns `left`; with text
+  left the real keys are sent (Ctrl+A, Backspace, Escape) and the page asked again; still text
+  → a FAILURE is said, never "closed". Wording widened: "close the whatsapp search", "delete
+  the text in the search bar", "clear the search text".
+- **Ran twice.** `_rethink` no longer executes a model proposal identical to the action that
+  just failed.
+- **New**: `message search <name> [and open it]` (`wa_search`: results said, search left open),
+  `message open result <n>` ("open the first one" — the log's "first search result not the
+  second one"), `message close this chat` (`chat.close`; "close the group" with WhatsApp in
+  front and no tab groups — the log's three `group_close` failures).
+- Tests: `test_browser_control.py` [20] now 107 checks (the log's cases are marked LOG),
+  `test_browser_extension.py` [9] (a list that filters 0.5 s after typing).
+
+### 2026-11-11 — fix round V11: scroll, search, close search, names (extension 1.10.0)
+
+Reported by the user after using Parts 4 and 5. Each was traced through the parser first.
+
+- **Scrolling did nothing in web apps.** `page.scroll` called `window.scrollBy`; Gmail, WhatsApp,
+  Docs scroll a box inside the page. The extension now scrolls the scrollable ancestor of what
+  is in the middle of the view (`where="side"`: the left list; WhatsApp: `#main` / `#pane-side`),
+  else the largest scrollable box, else the window, and returns `moved` / `atEnd` / `canScroll`.
+  `web_macros.page_scroll` says "Done" only when it moved, names an end as an end, and sends
+  the real Page Down / Ctrl+End keys when nothing scrolls by script (Sheets' canvas).
+  `common.scroll_request` parses "scroll the mail to bottom", "scroll up a bit", "scroll the
+  chat list down", "go to the top of the page" (direction, where, amount); "scroll to <words>"
+  is still a scroll TO those words. `linux._page_scroll`: another app in front gets real keys /
+  the wheel, never a hidden Chrome tab.
+- **"open graphics team group [in whatsapp]"** was a Chrome tab-group expand / an app launch.
+  `common._bare_fix` + `_WA_NAMED_RE`: "… in/on/from whatsapp" is a chat from anywhere (rules
+  first, and in `normalize_command` for a DMM token); "open X chat" is a chat unless an app or
+  site is called that; "open X group" is `group_collapse` with `or_chat` → `web_macros.group_open`
+  (a tab group when one has the name, else `wa_open`). With WhatsApp in front, "open the budget
+  sheet" is a Sheet again (it was sent to a chat).
+- **Editions.** `semantic_match.edition`: names that are what was said plus only numbers
+  ("Graphics Team (2026-27)", "(2025-26)") are editions of one chat — the one with the latest
+  message is picked, no question. One shared word ("graphics") still asks. `year_ranges`:
+  "2026 2027" = "2026-27" = "2026 to 27" on both sides, for chats and files.
+- **"read the recent chat"** looked for a chat called "recent". Now `recent` = the open chat,
+  else the first non-pinned (or unread) row. Reading a chat with N unread reads those N
+  ("2 new in …"). A chat found through WhatsApp's search leaves the search closed.
+- **"click on the search button and search for X"** was one click on a button of that name.
+  `common.search_request` → `search_here`; from 1.10.0 it is `page.search` (box found by
+  type/role/name, magnifier pressed first when the box is hidden, cleared, typed, Enter — no
+  Enter on live-filter apps, `_LIVE_SEARCH`). On the Sheets/Docs/Slides HOME list it navigates
+  to Google's own search (it used to press Ctrl+F there).
+- **"close the search bar"** (was: close an app called "search bar"): `browser.search_close` →
+  `page.searchClose` (empty, the box's own Cancel/Clear, Escape, focus back to the open chat's
+  message box on WhatsApp), highlights cleared, Gmail `#search/…` → `#inbox`, an editor's find
+  bar gets Escape. Rules-first (`_DIRECT_BROWSER`).
+- **File names.** `rank_titles`: a title that STARTS with the phrase 85; equal scores keep the
+  page's order (most recently opened first) instead of "shortest title first". `_find_files`:
+  the query is sent with numbers as digits, then without numbers, then the recent list is
+  matched locally (≥ 40 only). Same-name-different-year files open the first listed; other
+  near-ties still ask.
+- `pageType` with an empty text and `clear` now really empties a contenteditable box (WhatsApp's
+  search was left filtered after a failed lookup).
+- Tests: `test_browser_control.py` [20] (78 checks), `test_browser_extension.py` [8] (real
+  Chrome: inner-box scrolling, hidden search box, close search), 7 cases in `test_dmm_browser.py`.
+  Not tried on live, logged-in Gmail / WhatsApp / Sheets.
+
+### 2026-11-10 — round 5, part 5: WhatsApp, app context, the semantic matcher
+
+- **H0.2** `common.front_site` + the rules-first route: with WhatsApp in front (web-app window or
+  Chrome on web.whatsapp.com), "open X", "click on X", "go to X chat" are a chat; a known site or
+  app ("open youtube") stays itself unless "chat"/"group" is said. `linux.situation` remembers
+  the app the user was in for 2 minutes while Kayra's own window is in front.
+- **H0.3** `automation/semantic_match.py`: order-free stemmed / prefix / near-spelling word
+  overlap, spoken numbers, initials, taught aliases, local embeddings (nomic, LM Studio; meaning
+  alone can only ASK), recency for ties, usage; decisions pick / ask / none.
+- **H0.4** extension 1.9.0 `chat.list/open/messages/composer`; `web_macros.wa_open`, `wa_unread`,
+  `wa_read` (today filter; local-only summaries), `message_send` (opens the chat, then a late
+  confirmation naming it; on yes: same chat re-checked, typed, read back, Send, arrival checked).
+  `message.send` left the static CONFIRM set for that reason. Fixed: a failed WhatsApp search
+  left its text in the search box and filtered every later chat list; "tell rahul saying hi"
+  was addressed to "tell".
+- Tests: `test_browser_control.py` [19], `test_browser_extension.py` [7], `test_dmm_browser.py`
+  (72/72). Not verified on a live, logged-in WhatsApp.
+
+### 2026-11-10 — tuning pass V9: rules first, fewer round trips, live-checked lookups
+
+- `common.direct_tokens` + `llm_engine.set_rule_router`: utterances the browser parser fully
+  understands (allow-listed actions) skip the classifier — 466 ms -> < 1 ms; screen-aware for
+  Sheets / Slides / "close it". `tests/test_dmm_browser.py`: 62/62 on the local model, 50 rules-first.
+- Boot warm-up of the classifier and understanding prompts; per-site catalog trimming rejected
+  (it would break LM Studio's prompt cache).
+- Extension 1.8.0 `untilReady` (`waitMs`) for lists / comments / results / Calendar / transcript;
+  `web_macros._ready`; per-command `tabs.active` cache (`new_command`); file lists reuse a tab.
+- `ai.relevant` for page questions (1.1 s -> 0.74 s, answer kept); spoken numbers + near
+  spellings in `rank_titles`; `spoken_email`; Sheets header row detection and `where` filters.
+- Live site findings and fixes: `updates/UPDATE_V9.md` §2.
+
+### 2026-11-10 — round 5, part 4: Google Workspace
+
+- **E1 Sheets**: open by name (`page.docList` + local `rank_titles`; ties ask), create + name
+  (Rename + real keys), Name Box (`page.focus`), total / average / highest / lowest / count of a
+  column by letter or header, rows, a row read with its headers, the headers — from
+  `gviz/tq?tqx=out:csv` (export as fallback) fetched in the page (`page.fetchText`,
+  docs.google.com only), computed in Python. **E2 Docs**: open / search / create; read,
+  summarize, ask from `export?format=txt` (the editor is a canvas); Find = the editor's Ctrl+F;
+  share = Share + the address typed, the user presses Send. **E3 Slides**: present (also an
+  unqualified "start presenting" when Slides is in front — decided before the share question),
+  next / previous (also on the DMM fast path) / end. **E4 Drive**: search (`type:pdf`), recent,
+  download (xlsx / docx / pptx / the file). **E5 Gmail**: search, unread this week/today,
+  compose, labels. **E6 Calendar**: next meeting, join it (a VISIBLE Meet link only), weekday
+  agendas. **E7 Meet**: admit everyone. **E8** Keep note, a form's responses, Classroom due.
+- Not done from E: Sheets "add a row" / sort / chart, Docs typing beyond the existing `type`,
+  Gmail "mark all as read" and attachments, Calendar "move my 3 pm to 4", Meet noise
+  cancellation / layout / recording, Drive share.
+- Extension 1.7.0 (no new permission). Fixed while testing: `ws_download` unpacked four values
+  from a three-value helper; a hidden Meet link could have been taken as the next meeting's.
+- Tests: `test_browser_control.py` [17], `test_browser_extension.py` [5].
+
+### 2026-11-10 — round 5, part 3: about the page, bookmarks, history, downloads, "it"
+
+- **C5** `page_ask`: a question answered from the page text by the model ("the page doesn't
+  say" otherwise). **C6** `page.comments` (site table + marked-up reviews; YouTube is scrolled
+  to and polled), `page.transcript` (presses "...more" and "Show transcript", polled with
+  `_until`, falls back to the description). **C8** Google Translate for the page, the model for a
+  selection (`page.selection`). **C9** bookmark add (folder by name, created if missing), search,
+  delete (always asks; exact ids). **C10** history clear (today / hour / 15 min; always asks),
+  "what did I visit". **C11** downloads: list with progress, open (asks; Kayra runs xdg-open,
+  never a program or a flagged file), show in folder, pause / resume / cancel.
+- **G1** `web_macros.LAST_TAB`: the tab Kayra last opened or switched to by name — "close it",
+  "go back to it", "read it", "summarize it"; 10 minutes, and only while it is still open.
+- **G2** `search_here`: the site in front's own search (Gmail, YouTube, Drive, GitHub repo,
+  Amazon, Flipkart, Wikipedia, Reddit, Stack Overflow, Google results), Ctrl+F in Docs/Sheets,
+  the page's search box, else Google. "browser search for X" now goes here.
+- **G4** `page_help`: per-site hints.
+- Extension 1.6.0 (+ `downloads`). Fixed: "bookmark this page" tried to OPEN a bookmark
+  called "this page". DMM preamble: a question about the page is not a word find; downloads
+  are not closed tabs (both misread by the live local model before the fix).
+- Tests: `test_browser_control.py` [16], `test_browser_extension.py` [4].
+
+### 2026-11-10 — round 5, part 2c: the rest of tabs and windows, results, find
+
+- **B2** "close all YouTube tabs", "close all but pinned": more than 3 tabs asks first. New in
+  the runtime: a handler can return NEEDS_CONFIRMATION with `detail["confirm"]` = the exact
+  action to run on "yes" (here with the tab ids it found), and `execute_action` registers it.
+- **B4** tab groups (`groups.list/create/update/ungroup`, extension 1.5.0 + `tabGroups`):
+  group by topic (title/address, else page text), rename, colour, collapse/expand (one or all),
+  add this tab, ungroup, close (asks above 3), list.
+- **B5** `windows.detach` ("move this tab to a new window", "… to the other screen" = then a
+  Hyprland move of the new window), `windows.merge`.
+- **C3** `page.results`: site-aware result lists (Google, YouTube, Amazon, Flipkart, GitHub,
+  Reddit, DuckDuckGo, Bing), else the Nth content link; "open the third result" with no
+  `browser` prefix is caught before `app.open`.
+- **C4** `page.highlight`: marks every match, scrolls to the current one, next / previous /
+  clear; "find X on this page" uses it from 1.5.0.
+- Tests: `tests/test_browser_control.py` [15], `tests/test_browser_extension.py` [3].
+- Not tried against a live Chrome with the extension loaded.
+
+### 2026-11-10 — round 5, part 2M: meetings and screen sharing
+
+- **Four misroutes fixed** (the audit log of a live attempt): `common.share_request()` reads
+  every way of asking to share into ONE `meet.share` (surface monitor/window/browser, a name,
+  audio, "instead"); a bare token ("share screen", "click on share screen", "present now") is
+  caught before the click and screen prefixes. `merge_share_steps` folds `focus X` + `meet
+  share window` into one share of X, and keeps one share per utterance.
+  `llm_engine._guard_meeting_code` drops a meeting code the user never said (the preamble's
+  `abc-defg-hij`) and re-reads "meet join/start" as a share when the user said share.
+- **Share what was named** (`web_macros.meet_share`, `automation/share_picker.py`,
+  `extension/kayra-share-picker/kayra-share-picker`): a window by its Hyprland address, a
+  monitor by position (left to right) or the focused one, a tab via Chrome's tab list (your
+  pick), system audio (extension 1.4.0). Switching while sharing stops the old share first.
+- **Readiness, not clocks**: the four fixed `SLEEP`s in `meet_share` are gone; the pickers are
+  answered when they appear and the result is read from Meet's own "Stop presenting".
+- **Confirmation names what goes out**; "yes, don't ask again" trusts `meet.share` (and ONLY
+  it) until `meet leave`, three hours at most.
+- **Do Not Disturb while presenting** (mako), undone only if Kayra turned it on.
+- **Test hygiene**: `KAYRA_AUDIT_LOG` (a path, or `off`) redirects the audit log; `run_all.py`
+  points it at a temp file and `_harness.py` turns it off for suites run alone. The unit tier
+  no longer appends to `logs/automation.log`.
+- Tests: `tests/test_browser_control.py` sections [12]-[14].
+- Not verified in a live call (M0.7).
+
+### 2026-11-10 — tuning pass: less waiting, fewer model calls, no idle churn
+
+Measured on the reference laptop (gemma-4-e4b in LM Studio, RTX 4060 Laptop).
+
+| What | Before | After |
+|---|---|---|
+| Page / email / calendar summary (`ai.summarize`) | 10.1 s | 2.1 s (direct local call, thinking off) |
+| "What's on my screen" (local vision) | 7.8 s | 1.8 s (thinking off) |
+| WhatsApp send, fixed pauses | 5.5 s always | as soon as each step is ready |
+| Meet join / calendar add / email read, fixed pauses | 1.5-3 s each | readiness waits |
+| "pause", "next tab", "volume 40" | one model call (~0.4 s local) | no model call |
+| OCR screen capture | 151 ms (PNG) | 35 ms (PPM); the OCR itself is still ~1.2 s |
+| Bridge frame unmasking, 600 KB | ~100 ms | 2 ms |
+| `triggers.json` | rewritten every 20 s | written only on change; re-read only when its mtime moves |
+| App index | re-parsed every 5 min | re-parsed when an applications folder changes |
+| Bridge accept loop | one wake-up a second | none while idle |
+
+**What changed**
+- `automation/ai.py`: `_local_chat` (one keep-alive session, thinking off, the HTTP timeout is
+  the bound); `summarize` uses it when a local server is up and the cloud is not forced;
+  local vision sends `reasoning_effort: none`; "no local model" is cached for 30 s, not
+  forever (a server started after Kayra used to be ignored for the whole run); Qwen 3.5 is
+  recognised as a vision model.
+- `automation/web_macros.py`: `_until` (try, short poll, try again) replaces the fixed pauses in
+  WhatsApp, Meet join, calendar add and Gmail; the only fixed pauses left are the two OS
+  share-picker waits in `meet_share`, which are untested live and were left alone. Unknown
+  site names found by the web lookup are remembered in `data/learned_sites.json` (bounded,
+  only when the host carries the spoken name). `refresh_stale_extension` reloads an
+  out-of-date extension once when it connects.
+- Extension 1.2.1: `pageClick` scores names first and checks visibility only for matches;
+  `page.waitFor` waits on a `MutationObserver` in the page instead of re-reading it every
+  250 ms.
+- `automation/diagnostics.py`: probes run side by side (`PARALLEL`). `workflows.briefing`
+  fetches the weather while Chrome answers for calendar and mail.
+- `automation/browser_bridge.py`, `workflows.py`, `linux_apps.py`: the three idle-cost fixes
+  in the table.
+- `intelligence/llm_engine.py`: `fast_intent` (exact whole-utterance commands skip the model);
+  the local DMM call sends `reasoning_effort: none`.
+
+**Not done, on purpose:** the Hyprland event socket (replacing the 0.1-0.2 s window polls),
+the extension pushing the active tab, capturing only the focused window for OCR (changes
+which matches are found), backing off the extension's 30 s reconnect alarm (slower
+auto-connect), caching `_have()` (microseconds, and tests swap the runner).
+
+Tests: `tests/test_browser_control.py` section 8b (173 checks in the suite).
+
 ### 2026-11-10 — the understanding layer: a model works out what you meant
 
 **Why:** everything after the DMM was rules (tables and patterns). Fast and exact for what

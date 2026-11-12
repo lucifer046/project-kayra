@@ -7,14 +7,14 @@ This module implements the primary intelligence and intent routing orchestration
 It automatically handles local vs. cloud model selection, intent classification (DMM),
 and real-time token streaming for low-latency dialogue generation.
 
-Cloud Chat Priority: Groq (primary) -> Gemini (fallback on quota/rate-limit)
-DMM: Cohere Command-R (cloud) or local model (offline)
+Cloud routing (both the DMM and chat): Claude Haiku -> Groq -> Gemini, each only when its key
+is set. A local model server, when running, takes everything unless CLOUD_FIRST is on.
 """
 
+import re
 import time
 import socket
 import requests
-import cohere
 from urllib.parse import urlparse
 from openai import OpenAI
 
@@ -23,8 +23,8 @@ from kayra.core.config import env_values
 from kayra.core import logbus
 from kayra.core.logbus import Subsystem, info, warning, error, debug, field
 from kayra.intelligence.provider_router import (
-    ROUTE_CHAT, ROUTE_DECISION, COHERE, GROQ, GEMINI, LOCAL,
-    AllProvidersFailed, FailureKind, get_provider_router,
+    ROUTE_CHAT, ROUTE_DECISION, CLAUDE, GROQ, GEMINI, LOCAL,
+    AllProvidersFailed, FailureKind, get_provider_router, is_no_credit,
     # The router's own failure taxonomy, reused rather than re-invented: whether a failure is
     # worth retrying is answered from ONE vocabulary, and the local path gets the same reading
     # of an exception that the cloud path does.
@@ -161,16 +161,212 @@ def _attempt_timeout_seconds(budget_left=None):
     return timeout
 
 
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                 THE FAST PATH: commands that ARE their token           │
+# └────────────────────────────────────────────────────────────────────────┘
+# "pause", "next tab", "volume 40": the whole utterance already IS the token the classifier
+# would emit, so asking a model costs a round-trip (~0.4 s local, ~0.7 s cloud) to be told what
+# was said. The rule that keeps this safe is the one the local control vocabulary uses: the
+# match is EXACT on the WHOLE utterance (name and "please" removed), never a prefix or a
+# substring — so "pause" is here and "pause for a second and tell me a joke" is not, and
+# "stop the music" still reaches the model. Words that are also ordinary conversation on their
+# own ("search", "save", "print", "find", "enter", "restore", "battery") are deliberately
+# absent, as are the broad closes. `DMM_FAST_PATH=off` disables it.
+_FAST_COMMANDS = frozenset({
+    "pause", "resume", "next track", "previous track",
+    "new tab", "close tab", "next tab", "previous tab", "reopen tab", "duplicate tab",
+    "go back", "go forward", "refresh", "reload",
+    "maximize", "minimize", "minimize all", "show desktop", "snap left", "snap right",
+    "close window", "switch window", "alt tab", "task view", "fullscreen",
+    "zoom in", "zoom out", "reset zoom",
+    "undo", "redo", "select all", "copy", "paste", "cut",
+    "read clipboard", "clear clipboard",
+    "take screenshot", "screenshot", "scroll up", "scroll down",
+    "cancel timer", "list timers", "wifi on", "wifi off",
+})
+_FAST_PATTERNS = (
+    (re.compile(r"^(?:set )?(?:the )?volume (?:to )?(\d{1,3})(?: percent)?$"), "system volume {0}"),
+    (re.compile(r"^(?:set )?(?:the )?brightness (?:to )?(\d{1,3})(?: percent)?$"), "system brightness {0}"),
+    (re.compile(r"^mute$"), "system mute"),
+    (re.compile(r"^unmute$"), "system unmute"),
+    # Slides (Part 4, E3): two words the local model reads as chat.
+    (re.compile(r"^(next|previous) slide$"), "browser {0} slide"),
+    (re.compile(r"^(?:go )?back a slide$"), "browser previous slide"),
+)
+
+
+# Rules before the model (tuning pass V9): a callable (utterance) -> [token] | None that the
+# automation backend registers at boot (`common.direct_tokens`). The intelligence layer never
+# imports automation; it only calls what it was handed. None = no router (tests, Windows).
+RULE_ROUTER = None
+
+
+def set_rule_router(fn):
+    global RULE_ROUTER
+    RULE_ROUTER = fn
+
+
+def _fast_path_enabled(engine):
+    value = str((getattr(engine, "env_vars", None) or {}).get("DMM_FAST_PATH", "on"))
+    return value.strip().lower() not in ("0", "off", "false", "no", "disabled")
+
+
+def fast_intent(text, assistant_name=""):
+    """The token for an utterance that is itself a complete command, else None. No model."""
+    cleaned = re.sub(r"[^\w\s%]", " ", str(text or "").lower()).replace("%", " percent")
+    words = cleaned.split()
+    name = str(assistant_name or "").lower().strip()
+    words = [w for w in words if w != "please" and (not name or w != name)]
+    while words and words[0] in ("hey", "ok", "okay"):
+        words.pop(0)
+    if not words or len(words) > 6:
+        return None
+    cleaned = " ".join(words)
+    if cleaned in _FAST_COMMANDS:
+        return cleaned
+    for pattern, template in _FAST_PATTERNS:
+        match = pattern.match(cleaned)
+        if match:
+            return template.format(*match.groups())
+    return None
+
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                       CLOUD MODELS AND THEIR DEFAULTS                  │
+# └────────────────────────────────────────────────────────────────────────┘
+# Every id is overridable in `.env`. Each provider has a DECISION model (the DMM: a handful of
+# output tokens, latency is everything) and a CHAT model (a spoken reply); by default they are
+# the same model, called two different ways, so one key is enough for everything.
+#
+# Claude Haiku 5.5: the fastest first token and the cheapest call of the three, with vision.
+# Groq: gpt-oss-20b answers the DMM fastest; gpt-oss-120b talks better.
+# Gemini: the `-latest` alias follows Google's current Flash model, so a retirement (the reason
+# `gemini-2.5-flash` stopped answering) cannot strand a configuration again.
+CLAUDE_DEFAULT_MODEL = "claude-haiku-5-5"
+GROQ_DEFAULT_CHAT_MODEL = "openai/gpt-oss-120b"
+GROQ_DEFAULT_DECISION_MODEL = "openai/gpt-oss-20b"
+GEMINI_DEFAULT_MODEL = "gemini-flash-latest"
+
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# The keys that, when they change, rebuild that provider's client and clear its cooldown.
+PROVIDER_KEYS = {
+    CLAUDE: ("CLAUDE_API_KEY", "ANTHROPIC_API_KEY"),
+    GROQ: ("GROQ_API_KEY",),
+    GEMINI: ("GEMINI_API_KEY",),
+}
+
+
+_MEETING_CODE = re.compile(r"\b([a-z]{3})[\s-]*([a-z]{4})[\s-]*([a-z]{3})\b", re.I)
+_SHARE_WORDS = re.compile(r"\b(shar(?:e|ing)|screen ?share|present(?:ing| now)?)\b", re.I)
+
+
+def _guard_meeting_code(task, prompt):
+    """
+    A `meet …` token carrying a meeting code the user never said -> None (dropped), or, when
+    the user was asking to share their screen, `meet <the user's own words>` so the share
+    parser reads them. Every other token is returned unchanged. The code counts as said when
+    its ten letters appear in order in the utterance ("abc defg hij" spoken aloud included).
+    """
+    lowered = task.lower()
+    if not lowered.startswith("meet "):
+        return task
+    code = re.search(r"\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b", lowered)
+    if code is not None:
+        letters = re.sub(r"[^a-z]", "", code.group(0))
+        said = re.sub(r"[^a-z]", "", str(prompt or "").lower())
+        if letters in said:
+            return task
+    elif not (lowered.startswith("meet join") or lowered.startswith("meet start")) \
+            or not _SHARE_WORDS.search(str(prompt or "")) \
+            or re.search(r"\b(?:join|new (?:meeting|call)|(?:start|create|begin) an? "
+                         r"(?:new )?(?:meeting|call))\b", str(prompt or ""), re.I):
+        return task
+    # A fabricated code, or "start …" read as a new meeting when the user said share.
+    if _SHARE_WORDS.search(str(prompt or "")):
+        warning(Subsystem.DMM, "A share request was emitted as a meeting join; "
+                               "re-reading it from the user's words.")
+        return f"meet {' '.join(str(prompt).split())}"
+    warning(Subsystem.DMM, f"Meeting code the user never said was dropped ({task!r}).")
+    return None
+
+
+def _real_key(value):
+    """A key as typed, or "" for a blank or the `.env.example` placeholder."""
+    value = str(value or "").strip()
+    if not value or value.lower().startswith(("your_", "gsk_your", "sk-ant-your")):
+        return ""
+    return value
+
+
+def claude_speed_args(model, effort="low"):
+    """
+    The request fields that make a Claude call fast, for THIS model.
+
+    Haiku 5.5 thinks by default; a spoken reply and a three-token classification need no
+    reasoning pass, and on a voice turn that pass is the wait. Thinking can be turned off on
+    Haiku 5.5 (at effort high or below), not on Opus 5.5 or Sonnet 5.5, where low effort is the
+    lever. The Claude 4.5-and-older models take neither field (thinking is off there anyway).
+    """
+    name = str(model or "").lower()
+    if name.startswith(("claude-3", "claude-haiku-4", "claude-sonnet-4-5", "claude-opus-4-1",
+                        "claude-opus-4-0", "claude-sonnet-4-0")):
+        return {}
+    effort = effort if effort in ("low", "medium", "high") else "low"
+    args = {"output_config": {"effort": effort}}
+    if name.startswith("claude-haiku-5"):
+        args["thinking"] = {"type": "disabled"}
+    return args
+
+
+def to_claude_messages(api_messages):
+    """
+    OpenAI-format messages -> (system text, Claude messages).
+
+    Every caller of `generate_chat_stream` builds the OpenAI shape (system layers, history,
+    the query). Claude takes the system prompt as its own field and only user/assistant turns
+    in `messages`, so the system entries are joined in order into one system prompt. Text
+    parts of a list-shaped content are kept; a conversation must start with the user.
+    """
+    system_parts, messages = [], []
+    for message in api_messages or []:
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "\n".join(part.get("text", "") for part in content
+                                if isinstance(part, dict) and part.get("type") == "text")
+        content = str(content or "")
+        if role == "system":
+            if content.strip():
+                system_parts.append(content)
+            continue
+        if not content.strip():
+            continue
+        messages.append({"role": "assistant" if role == "assistant" else "user",
+                         "content": content})
+    if not messages or messages[0]["role"] != "user":
+        messages.insert(0, {"role": "user", "content": "Continue."})
+    return "\n\n".join(system_parts), messages
+
+
+def claude_text(response):
+    """The reply's text blocks, joined. Read by TYPE: a response may begin with thinking."""
+    return "".join(getattr(block, "text", "") for block in getattr(response, "content", None) or []
+                   if getattr(block, "type", "") == "text")
+
+
 class CentralizedLLMEngine:
     """
     Centralized intelligence routing matrix.
     Checks host environments to dynamically swap between offline local endpoints (Ollama/LM Studio)
-    and online cloud endpoints (Gemini/Cohere). Houses the Decision-Making Model (DMM) for intent parsing.
+    and online cloud endpoints (Claude/Groq/Gemini). Houses the Decision-Making Model (DMM) for intent parsing.
 
     Singleton: every module in the project does `engine = CentralizedLLMEngine()` at import
     time (main.py, chatbot.py, real_time_search.py, automation_windows.py, deep_research.py).
     Without a singleton, that meant up to 5 fully independent instances at every boot — each
-    re-probing the local LLM server, re-reading .env, and re-constructing its own Cohere/Groq/
+    re-probing the local LLM server, re-reading .env, and re-constructing its own Claude/Groq/
     Gemini API clients. `__new__` here ensures they all share ONE instance/one set of clients.
     """
     _instance = None
@@ -190,47 +386,34 @@ class CentralizedLLMEngine:
         # One cached parse of .env for the whole process — see kayra/core/config.py.
         self.env_vars = env_values()
         
-        # Load model identifier strings configured in profile
-        self.cohere_model        = self.env_vars.get("COHERE_DECISION_MODEL", "command-r-plus-08-2024")
-        self.groq_model          = self.env_vars.get("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
-        self.gemini_model        = self.env_vars.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
-        self.local_chat_model    = self.env_vars.get("LOCAL_CHAT_MODEL", "local-model")
-        self.local_decision_model = self.env_vars.get("LOCAL_DECISION_MODEL", "local-model")
-
-        # Read raw API keys
-        self._groq_key   = self.env_vars.get("GROQ_API_KEY", "").strip()
-        self._gemini_key = self.env_vars.get("GEMINI_API_KEY", "").strip()
-        self._cohere_key = self.env_vars.get("CohereAPIKey", "").strip()
-
-        force_online = self.env_vars.get("FORCE_ONLINE", "False").lower() == "true"
+        self._load_models()
+        self._load_local_settings()
+        force_online, cloud_first = self._cloud_pinned()
 
         # ┌────────────────────────────────────────────────────────┐
         # │                 MODE SELECTION MATRIX                  │
         # └────────────────────────────────────────────────────────┘
-        if force_online:
+        # LOCAL FIRST, unless the user pinned the cloud (FORCE_ONLINE, or CLOUD_FIRST with a
+        # cloud key). Re-checked while running — see `_sync_mode`.
+        self._mode_checked_at = time.monotonic()
+        if force_online or cloud_first:
             if not CentralizedLLMEngine._has_booted:
-                print_system("FORCE_ONLINE is active. Bypassing local checks to run Cloud Mode.")
+                reason = "FORCE_ONLINE" if force_online else "CLOUD_FIRST"
+                print_system(f"{reason} is active. Bypassing local checks to run Cloud Mode.")
             self.is_online = True
             self.is_local_active = False
         else:
-            self.local_base_url = self.env_vars.get("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
             self.is_local_active = self._check_local_server()
             self.is_online = not self.is_local_active
 
         # ┌────────────────────────────────────────────────────────┐
         # │                   CLIENT ALLOCATION                    │
         # └────────────────────────────────────────────────────────┘
-        # Priority Rule: Local LLM server (LM Studio / Ollama) ALWAYS wins.
-        # Cloud APIs are ONLY activated when no local server is detected.
-        # When local is active, ALL operations (DMM + Chat) go through local exclusively.
-
-        # ── Local client (always set if URL configured) ──
-        local_key = self.env_vars.get("LOCAL_API_KEY", "lm-studio")
-        if not self.is_online:
-            self.local_base_url = self.env_vars.get("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
+        # Priority Rule: a local LLM server (LM Studio / Ollama) wins unless the cloud is
+        # forced. When local is active, ALL operations (DMM + Chat) go through it exclusively.
+        local_key = self._setting("LOCAL_API_KEY", "lm-studio")
         self.local_client = OpenAI(
-            base_url=self.local_base_url if hasattr(self, "local_base_url")
-            else "http://127.0.0.1:1234/v1",
+            base_url=self.local_base_url,
             api_key=local_key,
             # Same rule as the cloud clients: one attempt, bounded. A local server that has
             # hung should hand the turn back rather than be retried behind the caller's back.
@@ -242,69 +425,35 @@ class CentralizedLLMEngine:
         #
         # `max_retries=0` IS LOAD-BEARING, AND IT WAS MEASURED, NOT ASSUMED.
         #
-        # The OpenAI SDK retries transport failures twice by default, with its own backoff.
-        # That is a SECOND retry authority underneath the router, and it produces exactly the
-        # failure mode the router exists to prevent: one user request becomes three provider
-        # calls, the fallback the router would have made instantly is delayed by the SDK's
-        # backoff, and a rate-limited key gets hit two more times on the way. Measured live on
-        # this machine before the change: a single Groq DMM call took 9.9s and then 24.0s,
-        # while the router's own fallback for the same class of failure takes ~700ms.
-        #
-        # The router is the one authority. A provider call fails once, is classified once, and
-        # the next provider gets its turn — see `ProviderRouter.run`.
-        #
-        # The timeout is the OTHER half of the same rule (1.3: "TIMEOUT: fallback after a
-        # bounded timeout"). Without it a hung provider blocks the user indefinitely while two
-        # perfectly good fallbacks sit idle.
-        timeout = self._provider_timeout()
+        # The OpenAI and Anthropic SDKs retry transport failures twice by default, with their
+        # own backoff. That is a SECOND retry authority underneath the router, and it produces
+        # exactly the failure mode the router exists to prevent: one user request becomes
+        # three provider calls, the fallback the router would have made instantly is delayed by
+        # the SDK's backoff, and a rate-limited key gets hit two more times on the way.
+        # Measured live on this machine before the change: a single Groq DMM call took 9.9s and
+        # then 24.0s, while the router's own fallback for the same class of failure takes
+        # ~700ms. The timeout is the other half of the same rule: a hung provider must hand
+        # the turn back rather than block the user while good fallbacks sit idle.
+        self.claude_client = self.groq_client = self.gemini_client = None
         if self.is_online:
-            self.cohere_client = (
-                cohere.Client(api_key=self._cohere_key, timeout=timeout)
-                if self._cohere_key else None
-            )
-            self.groq_client = (
-                OpenAI(api_key=self._groq_key, base_url="https://api.groq.com/openai/v1",
-                       max_retries=0, timeout=timeout)
-                if self._groq_key else None
-            )
-            self.gemini_client = (
-                OpenAI(api_key=self._gemini_key,
-                       base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                       max_retries=0, timeout=timeout)
-                if self._gemini_key else None
-            )
-            
-        else:
-            # Local mode — cloud clients set to None so no accidental cloud calls occur
-            self.cohere_client = None
-            self.groq_client   = None
-            self.gemini_client = None
+            self._build_cloud_clients()
 
         # ┌────────────────────────────────────────────────────────┐
         # │              THE PROVIDER ROUTING AUTHORITY            │
         # └────────────────────────────────────────────────────────┘
         # ONE router for the process, holding ONE set of cooldowns. Every provider decision
         # this engine makes goes through it, and neither `classify_intent` nor
-        # `generate_chat_stream` contains fallback logic of its own any more — two
-        # independent notions of "is this a rate limit?" is exactly how one user request
-        # became four provider calls against an already-limited key.
+        # `generate_chat_stream` contains fallback logic of its own.
         #
         # Availability is registered as a CALLABLE rather than a bool: the cloud clients
-        # exist only in online mode, and a router holding a stale True would route into a
-        # `None`. Local is registered too, so the same object can describe the offline
-        # routing in the boot report.
+        # exist only in online mode and are rebuilt when a key changes, and a router holding a
+        # stale True would route into a `None`.
         self.router = get_provider_router()
-        self.router.register(COHERE, lambda: self.cohere_client is not None)
+        self.router.register(CLAUDE, lambda: self.claude_client is not None)
         self.router.register(GROQ, lambda: self.groq_client is not None)
         self.router.register(GEMINI, lambda: self.gemini_client is not None)
         self.router.register(LOCAL, lambda: not self.is_online)
-
-        if self.is_online:
-            self.dmm_status = f"Decision routing: {self.router.describe(ROUTE_DECISION)}"
-            self.chat_status = f"Chat routing: {self.router.describe(ROUTE_CHAT)}"
-        else:
-            self.dmm_status = f"Decision routing: Local ({self.local_decision_model})"
-            self.chat_status = f"Chat routing: Local ({self.local_chat_model})"
+        self._refresh_status()
 
         # Secure the boot-lock so prints never repeat on subsequent instantiations
         CentralizedLLMEngine._has_booted = True
@@ -528,7 +677,45 @@ class CentralizedLLMEngine:
             ' saying ' or ':' instead.
             -> 'browser (what to do in the open web page or tabs)' — keep the user's words:
                'list my tabs' -> 'browser list tabs'; 'go to my gmail tab' -> 'browser switch
-               to gmail tab'; 'close the youtube tab' -> 'browser close youtube tab'; 'click
+               to gmail tab'; 'close the youtube tab' -> 'browser close youtube tab'; 'go to
+               the third tab' -> 'browser switch to the third tab'; 'close duplicate tabs' ->
+               'browser close duplicate tabs'; 'close the tabs on the right' -> 'browser close
+               tabs to the right'; 'what did I just close' -> 'browser what did i just close';
+               'find the tab where I was reading about rust' -> 'browser find the tab about
+               rust'; 'copy this page's link' -> 'browser copy the link'; 'open the third
+               result' / 'play the second video' -> 'browser open the third result' / 'browser
+               play the second video'; 'find pricing on this page' -> 'browser find pricing on
+               this page', then 'next match' -> 'browser next match'; 'close all my YouTube
+               tabs' -> 'browser close all youtube tabs'; 'close everything except the pinned
+               tabs' -> 'browser close all but pinned'; 'group my college tabs' -> 'browser group
+               my college tabs'; 'make the research group blue' / 'collapse the research group'
+               / 'rename this group to thesis' / 'ungroup the research group' -> 'browser ' +
+               the same words; 'move this tab to a new window' -> 'browser move this tab to a
+               new window'; 'merge my Chrome windows' -> 'browser merge my chrome windows';
+               ABOUT THE PAGE IN FRONT: a QUESTION about the page is answered from it, never a
+               word search: 'what does this page say about pricing' -> 'browser what does this
+               page say about pricing' (NOT 'browser find pricing on this page', which only
+               highlights a word); 'read the comments' / 'what are people saying
+               about this' / 'summarize the reviews' -> 'browser ' + the same words; 'summarize
+               this video' -> 'browser summarize this video'; 'translate this page to Hindi' ->
+               'browser translate this page to hindi'; 'explain the selected text' -> 'browser
+               explain the selected text'; 'bookmark this page' -> 'browser bookmark this page';
+               'delete the bookmark for X' -> 'browser delete the bookmark for x'; 'clear today's
+               history' -> 'browser clear today's history'; DOWNLOADS are files, not closed
+               tabs: 'what did I download' -> 'browser what did i download' (NOT 'what did i
+               just close'); 'open my last download' / 'pause the download' -> 'browser ' + the
+               same words; 'close it' / 'go
+               back to it' after Kayra opened a tab -> 'browser close it' / 'browser go back to
+               it'; 'search this sheet for Ravi' / 'search for Ravi here' -> 'browser search for
+               ravi here' (a web search for facts stays 'google search ...'); 'what can I do
+               here' -> 'browser what can i do here'; FORMS AND VIDEOS: 'fill this form with
+               my details' / 'select India in the country dropdown' / 'tick I agree' / 'submit
+               this form' / 'upload my resume here' / 'press tab' -> 'browser ' + the same
+               words; with a video in front 'skip 10 seconds' / 'go back 30 seconds' / 'go to
+               2:30' / 'play at 1.5x' / 'skip the ad' -> 'browser ' + the same words; 'search
+               Amazon for earbuds under 2000' -> 'browser search amazon for earbuds under 2000';
+               on a shop page 'how much is this' / 'sort by price low to high' -> 'browser ' +
+               the same words; 'click
                the sign in button' -> 'browser click on sign in'; 'type hello in the search
                box' -> 'browser type hello into search'; 'summarize this page' -> 'browser
                summarize this page'; 'read this article' -> 'browser read this page'; 'open
@@ -537,9 +724,15 @@ class CentralizedLLMEngine:
                A click INSIDE the browser page is 'browser click on X'; a click anywhere else
                on the screen is 'click on X'.
             -> 'meet (action)' — Google Meet: 'join my meeting abc-defg-hij' -> 'meet join
-               abc-defg-hij'; 'mute me' -> 'meet mic off'; 'turn on my camera' -> 'meet camera
-               on'; 'share my entire screen' -> 'meet share entire screen'; 'stop sharing' ->
-               'meet stop sharing'; 'leave the call' -> 'meet leave'.
+               abc-defg-hij' (ONLY a code the user actually said; 'start a meeting' -> 'meet
+               join new'); 'mute me' -> 'meet mic off'; 'turn on my camera' -> 'meet camera
+               on'; SCREEN SHARING is always ONE 'meet share' token, never a click and never
+               'meet join': 'share my screen' / 'start screen sharing' / 'present now' -> 'meet
+               share screen'; 'share the LM Studio window' -> 'meet share the lm studio window'
+               (NOT 'focus lm studio'); 'share this tab' -> 'meet share this tab'; 'share my
+               second screen' -> 'meet share my second screen'; 'share it with sound' -> 'meet
+               share screen with audio'; 'am I sharing' -> 'meet am i sharing'; 'stop sharing'
+               -> 'meet stop sharing'; 'leave the call' -> 'meet leave'.
             -> Gmail: 'email check' (how many unread); 'email open latest' ("open my latest
                email", "open the newest mail"); 'email open first' / 'email open second' ("open
                the first/second email"); 'email open from (name)'; 'email open unread';
@@ -549,12 +742,35 @@ class CentralizedLLMEngine:
                ("go to my sent mails"); 'email reply', 'email forward', 'email archive',
                'email delete', 'email back'; 'email draft to (address) about (subject) saying
                (text)', 'email send'. Opening an email is NEVER 'open (something)' — it is
-               'email open ...'.
+               'email open ...'. 'search my mail for the fee receipt' -> 'email search for fee
+               receipt'; 'show my unread emails from this week' -> 'email show unread from this
+               week'; 'compose a new email' -> 'email compose'; 'open my Work label' -> 'email
+               open my work label'.
+            -> GOOGLE WORKSPACE files are 'browser ...': 'open my budget sheet' -> 'browser open
+               my budget sheet'; 'open the doc about the internship' -> 'browser open the doc
+               about the internship'; 'search my docs for offer letter' -> 'browser search my docs
+               for offer letter'; 'find the PDF Ravi sent me' -> 'browser find the pdf ravi sent
+               me'; 'create a new sheet called Expenses' -> 'browser create a new sheet called
+               expenses'; 'go to cell B12' -> 'browser go to cell b12'; 'what's the total of
+               column C' -> 'browser what's the total of column c'; 'read row 5' -> 'browser read
+               row 5'; 'share this doc with ana@x.com' -> 'browser share this doc with ana@x.com';
+               'start the slideshow' / 'next slide' / 'end the slideshow' -> 'browser ' + the same
+               words; 'open my recent files' -> 'browser open my recent files'; 'add a note
+               saying buy milk' -> 'browser add a note saying buy milk'; 'open the responses of
+               my feedback form' -> 'browser open the responses of my feedback form'; 'what
+               assignments are due' -> 'browser what assignments are due'. A Google file is
+               NEVER 'open (app)'.
             -> ANY "click on X" / "scroll down" while the user is in the browser is fine as
                plain 'click on X' / 'scroll down': Kayra sends it into the page itself.
-            -> 'calendar today', 'calendar tomorrow', 'calendar add (title) (day) at (time)'.
+            -> 'calendar today', 'calendar tomorrow', 'calendar friday', 'calendar add (title)
+               (day) at (time)'; 'what's my next meeting' -> 'calendar next meeting'; 'join my
+               next meeting' -> 'calendar join my next meeting'. In a call, 'let them in' /
+               'admit everyone' -> 'meet admit everyone'.
             -> 'message (contact): (text)' — WhatsApp: "tell rahul I'm running late" ->
-               'message rahul: i'm running late'.
+               'message rahul: i'm running late'. Other WhatsApp requests: 'open the PR group on
+               WhatsApp' -> 'message open the pr group'; 'who messaged me on WhatsApp' ->
+               'message who messaged me'; 'what did they say in the core team today' -> 'message
+               read the core team today'.
             -> 'diagnose (what)' — "diagnose my computer", "why is my laptop slow", "why is the
                fan so loud", "what's draining my battery", "why is the internet slow", "is my
                computer secure", "what crashed" -> 'diagnose computer' / 'diagnose slow' /
@@ -618,7 +834,7 @@ class CentralizedLLMEngine:
         
         # Few-shot conversational history to teach DMM target output alignment.
         #
-        # IMPORTANT ORDER: Most recent examples (bottom of list) have HIGHEST weight in Cohere,
+        # IMPORTANT ORDER: Most recent examples (bottom of list) have HIGHEST weight with every model,
         # so the list ends with the CONTRASTIVE pairs — each correct classification sitting
         # next to the near-miss it is most often confused with (close app / close window /
         # close tab, minimize / minimize all, look-up vs open-results-page, authoring vs
@@ -698,7 +914,7 @@ class CentralizedLLMEngine:
             {"role": "Chatbot", "message": "minimize"},
             {"role": "User", "message": "Maximize window."},
             {"role": "Chatbot", "message": "maximize"},
-            # -- Open & Close (placed LAST for maximum recency weight in Cohere) --
+            # -- Open & Close (placed LAST for maximum recency weight) --
             {"role": "User", "message": "open chrome and tell me about mahatma gandhi."},
             {"role": "Chatbot", "message": "open chrome, general tell me about mahatma gandhi."},
             {"role": "User", "message": "open chrome and open telegram"},
@@ -711,7 +927,7 @@ class CentralizedLLMEngine:
             {"role": "Chatbot", "message": "close youtube"},
             {"role": "User", "message": "Open youtube."},
             {"role": "Chatbot", "message": "open youtube"},
-            # -- CONTRASTIVE BOUNDARIES (LAST = highest recency weight in Cohere) --
+            # -- CONTRASTIVE BOUNDARIES (LAST = highest recency weight) --
             # Each pair puts a correct classification next to the near-miss it is most often
             # confused with, which is what the model actually needs to separate them. These
             # sit at the end deliberately; see the ordering note above.
@@ -791,9 +1007,8 @@ class CentralizedLLMEngine:
         so classify_intent()/generate_chat_stream() work correctly whether or not this is ever
         called (callers that don't care about the boot narration, e.g. test scripts, can skip it).
         """
-        # The hierarchy, stated as a hierarchy. `Cohere > Groq > Gemini` on one line and
-        # `Groq > Gemini` on the next is the whole routing policy, visible at a glance at every
-        # boot — which is what makes a later `[DMM] Fallback: Groq` legible instead of
+        # The hierarchy, stated as a hierarchy. `Claude > Groq > Gemini` for each route is the
+        # whole routing policy, visible at a glance at every boot — which is what makes a later `[DMM] Fallback: Groq` legible instead of
         # surprising. Both lines come from the ONE router, so the boot report and the live
         # routing cannot drift into two accounts of the same configuration.
         info(Subsystem.LLM, "Providers")
@@ -834,7 +1049,7 @@ class CentralizedLLMEngine:
         else:
             gender = self.env_vars.get("ASSISTANT_GENDER", "Female").strip()
         lang = self.env_vars.get("LANGUAGE", "English").strip()
-        username = self.env_vars.get("USERNAME", "User").strip()
+        username = self._setting("USERNAME", "User")
         user_gender = self.env_vars.get("USER_GENDER", "Male").strip()
 
         user_title = "Ma'am" if user_gender.lower() == "female" else "Sir"
@@ -895,6 +1110,174 @@ class CentralizedLLMEngine:
                 )
 
         return prompt
+
+    # ── Cloud providers: models, clients, live key reload ──────────────
+
+    def _load_models(self):
+        """Model ids and keys from configuration. Re-run by `reload_providers`."""
+        env = self.env_vars
+        claude = env.get("CLAUDE_MODEL", "").strip() or CLAUDE_DEFAULT_MODEL
+        self.claude_model = claude
+        self.claude_decision_model = env.get("CLAUDE_DECISION_MODEL", "").strip() or claude
+        self.claude_effort = env.get("CLAUDE_EFFORT", "low").strip().lower() or "low"
+        self.groq_model = env.get("GROQ_CHAT_MODEL", "").strip() or GROQ_DEFAULT_CHAT_MODEL
+        self.groq_decision_model = (env.get("GROQ_DECISION_MODEL", "").strip()
+                                    or GROQ_DEFAULT_DECISION_MODEL)
+        self.gemini_model = env.get("GEMINI_CHAT_MODEL", "").strip() or GEMINI_DEFAULT_MODEL
+        self.gemini_decision_model = (env.get("GEMINI_DECISION_MODEL", "").strip()
+                                      or self.gemini_model)
+        self._keys = {
+            provider: next((_real_key(env.get(name)) for name in names
+                            if _real_key(env.get(name))), "")
+            for provider, names in PROVIDER_KEYS.items()
+        }
+
+    def _build_cloud_clients(self, only=None):
+        """
+        Constructs the cloud client for each provider that has a key (or only for `only`).
+
+        The Anthropic SDK is imported HERE, not at module top: importing this module must stay
+        cheap and side-effect free, and a missing package (setup not re-run since Claude was
+        added) must cost the Claude provider, not the whole engine.
+        """
+        timeout = self._provider_timeout()
+        wanted = set(only or PROVIDER_KEYS)
+        if CLAUDE in wanted:
+            self.claude_client = None
+            if self._keys.get(CLAUDE):
+                try:
+                    import anthropic
+                    self.claude_client = anthropic.Anthropic(
+                        api_key=self._keys[CLAUDE], max_retries=0, timeout=timeout)
+                except ImportError:
+                    warning(Subsystem.LLM, "A Claude key is set but the 'anthropic' package is "
+                                           "not installed. Run: python setup.py")
+        if GROQ in wanted:
+            self.groq_client = (OpenAI(api_key=self._keys[GROQ], base_url=GROQ_BASE_URL,
+                                       max_retries=0, timeout=timeout)
+                                if self._keys.get(GROQ) else None)
+        if GEMINI in wanted:
+            self.gemini_client = (OpenAI(api_key=self._keys[GEMINI], base_url=GEMINI_BASE_URL,
+                                         max_retries=0, timeout=timeout)
+                                  if self._keys.get(GEMINI) else None)
+
+    def _setting(self, name, default):
+        """
+        A configuration value, with BLANK treated as unset.
+
+        `.get(name, default)` returns "" for a line like `LOCAL_BASE_URL=` — which is exactly
+        what the Settings screen writes when a field is left empty. That blank endpoint made
+        the local probe dial port 80, find nothing, and send every request to the cloud while
+        LM Studio was running.
+        """
+        value = str(self.env_vars.get(name) or "").strip()
+        return value or default
+
+    def _load_local_settings(self):
+        self.local_chat_model = self._setting("LOCAL_CHAT_MODEL", "local-model")
+        self.local_decision_model = self._setting("LOCAL_DECISION_MODEL", "local-model")
+        self.local_base_url = self._setting("LOCAL_BASE_URL", "http://127.0.0.1:1234/v1")
+
+    def _cloud_pinned(self):
+        """(FORCE_ONLINE, CLOUD_FIRST-with-a-key). Either one means: do not use the local model."""
+        truthy = ("1", "true", "yes", "on")
+        force_online = self._setting("FORCE_ONLINE", "False").lower() in truthy
+        cloud_first = (self._setting("CLOUD_FIRST", "False").lower() in truthy
+                       and any(self._keys.values()))
+        return force_online, cloud_first
+
+    # How often the local server is re-checked while running. The probe is a loopback TCP
+    # connect (refused in well under a millisecond when nothing listens), plus one GET when it
+    # does — so this bounds log noise and the rare slow probe, not CPU.
+    MODE_RECHECK_SECONDS = 10.0
+
+    def _sync_mode(self, force=False):
+        """
+        Follows the local server WHILE KAYRA RUNS. LM Studio started after Kayra used to leave
+        the whole session on the cloud (the choice was made once, at boot); LM Studio quitting
+        left it calling a dead local server. Now: local whenever it answers, the cloud chain
+        otherwise — unless the user pinned the cloud, in which case nothing here changes.
+        """
+        if not force and time.monotonic() - getattr(self, "_mode_checked_at", 0.0) \
+                < self.MODE_RECHECK_SECONDS:
+            return
+        self._mode_checked_at = time.monotonic()
+        force_online, cloud_first = self._cloud_pinned()
+        if force_online or cloud_first:
+            local_up = False
+        else:
+            try:
+                local_up = self._check_local_server()
+            except Exception:
+                local_up = False
+        if local_up == (not self.is_online):
+            return
+        self.is_local_active = local_up
+        self.is_online = not local_up
+        if self.is_online and not any((self.claude_client, self.groq_client, self.gemini_client)):
+            self._build_cloud_clients()
+        self._refresh_status()
+        info(Subsystem.LLM, "Local model server is up: using it" if local_up else
+             "Local model server is not answering: using the cloud models")
+
+    def routing_summary(self):
+        """What answers right now, for the Settings screen: {"mode", "local_url", "answering"}."""
+        if self.is_online:
+            chain = self.router.describe(ROUTE_CHAT)
+            return {"mode": "cloud", "local_url": self.local_base_url,
+                    "answering": f"Cloud: {chain}"}
+        return {"mode": "local", "local_url": self.local_base_url,
+                "answering": f"LM Studio ({self.local_chat_model})"}
+
+    def _refresh_status(self):
+        if self.is_online:
+            self.dmm_status = f"Decision routing: {self.router.describe(ROUTE_DECISION)}"
+            self.chat_status = f"Chat routing: {self.router.describe(ROUTE_CHAT)}"
+        else:
+            self.dmm_status = f"Decision routing: Local ({self.local_decision_model})"
+            self.chat_status = f"Chat routing: Local ({self.local_chat_model})"
+
+    def reload_providers(self):
+        """
+        Applies changed cloud keys and model ids WITHOUT a restart. Returns the providers whose
+        key changed.
+
+        Before this, a key saved in Settings did nothing until Kayra restarted, and the
+        router still held the old key's verdict — a wrong key stands a provider down for 15
+        minutes — so a corrected key looked broken too. Now the changed provider's client is
+        rebuilt and its cooldown forgotten, so the very next request tries it.
+
+        The local/cloud MODE is not re-decided here: that changes what the whole session is
+        talking to and stays a startup decision. A key saved while a local server is active is
+        stored and used at the next start (or immediately with CLOUD_FIRST on).
+        """
+        from kayra.core.config import env_values as read_env, reset_cache
+        reset_cache()
+        before = dict(getattr(self, "_keys", {}))
+        self.env_vars = read_env()
+        self._load_models()
+        changed = [name for name in PROVIDER_KEYS if self._keys.get(name) != before.get(name)]
+        old_url = self.local_base_url
+        self._load_local_settings()
+        if self.local_base_url != old_url:
+            self.local_client = OpenAI(base_url=self.local_base_url,
+                                       api_key=self._setting("LOCAL_API_KEY", "lm-studio"),
+                                       max_retries=0, timeout=self._provider_timeout())
+        was_online = self.is_online
+        # The routing toggles apply NOW too: turning "Prefer cloud" on or off, or fixing the
+        # local endpoint, re-decides local vs cloud on the spot.
+        self._sync_mode(force=True)
+        if self.is_online and not was_online:
+            changed = list(PROVIDER_KEYS)
+        if self.is_online:
+            # Every client is rebuilt (a model id or the timeout may have changed too); only
+            # the providers whose KEY changed lose their cooldown.
+            self._build_cloud_clients()
+        if changed:
+            self.router.clear_cooldowns(changed)
+            info(Subsystem.LLM, "Provider keys updated: " + ", ".join(changed))
+        self._refresh_status()
+        return changed
 
     def _provider_timeout(self):
         """
@@ -1016,7 +1399,7 @@ class CentralizedLLMEngine:
                         turn: int = 0):
         """
         Classifies user prompt inputs into structured system task tokens.
-        Priority: Cohere (cloud DMM) -> Local.
+        Priority: a running local model; otherwise the DECISION route (Claude -> Groq -> Gemini).
 
         Parameters:
             prompt (str): Raw user query string.
@@ -1044,6 +1427,26 @@ class CentralizedLLMEngine:
                   f"cancelled: superseded by turn #{logbus.latest_turn()}")
             return []
 
+        if not retries and _fast_path_enabled(self):
+            token = fast_intent(prompt, (getattr(self, "env_vars", None) or {}).get("ASSISTANT_NAME", "Kayra"))
+            if token:
+                debug(Subsystem.DMM, f"fast path: {token}")
+                return [token]
+            if RULE_ROUTER is not None:
+                try:
+                    routed = RULE_ROUTER(prompt)
+                except Exception as exc:          # a rule bug must never cost the turn
+                    debug(Subsystem.DMM, f"rule route skipped: {exc}")
+                    routed = None
+                if routed:
+                    debug(Subsystem.DMM, f"rule route: {routed}")
+                    return list(routed)
+
+        if not retries:
+            # Local or cloud, re-checked here (throttled) — AFTER the fast path, so a command
+            # that needs no model never pays for the probe.
+            self._sync_mode()
+
         if not self.is_online and self._local_unhealthy():
             # The model has answered nothing for several requests running. Five more attempts
             # cannot change that, and the user is waiting.
@@ -1058,7 +1461,7 @@ class CentralizedLLMEngine:
                     response_text = self.router.run(
                         ROUTE_DECISION,
                         lambda provider: self._dmm_call(provider, prompt),
-                        describe=self._provider_label,
+                        describe=lambda provider: self._provider_label(provider, ROUTE_DECISION),
                     )
                 except AllProvidersFailed:
                     # Every decision provider is unconfigured or standing down. Degrading to
@@ -1130,6 +1533,15 @@ class CentralizedLLMEngine:
                             task = f"{header} {prompt}"
                             task_lower = task.lower()
                         break
+                # A meeting code the user never said is the preamble's EXAMPLE code
+                # ("abc-defg-hij"), emitted as a real one — it opened a stranger's meeting
+                # on 2026-11-10 (BROWSER_CONTROL_PLAN §12, M0.2). A code must come from the
+                # user's words; otherwise a share request is re-read from those words and
+                # anything else is dropped.
+                task = _guard_meeting_code(task, prompt)
+                if task is None:
+                    continue
+                task_lower = task.lower()
                 # Guard against the DMM itself emitting the exact same token twice
                 dedup_key = task_lower
                 if dedup_key in seen_tasks:
@@ -1206,9 +1618,9 @@ class CentralizedLLMEngine:
             return ["general " + prompt]
 
     # ── Per-provider DMM calls ────────────────────────────────────────────
-    # THE PROMPT CONTRACT IS IDENTICAL ON ALL THREE. The same strict system rule, the same
+    # THE PROMPT CONTRACT IS IDENTICAL ON EVERY PROVIDER. The same strict system rule, the same
     # `dmm_preamble` and the same `dmm_chat_history` in the same order reach every provider —
-    # only the transport differs (Cohere's native preamble/chat_history parameters versus the
+    # only the transport differs (Claude's own system field and message list versus the
     # OpenAI-compatible message list Groq and Gemini speak). A fallback that changed the
     # prompt would be classifying a different question, and the token contract the whole
     # automation layer depends on would silently vary with whichever provider answered.
@@ -1239,50 +1651,87 @@ class CentralizedLLMEngine:
         messages.append({"role": "user", "content": prompt})
         return messages
 
-    def _provider_label(self, provider):
-        """`Cohere (command-r-plus-08-2024)` — the name plus the model actually configured."""
-        return f"{provider} ({self._model_for(provider)})"
+    def _dmm_claude_request(self, prompt):
+        """
+        The DMM as a Claude request: the same contract, with the ~5.6K-token few-shot prefix
+        CACHED. The system prompt and the examples never change between turns, so after the
+        first call they are read from the prompt cache (faster, and a tenth of the price); only
+        the user's words are new. The breakpoint sits on the LAST example, so everything before
+        the user's words is one cached prefix.
+        """
+        history = []
+        for msg in self.dmm_chat_history:
+            history.append({"role": "user" if msg["role"] == "User" else "assistant",
+                            "content": [{"type": "text", "text": msg["message"]}]})
+        if history:
+            history[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        history.append({"role": "user", "content": prompt})
+        return dict(
+            model=self.claude_decision_model,
+            max_tokens=128,
+            system=[{"type": "text", "text": self._dmm_system(),
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=history,
+            **claude_speed_args(self.claude_decision_model, "low"),
+        )
 
-    def _model_for(self, provider):
+    def _provider_label(self, provider, route=ROUTE_CHAT):
+        """`Claude (claude-haiku-5-5)` — the name plus the model actually configured."""
+        return f"{provider} ({self._model_for(provider, route)})"
+
+    def _model_for(self, provider, route=ROUTE_CHAT):
+        if route == ROUTE_DECISION:
+            return {
+                CLAUDE: self.claude_decision_model,
+                GROQ: self.groq_decision_model,
+                GEMINI: self.gemini_decision_model,
+                LOCAL: self.local_decision_model,
+            }.get(provider, "unknown")
         return {
-            COHERE: self.cohere_model,
+            CLAUDE: self.claude_model,
             GROQ: self.groq_model,
             GEMINI: self.gemini_model,
             LOCAL: self.local_chat_model,
         }.get(provider, "unknown")
 
-    def _dmm_call(self, provider, prompt):
-        """
-        One DMM attempt against one provider. Raises on failure — the ROUTER decides what
-        that means and whether anybody else gets a turn. Nothing here retries, catches a
-        transport error or sleeps; a second retry authority inside a provider call is how one
-        user request turns into four calls against an already rate-limited key.
-        """
-        if provider == COHERE:
-            response_text = ""
-            stream = self.cohere_client.chat_stream(
-                model=self.cohere_model,
-                preamble=self._dmm_system(),
-                message=prompt,
-                chat_history=self.dmm_chat_history,
-                prompt_truncation="OFF",
-                temperature=0.1,
-            )
-            for event in stream:
-                if event.event_type == "text-generation":
-                    response_text += event.text
-            return response_text
+    # A reasoning model (gpt-oss on Groq, Gemini Flash) thinks before it answers unless told
+    # not to, and on a 128-token classification that hidden pass is the latency and can eat
+    # the whole budget. Asked with the lowest effort each provider accepts; a provider or
+    # model that rejects the field is asked once more without it, and that is remembered.
+    _OPENAI_DMM_REASONING = {GROQ: "low", GEMINI: "none"}
 
+    def _openai_dmm(self, provider, prompt):
         client = self.groq_client if provider == GROQ else self.gemini_client
         if client is None:
             raise RuntimeError(f"{provider} is not configured")
-        completion = client.chat.completions.create(
-            model=self._model_for(provider),
-            messages=self._dmm_messages(prompt),
-            temperature=0.1,
-            max_tokens=128,
-        )
+        request = dict(model=self._model_for(provider, ROUTE_DECISION),
+                       messages=self._dmm_messages(prompt), max_tokens=256)
+        effort = self._OPENAI_DMM_REASONING.get(provider)
+        skip = getattr(self, "_no_reasoning_field", set())
+        if effort and provider not in skip:
+            try:
+                completion = client.chat.completions.create(reasoning_effort=effort, **request)
+                return completion.choices[0].message.content or ""
+            except Exception as exc:
+                if classify_failure(exc)[0] != FailureKind.INVALID_REQUEST:
+                    raise
+                self._no_reasoning_field = skip | {provider}
+        completion = client.chat.completions.create(temperature=0.1, **request)
         return completion.choices[0].message.content or ""
+
+    def _dmm_call(self, provider, prompt):
+        """
+        One DMM attempt against one provider. Raises on failure — the ROUTER decides what
+        that means and whether anybody else gets a turn. Nothing here retries a transport
+        error or sleeps; a second retry authority inside a provider call is how one user
+        request turns into four calls against an already rate-limited key.
+        """
+        if provider == CLAUDE:
+            if self.claude_client is None:
+                raise RuntimeError("Claude is not configured")
+            return claude_text(self.claude_client.messages.create(
+                **self._dmm_claude_request(prompt)))
+        return self._openai_dmm(provider, prompt)
 
     def _dmm_local(self, prompt, timeout=None):
         """
@@ -1300,12 +1749,24 @@ class CentralizedLLMEngine:
                 client = client.with_options(timeout=timeout)
             except Exception:
                 client = self.local_client
-        response = client.chat.completions.create(
-            model=self.local_decision_model,
-            messages=self._dmm_messages(prompt),
-            temperature=0.1,
-            max_tokens=128,
-        )
+        # THINKING OFF. The DMM answers with a handful of tokens; a thinking model (Qwen 3.x,
+        # Gemma 4) that reasons first can spend the whole 128-token budget on hidden reasoning
+        # and return EMPTY content, which is the retry storm above. Measured on gemma-4-e4b the
+        # few-shot prompt already suppresses thinking (3-9 output tokens, ~0.4 s warm), so this
+        # costs nothing there and is what keeps a heavier thinking model on the same contract.
+        # A server that rejects the field is asked once more without it, and remembered.
+        request = dict(model=self.local_decision_model, messages=self._dmm_messages(prompt),
+                       temperature=0.1, max_tokens=128)
+        if getattr(self, "_local_no_think", True):
+            try:
+                response = client.chat.completions.create(
+                    extra_body={"reasoning_effort": "none"}, **request)
+                return response.choices[0].message.content
+            except Exception as e:
+                if "reasoning" not in str(e).lower() and type(e).__name__ != "BadRequestError":
+                    raise
+                self._local_no_think = False
+        response = client.chat.completions.create(**request)
         return response.choices[0].message.content
 
     # ┌────────────────────────────────────────────────────────────────────────┐
@@ -1318,12 +1779,10 @@ class CentralizedLLMEngine:
         ROUTING
             1. Local LLM (LM Studio / Ollama) — HIGHEST PRIORITY. When one is running, all
                generation goes there exclusively and zero cloud calls are made.
-            2. Otherwise the CHAT route, which is Groq -> Gemini, in that order and no other.
-               Cohere is NOT a chat provider: it leads the DECISION route and appears nowhere
-               here. The two hierarchies are separate on purpose and the router holds both.
+            2. Otherwise the CHAT route, Claude -> Groq -> Gemini, each only with its key.
 
         Fallback is the router's, not this function's. What used to live here — a private
-        string-matching notion of "quota error", a hand-rolled Groq-then-Gemini sequence, and
+        string-matching notion of "quota error", a hand-rolled provider sequence, and
         no memory of the failure from one request to the next — is exactly the duplication
         that made a rate-limited key get hit again on every following turn.
 
@@ -1333,6 +1792,7 @@ class CentralizedLLMEngine:
         Yields:
             str: The next text chunk from whichever provider answered.
         """
+        self._sync_mode()
         if not self.is_online:
             # ── Offline: local model only. Not routed; see `_dmm_local`. ──
             try:
@@ -1363,11 +1823,7 @@ class CentralizedLLMEngine:
             # Every chat provider is unconfigured or standing down. One clear sentence, in the
             # stream, because that is the only channel the user is actually watching — and no
             # further recursion: an exhausted chain does not become answerable by asking again.
-            if FailureKind.RATE_LIMITED in failure.kinds:
-                yield ("\n[Every conversational model is rate-limited right now. "
-                       "Please try again shortly.]")
-            else:
-                yield "\n[No conversational model is available right now.]"
+            yield "\n[" + self.chain_failure_sentence(failure) + "]"
         except Exception as e:
             # A mid-stream failure, after tokens have already reached the user. The router
             # re-raises rather than splicing a second provider's answer into a half-spoken
@@ -1375,6 +1831,39 @@ class CentralizedLLMEngine:
             # elsewhere. All that is left is to end this one honestly.
             debug(Subsystem.CHAT, f"Stream ended early: {type(e).__name__}: {e}")
             yield "\n[The response was cut short. Please ask again.]"
+
+    def chain_failure_sentence(self, failure):
+        """
+        One honest sentence for an exhausted chain, naming each provider and WHY.
+
+        It used to say "every conversational model is rate-limited" whenever any attempt was a
+        rate limit — including when the real problem was a retired model or a plan with no
+        access to it, which sent the user off to check limits on a key that had plenty.
+        """
+        reasons = {
+            FailureKind.RATE_LIMITED: "is rate-limited",
+            FailureKind.AUTH_FAILURE: "rejected its API key",
+            FailureKind.MODEL_UNAVAILABLE: "cannot serve the configured model on this key",
+            FailureKind.NETWORK_FAILURE: "could not be reached",
+            FailureKind.TIMEOUT: "timed out",
+            FailureKind.SERVER_ERROR: "had a server error",
+            FailureKind.INVALID_REQUEST: "rejected the request",
+        }
+
+        def reason(name, kind, exc):
+            if is_no_credit(exc):
+                return f"{name} has no API credit on its account"
+            return f"{name} {reasons.get(kind, 'failed')}"
+
+        if not failure.attempts:
+            if not any(self.router.configured(name) for name in (CLAUDE, GROQ, GEMINI)):
+                return "No cloud model is configured. Add a Claude, Groq or Gemini key in Settings."
+            return "Every configured model is cooling down after an error. Please try again shortly."
+        parts = [reason(name, kind, exc) for name, kind, exc in failure.attempts]
+        missing = [n for n in (CLAUDE, GROQ, GEMINI) if not self.router.configured(n)]
+        hint = (" Add a " + " or ".join(missing) + " key in Settings to have a fallback."
+                if missing and len(parts) == 1 else "")
+        return "No model could answer: " + "; ".join(parts) + "." + hint
 
     def _chat_call(self, provider, api_messages):
         """
@@ -1384,6 +1873,20 @@ class CentralizedLLMEngine:
         chunk — which is what makes the router's "fallback only before the first token" rule
         meaningful rather than theoretical.
         """
+        if provider == CLAUDE:
+            if self.claude_client is None:
+                raise RuntimeError("Claude is not configured")
+            system, messages = to_claude_messages(api_messages)
+            request = dict(model=self.claude_model, max_tokens=16000, messages=messages,
+                           **claude_speed_args(self.claude_model, self.claude_effort))
+            if system:
+                request["system"] = system
+            with self.claude_client.messages.stream(**request) as stream:
+                for text in stream.text_stream:
+                    if text:
+                        yield text
+            return
+
         client = self.groq_client if provider == GROQ else self.gemini_client
         if client is None:
             raise RuntimeError(f"{provider} is not configured")
@@ -1394,5 +1897,113 @@ class CentralizedLLMEngine:
             stream=True,
         )
         for chunk in stream:
-            if chunk.choices[0].delta.content:
+            if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                 KEY CHECKS FOR THE SETTINGS SCREEN                     │
+# └────────────────────────────────────────────────────────────────────────┘
+# The Settings screen's "Test" button. ONE tiny request with the key and model on screen, so
+# a wrong key, a model the key cannot use or an account with no credit is found out there,
+# not in the middle of a conversation. Module-level and engine-free: it builds a throwaway
+# client and touches neither the router nor its cooldowns.
+
+PROVIDER_MODEL_SUGGESTIONS = {
+    CLAUDE: ("claude-haiku-5-5", "claude-haiku-4-5", "claude-sonnet-5-5"),
+    GROQ: ("openai/gpt-oss-120b", "openai/gpt-oss-20b"),
+    GEMINI: ("gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"),
+}
+
+
+def _probe_client(provider, key, timeout):
+    if provider == CLAUDE:
+        import anthropic
+        return anthropic.Anthropic(api_key=key, max_retries=0, timeout=timeout)
+    base = GROQ_BASE_URL if provider == GROQ else GEMINI_BASE_URL
+    return OpenAI(api_key=key, base_url=base, max_retries=0, timeout=timeout)
+
+
+def _probe_sentence(provider, model, exc):
+    kind, _ = classify_failure(exc)
+    text = str(exc).lower()
+    if is_no_credit(exc):
+        hint = (" A claude.ai subscription does not include API usage; add credit at "
+                "console.anthropic.com → Plans & Billing." if provider == CLAUDE else "")
+        return kind, f"The key is valid, but the {provider} account has no API credit.{hint}"
+    if kind == FailureKind.AUTH_FAILURE:
+        if "credit" in text or "billing" in text or "402" in text:
+            return kind, f"The key is valid but the {provider} account has no credit."
+        return kind, f"{provider} rejected this key."
+    if kind == FailureKind.MODEL_UNAVAILABLE:
+        if "credit" in text or "billing" in text:
+            return kind, f"The key is valid but the {provider} account has no credit."
+        return kind, f"The key works, but it cannot use the model '{model}'."
+    if kind == FailureKind.RATE_LIMITED:
+        return kind, f"The key works; {provider} is rate-limiting it right now."
+    if kind == FailureKind.NETWORK_FAILURE:
+        return kind, f"Could not reach {provider}. Check the internet connection."
+    if kind == FailureKind.TIMEOUT:
+        return kind, f"{provider} did not answer in time."
+    if kind == FailureKind.SERVER_ERROR:
+        return kind, f"{provider} had a server error. Try again in a moment."
+    if kind == FailureKind.INVALID_REQUEST:
+        return kind, f"{provider} refused the request for '{model}'."
+    return kind, f"{provider} failed: {type(exc).__name__}."
+
+
+def probe_provider(provider, key, model, timeout=15.0):
+    """
+    {"ok": bool, "kind": str | None, "message": str, "seconds": float, "models": [ids]}.
+
+    Never raises. `models` is what the key can use, when the provider will list it, so the
+    screen can offer real choices after a successful test.
+    """
+    key = _real_key(key)
+    model = str(model or "").strip()
+    if not key:
+        return {"ok": False, "kind": FailureKind.AUTH_FAILURE, "seconds": 0.0, "models": [],
+                "message": "No key entered or stored."}
+    if not model:
+        return {"ok": False, "kind": FailureKind.INVALID_REQUEST, "seconds": 0.0, "models": [],
+                "message": "Choose a model first."}
+    started = time.monotonic()
+    try:
+        client = _probe_client(provider, key, timeout)
+        if provider == CLAUDE:
+            client.messages.create(model=model, max_tokens=16,
+                                   messages=[{"role": "user", "content": "Reply with: OK"}],
+                                   **claude_speed_args(model, "low"))
+        else:
+            client.chat.completions.create(model=model, max_tokens=32,
+                                           messages=[{"role": "user",
+                                                      "content": "Reply with: OK"}])
+    except ImportError:
+        return {"ok": False, "kind": FailureKind.UNKNOWN, "seconds": 0.0, "models": [],
+                "message": "The 'anthropic' package is missing. Run: python setup.py"}
+    except Exception as exc:
+        kind, sentence = _probe_sentence(provider, model, exc)
+        return {"ok": False, "kind": kind, "message": sentence, "models": [],
+                "seconds": round(time.monotonic() - started, 2)}
+    seconds = round(time.monotonic() - started, 2)
+    return {"ok": True, "kind": None, "seconds": seconds,
+            "message": f"Works. {model} answered in {seconds:.1f} s.",
+            "models": list_provider_models(provider, key, client=client)}
+
+
+def list_provider_models(provider, key, client=None, timeout=10.0):
+    """The chat-capable model ids this key can use, sorted; [] when the list is unavailable."""
+    try:
+        client = client or _probe_client(provider, _real_key(key), timeout)
+        ids = [str(getattr(m, "id", "") or "") for m in client.models.list()]
+    except Exception:
+        return []
+    skip = ("embed", "whisper", "tts", "guard", "audio", "image", "imagen", "veo", "aqa",
+            "transcribe", "orpheus", "playai", "learnlm", "-live", "native-audio")
+    ids = [i[len("models/"):] if i.startswith("models/") else i for i in ids]
+    ids = sorted({i for i in ids if i and not any(s in i.lower() for s in skip)})
+    if provider == CLAUDE:
+        ids = [i for i in ids if i.startswith("claude-")]
+    if provider == GEMINI:
+        ids = [i for i in ids if i.startswith("gemini-")]
+    return ids[:60]

@@ -6,7 +6,8 @@ this repository. Read this first; follow the links when you need depth.
 | You need | Read |
 |---|---|
 | Rules, conventions, what not to touch | **this file** |
-| Every subtle gotcha, with the bug that taught it | [`CLAUDE.md`](CLAUDE.md) (long; search it) |
+| The always-needed context: data flow, cross-platform rules, imports, paths, module map | [`CLAUDE.md`](CLAUDE.md) (short; loaded every session) |
+| Every subtle gotcha of ONE subsystem, with the bug that taught it | [`docs/reference/`](docs/reference/) — indexed at the top of `CLAUDE.md`; read the one you are changing |
 | How the system fits together | [`docs/architecture/OVERVIEW.md`](docs/architecture/OVERVIEW.md) → [`SYSTEM_DESIGN.md`](docs/architecture/SYSTEM_DESIGN.md) |
 | Startup / turn / shutdown sequence | [`docs/architecture/EXECUTION_FLOW.md`](docs/architecture/EXECUTION_FLOW.md) |
 | What each module owns | [`docs/architecture/MODULES.md`](docs/architecture/MODULES.md) |
@@ -18,9 +19,9 @@ this repository. Read this first; follow the links when you need depth.
 ## Pending work
 
 [`docs/roadmap/BROWSER_CONTROL_PLAN.md`](docs/roadmap/BROWSER_CONTROL_PLAN.md) — the
-browser-control round, built **one part per session** (§10 has the part table). Part 1 (open
-anything, anywhere) and 1b (the AI understanding layer) are done; Part 2 (tabs and windows) is
-next. Do the next part only when the user asks. The user also asked that every round proactively
+browser-control round, built **in parts** (§10 has the part table and what is next). Parts 1–16
+and 5P are done; see §10 for what remains (§11 S2, the rest of §13, H2 phrasings, H3 other apps, H4 multi-app, 5P P4). Do the next part only when
+the user asks. The user also asked that every round proactively
 add the obvious neighbouring features and list them for veto.
 
 ## What Kayra is
@@ -38,7 +39,7 @@ both: Win32 on Windows, Hyprland IPC + Wayland tools on Linux (`docs/platforms/L
 ## Tech stack
 
 Python 3.10–3.14 · PySide6-Essentials (Qt 6 widgets) · Selenium + Chrome/Edge (speech input) ·
-kokoro-onnx + ONNX Runtime (CPU or CUDA) · sounddevice/PortAudio · Cohere / Groq / Gemini /
+kokoro-onnx + ONNX Runtime (CPU or CUDA) · sounddevice/PortAudio · Claude (anthropic) / Groq / Gemini /
 local OpenAI-compatible servers (LM Studio, Ollama) · ddgs + BeautifulSoup · OpenCV + MediaPipe ·
 psutil · rich. One dependency manifest: `requirements.txt` (PEP 508 platform markers).
 
@@ -184,7 +185,8 @@ suite does not mean the UI looks right; render it. See `tests/TESTING.md`.
 
 ## Before you finish a change
 
-- Update the doc that describes what you changed (this file, `CLAUDE.md`, or `docs/…`).
+- Update the doc that describes what you changed (this file, the matching `docs/reference/*.md`,
+  or `docs/…`). `CLAUDE.md` is loaded into every session: keep it short, put detail in a reference.
 - For a major feature, security fix, dependency or breaking change, add the next
   `updates/UPDATE_V<n>.md` report and its row in `updates/README.md` (format described there).
 - Run the unit tier on your platform and say which platform/Python you ran it on.

@@ -503,7 +503,7 @@ def quiet_third_party():
     """
     for name in ("urllib3", "urllib3.connectionpool", "selenium",
                  "selenium.webdriver.remote.remote_connection",
-                 "httpx", "httpcore", "openai", "cohere", "requests",
+                 "httpx", "httpcore", "openai", "anthropic", "httpx2", "requests",
                  "PIL", "matplotlib", "comtypes", "asyncio"):
         try:
             logging.getLogger(name).setLevel(logging.WARNING)

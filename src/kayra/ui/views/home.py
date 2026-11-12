@@ -58,7 +58,8 @@ only while the screen is visible, on a slow timer, from data the backend already
 
 from PySide6.QtCore import Qt, QTimer, QSize, QRectF, QPointF
 from PySide6.QtGui import QPainter, QColor, QLinearGradient
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSizePolicy
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+                               QSizePolicy)
 
 from kayra.ui.theme import Space, Size, Motion, Color, Font
 from kayra.ui.components.orb import AssistantOrb
@@ -261,6 +262,7 @@ class _StatusLine(QWidget):
 
 class HomeView(View):
     title = ""          # Home is deliberately titleless: the orb IS the heading.
+    adapt_margins = False
 
     # How many activity lines the panel keeps. It is a glance, not a log; Activity holds the
     # full history. Larger than the old four because the panel is now a full column tall.
@@ -335,34 +337,103 @@ class HomeView(View):
         hardcoded geometry anywhere, so the same composition holds at 1040px and at 2560px
         and the panels simply get wider.
         """
-        columns = QHBoxLayout()
-        columns.setSpacing(Space.base)
-
-        left = QVBoxLayout()
+        left_box = QWidget()
+        left = QVBoxLayout(left_box)
+        left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(Space.base)
         self.intelligence_panel = self._build_intelligence()
         self.interaction_panel = self._build_interaction()
         left.addWidget(self.intelligence_panel, 4)
         left.addWidget(self.interaction_panel, 6)
 
-        right = QVBoxLayout()
+        right_box = QWidget()
+        right = QVBoxLayout(right_box)
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(Space.base)
         self.system_panel = self._build_system()
         self.activity_panel = self._build_activity()
         right.addWidget(self.system_panel, 6)
         right.addWidget(self.activity_panel, 4)
 
-        columns.addLayout(left, 3)
-        columns.addLayout(self._build_hero(), 4)
-        columns.addLayout(right, 3)
+        hero_box = QWidget()
+        hero_layout = self._build_hero()
+        hero_layout.setContentsMargins(0, 0, 0, 0)
+        hero_box.setLayout(hero_layout)
 
-        # A minimum per column that three of them plus the gaps still fit inside
-        # `min_window_width`. Below that the panels elide rather than the row overflowing.
+        # A minimum per column that three of them plus the gaps still fit inside the WIDE
+        # layout's threshold. Below it the page reflows (`_apply_layout`) instead of the row
+        # overflowing.
         for panel in (self.intelligence_panel, self.interaction_panel,
                       self.system_panel, self.activity_panel):
             panel.setMinimumWidth(228)
 
-        self.content.addLayout(columns, 1)
+        self._left_box, self._hero_box, self._right_box = left_box, hero_box, right_box
+        self._grid = QGridLayout()
+        self._grid.setHorizontalSpacing(Space.base)
+        self._grid.setVerticalSpacing(Space.base)
+        self.layout_mode = None
+        self.content.addLayout(self._grid, 1)
+        self._apply_layout("wide")
+
+    # ── Responsive composition ──
+    #
+    # THREE ARRANGEMENTS OF THE SAME FOUR PANELS, chosen from the page's OWN width:
+    #
+    #   wide    (>= WIDE_FROM)    left | orb | right, full height, no scrolling — the design
+    #   medium  (>= MEDIUM_FROM)  the orb on top, the two panel columns side by side below it
+    #   narrow                    one column: orb, then each panel, the page scrolls
+    #
+    # The panels are the same widgets in every arrangement — moved between grid cells, never
+    # rebuilt — so a resize keeps their state, timers and elided captions intact.
+    WIDE_FROM = 840
+    MEDIUM_FROM = 560
+
+    def _mode_for(self, width):
+        if width >= self.WIDE_FROM:
+            return "wide"
+        return "medium" if width >= self.MEDIUM_FROM else "narrow"
+
+    def _apply_layout(self, mode):
+        if mode == self.layout_mode:
+            return
+        self.layout_mode = mode
+        grid = self._grid
+        for box in (self._left_box, self._hero_box, self._right_box):
+            grid.removeWidget(box)
+        for index in range(3):
+            grid.setColumnStretch(index, 0)
+            grid.setRowStretch(index, 0)
+        if mode == "wide":
+            grid.addWidget(self._left_box, 0, 0)
+            grid.addWidget(self._hero_box, 0, 1)
+            grid.addWidget(self._right_box, 0, 2)
+            for index, share in enumerate((3, 4, 3)):
+                grid.setColumnStretch(index, share)
+            grid.setRowStretch(0, 1)
+        elif mode == "medium":
+            grid.addWidget(self._hero_box, 0, 0, 1, 2)
+            grid.addWidget(self._left_box, 1, 0)
+            grid.addWidget(self._right_box, 1, 1)
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+            grid.setRowStretch(1, 1)
+        else:
+            grid.addWidget(self._hero_box, 0, 0)
+            grid.addWidget(self._left_box, 1, 0)
+            grid.addWidget(self._right_box, 2, 0)
+            grid.setColumnStretch(0, 1)
+        # The wide page fits the window and never scrolls; the reflowed ones are taller than
+        # the window by design, so they scroll vertically (never sideways).
+        holder = self.scroll.widget()
+        scrolls = mode != "wide"
+        self.scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if scrolls else Qt.ScrollBarAlwaysOff)
+        if holder is not None:
+            holder.setSizePolicy(QSizePolicy.Preferred,
+                                 QSizePolicy.Minimum if scrolls else QSizePolicy.Expanding)
+        for panel in (self.intelligence_panel, self.interaction_panel,
+                      self.system_panel, self.activity_panel):
+            panel.setMinimumHeight(200 if scrolls else 0)
 
     # ── The centre column ──
 
@@ -1026,8 +1097,12 @@ class HomeView(View):
         wide window has plenty of width and no room to put it.
         """
         left, top, right, bottom = self.content.getContentsMargins()
-        usable = max(1, self.width() - left - right - 2 * Space.base)
-        centre = usable * 4.0 / 10.0                 # the hero column's stretch share
+        if self.layout_mode == "wide":
+            usable = max(1, self.width() - left - right - 2 * Space.base)
+            centre = usable * 4.0 / 10.0             # the hero column's stretch share
+        else:
+            # Reflowed: the orb has the full width of the page above the panels.
+            centre = max(1, self.width() - left - right)
         vertical = max(1, self.height() - top - bottom)
         self.orb.set_diameter(max(self.ORB_MIN,
                                   min(self.ORB_MAX,
@@ -1038,6 +1113,7 @@ class HomeView(View):
         # The captions re-elide THEMSELVES — see `_ElidedCaption`. Nothing here has to
         # remember to, which is what makes the timing bug unreachable rather than fixed.
         super().resizeEvent(event)
+        self._apply_layout(self._mode_for(self.width()))
         self._resize_orb()
 
     def on_show(self):

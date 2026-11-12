@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QSizePolicy
 
 from kayra.ui.theme import Space
 from kayra.ui.components.primitives import PageTitle, Subtitle
+from kayra.ui.smooth_scroll import install_smooth_scroll
 
 
 class View(QWidget):
@@ -23,6 +24,10 @@ class View(QWidget):
 
     title = ""
     subtitle = ""
+    # Narrow pages trade side margin for content (see `resizeEvent`). Home and Chat lay out
+    # their own margins (the dock clearance) and switch this off.
+    adapt_margins = True
+    NARROW_BELOW = 640
 
     def __init__(self, bridge, parent=None):
         super().__init__(parent)
@@ -51,6 +56,17 @@ class View(QWidget):
 
         self.scroll.setWidget(holder)
         outer.addWidget(self.scroll)
+        # §11 S1: every page's scrolling glides (wheel, touchpad momentum, keys).
+        install_smooth_scroll(self.scroll)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.adapt_margins:
+            return
+        side = Space.xl if self.width() >= self.NARROW_BELOW else Space.base
+        left, top, right, bottom = self.content.getContentsMargins()
+        if left != side:
+            self.content.setContentsMargins(side, Space.lg, side, Space.xl)
 
     # Lifecycle hooks. Default to nothing so a static screen costs nothing when shown.
     def on_show(self):

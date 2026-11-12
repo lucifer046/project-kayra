@@ -30,7 +30,7 @@ from PySide6.QtCore import (Qt, Signal, QPropertyAnimation, QEasingCurve, QRect,
                             QParallelAnimationGroup, Property)
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QButtonGroup,
-                               QGraphicsDropShadowEffect, QGraphicsOpacityEffect)
+                               QGraphicsOpacityEffect)
 
 from kayra.ui.theme import Color, Space, Size, Motion, Elevation
 from kayra.ui.components.navigation import (NavItem, NavIndicator, DESTINATIONS,
@@ -125,11 +125,12 @@ class NavigationDrawer(QWidget):
         footer.addWidget(self.detail_label)
         layout.addLayout(footer)
 
-        shadow = QGraphicsDropShadowEffect(self.panel)
-        shadow.setBlurRadius(Elevation.drawer_shadow_blur)
-        shadow.setOffset(Elevation.drawer_shadow_x, 0)
-        shadow.setColor(QColor(0, 0, 0, Elevation.drawer_shadow_alpha))
-        self.panel.setGraphicsEffect(shadow)
+        # A cached shadow layer beside the panel, not a QGraphicsDropShadowEffect: the effect
+        # re-rendered the whole panel offscreen on every frame of the slide.
+        from kayra.ui.components.shadow import ShadowLayer
+        self.panel_shadow = ShadowLayer(self.panel, 0, Elevation.drawer_shadow_blur // 2,
+                                        Elevation.drawer_shadow_x, 0,
+                                        Elevation.drawer_shadow_alpha)
 
     # ──────────────────────────────────────────────────────────────────
     #                              OPENING

@@ -348,7 +348,7 @@ def section_secrets():
     # The settings recorder must never print a secret's VALUE.
     recorder = settings_log.SettingsRecorder()
     with Capture() as cap:
-        recorder.record("CohereAPIKey", "zzTOPSECRETzz", old_value="")
+        recorder.record("CLAUDE_API_KEY", "zzTOPSECRETzz", old_value="")
         recorder.record("GROQ_API_KEY", "gsk_realkey", old_value="old")
         recorder.record("GEMINI_API_KEY", "", old_value="something")
     text = cap.text()
@@ -356,7 +356,7 @@ def section_secrets():
           "zzTOPSECRETzz" not in text and "set" in text, text)
     check("gsk_realkey never appears", "gsk_realkey" not in text, text)
     check("a cleared key logs 'cleared'", "cleared" in text, text)
-    check("and the setting is still named", "Cohere API key" in text, text)
+    check("and the setting is still named", "Claude API key" in text, text)
 
     # Memory content is a secret of a different kind, and is checked the same way.
     from kayra.memory import store
@@ -530,10 +530,10 @@ def section_third_party():
     print_system("\n[7] Third-party noise controlled, failures preserved")
 
     before = {name: logging.getLogger(name).level
-              for name in ("urllib3", "selenium", "httpx", "openai", "cohere")}
+              for name in ("urllib3", "selenium", "httpx", "openai", "anthropic")}
     logbus.quiet_third_party()
 
-    for name in ("urllib3", "selenium", "httpx", "openai", "cohere", "requests"):
+    for name in ("urllib3", "selenium", "httpx", "openai", "anthropic", "requests"):
         level = logging.getLogger(name).level
         check(f"{name} is raised to WARNING", level == logging.WARNING, str(level))
         check(f"{name} is NOT disabled", logging.getLogger(name).disabled is False)

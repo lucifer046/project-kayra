@@ -294,8 +294,17 @@ class Size:
     chrome_button = 46            # Windows caption buttons are wider than they are tall
     resize_margin = 6             # the grab band Windows hit-tests for resizing
 
-    min_window_width = 1040
-    min_window_height = 680
+    # ── Responsive bounds ──
+    # The window used to refuse to be narrower than 1040px, which on a tiling desktop (a
+    # half-screen Hyprland tile is ~950px on a 1920 monitor) meant it was simply cut off.
+    # It now goes down to a phone-ish width and the layout adapts instead:
+    #   below `rail_compact_below` the rail shrinks to its icons (`sidebar_collapsed`);
+    #   below `narrow_below` the dock drops its labels;
+    #   pages reflow from their OWN width (Home's three layouts, settings rows that stack).
+    rail_compact_below = 1100
+    narrow_below = 760
+    min_window_width = 480
+    min_window_height = 520
     default_window_width = 1280
     default_window_height = 820
     scrollbar = 10
@@ -346,6 +355,7 @@ class Motion:
     # motion is felt rather than watched, which is what keeps it from competing with the
     # interface. It also means the backdrop costs less per second than the orb does.
     backdrop_fps = 8
+    backdrop_fps_gpu = 30   # the GPU backdrop redraws only itself, so it can afford smooth
     backdrop_cycle_s = 90.0
 
 

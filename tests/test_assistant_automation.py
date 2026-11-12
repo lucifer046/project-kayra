@@ -172,7 +172,7 @@ def section_parsing():
         "browser close other tabs": ("browser.tabs_close_others", None),
         "browser click on the second reply button": ("browser.page_click", "reply"),
         "browser type hello world into search": ("browser.page_type", "search"),
-        "browser search for shoes": ("browser.page_type", "search"),
+        "browser search for shoes": ("browser.search_here", "shoes"),     # Part 3, G2
         "browser scroll until you see pricing": ("browser.page_scroll", "pricing"),
         "browser summarize this page": ("browser.page_summarize", None),
         "browser read this page": ("browser.page_read", None),
@@ -253,7 +253,9 @@ def section_parsing():
 
 def section_safety():
     check.section("[2] Sending, spending, sharing and removing all ask first")
-    for token in ("email send", "message rahul: hi", "calendar add lunch tomorrow at 1pm",
+    # "message rahul: hi" is not here since Part 5: the WhatsApp handler opens the chat FIRST and
+    # then always asks with the chat's real name (late confirmation) — test_browser_control [19].
+    for token in ("email send", "calendar add lunch tomorrow at 1pm",
                   "meet share entire screen", "browser close other tabs", "diagnose fix",
                   "git commit wip", "system update my system", "system install vlc",
                   "system uninstall vlc", "system forget the wifi home",
@@ -269,7 +271,7 @@ def section_safety():
 
     bridge = FakeBridge()
     with WebRig(bridge) as rig:
-        for token in ("email send", "message rahul: hi", "meet share entire screen",
+        for token in ("email send", "meet share entire screen",
                       "system install vlc", "diagnose fix"):
             result = rig.do(token)
             check(f"'{token}' waits for a yes", result.status == Status.NEEDS_CONFIRMATION)
@@ -403,10 +405,16 @@ def section_bridge():
     derived = "".join(chr(ord("a") + int(c, 16)) for c in hashlib.sha256(der).hexdigest()[:32])
     check("the manifest key really produces EXTENSION_ID", derived == browser_bridge.EXTENSION_ID,
           derived)
-    check("the extension never asks for cookies, downloads or debugger access",
-          not ({"cookies", "debugger", "downloads", "nativeMessaging"} & set(manifest["permissions"])))
+    check("the extension never asks for cookies, debugger or native messaging access "
+          "(downloads was approved for 1.6.0, plan decision D5)",
+          not ({"cookies", "debugger", "nativeMessaging"} & set(manifest["permissions"])))
     js = open(os.path.join(browser_bridge.extension_dir(), "background.js")).read()
-    check("the extension only connects to 127.0.0.1", "ws://127.0.0.1" in js and "fetch(" not in js)
+    fetches = js.count("fetch(")
+    check("the extension only connects to 127.0.0.1; its ONE fetch is the in-page Workspace read, "
+          "fenced to docs.google.com (Part 4)",
+          "ws://127.0.0.1" in js and fetches == 1 and "async function pageFetchText" in js
+          and js.index("fetch(") > js.index("async function pageFetchText")
+          and "only docs.google.com" in js, fetches)
     check("the extension refuses password fields itself", "password" in js and "never types" in js)
 
 
@@ -482,25 +490,15 @@ def section_web():
         result = rig.do("meet mic off")
         check("'meet mic off' clicks Meet's own 'Turn off microphone'",
               ("page.click", {"text": "Turn off microphone", "nth": 1}) in meet.calls, result.message)
-        rig.do("meet share entire screen")
+        result = rig.do("meet share entire screen")
         linux.resolve_confirmation("yes")
-        check("sharing first tells the page hook to prefer the entire screen",
-              ("page.setMain", {"key": "__kayraShareSurface", "value": "monitor"}) in meet.calls)
-        check("then clicks Meet's share button",
-              ("page.click", {"text": "Share screen", "nth": 1}) in meet.calls)
-        check("and confirms Chrome's picker and the portal picker with Enter",
-              rig.runner.calls.count(["wtype", "-k", "Return"]) == 2, rig.runner.calls)
-        check("the share picker window was focused first",
-              any("0xp" in d for d in rig.hypr.dispatched))
+        # This fake is ALREADY presenting ("Stop presenting" is on screen), so nothing is
+        # clicked twice. The full share flow is test_browser_control.py section [12].
+        check("sharing while already presenting says so instead of opening a second picker",
+              ("page.click", {"text": "Share screen", "nth": 1}) not in meet.calls)
 
-    whatsapp = FakeBridge(tabs=[{"id": 5, "title": "WhatsApp", "url": "https://web.whatsapp.com/"}])
-    with WebRig(whatsapp) as rig:
-        rig.do("message rahul: running late")
-        linux.resolve_confirmation("yes")
-        typed = [a for c, a in whatsapp.calls if c == "page.type"]
-        check("WhatsApp: search the contact, open the chat, type and send",
-              typed and typed[0]["text"] == "rahul" and typed[-1]["text"] == "running late"
-              and typed[-1]["submit"], typed)
+    # WhatsApp (open, read, send with a late confirmation naming the real chat) is covered with
+    # a WhatsApp-shaped fake in tests/test_browser_control.py section [19].
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

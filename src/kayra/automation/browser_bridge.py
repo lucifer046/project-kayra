@@ -72,6 +72,7 @@ class BridgeServer:
         self._stop = threading.Event()
         self.version = None
         self.connected_at = None
+        self.on_hello = None              # callable() run (on its own thread) after each hello
 
     # ── lifecycle ──
     def start(self):
@@ -82,7 +83,8 @@ class BridgeServer:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self.host, self.port))
             listener.listen(4)
-            listener.settimeout(1.0)
+            # No accept timeout: `stop()` shuts the socket down, which wakes accept() at once,
+            # so an idle bridge costs zero wake-ups instead of one a second for the whole run.
         except OSError:
             return False                  # port busy: another Kayra owns the bridge
         self._listener = listener
@@ -214,11 +216,22 @@ class BridgeServer:
             return
         if msg.get("type") == "hello":
             self.version = msg.get("version")
+            hook = self.on_hello
+            if hook is not None:               # never on the reader thread: the hook calls back
+                threading.Thread(target=self._run_hook, args=(hook,), name="kayra-bridge-hello",
+                                 daemon=True).start()
             return
         slot = self._pending.get(msg.get("id"))
         if slot is not None:
             slot["reply"] = msg
             slot["event"].set()
+
+    @staticmethod
+    def _run_hook(hook):
+        try:
+            hook()
+        except Exception:
+            pass
 
     def _send(self, conn, data, opcode=0x1):
         payload = data.encode() if isinstance(data, str) else data
@@ -249,13 +262,24 @@ def encode_frame(payload, opcode=0x1):
 
 
 def _recv_exact(conn, count):
-    data = b""
-    while len(data) < count:
-        chunk = conn.recv(count - len(data))
+    chunks, have = [], 0
+    while have < count:
+        chunk = conn.recv(min(count - have, 1 << 20))
         if not chunk:
             return None
-        data += chunk
-    return data
+        chunks.append(chunk)
+        have += len(chunk)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
+def _unmask(payload, mask):
+    """XOR with the repeating 4-byte mask as ONE big-integer operation: a 600 KB page read is
+    ~1 ms this way and ~100 ms as a per-byte Python loop."""
+    size = len(payload)
+    if not size:
+        return payload
+    key = (mask * (size // 4 + 1))[:size]
+    return (int.from_bytes(payload, "big") ^ int.from_bytes(key, "big")).to_bytes(size, "big")
 
 
 def read_frame(conn):
@@ -280,7 +304,7 @@ def read_frame(conn):
         if payload is None or mask is None:
             return None
         if masked:
-            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            payload = _unmask(payload, mask)
         if opcode >= 0x8:                    # control frames are never fragmented
             return opcode, payload
         if first_opcode is None:

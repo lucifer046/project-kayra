@@ -30,12 +30,12 @@ No subprocess is ever spawned on the refresh path.
 """
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QBoxLayout, QSizePolicy
 
 from kayra.ui.theme import Font, Color, Space, Motion, VERDICT_LABELS
 from kayra.ui.components.primitives import (
-    Card, Caption, Secondary, StatusPill, SectionLabel, Meter, StatRow, Disclosure,
-    ActionStatus, _label,
+    Card, Caption, Secondary, StatusPill, SectionLabel, Meter, Disclosure,
+    ActionStatus, FactGrid, _label,
 )
 from kayra.ui.views.base import View
 
@@ -173,8 +173,11 @@ class SystemView(View):
     # ──────────────────────────────────────────────────────────────────
 
     def _build_scores(self):
-        row = QHBoxLayout()
+        # A row of three on a normal window, a column on a narrow one (`resizeEvent`): three
+        # tiles side by side cannot fit much under ~470px without clipping their numbers.
+        row = QBoxLayout(QBoxLayout.LeftToRight)
         row.setSpacing(Space.base)
+        self._score_row = row
         self.tiles = {}
         for key in ("compatibility", "performance", "readiness"):
             tile = ScoreTile(key)
@@ -338,59 +341,75 @@ class SystemView(View):
 
         product, version = os_summary()
 
-        rows = [
-            StatRow("Processor", profile["cpu_name"] or "unknown", mono=False),
-            StatRow("Cores", f"{profile['cpu_cores'] or '?'} physical / "
-                             f"{profile['cpu_threads'] or '?'} logical"),
-            StatRow("Base clock", f"{profile['cpu_max_mhz']:.0f} MHz"
-                                  if profile["cpu_max_mhz"] else "unknown"),
-            StatRow("Memory", human_bytes(profile["ram_total"])),
+        # TILES, NOT A TABLE. This was a two-column "label ......... value" list of fifteen
+        # rows, with the values right-aligned and wrapping into ragged blocks; related facts
+        # (a GPU, its video memory, its driver) were three separate rows. Each tile is now one
+        # THING with its headline value and a line of detail, and the grid reflows from three
+        # columns to one with the page.
+        cores = profile.get("cpu_cores")
+        threads = profile.get("cpu_threads")
+        cpu_detail = []
+        if cores or threads:
+            cpu_detail.append(f"{cores or '?'} cores · {threads or '?'} threads")
+        if profile.get("cpu_max_mhz"):
+            cpu_detail.append(f"{profile['cpu_max_mhz'] / 1000:.2f} GHz")
+        facts = [
+            ("Processor", profile["cpu_name"] or "unknown", "  ·  ".join(cpu_detail)),
+            ("Memory", human_bytes(profile["ram_total"]), "installed"),
         ]
 
-        # One row per real adapter, so a switchable-graphics laptop shows both rather than
+        # One tile per real adapter, so a switchable-graphics laptop shows both rather than
         # whichever one happened to win a sort. Virtual adapters are omitted: naming the
         # Microsoft Basic Display Adapter as "your graphics" helps nobody.
         real = [g for g in profile.get("gpus") or [] if not g.get("software")]
         if real:
             for adapter in real[:3]:
                 label = "Graphics" if adapter is real[0] else "Graphics (also)"
-                rows.append(StatRow(label, adapter["name"], mono=False))
-                rows.append(StatRow("  Video memory", adapter["memory_text"]))
+                memory = adapter.get("memory_text") or "unknown"
+                detail = [f"{memory} video memory" if memory != "unknown"
+                          else "video memory not reported"]
                 if adapter.get("driver_version"):
-                    rows.append(StatRow("  Driver", adapter["driver_version"]))
+                    detail.append(f"driver {adapter['driver_version']}")
+                facts.append((label, adapter["name"], "  ·  ".join(detail)))
         else:
-            rows.append(StatRow("Graphics", "not detected", mono=False))
+            facts.append(("Graphics", "not detected", ""))
 
-        rows.extend([
-            # The CORRECTED product name and the REAL build. This row used to read
-            # "(build 10)" from `platform.release()`, which is 10 on every Windows 11
-            # machine — see `core/hardware.py` for why every cheap source lies here.
-            StatRow("Operating system", product, mono=False),
-            StatRow("OS version", version or "unknown", mono=False),
-            StatRow("Architecture", profile["architecture"] or "unknown"),
-        ])
+        # The CORRECTED product name and the REAL build — see `core/hardware.py` for why every
+        # cheap source lies about Windows versions.
+        version = str(version or "")
+        if version.lower().startswith("version "):
+            version = version[len("version "):]
+        system_line = " ".join(part for part in (product, version) if part) or "unknown"
+        facts.append(("Operating system", system_line, profile["architecture"] or ""))
         if profile.get("screen_width") and profile.get("screen_height"):
             scale = profile.get("screen_scale") or 1.0
             monitors = profile.get("monitor_count") or 1
-            detail = f"{profile['screen_width']} x {profile['screen_height']}"
+            detail = []
             if scale and abs(scale - 1.0) > 0.01:
-                detail += f" at {scale:g}x"
-            if monitors > 1:
-                detail += f"  ·  {monitors} monitors"
-            rows.append(StatRow("Display", detail))
-        rows.extend([
-            StatRow("Audio devices", f"{profile['audio_outputs']} output / "
-                                     f"{profile['audio_inputs']} input"),
-            StatRow("Python", profile["python_version"]),
-        ])
-        for disk in profile["disks"][:4]:
-            label = f"Drive {disk['mount']}"
-            if disk.get("system"):
-                label += " (system)"
-            rows.append(StatRow(
-                label,
-                f"{human_bytes(disk['free'])} free of {human_bytes(disk['total'])}"))
-        self._replace(self.device_body, rows)
+                detail.append(f"{scale:g}x scale")
+            detail.append(f"{monitors} monitor" + ("s" if monitors > 1 else ""))
+            facts.append(("Display", f"{profile['screen_width']} x {profile['screen_height']}",
+                          "  ·  ".join(detail)))
+        facts.append(("Audio devices", f"{profile['audio_outputs']} outputs",
+                      f"{profile['audio_inputs']} inputs"))
+        facts.append(("Python", profile["python_version"], "the interpreter Kayra runs on"))
+        # Mounts of ONE filesystem (btrfs subvolumes: /, /home, /var/log, the package cache)
+        # report the same total and free space; they are one disk to the person reading this,
+        # so they are one tile, with the mounts named underneath.
+        volumes = {}
+        for disk in profile["disks"]:
+            key = (disk["total"], disk["free"])
+            volumes.setdefault(key, []).append(disk)
+        for (total, free), mounts in list(volumes.items())[:4]:
+            names = [d["mount"] for d in mounts]
+            label = "Storage" if any(d.get("system") for d in mounts) else f"Drive {names[0]}"
+            shown = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
+            facts.append((label, f"{human_bytes(free)} free of {human_bytes(total)}",
+                          shown))
+
+        grid = FactGrid(min_column=230, max_columns=3)
+        grid.set_facts(facts)
+        self._replace(self.device_body, [grid])
 
     def _render_advice(self, result):
         """
@@ -445,6 +464,13 @@ class SystemView(View):
     #                            LIFECYCLE
     # ──────────────────────────────────────────────────────────────────
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        row = getattr(self, "_score_row", None)
+        if row is not None:
+            narrow = self.width() < 560
+            row.setDirection(QBoxLayout.TopToBottom if narrow else QBoxLayout.LeftToRight)
+
     def on_show(self):
         self._refresh_metrics()
         self._timer.start()
@@ -497,11 +523,16 @@ class _FindingRow(QWidget):
         name = _label(finding.subsystem, "SubsystemName")
         value = _label(finding.summary, "Mono")
         value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # WRAPS rather than holding the row open. A GPU or processor name is long, and an
+        # unwrapped value made this row — and so the whole page — at least ~490px wide.
+        value.setWordWrap(True)
+        value.setMinimumWidth(60)
+        value.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
 
         top.addWidget(holder)
         top.addWidget(name)
         top.addStretch(1)
-        top.addWidget(value)
+        top.addWidget(value, 1)
         layout.addLayout(top)
 
         reason = finding.advice or finding.detail

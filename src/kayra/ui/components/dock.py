@@ -63,9 +63,9 @@ the events the rest of the UI already receives.
 
 from PySide6.QtCore import Qt, Signal, QRectF, QVariantAnimation, QEasingCurve, QEvent
 from PySide6.QtGui import QPainter, QColor, QPen, QFont
-from PySide6.QtWidgets import (QWidget, QHBoxLayout, QFrame, QSizePolicy,
-                               QGraphicsDropShadowEffect)
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QFrame, QSizePolicy)
 
+from kayra.ui import profile
 from kayra.ui.theme import Color, Font, Space, Size, Motion, Elevation
 from kayra.ui.components.primitives import _icon_glyph
 
@@ -312,6 +312,7 @@ class DockButton(QWidget):
         return _lit(_mix(QColor(Color.text_secondary), QColor(Color.text), self._hover),
                     self._hover, 0.30)
 
+    @profile.timed("dock-button")
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -452,6 +453,7 @@ class DockDivider(QWidget):
         self.setFixedWidth(14)
         self.setFixedHeight(Size.dock_button)
 
+    @profile.timed("dock")
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -561,11 +563,12 @@ class FloatingDock(QFrame):
         # Qt does not honour `box-shadow` in QSS, so the float is a real effect. One effect on
         # the pill, not one per button — a drop shadow per control would be nine composited
         # layers for a decoration nobody would notice.
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(Elevation.dock_shadow_blur)
-        shadow.setOffset(0, Elevation.dock_shadow_y)
-        shadow.setColor(QColor(0, 0, 0, Elevation.dock_shadow_alpha))
-        self.setGraphicsEffect(shadow)
+        # A CACHED shadow layer under the pill (`components/shadow.py`), not a
+        # QGraphicsDropShadowEffect: the effect re-rendered the whole pill offscreen and blurred
+        # it on every hover frame and state change.
+        from kayra.ui.components.shadow import ShadowLayer
+        self.shadow = ShadowLayer(self, Size.dock_radius, Elevation.dock_shadow_blur // 2,
+                                  0, Elevation.dock_shadow_y, Elevation.dock_shadow_alpha)
 
     # ──────────────────────────────────────────────────────────────────
     #                       STATE, READ NOT REMEMBERED

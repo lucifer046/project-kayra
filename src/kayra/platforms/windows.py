@@ -225,3 +225,12 @@ def automation_support(which=None, compositor=None):
 def battery_status(root=None):
     """None: Windows reads its battery through psutil in the automation layer."""
     return None
+
+
+def browser_user_data_dirs():
+    """[(browser key, user-data folder)] for the Chromium-family browsers (Part 5P)."""
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    return [("google-chrome", os.path.join(local, "Google", "Chrome", "User Data")),
+            ("chromium", os.path.join(local, "Chromium", "User Data")),
+            ("brave", os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data")),
+            ("microsoft-edge", os.path.join(local, "Microsoft", "Edge", "User Data"))]

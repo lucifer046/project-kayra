@@ -39,6 +39,95 @@ from kayra.core.paths import model_path as model_file
 from kayra.core import logbus
 from kayra.utils import print_info, print_warning, print_error, console, now_ms, speech_safe_text
 
+# ── Which Kokoro file to load, fastest first ─────────────────────────────
+# MEASURED on the reference laptop (Ryzen 9 8945HS, RTX 4060 Laptop), synthesis time divided by
+# audio length for a 6.5 s sentence, 2026-11-10:
+#
+#     file                      processor     NVIDIA GPU    VRAM
+#     kokoro-v1.0.fp16.onnx       0.22          0.04       +637 MiB
+#     kokoro-v1.0.onnx (fp32)     0.22          0.03      +1151 MiB
+#     kokoro-v1.0.int8.onnx       1.06          0.95       +381 MiB
+#
+# THE QUANTIZED FILE IS THE SLOW ONE, on both devices. It was believed to be the fast one for
+# months (and `models/kokoro.onnx`, long described as "full precision", is byte-for-byte that
+# int8 file). Its quantized operators have no CUDA kernels — that is the "547 Memcpy nodes"
+# warning — and ONNX Runtime's CPU kernels for them are slower than the float ones here. So:
+# half precision first (same speed as fp32, half the download and half the VRAM), then full
+# precision, and the quantized files only when nothing else is installed.
+VOICE_MODELS = ("kokoro-v1.0.fp16.onnx", "kokoro-v1.0.onnx", "kokoro-v1.0.int8.onnx",
+                "kokoro.onnx")
+VOICE_FILES = ("voices-v1.0.bin", "voices.bin")
+_QUANTIZED_BYTES = range(80_000_000, 110_000_000)     # the int8 graph is ~92 MB; fp16 ~177 MB
+
+
+_VOICE_NAMES = {}
+
+
+def voice_names(path):
+    """The voice ids inside a Kokoro voices file (an .npz), sorted. Cached per path."""
+    if path not in _VOICE_NAMES:
+        try:
+            with np.load(path) as bundle:
+                _VOICE_NAMES[path] = tuple(sorted(bundle.files))
+        except Exception:
+            _VOICE_NAMES[path] = ()
+    return _VOICE_NAMES[path]
+
+
+# ── Part 14 (§13 N4): speaking speed, and a voice that follows the language ──
+DEFAULT_SPEED = 1.1                 # what Kayra always spoke at; "normal speed"
+MIN_SPEED, MAX_SPEED = 0.7, 1.6
+# Kokoro voice ids start with a language letter. Scripts that say their language by the letters
+# themselves are detected per sentence; Latin-script languages are not guessed (English words
+# inside a Spanish sentence would flip voices back and forth).
+_SCRIPTS = (("hi", "h", ((0x0900, 0x097F),)),                       # Devanagari
+            ("ja", "j", ((0x3040, 0x30FF),)),                       # Hiragana, Katakana
+            ("cmn", "z", ((0x4E00, 0x9FFF),)))                      # CJK ideographs (after kana: Japanese uses both)
+
+
+def clamp_speed(value, default=DEFAULT_SPEED):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return round(min(MAX_SPEED, max(MIN_SPEED, value)), 2)
+
+
+def script_language(text):
+    """'hi' / 'ja' / 'cmn' when most letters of `text` are in that script, else None."""
+    letters = [ch for ch in str(text or "") if ch.isalpha()]
+    if not letters:
+        return None
+    for lang, _prefix, ranges in _SCRIPTS:
+        hits = sum(1 for ch in letters if any(lo <= ord(ch) <= hi for lo, hi in ranges))
+        if hits * 2 >= len(letters):
+            return lang
+    return None
+
+
+def voice_for_language(lang, current, names):
+    """The voice for `lang` in the same gender as `current` ('af_bella' -> 'hf_alpha'), or None."""
+    prefix = next((p for code, p, _r in _SCRIPTS if code == lang), None)
+    if not prefix:
+        return None
+    gender = current[1] if len(current) > 1 and current[1] in "fm" else "f"
+    same = [n for n in names if n.startswith(prefix + gender + "_")]
+    other = [n for n in names if n.startswith(prefix)]
+    return (same or other or [None])[0]
+
+
+def is_quantized_voice_model(path):
+    """True for the slow int8 graph, by name or — for the historical `kokoro.onnx` — by size."""
+    name = os.path.basename(str(path)).lower()
+    if "int8" in name:
+        return True
+    if "fp16" in name or name == "kokoro-v1.0.onnx":
+        return False
+    try:
+        return os.path.getsize(path) in _QUANTIZED_BYTES
+    except OSError:
+        return False
+
 
 # Sample rate the Kokoro v1.0 checkpoints synthesize at.
 SAMPLE_RATE = 24000
@@ -158,7 +247,7 @@ class DynamicVoiceEngine:
         "enough", "cancel", "nevermind", "never mind",
     )
 
-    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin",
+    def __init__(self, model_filename=None, voices_filename=None,
                  warm_up=True, device_mode=None):
         # Paths and configuration both come from the core, never from a local guess at
         # where the project root is relative to this file.
@@ -180,34 +269,28 @@ class DynamicVoiceEngine:
         else:
             gender = env_vars.get("ASSISTANT_GENDER", "Female").strip().lower()
 
-        model_path = model_file(model_filename)
-        voices_path = model_file(voices_filename)
-
-        # Automatic fallback to standard filenames if default filenames are not present
-        if not os.path.exists(model_path) or not os.path.exists(voices_path):
-            alt_model_path = model_file("kokoro.onnx")
-            alt_voices_path = model_file("voices.bin")
-            if os.path.exists(alt_model_path) and os.path.exists(alt_voices_path):
-                model_path = alt_model_path
-                voices_path = alt_voices_path
-                # The full-precision graph synthesizes at roughly 1.0-1.4x real time on a
-                # typical CPU, which is the single largest remaining contributor to
-                # speaking latency. The int8 checkpoint this class asks for by default is
-                # several times faster at effectively identical audio quality.
-                print_warning(
-                    "Using full-precision kokoro.onnx. Dropping the quantized "
-                    f"'{model_filename}' + '{voices_filename}' into models/ cuts speech "
-                    "synthesis latency substantially."
-                )
-            else:
-                # Direct CWD check
-                if os.path.exists(model_filename) and os.path.exists(voices_filename):
-                    model_path = os.path.abspath(model_filename)
-                    voices_path = os.path.abspath(voices_filename)
+        # WHICH MODEL FILE. With no explicit file the fastest one present wins — see
+        # `VOICE_MODELS` for the measured order. An explicit filename is honoured as given and
+        # only then falls back to the same search, so an older caller keeps working.
+        model_path = model_file(model_filename) if model_filename else ""
+        voices_path = model_file(voices_filename) if voices_filename else ""
+        if not (model_path and os.path.exists(model_path)):
+            model_path = next((model_file(name) for name in VOICE_MODELS
+                               if os.path.exists(model_file(name))), model_path)
+        if not (voices_path and os.path.exists(voices_path)):
+            voices_path = next((model_file(name) for name in VOICE_FILES
+                                if os.path.exists(model_file(name))), voices_path)
+        if model_path and is_quantized_voice_model(model_path):
+            print_warning(
+                "Speech is using the QUANTIZED Kokoro model, which synthesizes at roughly real "
+                "time. Run setup.py to fetch kokoro-v1.0.fp16.onnx (about 5x faster on the "
+                "processor, 25x on an NVIDIA GPU).")
 
         # Verify physical model presence
-        if not os.path.exists(model_path) or not os.path.exists(voices_path):
-            print_error(f"Core voice matrix components missing: Check {model_path}")
+        if not model_path or not voices_path or not os.path.exists(model_path) \
+                or not os.path.exists(voices_path):
+            print_error("Core voice matrix components missing: no Kokoro model in models/ "
+                        f"(looked for {', '.join(VOICE_MODELS)}).")
             sys.exit(1)
 
         self._model_path = model_path
@@ -288,6 +371,17 @@ class DynamicVoiceEngine:
             self.voice = "am_adam"  # High-quality North American Male style vector
         else:
             self.voice = "af_bella"  # Ultra-realistic North American Female style vector
+        # ASSISTANT_VOICE (Settings → Voice) wins when it names a voice this voices file
+        # actually holds. The setting existed on the Settings screen for a long time and was
+        # never read here, so choosing a voice did nothing at all.
+        chosen = str(env_vars.get("ASSISTANT_VOICE", "") or "").strip()
+        if chosen and chosen in voice_names(voices_path):
+            self.voice = chosen
+        # Part 14: the speaking speed (Settings → Voice, or "speak a bit faster"), and whether a
+        # Hindi / Japanese / Mandarin sentence is spoken by a voice of that language.
+        self.speed = clamp_speed(env_vars.get("ASSISTANT_SPEECH_RATE"))
+        self.follow_language = str(env_vars.get("VOICE_FOLLOWS_LANGUAGE", "on") or "on").strip().lower() \
+            not in ("0", "off", "false", "no")
 
         # First Kokoro inference pays the ONNX graph-optimization + weight-warm cost
         # (~0.6-1.5s on CPU). Doing it here, silently, on a background thread means the
@@ -335,7 +429,7 @@ class DynamicVoiceEngine:
         """Runs one throwaway synthesis so the first user-visible utterance is not the cold one."""
         try:
             t0 = time.perf_counter()
-            for _ in self.onnx.stream("Ready.", voice=self.voice, speed=1.1):
+            for _ in self.onnx.stream("Ready.", voice=self.voice, speed=getattr(self, "speed", DEFAULT_SPEED)):
                 break  # first chunk is enough to force the full graph warm-up
             self.warm_up_seconds = time.perf_counter() - t0
         except Exception:
@@ -362,7 +456,9 @@ class DynamicVoiceEngine:
                     # between sentences; reading it once here means a switch can never replace
                     # the engine underneath a generator that is mid-inference.
                     onnx = self.onnx
-                    for audio_samples, _rate in onnx.stream(text, voice=self.voice, speed=1.1):
+                    voice, lang = self.voice_and_language(text)
+                    for audio_samples, _rate in onnx.stream(text, voice=voice, lang=lang,
+                                                            speed=getattr(self, "speed", DEFAULT_SPEED)):
                         if epoch != self._epoch:
                             break  # Barge-in mid-sentence: abandon the rest of this sentence.
                         self._audio_queue.put((epoch, np.asarray(audio_samples, dtype=np.float32)))
@@ -601,6 +697,29 @@ class DynamicVoiceEngine:
         with self._lock:
             self._interrupted = False
 
+    def preview(self, text, voice):
+        """N3.5: speak `text` once in `voice` without changing the voice in use. Non-blocking."""
+        once = self.__dict__.setdefault("_voice_once", {})
+        once[str(text)] = voice
+        self.speak(text)
+
+    def voice_and_language(self, text):
+        """(voice, Kokoro lang) for one sentence: the chosen voice in English; a voice of the
+        sentence's own language when it is written in Devanagari, kana or Han (and one exists)."""
+        voice = (self.__dict__.get("_voice_once") or {}).pop(str(text), None) or getattr(self, "voice", "af_bella")
+        if getattr(self, "follow_language", True):
+            lang = script_language(text)
+            if lang:
+                other = voice_for_language(lang, voice, voice_names(getattr(self, "_voices_path", "") or ""))
+                if other:
+                    return other, lang
+        return voice, "en-us" if voice[:1] in ("a", "") else "en-gb" if voice[:1] == "b" else "en-us"
+
+    def set_speed(self, rate):
+        """Applies from the next sentence. Returns the speed now in use."""
+        self.speed = clamp_speed(rate, getattr(self, "speed", DEFAULT_SPEED))
+        return self.speed
+
     def speak(self, text, blocking: bool = False):
         """
         Queues text for synthesis and playback.
@@ -764,7 +883,7 @@ class TextToSpeechEngine(DynamicVoiceEngine):
     used to request the full-precision files by name, so a quantized model sitting in
     models/ was never picked up.
     """
-    def __init__(self, model_filename="kokoro-v1.0.int8.onnx", voices_filename="voices-v1.0.bin",
+    def __init__(self, model_filename=None, voices_filename=None,
                  warm_up=True, device_mode=None):
         super().__init__(model_filename=model_filename, voices_filename=voices_filename,
                          warm_up=warm_up, device_mode=device_mode)

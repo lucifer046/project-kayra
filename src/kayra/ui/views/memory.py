@@ -232,15 +232,11 @@ class MemoryView(View):
         row on click and finds it back after a restart is worse than one that admits the
         failure.
         """
-        from PySide6.QtWidgets import QMessageBox
+        from kayra.ui.components.confirm import ConfirmDialog
 
-        box = QMessageBox(self)
-        box.setWindowTitle("Delete memory")
-        box.setText("Delete this memory?")
-        box.setInformativeText("It is removed from Kayra's long-term memory permanently.")
-        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
-        box.setDefaultButton(QMessageBox.Cancel)
-        if box.exec() != QMessageBox.Yes:
+        if not ConfirmDialog.ask(self, "Delete this memory?",
+                                 "It is removed from Kayra's long-term memory permanently.",
+                                 confirm_label="Delete"):
             return
 
         deleted, detail = self.bridge.delete_memory(memory_id)
@@ -260,21 +256,17 @@ class MemoryView(View):
         Cancel: this is the one control on the screen that can destroy months of the user's
         data in a click, and it should read like it.
         """
-        from PySide6.QtWidgets import QMessageBox
+        from kayra.ui.components.confirm import ConfirmDialog
 
         total = (self.bridge.memory_store() or {}).get("count", 0)
         if not total:
             return
 
-        box = QMessageBox(self)
-        box.setWindowTitle("Clear all memories")
-        box.setText("Delete all stored memories? This cannot be undone.")
-        box.setInformativeText(
-            f"All {total} saved entries are removed from Kayra's long-term memory "
-            f"permanently. Learned routines are not affected.")
-        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
-        box.setDefaultButton(QMessageBox.Cancel)
-        if box.exec() != QMessageBox.Yes:
+        if not ConfirmDialog.ask(
+                self, "Delete all stored memories?",
+                f"All {total} saved entries are removed from Kayra's long-term memory "
+                f"permanently. This cannot be undone. Learned routines are not affected.",
+                confirm_label="Delete all"):
             return
 
         cleared, ok = self.bridge.clear_memories()

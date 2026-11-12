@@ -654,6 +654,28 @@ def bootstrap():
                     f"{k} {'on' if v else 'off'}" for k, v in started.items()), correlate=False)
             except Exception as exc:
                 logbus.warning(Subsystem.AUTO, f"Automation services did not start: {exc}")
+        # Part 14: "speak a bit faster" reaches the running voice through a getter — the
+        # automation layer never imports the speech engine.
+        try:
+            from kayra.automation import common as _speech_rules
+            _speech_rules.SPEECH["engine"] = lambda: tts_engine
+        except Exception:
+            pass
+        # Rules before the classifier: an utterance the automation rules fully understand
+        # skips the model (tuning pass V9). Linux only — it routes browser/Workspace commands.
+        if hasattr(_hands, "situation"):
+            from kayra.automation import common as _rules
+            from kayra.intelligence import llm_engine as _llm
+            _llm.set_rule_router(lambda text: _rules.direct_tokens(text, _hands.situation))
+        # Warm the local model's prompt cache for the understanding layer in the background,
+        # so the first failed-rule request after boot is not the slow one (tuning pass V9).
+        def _warm():
+            try:
+                from kayra.automation import ai as _ai, interpreter as _interp
+                _ai.warm_up([_interp.system_prompt()])
+            except Exception:
+                pass
+        threading.Thread(target=_warm, name="kayra-warmup", daemon=True).start()
     except Exception as e:
         # `Exception`, not just ImportError: a desktop library that cannot reach a display
         # fails with its own error type. Isolating that HERE is what keeps conversation,
@@ -705,6 +727,16 @@ def bootstrap():
 
     engine = CentralizedLLMEngine()
     BOOT.mark("LLM engine ready (routing + DMM)")
+
+    # Warm the classifier's ~5.6K-token prompt in the local server's cache while the speech
+    # engines finish loading, so the user's FIRST command is as quick as the rest (V9).
+    def _warm_dmm(local_engine=engine):
+        try:
+            if not local_engine.is_online:
+                local_engine._dmm_local("hello", timeout=20)
+        except Exception:
+            pass
+    threading.Thread(target=_warm_dmm, name="kayra-warmup-dmm", daemon=True).start()
 
     # ── STAGE 3 — join & verify readiness ──
     # Nothing below may run before the engines it depends on actually exist, so no command can
@@ -1660,6 +1692,14 @@ def _repair_stage():
             except Exception:
                 vocabulary = []
             _REPAIR_STAGE = get_transcript_repair(vocabulary=vocabulary)
+            # The names on screen (chats, file titles, buttons), so "make her sharma" can
+            # become the Megha Sharma that is actually in the list. Injected: the input layer
+            # never imports automation.
+            try:
+                from kayra.automation import screen_vocabulary
+                _REPAIR_STAGE.set_screen_source(screen_vocabulary.names)
+            except Exception as exc:
+                print_warning(f"On-screen names unavailable to transcript repair (non-fatal): {exc}")
         except Exception as exc:
             print_warning(f"Transcript repair unavailable (non-fatal): {exc}")
             _REPAIR_STAGE = False          # False, not None: do not retry every utterance

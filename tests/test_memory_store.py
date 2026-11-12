@@ -614,11 +614,14 @@ def section_ui():
           "from kayra.memory.conversation import" not in source)
 
     check("deleting one memory confirms first",
-          source.count("QMessageBox") >= 2)
+          source.count("ConfirmDialog.ask") >= 2)
     check("clearing everything states that it cannot be undone",
           "cannot be undone" in source, "")
-    check("and the default button is Cancel",
-          source.count("setDefaultButton(QMessageBox.Cancel)") >= 2)
+    import inspect as _inspect
+    from kayra.ui.components import confirm as _confirm
+    confirm_source = _inspect.getsource(_confirm)
+    check("and the default answer is Cancel (focus starts there, Enter cancels)",
+          "self.cancel_button.setFocus" in confirm_source)
     check("a failed deletion does not remove the row",
           "if not deleted:" in source and "return" in source)
 

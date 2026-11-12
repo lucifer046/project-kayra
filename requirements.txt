@@ -34,7 +34,8 @@ send2trash>=1.8      # OPTIONAL. When present, file deletion goes to the Recycle
 
 # LLM & AI Clients
 openai>=1.30         # Also used as the OpenAI-compatible client for Groq/Gemini/local endpoints
-cohere>=6.0,<8       # chat_stream(message=, preamble=, chat_history=) verified through 7.3.1
+anthropic>=2.0       # Claude (Haiku): the first cloud provider. Verified with 2.7.0
+keyring>=25          # API keys from Settings go to the system keyring (Secret Service / Credential Manager)
 
 # Audio & Voice (Kokoro TTS)
 kokoro-onnx>=0.4

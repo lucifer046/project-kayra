@@ -48,7 +48,8 @@ from kayra.ui.controls import KayraControls
 from kayra.ui.components.navigation import Sidebar
 from kayra.ui.components.orb import AssistantOrb
 from kayra.ui.components.primitives import Caption, _label
-from kayra.ui.components.backdrop import AmbientBackdrop, prefers_reduced_motion
+from kayra.ui.components.backdrop import create_backdrop, prefers_reduced_motion
+from kayra.ui import gpu
 from kayra.ui.components.navigation import _motion_allowed
 from kayra.ui.components.dock import FloatingDock
 from kayra.ui.components.chrome import (AppWindowChrome, install_native_chrome,
@@ -381,7 +382,9 @@ class KayraWindow(QMainWindow):
         # ── The ambient ground ──
         # A plain child, positioned by hand and lowered, rather than a layout item: it has to
         # sit BEHIND everything including the rail, and a layout item would take space.
-        self.backdrop = AmbientBackdrop(root)
+        # On the GPU when `ui.gpu` found a usable one (which also moves the whole window's
+        # composition to the GPU), else the CPU-drawn version — identical to look at.
+        self.backdrop = create_backdrop(root)
         self.backdrop.setGeometry(0, 0, root.width(), root.height())
         # Respect the platform's reduced-motion preference. The still frame is a complete
         # picture, so nothing is lost except the drift.
@@ -846,6 +849,21 @@ class KayraWindow(QMainWindow):
         if root is not None and getattr(self, "backdrop", None) is not None:
             self.backdrop.setGeometry(0, 0, root.width(), root.height())
             self.backdrop.lower()
+        self._apply_responsive()
+
+    def _apply_responsive(self):
+        """
+        The window-level half of the responsive layout: the rail's width and the dock's
+        labels, from the window's width. Pages reflow from their own width on their own.
+        """
+        if getattr(self, "sidebar", None) is None or getattr(self, "dock", None) is None:
+            return
+        width = self.width()
+        self.sidebar.set_compact(width < Size.rail_compact_below)
+        if hasattr(self.dock, "set_compact"):
+            self.dock.set_compact(width < Size.narrow_below)
+        self.host.content_left = self.sidebar.width()
+        self.host.reposition_overlays()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1048,8 +1066,18 @@ def main(argv=None):
     # Round produces on 1px borders, which this design uses heavily.
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    # GPU rendering: shared GL contexts, vsync. Must precede the QApplication.
+    gpu.configure_before_app()
 
     app = QApplication(argv)
+    # Decided ONCE: a real GPU, or the CPU (headless, software GL, KAYRA_UI_GPU=off).
+    status = gpu.probe()
+    try:
+        from kayra.core.logbus import Subsystem, info
+        info(Subsystem.UI, f"Rendering: {status.describe()} on "
+                           f"{QGuiApplication.platformName() or 'unknown'}")
+    except Exception:
+        pass
     app.setApplicationName("Kayra")
     app.setOrganizationName("Kayra")
     # The Wayland app-id (and X11 WM_CLASS). Without it Hyprland sees a generic `python3`

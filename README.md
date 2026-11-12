@@ -73,8 +73,9 @@ a local LLM server and it never touches the network.
 
 **Intelligence**
 
-- `cohere` - Command-R for intent classification (the "DMM")
-- `openai` client against **Groq** (primary chat), **Gemini** (fallback), or any local
+- `anthropic` - **Claude Haiku**, the first cloud model for intent classification (the "DMM")
+  and conversation
+- `openai` client against **Groq** and **Gemini** (the fallbacks), or any local
   OpenAI-compatible server (LM Studio / Ollama)
 
 **Automation**
@@ -188,7 +189,7 @@ Kayra:
   ✓ Dependencies                 installed
   ✓ Kayra package                importable
     Local LLM                    available
-  ✓ Cloud keys                   Cohere SET, chat SET
+  ✓ Cloud keys                   cloud key SET
   ✓ Speech model                 full precision
   ✓ Speech device                GPU ready (CUDAExecutionProvider verified)
   ✓ Audio output                 ready
@@ -232,18 +233,23 @@ LOCAL_CHAT_MODEL=local-model
 LOCAL_DECISION_MODEL=local-model
 
 # ── Cloud keys (only needed when no local server is running) ───────────
-CohereAPIKey=...            # intent classification - without it, everything is chat
-GROQ_API_KEY=...            # primary conversational model
-GEMINI_API_KEY=...          # fallback when Groq is rate-limited
+CLAUDE_API_KEY=...          # Claude Haiku: first choice for intent AND chat (console.anthropic.com)
+GROQ_API_KEY=...            # fallback (free key)
+GEMINI_API_KEY=...          # last fallback, and a second vision model
+CLOUD_FIRST=False           # True: use the cloud keys even while a local server runs
 ```
+
+ONE key is enough: every provider both classifies and converses. A claude.ai subscription does
+not include API access; the Claude key comes from console.anthropic.com (pay-as-you-go).
 
 ### Model routing, in one paragraph
 
 Kayra is **local-first**. On startup it probes `LOCAL_BASE_URL`; if something answers, *all*
-traffic goes there and no cloud client is even constructed. If nothing answers, it uses Cohere
-for intent and Groq → Gemini for chat. Set `FORCE_ONLINE=True` to skip the local check.
+traffic goes there and no cloud client is even constructed. If nothing answers, it uses
+Claude → Groq → Gemini for intent and for chat, each only when its key is set. Set
+`FORCE_ONLINE=True` to skip the local check, or `CLOUD_FIRST=True` to prefer the cloud keys.
 
-**Without a Cohere key and without a local server, every request is treated as conversation** -
+**Without any cloud key and without a local server, every request is treated as conversation** -
 no automation, no search routing. That is the single most common cause of "it just chats at me".
 
 ### The rest
@@ -684,9 +690,10 @@ audio device changed underneath her.
 
 Intent classification is not running. Either:
 
-- **No Cohere key and no local server** - every request degrades to conversation. This is stated
+- **No cloud key and no local server** - every request degrades to conversation. This is stated
   at boot.
-- **Cohere is rate-limited** - you will see cooldown warnings, then the same degradation.
+- **Every configured provider failed** - the log names each one and why (`RATE_LIMITED`,
+  `AUTH_FAILURE`, `MODEL_UNAVAILABLE` ...), then the same degradation.
 
 Check what is routing:
 
@@ -695,7 +702,7 @@ Check what is routing:
 ```
 
 The first line tells you which model answered. Note it follows the same local-first rule as the
-assistant - with LM Studio running, it measures your *local* model, not Cohere.
+assistant - with LM Studio running, it measures your *local* model, not the cloud.
 
 ---
 
@@ -863,8 +870,8 @@ Stated plainly. Several are deliberate trade-offs rather than defects.
   listening" if you want it genuinely closed.
 - **Emotion detection is text-only.** It cannot hear "Fine." said angrily - the raw audio never
   enters the process.
-- **Cloud intent classification is Cohere-only**, with no fallback. Without it and without a
-  local server, everything becomes conversation.
+- **Cloud intent classification needs one cloud key** (Claude, Groq or Gemini). Without any and
+  without a local server, everything becomes conversation.
 - **No speaker identification.** Anyone audible can issue commands, bounded only by the safety
   policy and its confirmation prompts.
 - **The proactive agent offers, it does not act.** It can tell you a routine is due; it will not

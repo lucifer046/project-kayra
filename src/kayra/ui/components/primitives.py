@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, Signal, QSize, QPointF, QRectF
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QFrame, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QSizePolicy,
-    QGraphicsOpacityEffect, QButtonGroup,
+    QGraphicsOpacityEffect, QButtonGroup, QGridLayout,
 )
 
 from kayra.ui.theme import (
@@ -626,6 +626,110 @@ class StatRow(QWidget):
 
     def set_value(self, value):
         self.value_label.setText(str(value))
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │                              FACT GRID                                 │
+# └────────────────────────────────────────────────────────────────────────┘
+
+class FactTile(QFrame):
+    """One fact: a quiet label, its value, and an optional line of detail under it."""
+
+    def __init__(self, label, value="", detail="", parent=None):
+        super().__init__(parent)
+        self.setObjectName("FactTile")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(Space.md, Space.sm + 2, Space.md, Space.sm + 2)
+        layout.setSpacing(2)
+        self.label = _label(label, "FactLabel")
+        self.value = _label(value, "FactValue", wrap=True)
+        self.detail = _label(detail, "FactDetail", wrap=True)
+        self.detail.setVisible(bool(detail))
+        for widget in (self.label, self.value, self.detail):
+            widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(widget)
+        layout.addStretch(1)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+    def set(self, label, value, detail=""):
+        self.label.setText(label)
+        self.value.setText(value)
+        self.detail.setText(detail)
+        self.detail.setVisible(bool(detail))
+
+
+class FactGrid(QWidget):
+    """
+    Facts as a grid of tiles that reflows from ITS OWN width: as many columns as fit at
+    `min_column` each, up to `max_columns`.
+
+    It replaced two things that read as clutter: "Label: value" lines stacked as raw text
+    (the speech cards in Settings) and long label ... value tables whose values wrapped into
+    ragged right-aligned columns (System's device sheet). A tile puts the label ABOVE its
+    value, so a long value — a GPU name, a driver string — has the tile's whole width.
+
+    `setText("A: 1\nB: 2")` / `text()` keep the plain-text form for callers that build lines;
+    the text is exactly what is shown, one "Label: value" line per tile.
+    """
+
+    def __init__(self, min_column=200, max_columns=4, parent=None):
+        super().__init__(parent)
+        self._min_column = min_column
+        self._max_columns = max_columns
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(Space.sm)
+        self._grid.setVerticalSpacing(Space.sm)
+        self._tiles = []
+        self._facts = []
+        self._columns = 0
+
+    def set_facts(self, facts):
+        """`facts`: (label, value) or (label, value, detail) tuples, in reading order."""
+        facts = [tuple(f) + ("",) * (3 - len(f)) for f in facts]
+        if facts == self._facts:
+            return
+        self._facts = facts
+        while len(self._tiles) < len(facts):
+            self._tiles.append(FactTile("", "", "", self))
+        for tile, (label, value, detail) in zip(self._tiles, facts):
+            tile.set(str(label), str(value), str(detail or ""))
+        for extra in self._tiles[len(facts):]:
+            extra.hide()
+        self._columns = 0
+        self._reflow()
+
+    def setText(self, text):
+        facts = []
+        for line in str(text or "").splitlines():
+            if not line.strip():
+                continue
+            label, sep, value = line.partition(":")
+            facts.append((label.strip(), value.strip()) if sep else ("", line.strip()))
+        self.set_facts(facts)
+
+    def text(self):
+        return "\n".join(f"{label}: {value}" if label else value
+                         for label, value, _detail in self._facts)
+
+    def _reflow(self):
+        width = max(1, self.width())
+        columns = max(1, min(self._max_columns, width // max(1, self._min_column),
+                             len(self._facts) or 1))
+        if columns == self._columns:
+            return
+        self._columns = columns
+        for tile in self._tiles:
+            self._grid.removeWidget(tile)
+        for column in range(self._max_columns):
+            self._grid.setColumnStretch(column, 1 if column < columns else 0)
+        for index, tile in enumerate(self._tiles[:len(self._facts)]):
+            self._grid.addWidget(tile, index // columns, index % columns)
+            tile.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow()
 
 
 # ┌────────────────────────────────────────────────────────────────────────┐

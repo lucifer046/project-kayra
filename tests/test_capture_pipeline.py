@@ -384,7 +384,7 @@ def section_repair_refuses():
     check("an unchanged result reports itself as unchanged",
           isinstance(outcome, RepairResult) and repair.repair("hello there").changed is False)
     check("the stage keeps counters", set(repair.describe()["stats"]) ==
-          {"seen", "reranked", "phonetic", "unchanged"})
+          {"seen", "reranked", "phonetic", "screen", "unchanged"})
 
     # One stage per process, and injecting vocabulary updates it rather than forking it.
     first = get_transcript_repair(vocabulary=["open chrome"])
@@ -637,6 +637,112 @@ def section_wiring():
           'getattr(engine, "funcs"' in app_source)
 
 
+SCREEN = ["Megha Sharma IITM", "Himanshu Sharma Sports Head Sundarbans", "Send", "Search",
+          "Join now", "Safe House", "General Panchayat", "Council Details 2026_27", "Menu"]
+
+
+def section_screen_names():
+    print_system("\n── Names on screen (2026-11-11) ──────────────────────────")
+
+    reads = []
+
+    def source():
+        reads.append(1)
+        return SCREEN
+
+    repair = make_repair()
+    repair.set_screen_source(source)
+
+    # The mishearings from the audit log of 2026-11-11, each with its name on screen.
+    for heard, meant in (("click sand button", "click Send button"),
+                         ("press the sand button", "press the Send button"),
+                         ("open make her sharma iitm chat", "open Megha Sharma IITM chat"),
+                         ("open sapphire house", "open Safe House"),
+                         ("open general punchayat", "open General Panchayat")):
+        outcome = repair.repair(heard)
+        check(f"'{heard}' -> '{meant}'", outcome.text == meant and outcome.reason.startswith("screen:"),
+              repr(outcome))
+
+    # What it must leave alone.
+    for said in ("tell me about sand dunes",            # conversation: no command head
+                 "search for sand",                      # free text after search
+                 "send hello",                           # a message, not a name
+                 "send hello to raju",                   # nothing on screen sounds like raju
+                 "open safe house",                      # already names something on screen
+                 "message megha sharma saying hi",       # heard right: part of a real name
+                 "click join me",                        # "join" is part of "Join now"
+                 "open central panchayat",               # another first letter: maybe another chat
+                 "open make her sharma",                 # Megha / Himanshu Sharma fit equally
+                 "open council details 2026 27",
+                 "close whatsapp"):
+        outcome = repair.repair(said)
+        check(f"'{said}' is left alone", not outcome.changed, repr(outcome))
+
+    check("a confident recognizer is not second-guessed",
+          not repair.repair("click sand button", confidence=0.97).changed)
+
+    # Its own readings first: an alternative that names something on screen wins.
+    outcome = repair.repair("open sapphire horse", alternatives=[
+        {"text": "open sapphire horse", "confidence": 0.6},
+        {"text": "open safe house", "confidence": 0.3}])
+    check("an alternative naming an on-screen chat is preferred",
+          outcome.text == "open safe house" and outcome.reason == "alternative:screen", repr(outcome))
+
+    # The screen is read once per sentence, not once per rule.
+    reads.clear()
+    fresh = make_repair()
+    fresh.set_screen_source(source)
+    fresh.clock = lambda: 100.0
+    fresh.repair("click sand button")
+    fresh.repair("open sapphire house")
+    check("the screen is read at most once per TTL", len(reads) == 1, str(len(reads)))
+
+    broken = make_repair()
+    broken.set_screen_source(lambda: (_ for _ in ()).throw(RuntimeError("bridge down")))
+    check("a failing screen read costs the repair, never the command",
+          broken.repair("click sand button").text == "click sand button")
+    check("no screen source: nothing changes",
+          not make_repair().repair("click sand button").changed)
+
+    # The reader itself, against a fake extension.
+    from kayra.automation import screen_vocabulary as SV
+
+    class FakeBridge:
+        def __init__(self, live=True):
+            self.live, self.calls = live, []
+
+        def connected(self):
+            return self.live
+
+        def call(self, cmd, timeout=10.0, **args):
+            self.calls.append((cmd, timeout))
+            if cmd == "chat.list":
+                return {"ready": True, "chats": [{"name": "Megha Sharma IITM"}, {"name": "Safe House"}]}
+            if cmd == "tabs.active":
+                return {"url": "https://docs.google.com/spreadsheets/u/0/?q=council"}
+            if cmd == "page.docList":
+                return [{"title": "Council Details 2026_27"}]
+            if cmd == "page.controls":
+                return [{"name": "Search"}, {"name": "Safe House"}, {"name": "x" * 90}]
+            raise AssertionError(cmd)
+
+    saved = SV.BRIDGE
+    try:
+        SV.BRIDGE = FakeBridge()
+        got = SV.names()
+        check("chats, file titles and controls are gathered, deduplicated, long ones dropped",
+              got == ["Megha Sharma IITM", "Safe House", "Council Details 2026_27", "Search"], str(got))
+        check("every read has a short timeout",
+              all(t <= 0.5 for _c, t in SV.BRIDGE.calls), str(SV.BRIDGE.calls))
+        SV.BRIDGE = FakeBridge(live=False)
+        check("no bridge: no names and no calls", SV.names() == [] and not SV.BRIDGE.calls)
+    finally:
+        SV.BRIDGE = saved
+
+    app_source = open(os.path.join(project_root, "src", "kayra", "app.py"), encoding="utf-8").read()
+    check("app.py injects the on-screen names", "set_screen_source(screen_vocabulary.names)" in app_source)
+
+
 # ┌────────────────────────────────────────────────────────────────────────┐
 # │                                RUNNER                                  │
 # └────────────────────────────────────────────────────────────────────────┘
@@ -651,6 +757,7 @@ if __name__ == "__main__":
     section_context_drives_repair()
     section_page()
     section_wiring()
+    section_screen_names()
 
     print_system("\n" + "=" * 60)
     if FAILURES:

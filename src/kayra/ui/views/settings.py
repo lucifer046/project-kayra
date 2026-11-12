@@ -28,14 +28,31 @@ is the one control with no restart note.
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout, QLineEdit, QComboBox, QSizePolicy,
+    QSpacerItem, QFrame,
 )
 
 from kayra.ui.theme import Space, Size, repolish
 from kayra.ui.components.primitives import (
-    Card, Caption, Secondary, StatusPill, AccentButton, GhostButton, Toggle,
-    RowRule, _label,
+    Card, Caption, StatusPill, AccentButton, GhostButton, Toggle,
+    RowRule, FactGrid, SegmentedControl, OutlineButton, _label,
 )
+
+QWIDGETSIZE_MAX = 16777215
+
+
+def fit_field(control):
+    """
+    A settings control that is AT MOST `Size.control_field` wide and shrinks below it.
+
+    Every control used to be FIXED at 300px, which is what kept the whole screen from fitting
+    a narrow window: a fixed control is a fixed minimum for the row, the card and the page.
+    The maximum keeps the single right edge on a wide window; the minimum lets it give way.
+    """
+    control.setMinimumWidth(120)
+    control.setMaximumWidth(Size.control_field)
+    control.setSizePolicy(QSizePolicy.Expanding, control.sizePolicy().verticalPolicy())
+    return control
 from kayra.ui.views.base import View
 
 
@@ -55,12 +72,18 @@ class SettingRow(QWidget):
     assembled rather than designed.
     """
 
+    # Below this width the control moves UNDER its label instead of beside it. A row is the
+    # label's readable minimum plus the control column; narrower than that, side by side means
+    # either a crushed label or a control pushed past the card's edge.
+    STACK_BELOW = Size.control_field + Space.lg + 240
+
     def __init__(self, name, help_text, control, parent=None):
         super().__init__(parent)
         self.setObjectName("SettingRow")
-        layout = QHBoxLayout(self)
+        layout = QBoxLayout(QBoxLayout.LeftToRight, self)
         layout.setContentsMargins(0, Space.sm, 0, Space.sm)
         layout.setSpacing(Space.lg)
+        self._layout = layout
 
         text = QVBoxLayout()
         text.setSpacing(1)
@@ -71,23 +94,74 @@ class SettingRow(QWidget):
             help_label.setMaximumWidth(Size.settings_label_max)
             text.addWidget(help_label)
 
-        # One column, one width, one right edge — for every control type.
+        # One column, one width, one right edge — for every control type — while there is room.
         holder = QWidget()
         holder.setFixedWidth(Size.control_field)
         holder_layout = QHBoxLayout(holder)
         holder_layout.setContentsMargins(0, 0, 0, 0)
         holder_layout.setSpacing(Space.sm)
-        holder_layout.addStretch(1)
         holder_layout.addWidget(control)
+        # ONLY a fixed-size control (a Toggle) is aligned. An aligned widget is given its size
+        # HINT, not the space, so aligning a text field or a combo shrank it to its content and
+        # brought back the ragged right edge `fit_field` exists to remove.
+        self._aligned = (control.minimumWidth() == control.maximumWidth()
+                         or control.sizePolicy().horizontalPolicy() == QSizePolicy.Fixed)
+        if self._aligned:
+            holder_layout.setAlignment(control, Qt.AlignRight | Qt.AlignVCenter)
+        # Takes the slack to the RIGHT of a capped control once the row is stacked, so the
+        # control starts under its label instead of floating in the middle. Zero-width (and
+        # inert) while the row is side by side.
+        self._tail = QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        holder_layout.addItem(self._tail)
+        holder_layout.setStretch(0, 100)      # the control fills to its cap before the spacer
+        self._holder, self._holder_layout = holder, holder_layout
 
         layout.addLayout(text, 1)
         layout.addWidget(holder, 0, Qt.AlignRight | Qt.AlignVCenter)
         self.control = control
+        self.stacked = False
+
+    def set_stacked(self, stacked):
+        """Control beside the label (False) or under it (True). Idempotent."""
+        if stacked == self.stacked:
+            return
+        self.stacked = stacked
+        if stacked:
+            self._layout.setDirection(QBoxLayout.TopToBottom)
+            self._layout.setSpacing(Space.xs)
+            self._layout.setStretch(0, 0)
+            self._holder.setMinimumWidth(0)
+            self._holder.setMaximumWidth(QWIDGETSIZE_MAX)
+            self._layout.setAlignment(self._holder, Qt.Alignment())
+            self._holder_layout.setAlignment(
+                self.control, (Qt.AlignLeft | Qt.AlignVCenter) if self._aligned
+                else Qt.Alignment())
+            self._tail.changeSize(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum)
+            self._holder_layout.invalidate()
+        else:
+            self._layout.setDirection(QBoxLayout.LeftToRight)
+            self._layout.setSpacing(Space.lg)
+            self._layout.setStretch(0, 1)
+            self._holder.setFixedWidth(Size.control_field)
+            self._layout.setAlignment(self._holder, Qt.AlignRight | Qt.AlignVCenter)
+            self._holder_layout.setAlignment(
+                self.control, (Qt.AlignRight | Qt.AlignVCenter) if self._aligned
+                else Qt.Alignment())
+            self._tail.changeSize(0, 0, QSizePolicy.Fixed, QSizePolicy.Minimum)
+            self._holder_layout.invalidate()
+
+    def resizeEvent(self, event):
+        # Decided from the row's OWN width, so it holds in any card on any screen without the
+        # window having to tell it anything. A direction change alters the height only, so it
+        # cannot feed back into the width that decided it.
+        super().resizeEvent(event)
+        self.set_stacked(self.width() < self.STACK_BELOW)
 
 
 class SettingsView(View):
     title = "Settings"
-    subtitle = "Configuration is stored in .env. Secrets are never displayed."
+    subtitle = ("Configuration is stored in .env. API keys go to the system keyring when "
+                "there is one, and are never displayed.")
 
     # (env key, label, help, kind, options)
     GENERAL = (
@@ -95,26 +169,81 @@ class SettingsView(View):
         ("USERNAME", "Your name", "Used when Kayra addresses you.", "text", None),
     )
     VOICE = (
-        ("ASSISTANT_VOICE", "Voice", "Kokoro voice model, e.g. am_adam or af_bella.",
-         "text", None),
-        ("INPUT_LANGUAGE", "Recognition language", "Language code for speech input.",
-         "choice", ["en-US", "en-GB", "en-IN", "hi-IN", "es-ES", "fr-FR", "de-DE"]),
+        ("ASSISTANT_VOICE", "Voice", "How Kayra sounds. Applies to the next sentence.",
+         "voice", None),
+        ("ASSISTANT_SPEECH_RATE", "Speaking speed", "How fast Kayra talks; 1.1 is normal. Applies to the next "
+         "sentence. You can also say \u201cspeak a bit faster\u201d.", "choice",
+         ["0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5"]),
+        ("VOICE_FOLLOWS_LANGUAGE", "Speak other languages in their own voice",
+         "A Hindi, Japanese or Mandarin sentence is spoken by a voice of that language.", "bool", None),
+        ("INPUT_LANGUAGE", "Recognition language", "The language you speak to Kayra in.",
+         "language", None),
+    )
+    LANGUAGES = (
+        ("en-US", "English (United States)"), ("en-GB", "English (United Kingdom)"),
+        ("en-IN", "English (India)"), ("hi-IN", "Hindi (India)"), ("es-ES", "Spanish (Spain)"),
+        ("fr-FR", "French (France)"), ("de-DE", "German (Germany)"),
+    )
+    # What an empty field means, shown in it, so a blank box never looks broken.
+    PLACEHOLDERS = {
+        "ASSISTANT_NAME": "Kayra",
+        "LOCAL_BASE_URL": "http://127.0.0.1:1234/v1",
+    }
+    # Kokoro voice ids are "<language><gender>_<name>"; the list shows them in words.
+    VOICE_LANGUAGES = {
+        "a": "American English", "b": "British English", "e": "Spanish", "f": "French",
+        "h": "Hindi", "i": "Italian", "j": "Japanese", "p": "Portuguese", "z": "Mandarin",
+    }
+    # The four sections the screen is split into, in order.
+    SECTIONS = (
+        ("general", "General"), ("voice", "Voice"), ("models", "AI models"),
+        ("gestures", "Gestures"), ("proactive", "Proactive"),
     )
     # STT_BROWSER is deliberately NOT in the group above any more. Everything there is written
     # to `.env` and applies at the next start; the speech backend now switches the LIVE
     # session, so it has its own card and its own transactional handler — see `_build_speech`.
+    # ONE switch decides local vs cloud. Off (the default): LM Studio answers whenever it is
+    # running, and the cloud only when it is not. FORCE_ONLINE still works from `.env` but is
+    # no longer offered here — two toggles that both meant "use the cloud" was a puzzle.
     MODELS = (
-        ("FORCE_ONLINE", "Always use cloud models",
-         "Skip the local model check entirely at startup.", "bool", None),
-        ("LOCAL_BASE_URL", "Local model endpoint",
-         "An OpenAI-compatible server, e.g. http://localhost:1234/v1.", "text", None),
+        ("CLOUD_FIRST", "Use cloud models even when LM Studio is running",
+         "Off: your local model answers whenever LM Studio is running, and Claude, Groq or "
+         "Gemini only when it is not. On: the cloud models answer even while LM Studio runs.",
+         "bool", None),
+        ("LOCAL_BASE_URL", "LM Studio address",
+         "Where your local model server listens. Leave empty for the default.", "text", None),
     )
-    KEYS = (
-        ("CohereAPIKey", "Cohere",
-         "Intent classification. Without it, every request is treated as conversation."),
-        ("GROQ_API_KEY", "Groq", "Primary conversational model."),
-        ("GEMINI_API_KEY", "Gemini", "Fallback when Groq is rate-limited."),
+
+    # (provider, key name, what it is for, ((model env key, label, help), ...))
+    PROVIDERS = (
+        ("Claude", "CLAUDE_API_KEY",
+         "Asked first, for commands and conversation. A key from console.anthropic.com "
+         "(pay-as-you-go; a claude.ai plan does not include API access).",
+         (("CLAUDE_MODEL", "Model",
+           "Haiku 5.5 is the fastest and cheapest, and can read the screen."),)),
+        ("Groq", "GROQ_API_KEY",
+         "Used when Claude is not set or cannot answer. Free key: console.groq.com.",
+         (("GROQ_CHAT_MODEL", "Chat model", "Answers conversation."),
+          ("GROQ_DECISION_MODEL", "Command model",
+           "Works out what you asked for. The small model is the fastest."))),
+        ("Gemini", "GEMINI_API_KEY",
+         "The last fallback, and a second model for reading the screen. Key from "
+         "aistudio.google.com.",
+         (("GEMINI_CHAT_MODEL", "Model",
+           "gemini-flash-latest follows Google's current Flash model."),)),
     )
+    # What each model box shows when `.env` names nothing — the engine's own defaults.
+    DEFAULT_MODELS = {
+        "CLAUDE_MODEL": "claude-haiku-5-5",
+        "GROQ_CHAT_MODEL": "openai/gpt-oss-120b",
+        "GROQ_DECISION_MODEL": "openai/gpt-oss-20b",
+        "GEMINI_CHAT_MODEL": "gemini-flash-latest",
+    }
+    KEY_STATUS = {
+        "keyring": ("In keyring", "success"),
+        "file": ("Saved", "success"),
+        "missing": ("Missing", "warning"),
+    }
 
     def __init__(self, bridge, parent=None):
         super().__init__(bridge, parent)
@@ -122,17 +251,24 @@ class SettingsView(View):
         self._controls = {}
         self._secret_fields = {}
 
-        self._build_group("General", self.GENERAL)
-        self._build_group("Voice and speech", self.VOICE)
+        self._build_sections()
+        self._section("general")
+        self._build_group("Identity", self.GENERAL)
+        self._section("voice")
+        self._build_group("Voice", self.VOICE)
         self._build_speech()
         self._build_device()
-        self._build_group("Models", self.MODELS)
-        self._build_keys()
+        self._section("models")
+        self._build_routing()
+        self._build_providers()
+        self._section("gestures")
         self._build_gesture()
+        self._section("proactive")
         self._build_proactive()
         self._build_presence()
         self._build_actions()
         self.content.addStretch(1)
+        self.show_section("general")
 
         # GPU telemetry is the only value on this screen with no event source, so it is the
         # only thing here on a timer — and the timer runs ONLY while the screen is visible
@@ -157,12 +293,27 @@ class SettingsView(View):
             self._controls[env_key] = (control, kind)
             if index:
                 card.body.addWidget(RowRule())      # a hairline, not a gap
-            card.body.addWidget(SettingRow(label, help_text, control))
+            shown = control
+            if kind == "voice":
+                # N3.5: hear a voice before saving it.
+                shown = QWidget()
+                line = QHBoxLayout(shown)
+                line.setContentsMargins(0, 0, 0, 0)
+                line.setSpacing(Space.sm)
+                line.addWidget(control, 1)
+                play = GhostButton("Play")
+                play.setToolTip("Hear this voice")
+                play.clicked.connect(lambda _=False, c=control: self.bridge.preview_voice(c.currentData() or c.currentText()))
+                line.addWidget(play)
+                self.voice_preview = play
+            card.body.addWidget(SettingRow(label, help_text, shown))
         if restart_note:
-            note = Caption("Changes apply the next time Kayra starts.")
+            note = Caption("Changes apply the next time Kayra starts."
+                           if title != "Voice" else
+                           "The voice changes on Save; the language at the next start.")
             note.setContentsMargins(0, Space.sm, 0, 0)
             card.body.addWidget(note)
-        self.content.addWidget(card)
+        self._add(card)
 
     def _make_control(self, env_key, kind, options):
         value = self._current(env_key)
@@ -172,16 +323,123 @@ class SettingsView(View):
             control = QComboBox()
             control.setEditable(False)
             control.addItems(options or [])
-            control.setFixedWidth(Size.control_field)
+            fit_field(control)
             if value and value in (options or []):
                 control.setCurrentText(value)
             elif value:
                 control.addItem(value)
                 control.setCurrentText(value)
+        elif kind == "language":
+            control = QComboBox()
+            control.setEditable(False)
+            for code, name in self.LANGUAGES:
+                control.addItem(name, code)
+            current = value or "en-US"
+            if control.findData(current) < 0:
+                control.addItem(current, current)
+            control.setCurrentIndex(control.findData(current))
+            fit_field(control)
+        elif kind == "voice":
+            control = QComboBox()
+            control.setEditable(False)
+            voices = self.bridge.available_voices()
+            current = value or self.bridge.current_voice() or (
+                "am_adam" if str(self._current("ASSISTANT_GENDER", "Female")).lower() == "male"
+                else "af_bella")
+            if current and current not in voices:
+                voices = [current] + list(voices)
+            for voice in voices:
+                control.addItem(self._voice_label(voice), voice)
+            index = control.findData(current)
+            control.setCurrentIndex(max(0, index))
+            control.setMaxVisibleItems(14)
+            fit_field(control)
         else:
             control = QLineEdit(str(value))
-            control.setFixedWidth(Size.control_field)
+            placeholder = self.PLACEHOLDERS.get(env_key)
+            if env_key == "USERNAME":
+                import getpass
+                try:
+                    placeholder = getpass.getuser().title()
+                except Exception:
+                    placeholder = "User"
+            if placeholder:
+                control.setPlaceholderText(f"{placeholder}  (default)")
+            fit_field(control)
         return control
+
+    @classmethod
+    def _voice_label(cls, voice):
+        """'af_bella' -> 'Bella · American English, female'."""
+        prefix, _, name = str(voice).partition("_")
+        if len(prefix) != 2 or not name:
+            return str(voice)
+        language = cls.VOICE_LANGUAGES.get(prefix[0], prefix[0].upper())
+        gender = {"f": "female", "m": "male"}.get(prefix[1], "")
+        return f"{name.title()}  ·  {language}" + (f", {gender}" if gender else "")
+
+    # ──────────────────────────────────────────────────────────────────
+    #                    SECTIONS AND THE PINNED SAVE BAR
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_sections(self):
+        """
+        One section at a time, chosen from a segmented switcher (a dropdown on a narrow
+        window, where five segments do not fit). The page used to be eleven cards in one
+        scroll, which is what made it hard to find anything; each section is now one or two
+        screens of related settings.
+        """
+        self.section_switch = SegmentedControl(self.SECTIONS, "general")
+        self.section_switch.changed.connect(self.show_section)
+        self.section_combo = QComboBox()
+        for key, label in self.SECTIONS:
+            self.section_combo.addItem(label, key)
+        self.section_combo.currentIndexChanged.connect(
+            lambda i: self.show_section(self.section_combo.itemData(i)))
+        self.section_combo.hide()
+        switch_row = QHBoxLayout()
+        switch_row.setContentsMargins(0, 0, 0, Space.xs)
+        switch_row.addWidget(self.section_switch)
+        switch_row.addWidget(self.section_combo)
+        switch_row.addStretch(1)
+        self.content.addLayout(switch_row)
+
+        self._sections = {}
+        for key, _name in self.SECTIONS:
+            box = QWidget()
+            layout = QVBoxLayout(box)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(Space.base)
+            box.hide()
+            self._sections[key] = (box, layout)
+            self.content.addWidget(box)
+        self._target = None
+
+    def _section(self, key):
+        self._target = self._sections[key][1]
+
+    def _add(self, widget):
+        (self._target or self.content).addWidget(widget)
+
+    def show_section(self, key):
+        if key not in self._sections:
+            return
+        for name, (box, _layout) in self._sections.items():
+            box.setVisible(name == key)
+        self.current_section = key
+        self.section_switch.select(key)
+        index = self.section_combo.findData(key)
+        if index >= 0 and self.section_combo.currentIndex() != index:
+            self.section_combo.blockSignals(True)
+            self.section_combo.setCurrentIndex(index)
+            self.section_combo.blockSignals(False)
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        narrow = self.width() < 600
+        self.section_switch.setVisible(not narrow)
+        self.section_combo.setVisible(narrow)
 
     # ──────────────────────────────────────────────────────────────────
     #                          SPEECH INPUT
@@ -213,7 +471,7 @@ class SettingsView(View):
             self.backend_combo.addItem(stt_backend.label_for(current), current)
             index = self.backend_combo.count() - 1
         self.backend_combo.setCurrentIndex(index)
-        self.backend_combo.setFixedWidth(Size.control_field)
+        fit_field(self.backend_combo)
         self.backend_combo.currentIndexChanged.connect(self._on_backend)
 
         card.body.addWidget(SettingRow(
@@ -225,14 +483,16 @@ class SettingsView(View):
 
         self.backend_pill = StatusPill("Checking", "neutral")
         card.add_header_widget(self.backend_pill)
-        self.backend_active = Secondary("Reading the live session…")
-        self.backend_active.setWordWrap(True)
+        self.backend_active = FactGrid(min_column=170, max_columns=3)
+        self.backend_active.setText("Status: reading the live session…")
         self.backend_detail = Caption("")
         self.backend_detail.setWordWrap(True)
+        card.body.addSpacing(Space.sm)
         card.body.addWidget(self.backend_active)
+        card.body.addSpacing(Space.xs)
         card.body.addWidget(self.backend_detail)
 
-        self.content.addWidget(card)
+        self._add(card)
         self.bridge.sttBackendChanged.connect(lambda _state: self._refresh_backend())
         self._refresh_backend()
 
@@ -338,7 +598,7 @@ class SettingsView(View):
         for mode in tts_device.MODES:
             self.device_combo.addItem(tts_device.MODE_LABELS[mode], mode)
         self.device_combo.setCurrentIndex(list(tts_device.MODES).index(current))
-        self.device_combo.setFixedWidth(Size.control_field)
+        fit_field(self.device_combo)
         self.device_combo.currentIndexChanged.connect(self._on_device_mode)
 
         card.body.addWidget(SettingRow(
@@ -349,11 +609,13 @@ class SettingsView(View):
         card.body.addWidget(RowRule())
 
         self.device_status_pill = StatusPill("Checking", "neutral")
-        self.device_active = Secondary("Reading the live session\u2026")
-        self.device_active.setWordWrap(True)
+        self.device_active = FactGrid(min_column=170, max_columns=3)
+        self.device_active.setText("Status: reading the live session\u2026")
         self.device_detail = Caption("")
         self.device_detail.setWordWrap(True)
+        card.body.addSpacing(Space.sm)
         card.body.addWidget(self.device_active)
+        card.body.addSpacing(Space.xs)
         card.body.addWidget(self.device_detail)
         card.add_header_widget(self.device_status_pill)
 
@@ -362,7 +624,7 @@ class SettingsView(View):
         self.gpu_line.setWordWrap(True)
         card.body.addWidget(self.gpu_line)
 
-        self.content.addWidget(card)
+        self._add(card)
         self._refresh_device()
 
     def _on_device_mode(self, _index):
@@ -464,39 +726,190 @@ class SettingsView(View):
             parts.append(f"{metrics['temperature_c']:.0f}\u00b0C")
         self.gpu_line.setText("  \u00b7  ".join(parts))
 
-    def _build_keys(self):
-        card = Card("API keys")
-        card.body.setSpacing(0)
-        intro = Caption(
-            "Stored in .env and never shown. Type a new value to replace an existing key; "
-            "leave a field empty to keep what is already stored.")
-        intro.setContentsMargins(0, 0, 0, Space.sm)
-        card.body.addWidget(intro)
+    # ──────────────────────────────────────────────────────────────────
+    #                     CLOUD MODELS: KEYS AND MODEL CHOICE
+    # ──────────────────────────────────────────────────────────────────
 
-        for index, (env_key, label, help_text) in enumerate(self.KEYS):
-            if index:
-                card.body.addWidget(RowRule())
-            present = bool(self._current(env_key))
+    def _build_routing(self):
+        """Local vs cloud: the one switch, the endpoint, and what is ACTUALLY answering now."""
+        self._build_group("Local or cloud", self.MODELS, restart_note=False)
+        card = self._target.itemAt(self._target.count() - 1).widget()
+        self.routing_facts = FactGrid(min_column=200, max_columns=2)
+        card.body.addSpacing(Space.sm)
+        card.body.addWidget(self.routing_facts)
+        self._refresh_routing()
+
+    def _refresh_routing(self):
+        state = self.bridge.model_routing()
+        if not state:
+            self.routing_facts.set_facts([("Answering now", "Kayra is still starting")])
+            return
+        self.routing_facts.set_facts([
+            ("Answering now", state.get("answering", "")),
+            ("LM Studio", "running" if state.get("mode") == "local"
+             else "not used" if self._controls["CLOUD_FIRST"][0].isChecked()
+             else "not running", state.get("local_url", "")),
+        ])
+
+    # What each provider is FOR, under its name.
+    PROVIDER_ROLES = {"Claude": "First choice", "Groq": "Fallback", "Gemini": "Last fallback"}
+
+    def _build_providers(self):
+        """
+        One panel per provider: name and role, where its key is kept, the key, its model(s),
+        and Test / Remove.
+
+        Models are CHOSEN, never typed. A free-text model box let a typo become "no model
+        could answer" at the next request; the list holds the models Kayra knows to work, and
+        a successful Test replaces it with exactly what that key can use.
+
+        Keys are SAVED with the Save bar like every other setting and applied to the running
+        engine at once. Test checks the key on screen — or the stored one when the field is
+        empty — with one tiny request. Remove deletes the stored key after asking.
+        """
+        card = Card("Cloud models")
+        card.body.setSpacing(Space.md)
+        self._provider_ui = {}
+        self.key_storage = Caption("")
+        self.key_storage.setWordWrap(True)
+        card.body.addWidget(self.key_storage)
+
+        suggestions = self.bridge.provider_model_suggestions()
+        for provider, key_name, purpose, models in self.PROVIDERS:
+            panel = QFrame()
+            panel.setObjectName("ProviderPanel")
+            body = QVBoxLayout(panel)
+            body.setContentsMargins(Space.base, Space.md, Space.base, Space.sm)
+            body.setSpacing(0)
+
+            header = QHBoxLayout()
+            header.setSpacing(Space.sm)
+            names = QVBoxLayout()
+            names.setSpacing(0)
+            names.addWidget(_label(provider, "ProviderName"))
+            names.addWidget(_label(self.PROVIDER_ROLES.get(provider, ""), "ProviderRole"))
+            header.addLayout(names, 1)
+            pill = StatusPill("Missing", "warning")
+            header.addWidget(pill, 0, Qt.AlignTop)
+            body.addLayout(header)
+            body.addSpacing(Space.xs)
+
             field = QLineEdit()
             field.setEchoMode(QLineEdit.Password)
             field.setProperty("secret", "true")
             repolish(field)
-            field.setFixedWidth(Size.control_field - 66)
-            field.setPlaceholderText("Stored — type to replace" if present else "Not set")
-            self._secret_fields[env_key] = field
+            fit_field(field)
+            body.addWidget(SettingRow("API key", purpose, field))
+            self._secret_fields[key_name] = field
 
-            control = QWidget()
-            row = QHBoxLayout(control)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(Space.sm)
-            pill = StatusPill("Set" if present else "Missing",
-                              "success" if present else "warning")
-            pill.setFixedWidth(58)
-            row.addWidget(pill)
-            row.addWidget(field)
+            combos = []
+            for env_key, label, help_text in models:
+                combo = QComboBox()
+                combo.setEditable(False)
+                fit_field(combo)
+                current = self._current(env_key) or self.DEFAULT_MODELS.get(env_key, "")
+                self._fill_models(combo, suggestions.get(provider, []), current)
+                self._controls[env_key] = (combo, "model")
+                combos.append(combo)
+                body.addWidget(SettingRow(label, help_text, combo))
 
-            card.body.addWidget(SettingRow(label, help_text, control))
-        self.content.addWidget(card)
+            actions = QHBoxLayout()
+            actions.setContentsMargins(0, Space.sm, 0, Space.xs)
+            actions.setSpacing(Space.sm)
+            test = OutlineButton("Test key")
+            test.setToolTip(f"Send one tiny request to {provider} with this key and model")
+            remove = GhostButton("Remove key")
+            remove.setProperty("tone", "danger")
+            result_pill = StatusPill("", "neutral")
+            result_pill.hide()
+            result = Caption("")
+            result.setWordWrap(True)
+            result.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            actions.addWidget(test)
+            actions.addWidget(remove)
+            actions.addWidget(result_pill)
+            actions.addWidget(result, 1)
+            body.addLayout(actions)
+            card.body.addWidget(panel)
+
+            test.clicked.connect(lambda _=False, p=provider: self._test_provider(p))
+            remove.clicked.connect(lambda _=False, p=provider: self._remove_provider_key(p))
+            self._provider_ui[provider] = {
+                "key_name": key_name, "field": field, "pill": pill, "combos": combos,
+                "test": test, "remove": remove, "result": result, "result_pill": result_pill,
+            }
+
+        self.bridge.providerTested.connect(self._on_provider_tested)
+        self._add(card)
+        self._refresh_key_status()
+
+    @staticmethod
+    def _fill_models(combo, models, current):
+        """The known models plus whatever is configured; the current one selected."""
+        combo.blockSignals(True)
+        combo.clear()
+        names = list(dict.fromkeys([m for m in models if m] + ([current] if current else [])))
+        for name in names:
+            combo.addItem(name, name)
+        index = combo.findData(current) if current else 0
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+
+    def _refresh_key_status(self):
+        status = self.bridge.provider_key_status()
+        where = self.bridge.key_storage_label()
+        self.key_storage.setText(
+            "Kayra asks Claude first, then Groq, then Gemini, for commands and conversation "
+            f"alike. One key is enough. New keys are saved in {where} and never shown again.")
+        for provider, ui in getattr(self, "_provider_ui", {}).items():
+            state = status.get(provider, "missing")
+            text, tone = self.KEY_STATUS.get(state, self.KEY_STATUS["missing"])
+            ui["pill"].set_status(text, tone)
+            ui["field"].setPlaceholderText(
+                "Type to replace" if state != "missing" else "Paste a key")
+            ui["remove"].setEnabled(state != "missing")
+
+    def _test_provider(self, provider):
+        ui = self._provider_ui[provider]
+        model = (str(ui["combos"][0].currentData() or ui["combos"][0].currentText()).strip()
+                 if ui["combos"] else "")
+        ui["test"].setEnabled(False)
+        ui["result_pill"].hide()
+        ui["result"].setText(f"Testing {model}…")
+        self.bridge.test_provider(provider, ui["field"].text().strip(), model)
+
+    def _on_provider_tested(self, provider, result):
+        ui = getattr(self, "_provider_ui", {}).get(provider)
+        if ui is None:
+            return
+        ui["test"].setEnabled(True)
+        ok = bool(result.get("ok"))
+        ui["result_pill"].set_status("Works" if ok else "Failed", "success" if ok else "danger")
+        ui["result_pill"].show()
+        ui["result"].setText(str(result.get("message") or ""))
+        models = result.get("models") or []
+        if ok and models:
+            suggestions = self.bridge.provider_model_suggestions().get(provider, [])
+            for combo in ui["combos"]:
+                current = str(combo.currentData() or combo.currentText()).strip()
+                ordered = [m for m in suggestions if m in models] + models
+                self._fill_models(combo, ordered, current)
+
+    def _remove_provider_key(self, provider):
+        from kayra.ui.components.confirm import ConfirmDialog
+        if not ConfirmDialog.ask(
+                self, f"Remove the {provider} key?",
+                f"Kayra will stop using {provider} until a new key is saved. The key is "
+                "deleted from this computer and cannot be shown again.",
+                confirm_label="Remove key"):
+            return
+        outcome = self.bridge.save_provider_key(provider, "")
+        ui = self._provider_ui[provider]
+        ui["field"].clear()
+        ui["result_pill"].hide()
+        ui["result"].setText(f"{provider} key removed." if outcome.get("where")
+                             else "Could not remove the key — check file permissions.")
+        self._refresh_key_status()
 
     # ──────────────────────────────────────────────────────────────────
     #                       HAND GESTURE CONTROL
@@ -570,7 +983,7 @@ class SettingsView(View):
                                       "starts.")
         self.gesture_detail.setContentsMargins(0, Space.sm, 0, 0)
         card.body.addWidget(self.gesture_detail)
-        self.content.addWidget(card)
+        self._add(card)
 
         self.bridge.gestureStateChanged.connect(self._on_gesture_status)
         # Built before the backend is ready, like every other screen — so it must re-read when
@@ -653,7 +1066,7 @@ class SettingsView(View):
         self._controls["PROACTIVE_AGENT_ENABLED"] = (enabled_control, "bool")
         card.body.addWidget(SettingRow(
             "Enable at startup", "Whether the service starts with Kayra.", enabled_control))
-        self.content.addWidget(card)
+        self._add(card)
 
     # (env key, category, label, help)
     PRESENCE = (
@@ -711,7 +1124,7 @@ class SettingsView(View):
                        "Turning off Unprompted suggestions silences all of these.")
         note.setContentsMargins(0, Space.sm, 0, 0)
         card.body.addWidget(note)
-        self.content.addWidget(card)
+        self._add(card)
 
     def _on_presence(self, enabled):
         self.bridge.set_presence(bool(enabled))
@@ -719,12 +1132,16 @@ class SettingsView(View):
             control.setEnabled(bool(enabled))
 
     def _build_actions(self):
-        row = QWidget()
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
+        """The Save bar: OUTSIDE the scroll area, pinned to the bottom of the screen, so saving
+        never means scrolling to the end of a section to find the button."""
+        bar = QFrame()
+        bar.setObjectName("ActionBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(Space.lg, Space.sm, Space.lg, Space.sm)
         layout.setSpacing(Space.sm)
 
         self.status = Caption("")
+        self.status.setWordWrap(True)
         save = AccentButton("Save changes")
         save.clicked.connect(self._save)
         reload_button = GhostButton("Reload")
@@ -733,9 +1150,8 @@ class SettingsView(View):
         layout.addWidget(self.status, 1)
         layout.addWidget(reload_button)
         layout.addWidget(save)
-        self.content.addWidget(row)
-
-    # ──────────────────────────────────────────────────────────────────
+        self.layout().addWidget(bar)
+        self.action_bar = bar
 
     def _save(self):
         from kayra.core.config import write_env_values
@@ -744,6 +1160,8 @@ class SettingsView(View):
         for env_key, (control, kind) in self._controls.items():
             if kind == "bool":
                 updates[env_key] = "True" if control.isChecked() else "False"
+            elif kind in ("model", "voice", "language"):
+                updates[env_key] = str(control.currentData() or control.currentText()).strip()
             elif kind == "choice":
                 updates[env_key] = control.currentText().strip()
             else:
@@ -754,13 +1172,6 @@ class SettingsView(View):
         if getattr(self, "device_combo", None) is not None:
             updates["TTS_DEVICE_MODE"] = self.device_combo.currentData()
 
-        # Secrets: only send what was actually typed. An untouched field must never overwrite
-        # a stored key with an empty string.
-        for env_key, field in self._secret_fields.items():
-            typed = field.text().strip()
-            if typed:
-                updates[env_key] = typed
-
         previous = {key: self._current(key) for key in updates}
 
         if write_env_values(updates):
@@ -770,11 +1181,39 @@ class SettingsView(View):
             # print the value of anything it classifies as a credential.
             from kayra.core.settings_log import get_settings_recorder
             get_settings_recorder().record_many(updates, previous)
-            for env_key, field in self._secret_fields.items():
-                if field.text().strip():
-                    field.clear()
-                    field.setPlaceholderText("Stored — type to replace")
-            self.status.setText("Saved. Restart Kayra for model and voice changes to apply.")
+            # Keys: only what was actually typed (an untouched field never erases a stored
+            # key), each through the keyring-or-file store, applied to the engine at once.
+            saved, failed = [], []
+            for provider, ui in getattr(self, "_provider_ui", {}).items():
+                typed = ui["field"].text().strip()
+                if not typed:
+                    continue
+                outcome = self.bridge.save_provider_key(provider, typed)
+                (saved if outcome.get("where") else failed).append(provider)
+                if outcome.get("where"):
+                    ui["field"].clear()
+            # Model ids apply NOW too: the engine re-reads them and rebuilds its clients.
+            try:
+                self.bridge.reload_providers()
+            except Exception:
+                pass
+            self._refresh_routing()
+            # And the voice: the running speech engine switches at the next sentence.
+            if "ASSISTANT_VOICE" in updates:
+                self.bridge.apply_voice(updates["ASSISTANT_VOICE"])
+            if "ASSISTANT_SPEECH_RATE" in updates:
+                self.bridge.apply_speech_rate(updates["ASSISTANT_SPEECH_RATE"])
+            if "VOICE_FOLLOWS_LANGUAGE" in updates:
+                self.bridge.apply_follow_language(updates["VOICE_FOLLOWS_LANGUAGE"] == "True")
+            self._refresh_key_status()
+            if failed:
+                self.status.setText("Saved, but the key for " + ", ".join(failed)
+                                    + " could not be stored.")
+            elif saved:
+                self.status.setText("Saved. " + ", ".join(saved) + " key in use now; voice "
+                                    "changes apply at the next start.")
+            else:
+                self.status.setText("Saved. Models apply now; voice changes at the next start.")
         else:
             self.status.setText("Could not write .env — check file permissions.")
 
@@ -788,8 +1227,13 @@ class SettingsView(View):
             elif kind == "choice":
                 if value:
                     control.setCurrentText(value)
+            elif kind in ("model", "voice", "language"):
+                index = control.findData(value or self.DEFAULT_MODELS.get(env_key, ""))
+                if index >= 0:
+                    control.setCurrentIndex(index)
             else:
                 control.setText(str(value))
+        self._refresh_key_status()
         self.status.setText("Reloaded from .env.")
 
     def on_show(self):
@@ -803,6 +1247,8 @@ class SettingsView(View):
         self._sync_presence()
         self._refresh_backend()
         self._refresh_device()
+        self._refresh_key_status()
+        self._refresh_routing()
         self._gpu_timer.start()
 
     def _sync_presence(self):

@@ -1,7 +1,9 @@
 # Browser Control — Implementation Plan (round 5)
 
-> **Status: IN PROGRESS — Part 1 of 7 done, plus the AI understanding layer (2026-11-10).**
-> See §10 for the parts and what is next (Part 2). Written 2026-11-10 at the user's request; the user asked for it to be built one part
+> **Bugs and errors are NOT in this file** — see [`BUGS.md`](BUGS.md) (open bugs first).
+>
+> **Status: IN PROGRESS — Parts 1, 1b, 2 (2a, 2b, 2c), 2M, 3, 4, 5, 5P, 6 (6a + 6b), 7 (7a/7b/7c), 8–16 and the V9 / V11 fix rounds done (2026-11-11).**
+> See §10 for the parts and what is next (left: H2 phrasings + tone, H3 other apps, H4 multi-app sends, M4.2–M4.5, 5P's P4; 2M and WhatsApp still need live tries). Written 2026-11-10 at the user's request; the user asked for it to be built one part
 > per session because of usage quota.
 > Implement ONLY what the user asks for (all, a phase, or numbered items). Tick items off in
 > the checklist at the bottom and add a changelog entry to
@@ -69,8 +71,9 @@ Rules (each has bitten before):
   (`linux._browser_in_front`). Keep it.
 - **Spoken results are one or two plain sentences** and say what actually happened
   ("Opened Budget 2026, the newest of 3 matches"), never "Done." for a navigation.
-- **Wait for readiness, not fixed sleeps:** add an extension command
-  `page.waitFor {text|selector|urlIncludes, timeoutMs}` and use it instead of `SLEEP(1.5)`.
+- **Wait for readiness, not fixed sleeps:** `web_macros._wait_for` (the extension's
+  `page.waitFor`) or `web_macros._until` (try the action, short poll, try again). Never a
+  fixed `SLEEP` in front of a page action — a test in `test_browser_control.py` counts them.
 - Logs/audit carry counts and ids, never email bodies, sheet contents or document text.
 
 ## 3. Safety (unchanged rules, extended)
@@ -380,12 +383,14 @@ most recent message), learn from how the user talks, and reuse what it learned.
 
 ## 7. Open decisions (ask the user when you reach them)
 
-- **D1** Shopping: stop at "add to cart"? (recommended: yes)
-- **D2** Form profile fields to store in `data/profile.json` (name, email, phone, address,
-  college, roll number?) — never passwords/cards.
-- **D3** May Kayra read Drive/Docs **file names** (in Chrome only, never stored) to search them?
+- **D1** Shopping: stop at "add to cart"? — **answered 2026-11-11: search and open ONLY** (no
+  add-to-cart, no cart page, no checkout; the policy refuses those clicks).
+- **D2** Form profile fields to store in `data/profile.json` — **answered 2026-11-11: name,
+  email, phone, postal address, college and roll number, date of birth and gender** — never
+  passwords/cards.
+- **D3** May Kayra read Drive/Docs **file names** (in Chrome only, never stored) to search them? — **approved 2026-11-10**: matched locally, never sent to a model.
 - **D4** URLs of the user's IITM portals for the site registry.
-- **D5** Extra permissions: `downloads` (C11), `tabGroups` (B4). `debugger` is NOT to be added.
+- **D5** Extra permissions: `downloads` (C11) — **approved 2026-11-10**, in 1.6.0; `tabGroups` (B4) — **approved 2026-11-10**, in 1.5.0. `debugger` is NOT to be added.
 
 ## 7a. Which local model runs the page agent  *(decided 2026-11-10)*
 
@@ -407,6 +412,26 @@ Studio id, and add `PAGE_AGENT_MODEL` (new) defaulting to the same.
 **Fallback / fast lane: keep `gemma-4-e4b`** for quick single-step decisions if Qwen is
 unloaded, and **`nomic-embed-text`** for the semantic matcher (H0.3).
 **Do not** load two 8–9B models at once on this GPU.
+
+**Measured 2026-11-11** (`tests/bench_page_agent.py`: 30 one-step decisions on Gmail / WhatsApp /
+Sheets / shop / form / settings / GitHub-shaped pages through the real `pageSnapshot`, prompt
+and parser; local only; one model on the GPU at a time — loading both fails on 8 GB):
+
+| Model | Valid JSON | Correct action | Median / worst s per step | Whole runs (`--loops`) |
+|---|---|---|---|---|
+| Qwen3.5-9B (before prompt tuning) | 28/30 | 21/30 | 2.26 / 3.36 | — |
+| gemma-4-e4b (before prompt tuning) | 22/30 | 17/30 | 0.69 / 1.79 | — |
+| **Qwen3.5-9B** (tuned, `/no_think`) | 30/30 | **30/30** | 1.40 / 2.38 | 2/2 |
+| **gemma-4-e4b** (tuned) | 30/30 | **27/30** | 0.70 / 0.95 | 2/2 |
+
+What the tuning was: rules + four worked examples in the agent prompt ("type, don't click a
+text box", "Enter after a search", "answer a question from the page"), a question hint,
+"already done — never repeat", the agent telling the model when a click / key changed nothing,
+Qwen's `/no_think` (latency halved), and choosing an already-chosen option = done. Both models
+clear the 90 % bar. **Default: the decision model (gemma) — no model swap on an 8 GB GPU;**
+set `PAGE_AGENT_MODEL=qwen/qwen3.5-9b` for accuracy when LM Studio runs Qwen for everything.
+Gemma's three misses: re-typing instead of pressing Enter / Send twice, and one question
+answered by acting.
 
 **Required before trusting it (part of H1):** a small benchmark — 30 scripted page-agent
 tasks against the fixture pages (WhatsApp/Gmail/Sheets shapes) measuring valid-JSON rate,
@@ -432,19 +457,21 @@ agents ranking, Qwen3.5-9B listings (Together, DeepInfra, ApX).
 | H4 — Cross-app layer | H4 |
 
 - [x] A1 [x] A2 [x] A3 [x] A4 [x] A5 [x] A6  *(A6: GitHub "my repos" has no user-free URL — not added)*
-- [ ] B1 [ ] B2 [ ] B3 [ ] B4 [ ] B5 [ ] B6 [ ] B7 [ ] B8
-- [ ] C1 [ ] C2 [ ] C3 [ ] C4 [ ] C5 [ ] C6 [ ] C7 [ ] C8 [ ] C9 [ ] C10 [ ] C11
-- [ ] D1 [ ] D2 [ ] D3 [ ] D4 [ ] D5
-- [ ] E1 [ ] E2 [ ] E3 [ ] E4 [ ] E5 [ ] E6 [ ] E7 [ ] E8
-- [ ] F1 [ ] F2 [ ] F3 [ ] F4 [ ] F5 [ ] F6
-- [ ] G1 [ ] G2 [x] G3 [ ] G4 [ ] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
-- [x] H0.1 [ ] H0.2 [ ] H0.3 [ ] H0.4 [ ] H1 [ ] H1.1 [ ] H2 [ ] H3 [ ] H4 [ ] §7a model benchmark
+- [x] B1 [x] B2 [x] B3 [x] B4 [x] B5 [x] B6 [x] B7 [x] B8
+- [x] C1 [x] C2 [x] C3 [x] C4 [x] C5 [x] C6 [x] C7 [x] C8 [x] C9 [x] C10 [x] C11
+- [x] D1 [x] D2 [x] D3 [x] D4 [x] D5  *(D5 not yet tried against the real portal file chooser)*
+- [x] E1 [x] E2 [x] E3 [x] E4 [~] E5 [~] E6 [~] E7 [x] E8  *(E5: no mark-all-read / attach; E6: no "move my 3 pm"; E7: admit only — see §10 Part 4)*
+- [x] F1 [x] F2 [~] F3 [x] F4 [x] F5 [x] F6  *(F3: search, sort, filter, open, read — no cart, by decision D1; F4–F6 = slice 6b, not tried on the live sites)*
+- [x] G1 [x] G2 [x] G3 [x] G4 [x] G5 [ ] G6  *(G3: `page.waitFor` exists and email check uses it; the other fixed sleeps move over part by part)*
+- §12 meetings: [x] M0.1 [x] M0.2 [x] M0.3 [x] M0.4 [x] M0.5 [x] M0.6 [ ] M0.7 (live call) [x] M1.1 [~] M1.2 [x] M1.3 [x] M1.4 [x] M1.5 [x] M2.1 [x] M2.2 [x] M2.3 [~] M3 [x] M4  *(M3: no device switch; M4.1 by Calendar's own notifications, M4.2–M4.5 in Part 13)*  *(M1.2: Chrome's tab list opens, the user picks the tab)*
+- [x] H0.1 [x] H0.2 [x] H0.3 [x] H0.4 [x] H1 [x] H1.1 [~] H2 [~] H3 [~] H4 [x] §7a model benchmark  *(H3: WhatsApp done; Instagram / Telegram / Discord / Slack / LinkedIn go through the page agent, no site helpers yet. H4: inbox, reply-where-they-wrote, offers done; one request to several apps and reply reminders not)*  *(H2: aliases + transparency done; learned phrasings and tone not — they would touch the cached classifier prompt)*
 
 ## 9. Known state at the time of writing
 
 - Rounds 1–4 were committed in `1261170` (feature/linux-desktop-automation); Part 1 in
   `2a8e51b`; the understanding layer in `677eba3`, made fast in `c0ee678`.
-- Extension in the repo is **1.2.0** (Part 1). From 1.1.0 on it updates itself: when Kayra
+- Extension in the repo is **1.2.1** (Part 1 + the 2026-11-10 tuning pass; see the changelog in
+  `docs/platforms/LINUX_AUTOMATION.md`). From 1.1.0 on it updates itself: when Kayra
   needs a newer command it sends `runtime.reload` and says so; only a 1.0.x extension still
   needs the manual reload on chrome://extensions.
 - Unit tier: 4529 checks green (`tests/test_browser_control.py`: 130); extension integration
@@ -466,12 +493,367 @@ checklist above ticked and a changelog entry in LINUX_AUTOMATION.md / CHROME_BRI
 |---|---|---|
 | 1 | Tuning pass; A1–A6, G3 (`page.waitFor`), H0.1, `browser update` + self-updating extension | **done 2026-11-10** |
 | 1b | The understanding layer (`automation/interpreter.py`), requested by the user | **done 2026-11-10** |
-| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | next |
-| 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | |
-| 4 | E1–E8 Google Workspace (needs D3 answered) | |
-| 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | |
-| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | |
-| 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | |
+| 2 | B1–B8 tabs & windows (by position, bulk close, groups, reopen, discard, find-the-tab), C1–C4, C7 | **done 2026-11-10** — 2c done (B2 by site + all but pinned with CONFIRM > 3, B4 groups, B5 windows, C3 the Nth result, C4 find with highlight; extension 1.5.0 + tabGroups); 2a done (B1 by position, B2 duplicates / right / left); 2b done (B3 mute the rest, B6 recently closed + reopen by name, B7 sleep tabs, B8 find the tab, C1 hard reload, C2 zoom to N %, C7 copy link/title) — 2026-11-10. Next (2c): B2 "all YouTube tabs" + CONFIRM > 3, B4 groups, B5 windows, C3 "open the third result", C4 find with highlight |
+| 2M | §12 Meetings and screen sharing. M0 bugs (misroutes, fake meet code, fixed waits, confirm, test log hygiene), M1 share a named window / tab / monitor (xdph picker helper), M2.1 DND | **done 2026-11-10** except M0.7 (try it in a live call — needs the user) and M2.2/M2.3, M3, M4 (next meeting slice, after 2c or when asked) |
+| N | §13 neighbouring features (browser N1, models N2, interface N3, voice N4, housekeeping N5) — pick up beside the part each neighbours | |
+| 3 | C5, C6, C8–C11 (questions about a page, YouTube transcript, translate, bookmarks, history, downloads — D5 permission), G1, G2, G4 | **done 2026-11-10** (extension 1.6.0 + `downloads`) |
+| 4 | E1–E8 Google Workspace (needs D3 answered) | **done 2026-11-10** (D3 approved; extension 1.7.0). Left for later: Sheets add-row/sort/chart, Gmail mark-all-read/attach, Calendar move, Meet layout/recording, Drive share |
+| 5 | H0.2–H0.4: app context, `semantic_match.py`, WhatsApp core | **done 2026-11-10** (extension 1.9.0; not yet tried on a live, logged-in WhatsApp) |
+| 5F | Fix round V11 after live use of Parts 4–5: scrolling inside web apps, one search action + close search, WhatsApp chats by loose name from anywhere, "recent chat", year ranges and recency for file names | **done 2026-11-11** (extension 1.11.0 after the second pass from the audit log; `updates/UPDATE_V11.md`; not yet re-tried on live Gmail / WhatsApp / Sheets) |
+| 5P | **§14 Chrome profiles** — open Chrome as a profile / with an account, discovered from Chrome itself (requested 2026-11-10) | **done 2026-11-11** (P1, P2, P3, P5; `updates/UPDATE_V14.md`). Open: P4 (the extension in several profiles), "always open Chrome as X" (a Settings key), spoken aliases (H2) |
+| 6 | D1–D5 forms (needs D2), F1–F6 big sites (needs D1), G5 | **done 2026-11-11** — 6a (D1–D5, F1, F2, F3 within D1; extension 1.12.0; `updates/UPDATE_V12.md`); 6b (F4 ask ChatGPT/Claude/Gemini, F5 WhatsApp reply + send a file, F6 Reddit/LinkedIn/GitHub, G5 several steps; extension 1.13.0; `updates/UPDATE_V13.md`) |
+| 8 | H3 WhatsApp extras: mute / pin / archive / read, star, react, quote-reply, forward, calls; refused: block / delete / clear / leave | **done 2026-11-11** (extension 1.15.0; `updates/UPDATE_V16.md`) |
+| 9 | §12 M2.2 sensitive windows on a shared screen, M2.3 quiet while sharing, M3 in-call (people, reactions, pin, meeting chat, the link), M4.1 meeting reminders | **done 2026-11-11** (M3 device switch, M4.2–M4.5 open) |
+| 10 | H4 one inbox: "who messaged me anywhere", "reply to X" where X last wrote, spoken offers from notifications | **done 2026-11-11** (one request to several apps, reply reminders open) |
+| 11 | §11 S1 smooth scrolling (wheel glide that accumulates, touchpad 1:1 + momentum, keys, refresh-paced, reduced motion) + S3 measuring | **done 2026-11-11** (`updates/UPDATE_V17.md`). S2 GPU tile layer open |
+| 12 | §13 N1 browser neighbours: tab sessions, reading list, picture-in-picture, page screenshots (full page), tidy-tabs suggestion, open in another browser / profile | **done 2026-11-11** (extension 1.16.0) |
+| 13 | §12 M4: present a deck into the call, meeting notes + local summary, recording (asks), Zoom / Teams / Discord in the browser | **done 2026-11-11** (extension 1.16.0) |
+| 14 | §13 N4.1 speaking speed (voice + Settings, live), N4.2 a voice per language (Hindi / Japanese / Mandarin by script), N3.5 voice preview | **done 2026-11-11** (`updates/UPDATE_V18.md`) |
+| 15 | §13 N2.3 LM Studio by voice (what is loaded, load / unload, vision warning), N2.2 local speed test, N2.4 key health (on request; at boot only with `KEY_HEALTH_ON_BOOT=on`) | **done 2026-11-11** |
+| 16 | §13 N5.1 + N2.6 backup / restore without keys, N5.3 the test-hygiene sweep in `run_all.py` | **done 2026-11-11** (the sweep found no suite writing to `data/`, `logs/`, `Reports/`, `backups/`) |
+| 17 | Audit-log bugs L1–L9 (now in `BUGS.md`) (Chrome closed, placeholder targets, double runs, WhatsApp names, compound sentences, closing tabs, Workspace files, open-then-act race) | **done 2026-11-11** — L1–L8 `updates/UPDATE_V20.md`, L9 `updates/UPDATE_V21.md`, L0 mishearing V19. Not tried live |
+| 7 | H1, H1.1, H2 (page agent, recipes, learning; §7a benchmark first), then H3, H4 | **7a/7b/7c done 2026-11-11** (§7a benchmark, H1 page agent, H1.1 recipes, H2 aliases + transparency; extension 1.14.0; `updates/UPDATE_V15.md`). Open: H2 phrasings / tone, H3, H4 |
+
+**Parts 14–16 — Kayra's voice, local models and keys, backups** (done 2026-11-11). Detail:
+`updates/UPDATE_V18.md`.
+- 14: `text_to_speech.clamp_speed` / `script_language` / `voice_for_language`; the engine's
+  `speed`, `follow_language`, `voice_and_language`, `set_speed`, `preview`. "speak a bit faster",
+  "speak at normal speed", "set your speaking speed to 1.3", "what's your speaking speed" reach the
+  engine through `common.SPEECH` (set by `app.bootstrap`; automation never imports the engine) and
+  are saved with `write_env_values` + `settings_log.record`. Settings → Voice: speed, "speak other
+  languages in their own voice", a Play button (queued, never blocks the UI).
+- 15: `automation/local_models.py` — `/api/v0/models` for state and type, `lms` for load / unload
+  (unload first: one 8–9B model fits), the cached local model id is forgotten after a switch;
+  `speed_test` local only; `key_health` = one `probe_provider` per stored key, only when asked or
+  with `KEY_HEALTH_ON_BOOT=on`.
+- 16: `automation/backup.py` + `paths.backups_dir()` (gitignored): `data/` + `.env` minus every
+  secret / `@keyring` line, 0600, ten kept; restore is CONFIRM, saves the current state first,
+  `data/` only (no `..` / absolute), settings merged without touching secrets. `run_all.py`
+  fingerprints `data/ logs/ Reports/ backups/` and fails the run on any change.
+- The understanding layer may not propose `models`, `voice` or `backup` actions.
+
+**Parts 11–13 — smooth scrolling, browser neighbours, around the call** (done 2026-11-11,
+extension 1.16.0). Detail: `updates/UPDATE_V17.md`.
+- 11 (§11 S1/S3) `ui/smooth_scroll.py` on every scroll area (`View`, the Chat transcript; a test
+  fails if a new `QScrollArea` lacks it): ease-out wheel glide whose target accumulates, touchpad
+  1:1 with momentum after a flick (≥ 2 samples), PageUp/Down/Home/End/arrows, a timer at the
+  screen's refresh rate, instant under reduced motion, programmatic moves (Chat following) win.
+  `KAYRA_UI_PROFILE=1` logs "scroll" frames. Measured offscreen: a notch is ~20 steps of ≤ 21 px
+  (was one 60 px jump); offscreen frame cost (~4 ms) does not reproduce the real window's — the
+  laptop's numbers come from the profile log. S2 (GPU tiles) not started.
+- 12 (§13 N1) sessions / reading list in Kayra's private store (no `readingList` permission);
+  `windows.openUrls`; `tabs.capture` (full page = slices paced in the extension, stitched with
+  Pillow); PiP behind the trusted-Space hook; `tabs_tidy_suggestion` in the existing watcher
+  (≥ 15 tabs and ≥ 3 duplicates, every 2 h, `TAB_TIDY_SUGGESTIONS`); "open this in Chromium / my
+  Work profile" (5P).
+- 13 (§12 M4) `_activate_call` + `_SITE_LABELS`: mic / camera / hand / share / stop / leave on Zoom,
+  Teams, Discord (share hook content script now matches them); `meet_present` = a plan (open deck ->
+  share this tab [asks] -> slideshow); `automation/meeting_notes.py` (captions every 3 s on one
+  on-demand thread, saved 0600 to Reports/meetings on stop / leave / shutdown, summary LOCAL only);
+  `meet.record` CONFIRM, `record_stop` not.
+- Known: the local model reads "what's a reading list in chrome" as a browser command (the guessed
+  click then goes to the understanding layer). **Not tried live.**
+
+**Parts 8–10 — WhatsApp extras, the call, one inbox** (done 2026-11-11, extension 1.15.0). Detail:
+`updates/UPDATE_V16.md`.
+- 8 (H3) `pageWa`: the chat row's / newest message's / header's own menus by name, a dialog's
+  choice + button (mute 8 h / 1 week / always), reactions, the forward picker, call buttons.
+  `wa_manage` (mute, pin, archive, read / unread — just happen, "already pinned" said),
+  `wa_message` (star happens; react, quote-reply, forward, call ASK naming chat + message; on yes
+  the chat must still be open and the message still the newest). Block / report / clear / delete
+  / leave are refused by voice.
+- 9 (§12) `pageMeet`: people, reactions, pin, the meeting chat (asks), copy / send the link (send =
+  WhatsApp, asks). M2.2 `sensitive_on_screen` adds "WhatsApp and Bitwarden are open on that
+  screen." to a whole-screen share question (`common.SHARE_WARNING`); M2.3 `workflows.in_call` is
+  true while Kayra's share is on; M4.1 from Calendar's own desktop notifications.
+- 10 (H4) `automation/inbox.py`: `inbox_all` (open WhatsApp, Gmail's tab title, the notification
+  log — never opens an app to look), `reply_anywhere` (newest notification naming them, else their
+  WhatsApp chat; email = opened + reply written, never sent), `on_notification` (sender + app only,
+  10 min per sender, 6 an hour, "stop telling me about new messages", `INBOX_ANNOUNCE`,
+  `MEETING_REMINDERS`).
+- **Not tried live** (WhatsApp's menu labels and Meet's reaction / pin names are from their 2026
+  accessible names; each falls back to "I couldn't find …").
+
+**Part 7 — the page agent, recipes, learning** (done 2026-11-11, extension 1.14.0; 7a §7a + H1,
+7b H1.1, 7c H2 aliases). Detail: `updates/UPDATE_V15.md`.
+- 7a `page.snapshot` (stable `data-kayra-id`, role, accessible name, value, secret flag, masked
+  codes) and `page.act` (click / type / select / check / press / scroll; secret fields refused in
+  the page). `automation/page_agent.py`: observe -> decide (local model, one JSON action from a
+  closed set) -> act -> verify, ≤ 8 steps, loop and "nothing changed" detection. Clicks judged by
+  `policy.classify_action` + the agent's social verbs (CONFIRM, late, naming the control; cart /
+  pay DENY); Enter after typing into a message box CONFIRMs; it may TYPE only the user's words.
+  Triggers: "on this page, …", "figure out how to …", "browser agent …"; the understanding layer
+  may propose it. `PAGE_AGENT=off` disables it.
+- 7b recipes: a run whose every step worked is saved (`data/recipes.json`, 0600): host, the
+  request as a template with typed words as slots, steps by role + NAME. Replayed with no model;
+  a missing control hands over to the model from that step and the recipe is rewritten.
+  "list my page shortcuts", "forget the shortcut for …".
+- 7c learning (`automation/learning.py`, `data/aliases.json`, 0600): Kayra's "which one?" is
+  remembered for 2 min; the answer ("the second one", "the core team one") runs the action and,
+  for WhatsApp names, teaches the alias; "no, the other one" opens the runner-up and swaps the
+  alias; "what have you learned about me", "forget that", "forget everything about WhatsApp",
+  "forget everything you learned" (asks). The model never changes what was learned.
+- Not done: H2 learned phrasings as classifier hints and a tone note (both would touch the
+  cached DMM prompt), H3, H4. **Not tried on live sites** — whole runs were real Chrome + real
+  local model on fixture pages.
+
+**Part 5P — Chrome profiles** (done 2026-11-11; §14 P1, P2, P3, P5). Detail:
+`updates/UPDATE_V14.md`.
+- P1 `automation/chrome_profiles.py` reads `Local State` (`profile.info_cache`) of Chrome,
+  Chromium, Brave or Edge — folder from `platforms.browser_user_data_dirs()` (all three backends)
+  — and re-parses only when its mtime / size changes; an unreadable file is said so, plain "open
+  Chrome" still works. Nothing about any profile is in code or config.
+- P2 `common.profile_action` (shapes only; the parser never reads the file): "open my X Chrome",
+  "open Chrome as / with / on X", "open X's Chrome", "open <site> in my X Chrome", "switch to my X
+  profile", "which Chrome profiles do I have", "open Chrome as a guest". `resolve()` tiers:
+  profile name > email / its prefix > account name > domain (whole or any label) > position >
+  loose match; ties ask ONE question naming name + account.
+- P3 `<binary> --profile-directory=<folder> [url]` through `linux.RUNNER`, the new window
+  focused, "Opened Chrome as Work (account name)".
+- P5 `tests/test_chrome_profiles.py` (unit, made-up Local State) and
+  `tests/test_profile_privacy_guard.py` (integration: the real profiles' emails, prefixes,
+  domains and account names must not be in any tracked file; prints only file + kind). Its
+  first run flagged a public portal URL in the site table that shares a hosted domain — web
+  addresses are now allowed, everything else still fails.
+- **Open**: P4 (one bridge connection per profile; "Chrome is open as X but the extension isn't
+  installed there"), "always open Chrome as X" (needs a Settings control), spoken aliases (H2).
+  Not tried by voice on the live machine (the parser and launcher were checked with recorded
+  argv; the resolver was checked against this machine's real profiles, counts only).
+
+**Part 6b — AI sites, WhatsApp files, Reddit / LinkedIn / GitHub, several steps** (done
+2026-11-11, extension 1.13.0, no new permission). Detail: `updates/UPDATE_V13.md` and the
+changelog in `docs/platforms/LINUX_AUTOMATION.md`.
+- F4 `ai_ask` / `ai_read` (`page.aiChat`: state / ask / wait-in-page / read; the site's tab
+  reused; bounded 90 s wait announced once; never routed there by a model).
+- F5 `message.send` to the open chat ("reply saying …"), `message.send_file` (`chat.attach`:
+  arm with the trusted-Space hook, read the preview, press the preview's Send); late
+  confirmation naming file AND chat; never from a model.
+- F6 `social` (`page.social`): notifications / messages / top post / subreddit / repo, LinkedIn
+  jobs search through the site table.
+- G5 `direct_tokens` splits complete halves with the later half judged against the predicted
+  screen; batches park the rest behind a yes; a failed open stops the dependent step;
+  `ws_open` waits for the page; the planner's catalog grew.
+- Tried and dropped: a DMM preamble paragraph for 6b — it made the local model misread "mute
+  me"; all 6b phrasings are rules-first instead.
+- Tests: `test_browser_control.py` [22], `test_browser_extension.py` [11], `test_dmm_browser.py`
+  110/110 on the local model (91 rules-first).
+- **Not verified live**: real ChatGPT / Claude / Gemini, a real WhatsApp file send, live
+  LinkedIn / Reddit / GitHub pages.
+
+**Part 6a — forms, the video, site search and shopping** (done 2026-11-11, extension 1.12.0;
+D1 and D2 answered by the user that day). Detail: `updates/UPDATE_V12.md` and the changelog
+in `docs/platforms/LINUX_AUTOMATION.md`.
+- D1 `form_choose` (drop-down incl. Google Forms, radio, tick/untick, date); D2 `page_key`;
+  D3 `form_profile.py` + `form_fill` (late confirmation naming fields; never submits; values
+  never in the pending action or the audit log); D4 `form_submit` (CONFIRM; invalid form and
+  pay buttons refused); D5 `file_upload` (late confirmation naming the file; trusted-key hook;
+  chooser driven with Ctrl+L).
+- F1 `video` (speed, seek, captions, skip ad, next, like, watch later, full screen, state) and
+  `video_subscribe` (CONFIRM). F2 `site_search` (any site with a search template, Amazon /
+  Flipkart price and sort, images). F3 `shop_refine`, `product_info`; cart / buy / checkout /
+  pay refused by `policy._SHOPPING_STOP` (decision D1).
+- Tests: `test_browser_control.py` [21], `test_browser_extension.py` [10], `test_dmm_browser.py`
+  95/95 on the local model.
+- **Not verified live**: real forms, the real portal file chooser, live YouTube / Amazon /
+  Flipkart pages.
+
+**Part 5F — fix round V11** (done 2026-11-11, extension 1.10.0). Detail: the changelog in
+`docs/platforms/LINUX_AUTOMATION.md` and `updates/UPDATE_V11.md`.
+- `page.scroll` scrolls the box in view and reports `moved`; `common.scroll_request`.
+- `page.search` / `page.searchClose`; `common.search_request`, `browser.search_close`.
+- WhatsApp from anywhere ("… in whatsapp", "X chat", "X group" with a tab-group check), `recent`,
+  unread-only reads, editions (`semantic_match.edition`), `year_ranges`.
+- `rank_titles` by recency + prefix tier, `_find_files` fallbacks.
+- Second pass (audit log, extension 1.11.0): `chat.search` waits for WhatsApp's results (the
+  list was read before it filtered), search by words, search always closed, `search_close`
+  verified with a real-key fallback, `message search` / `open result <n>` / `close this chat`,
+  `_rethink` never re-runs the failed command.
+- Changed on purpose: the same name with different YEARS no longer asks (chats: latest message;
+  files: first listed). Everything else that asked still asks.
+
+**Part 5 — WhatsApp, app context, the semantic matcher** (done 2026-11-10, extension 1.9.0).
+- H0.2 app context: `common.front_site(situation)` — a web-app window's site, or Chrome's tab
+  when CHROME is in front (Chrome's active tab is not "in front" while another app is). With
+  WhatsApp in front, `direct_tokens` turns "open X" / "click on X" / "go to X chat" into
+  `message open X` (a known site or app stays itself unless "chat"/"group" is said), "read it"
+  into `message read this`, "who messaged me" into `message who messaged me`.
+  `linux.situation` remembers the app the user was in for 2 min while Kayra's window is in front.
+  Not added: a DMM context hint (the rules-first route covers it without touching the cached prompt).
+- H0.3 `automation/semantic_match.py` — `match(query, candidates, embed, aliases)` -> pick / ask /
+  none. Measured on the user's example and 9 more names; local nomic embeddings were tried as a
+  blend and made "PR group" a confident wrong pick, so meaning breaks near-ties only and can by
+  itself only ASK. Aliases are an input; learning them is H2 (Part 7). `ws_open` (Part 4) still
+  uses `rank_titles`.
+- H0.4 WhatsApp: `message open <chat>` (visible list, then WhatsApp's search; the search box is
+  emptied when nothing opens), `message who messaged me`, `message read <chat> [today]` / `message
+  read this` (short -> read out; long -> LOCAL model only; no local model -> the latest 3),
+  `message <chat>: <text>` (opens the chat, then asks "Send '<text>' to <real chat name>?"; on yes
+  the open chat is re-checked, typed with clear, read back, Send (else Enter), arrival checked).
+  `message.send` moved from the static CONFIRM set to this late confirmation (asserted).
+- Tests: [19] (matcher table, app context, situation memory, open / ambiguous / search / unread /
+  read / privacy / send / no / chat switched / old extension), `test_browser_extension.py` [7]
+  (WhatsApp-shaped page), `test_dmm_browser.py` 72/72 on the local model (55 rules-first).
+- **Not verified on a live, logged-in WhatsApp** (it needs the user's phone to link; Claude in
+  Chrome was not connected). The selectors are by role / title / aria-label with the old class
+  names as fallback.
+
+**Tuning pass V9** (2026-11-10, extension 1.8.0, local model only) — see `updates/UPDATE_V9.md`.
+Rules before the classifier (466 ms -> < 1 ms for browser commands; 62/62 on the new
+`tests/test_dmm_browser.py`), boot warm-up, waits inside the browser, a per-command active-tab
+cache, relevant text for page questions, spoken numbers / near spellings / spoken emails, Sheets
+header + `where` filter, and site lookups fixed after live checks (Google bot page, YouTube Up
+next + ads + transcript button, Amazon sponsored + `reviewText`, Bing organic, Wikipedia,
+generic heading links). Open from the pass: streaming spoken answers (needs the turn pipeline),
+live checks of the signed-in Google apps (Claude in Chrome was not connected).
+
+**Part 4 — Google Workspace** (done 2026-11-10, extension 1.7.0, no new permission; D3
+approved by the user: names read in Chrome, matched locally, never stored or sent to a model).
+- Names: `page.docList` (Docs/Sheets/Slides/Forms links + `data-id` rows; Drive rows open via
+  `drive.google.com/open?id=`) and `web_macros.rank_titles` (exact 100 / phrase 80 / all words
+  60 / partial 40×share, shorter first). Two near-equal results under 80 → asks which.
+- E1 `open my <name> sheet`, `create a new sheet called <Title>` (Rename + real keyboard; the
+  user's capitals kept), `go to cell B12` (`page.focus` on the Name Box), `what's the total |
+  average | highest | lowest | count of column C | the <header> column`, `how many rows`,
+  `read row N`, `what are the columns` — from `gviz/tq?tqx=out:csv&headers=1&gid=<the tab>`
+  (export as fallback) through `page.fetchText`, parsed with `csv`, currency / thousands
+  separators / (negatives) understood, text cells skipped and said so. Sheets values never
+  reach a model.
+- E2 Docs `open the doc about X`, `search my docs for X`, `create a new doc`; read / summarize /
+  ask use `export?format=txt` (`_page_of` → `doc_text`); `find X` in any Google editor = its
+  Ctrl+F; `share this doc with <email>` opens Share and types the address — Kayra NEVER
+  presses Send.
+- E3 `start the slideshow` (Ctrl+F5); a bare "start presenting" with a Slides tab in front is
+  the slideshow (`AutomationRuntime._slides_in_front`, decided before the share CONFIRM);
+  `next slide` / `previous slide` (fast path — the local model read them as chat), `end the
+  slideshow`.
+- E4 `find the PDF Ravi sent me` (`type:pdf`; opens the one clear match), `search my drive
+  for`, `open my recent files`, `download this file` (xlsx / docx / pptx / uc?export=download).
+- E5 `email search for X`, `email show unread from this week|today`, `email compose`, `email
+  open my <name> label`. E6 `calendar next meeting`, `calendar join my next meeting` (the event's
+  own visible Meet link → `meet_join`), `calendar friday`. E7 `meet admit everyone`. E8 `add a
+  note saying …` (Keep), `open the responses of my <name> form`, `what assignments are due`
+  (Classroom to-do page, summarized).
+- Live local DMM: 20 Workspace phrasings, 19 right first time; "next slide" now on the fast
+  path. DMM matrix 50/53 (baseline).
+- Tests: `test_browser_control.py` [17], `test_browser_extension.py` [5].
+- **Not done** (later): Sheets add-row / sort / chart, Gmail mark-all-read and attachments,
+  Calendar "move my 3 pm to 4", Meet noise cancellation / layout / recording, Drive share.
+- **Not verified** against the live Google apps with the extension connected; the Docs home
+  list markup and Calendar's schedule view are the most likely to need tuning.
+
+**Part 3 — about the page, bookmarks, history, downloads, "it"** (done 2026-11-10,
+extension 1.6.0 + `downloads`, approved by the user for D5).
+- C5 `browser what does this page say about X` / `does this page mention X` / `ask this
+  page: …` -> `page_ask` (model reads the page text; "The page doesn't say." otherwise).
+- C6 `read the comments`, `summarize the reviews`, `what are people saying about this` ->
+  `page.comments` (YouTube scrolled to + polled, Reddit, Amazon, Flipkart, HN, GitHub, any
+  `itemprop=reviewBody`); `summarize this video` -> `page.transcript` (opens the panel, polled,
+  description fallback said so); not YouTube -> the page summary.
+- C8 `translate this page to <language>` (Google Translate, this tab, 28 languages),
+  `translate the selected text to …`, `explain the selected text` (`page.selection`).
+- C9 `bookmark this page [in <folder>]` (folder created if missing; an existing bookmark is
+  said so), `search my bookmarks for …`, `delete the bookmark for …` (ALWAYS asks, exact ids).
+- C10 `clear today's history` / `the last hour` / `15 minutes` (ALWAYS asks; never all time;
+  "delete my browsing history" = today), `what did I visit today|yesterday|this week`.
+- C11 `what did I download` (progress for active ones), `open my last download` (ALWAYS asks;
+  never a program or a Chrome-flagged file; Kayra opens it with xdg-open — the
+  `downloads.open` permission is NOT requested), `show it in folder`, `pause|resume|cancel
+  the download`.
+- G1 `LAST_TAB`: "close it" / "go back to it" / "read it" / "summarize it" = the tab Kayra last
+  opened or switched to BY NAME (not by position), 10 minutes, only while still open.
+- G2 `search_here`: site table, Docs/Sheets Ctrl+F, the page's search box, else Google.
+- G4 `what can I do here` -> per-site hints (Gmail, Calendar, Meet, YouTube, Docs, WhatsApp,
+  Google results, shops, GitHub; a general list elsewhere).
+- Late confirmations (from 2c) carry the exact ids / id / `confirmed` flag.
+- Live local DMM: 12 phrasings; the two misreads (a page question read as a word find,
+  "what did I download" read as closed tabs) fixed in the preamble and re-checked; bare
+  "close it" is still read as chat by the DMM, which cannot see that Kayra just opened a tab
+  (a G1 follow-up: give the DMM the last opened tab as context). DMM matrix 51/53.
+- Tests: `test_browser_control.py` [16], `test_browser_extension.py` [4] (real Chrome:
+  reviews, dedupe, max, transcript off YouTube).
+- **Not verified** against the live Chrome with the extension connected.
+
+**Part 2c — the rest of tabs and windows** (done 2026-11-10, extension 1.5.0 + `tabGroups`,
+approved by the user for D5).
+- B2 `browser close all youtube tabs`, `browser close all but pinned`: > 3 tabs asks first; the
+  approved action carries the exact tab ids (`confirmed_ids`), so "yes" never closes a tab
+  opened in between. Mechanism: a handler returns NEEDS_CONFIRMATION with `detail["confirm"]`
+  and `AutomationRuntime.execute_action` registers it ("larger than it sounded").
+- B4 `browser group my <topic> tabs [as <name>]` (title/address match, else page text ≥ 2
+  mentions, one window), `rename`, `make … <colour>`, `collapse/expand` (one / all), `add this
+  tab to …`, `ungroup` (one / all), `close the … group` (> 3 asks), `list my tab groups`.
+  "this group" = the active tab's.
+- B5 `browser move this tab to a new window` / `… to the other screen` (Hyprland moves the new
+  window), `browser merge my chrome windows` (same incognito-ness only).
+- C3 `open the third result` / `play the second video` / `… in a new tab` / `what are the
+  results` — `page.results` (site table + generic content links; nav/header/footer/aside
+  excluded, deduplicated by address). Caught before `app.open` without the `browser` prefix.
+- C4 `find X on this page` highlights (`page.highlight`, `<mark data-kayra-find>`, never inside
+  inputs/textareas/contenteditable), `next match`, `previous match` (wraps), `clear highlights`.
+- Live local DMM: 11/11 new phrasings produced the right token; DMM matrix 50/53 (baseline).
+- Tests: `test_browser_control.py` [15] (36 + flows), `test_browser_extension.py` [3] (real
+  headless Chrome: result list, highlight, step, wrap, clear restores the text exactly).
+- **Not verified** against the live Chrome with the extension connected (as for 2a/2b).
+
+**Part 2M — meetings and screen sharing** (done 2026-11-10, extension 1.4.0). §12 in full.
+- M0.1 `common.share_request()` reads every phrasing ("share screen", "start screen sharing",
+  "present now", "share the LM Studio window", "share this tab", "share my second screen",
+  "… with sound", "… instead") into ONE `meet.share {surface, name, audio, instead}`; a bare
+  token ("click on share screen") is caught before the click/screen prefixes; "meet am i
+  sharing" is `meet.share_status`. The DMM preamble and `interpreter.CATALOG` (+ a worked
+  example) carry the shapes. Live check against the local gemma model: all nine test
+  phrasings produced the right token.
+- M0.2 `llm_engine._guard_meeting_code`: a code the user never said is dropped (or, when the
+  user said share, re-read as the share).
+- M0.3 `common.merge_share_steps`: `focus X` + `meet share window` -> one share of X; one share
+  per utterance.
+- M0.4 no fixed sleeps in `web_macros` (asserted): `_drive_pickers` acts on the windows that
+  actually appear and reads success from Meet's "Stop presenting".
+- M0.5 the question names what goes out; "yes, don't ask again" trusts `meet.share` only, until
+  `meet leave` (≤ 3 h).
+- M0.6 `KAYRA_AUDIT_LOG` (path | off); `run_all.py` -> temp file, `_harness.py` -> off. The
+  unit tier no longer writes `logs/automation.log` (checked: 14,258 lines before and after).
+- M1.1 `extension/kayra-share-picker/kayra-share-picker` (stdlib-only, wraps the configured
+  picker) + `automation/share_picker.py` (one-shot request in `$XDG_RUNTIME_DIR/kayra`, 0600;
+  `install`/`uninstall`/`status` of the `xdph.conf` line; `setup.py` offers it). Without it, a
+  named window is left for the user to pick — never Enter on the first entry.
+- M1.2 tab: Chrome's tab list opens; the user picks (no API selects a tab in Chrome's picker).
+- M1.3 monitor by position left to right, or the focused one; M1.4 switch while sharing, "am I
+  sharing?"; M1.5 `systemAudio: "include"` (extension 1.4.0, `__kayraShareAudio`).
+- M2.1 mako Do Not Disturb for the length of a share (`MEET_SHARE_DND`).
+- Tests: `tests/test_browser_control.py` [12] (sharing), [13] (the picker helper, run as the
+  portal runs it), [14] (audit log).
+- **Not done:** M0.7 — nothing here has been tried in a live Meet call. Next time the user is
+  in a call: install the helper (`python setup.py`), say "share the LM Studio window", and
+  record what each picker did in CHROME_BRIDGE.md.
+
+**Part 2a — tabs by position and bulk close** (done 2026-11-10, extension 1.2.2).
+- `common.tab_position()` turns "the third tab" / "tab 4" / "the last tab" / "the second last
+  tab" / "the tab on the right|left" into `#3`, `#4`, `#-1`, `#-2`, `+1`, `-1`; `tab_switch` and
+  `tab_close` accept those targets. Positions count in the FOCUSED window's tab strip.
+- `browser close duplicate tabs` (same page, ignoring `#fragment` and a trailing `/`; the active
+  copy and pinned tabs are kept) and `browser close tabs to the right|left` (pinned tabs kept;
+  CONFIRM-gated as `browser.tabs_close_side`).
+- Extension 1.2.2: `tabs.close {tabIds}`; `REQUIRED_VERSION` bumped, so 1.1.0+ extensions reload
+  themselves; an older one is never sent a tab-id close.
+- New shapes are in `interpreter.CATALOG` and the DMM preamble. Tests:
+  `tests/test_browser_control.py` section [10] (27 checks).
+
+**Part 2b — the rest of the tab and page basics** (done 2026-11-10, extension 1.3.0).
+- B3 `browser mute everything except this tab` / `unmute all other tabs` (`tabs.muteOthers`).
+- B6 `browser what did i just close` (`tabs.recentlyClosed`, newest first) and `browser reopen
+  the <site> tab i closed` (`tabs.restore {sessionId}` — a NAMED closed tab, not just the last).
+- B7 `browser free up memory in chrome` / `put background tabs to sleep` (`tabs.discard`: never
+  an active tab, never one playing sound, pinned kept). The honest limit from B7 stands: MV3
+  cannot say which tab uses the most memory, and Kayra does not guess.
+- B8 `browser find the tab about <topic>`: title/address match first, then the text of each tab
+  (≤ 30 tabs, 20 KB each, sleeping tabs by title only), switches to the best.
+- C1 `browser hard reload` (`tabs.reload {hard}`); C2 `browser zoom to 150 percent`
+  (`tabs.zoom`; zoom in/out/reset stay Ctrl+plus/minus/0); C7 `browser copy the link | page
+  title` (to the clipboard).
+- Every new command checks `_outdated((1, 3, 0))` first. Shapes are in `interpreter.CATALOG`
+  and the DMM preamble. Tests: `tests/test_browser_control.py` [11] (25 checks).
+- NOT verified against a live Chrome with the extension loaded (see `updates/UPDATE_V4.md` §7).
 
 **Part 1b — the understanding layer** (`automation/interpreter.py`). The user asked that
 Kayra not be only hard-coded rules: "it should ask AI whether this is automation or chat, like
@@ -507,3 +889,302 @@ proper human-alike intelligence."
   web player on Windows; Linux now does what Windows (and CLAUDE.md) describe.
 - "open the article I read yesterday" reached the app launcher; it is a history lookup now.
 - This section's stale "nothing committed yet" and the extension version.
+
+---
+
+## 11. UI: smooth, GPU-composited scrolling  *(S1 + S3 done 2026-11-11 — Part 11; S2 the GPU tile layer open)*
+
+Requested by the user after the GPU rendering pass ("the UI is very smooth now; scrolling
+still feels like CPU"). Measured before planning (offscreen, 1280x800 @ 2.25x): one scroll
+frame repaints the whole visible page — **27 ms median on Settings, 33 ms on System** — and a
+wheel notch jumps 60 px in a single frame. Two causes:
+
+1. **No interpolation.** Qt applies each wheel notch as one 60 px jump.
+2. **No blit scrolling.** The pages are translucent over the animated backdrop, so Qt cannot
+   move the already-drawn pixels; every scroll step repaints every visible card on the CPU,
+   capping scrolling near 30 fps (a 120 Hz display needs ≤ 8 ms a frame).
+
+### The plan
+
+**S1. Smooth scrolling everywhere** (one helper installed on every scroll area: the `View`
+base, the Chat transcript, any other `QScrollArea`):
+- mouse wheel: each notch glides ~200 ms with ease-out; rapid notches ACCUMULATE into one
+  continuous glide instead of restarting;
+- touchpad: pixel deltas follow the fingers 1:1; a flick coasts and decays (kinetic momentum);
+- keyboard: PageUp/PageDown/Home/End/arrows glide too;
+- frames paced from the window's own refresh (`QWindow.requestUpdate`), so 60 / 120 Hz
+  displays both get one step per refresh, not a fixed 16 ms timer;
+- off under reduced motion (`prefers_reduced_motion()`).
+
+**S2. A GPU scroll layer** (how browsers do it): while a scroll is in motion the page is shown
+as pre-rendered tiles held as GPU textures and each frame only moves them (~1 ms); at rest the
+live widgets swap back in.
+- tiles (viewport-sized strips above and below) are rendered while the page is idle, so the
+  first frame of a scroll does not stall (`QWidget.grab()` costs ~12 ms — see the page-fade
+  note in `docs/reference/UI.md`; never pay it on the input path);
+- any change to the page (a child repaint, a new chat message, a live meter) invalidates the
+  tiles; a page that changes while scrolling (System's live meters, a streaming reply) falls
+  back to live painting for that gesture — smooth motion, without the 1 ms frames;
+- Chat uses the layer only while nothing is streaming.
+
+**S3. Measure.** Extend `KAYRA_UI_PROFILE=1` with scroll frame time and frames per second;
+target < 8 ms per frame. Report before/after numbers measured on the reference laptop.
+
+**Tests:** the glide lands exactly on the target; rapid notches accumulate; reduced motion
+disables it; the layer never shows stale content and always returns to the live page; no
+scroll area is left without the helper.
+
+**The honest limit:** Qt Widgets still paint on the CPU; only a Qt Quick rewrite would put
+every frame of a live-changing page on the GPU. Not proposed.
+
+---
+
+## 12. Meetings and screen sharing  *(M0, M1, M2.1 done 2026-11-10 — see §10 "Part 2M"; M0.7 live test, M2.2–M4 open)*
+
+The user tried "start screen sharing of this meet and share the LM Studio window" in a live
+Google Meet call and nothing useful happened. What exists today: `web_macros.meet_share()` —
+entire screen only, built against Chrome's and the portal's pickers but **never tried in a live
+call**. Sharing a named window does not exist. None of this was in the plan before.
+
+### M0. Bugs found in the audit log (fix first)
+
+The real attempt, `logs/automation.log` 16:25–16:26 on 2026-11-10:
+
+| Said / did | What Kayra ran | Bug |
+|---|---|---|
+| (start sharing) | `meet.join abc-defg-hij` | the DMM preamble's EXAMPLE meeting code was emitted as a real one |
+| "share screen" | `mouse.click_text "share screen"` | a plain click, not `meet.share`; Chrome's picker opened and nobody chose |
+| "share the LM Studio window" | `window.focus lm studio` + `meet.share monitor` → CONFIRM | focused away from Meet, shared the whole MONITOR, then waited on an unanswered confirmation |
+| "meet start screen sharing" | `meet.join new` | "start …" is read as start a meeting |
+
+- M0.1 Parsing: "start screen sharing", "present (now)", "share my screen", "share the <X>
+  window", "share this tab", "share my second screen" → ONE `meet.share` with
+  `surface` (monitor | window | browser) and an optional `target` name; never a click, never
+  `meet.join`. Add the shapes to `interpreter.CATALOG` and the DMM preamble with the right
+  examples, and assert the old ones no longer misroute.
+- M0.2 Placeholder guard: any token argument that appears verbatim as an example in the DMM
+  preamble (`abc-defg-hij`, …) is rejected like the `general query` placeholder; a real Meet
+  code must match `[a-z]{3}-[a-z]{4}-[a-z]{3}` AND come from the user's words.
+- M0.3 Compound requests: "share the X window" must NOT run `window.focus X` first (it takes
+  Meet out of focus); the name belongs to the share.
+- M0.4 Readiness, not clocks: replace the fixed `SLEEP(1.5)` steps in `meet_share` with
+  `_until` waits for Chrome's picker, the portal picker and Meet's "Stop presenting".
+- M0.5 Confirmation: speak "Share your entire screen / the LM Studio window with everyone in
+  the call?" and accept a spoken yes (`resolve_confirmation`); offer a per-call "don't ask
+  again for sharing" opt-in.
+- M0.6 Test hygiene: the unit tier writes `AUTOMATION_*` lines into the developer's real
+  `logs/automation.log` (every run adds six `meet.*` entries). Route the audit logger to a temp
+  file under `EnvironmentGuard`, and assert the real log is untouched.
+- M0.7 Try it live in a real call on the reference laptop and tune; record what each picker
+  did in `docs/platforms/CHROME_BRIDGE.md` ("How share my entire screen works").
+
+### M1. Share exactly what was named
+
+- M1.1 **A named window** ("share the LM Studio window"). On Hyprland: ship a small picker
+  helper and set it as xdg-desktop-portal-hyprland's `screencopy:custom_picker_binary`. Kayra
+  writes the wanted selection (window handle by exact Hyprland identity, or monitor) to a
+  one-shot file; the helper prints it as `[SELECTION]window:<handle>` and deletes it; with no
+  request pending it execs the normal `hyprland-share-picker`, so manual sharing is unchanged.
+  `setup.py` offers the config change (asked, reversible). On X11 / other compositors: the
+  Chrome picker's window list, selected by title through the extension where possible, else say
+  "press Share on <title>".
+- M1.2 A specific Chrome tab ("share the YouTube tab"): `displaySurface: "browser"` plus
+  activating that tab first / `preferCurrentTab` where Meet allows.
+- M1.3 A specific monitor ("share my second screen"): monitor selection through the same helper.
+- M1.4 Switch mid-call ("share LM Studio instead"), "am I sharing?", "stop sharing" (exists).
+- M1.5 Share with sound ("share with audio"): `systemAudio: "include"` in the page hook.
+
+### M2. Privacy while presenting
+
+- M2.1 Do Not Disturb for the length of a share (Omarchy/mako `makoctl mode -a do-not-disturb`,
+  restored on stop) so notifications never appear on a shared screen.
+- M2.2 Before sharing a whole screen, warn when a sensitive window is visible on it (password
+  manager, WhatsApp, email, banking) — "WhatsApp is open on that screen; share anyway?".
+- M2.3 Kayra's own spoken lines stay quiet during a call (call detection exists; confirm it
+  covers a sharing session).
+
+### M3. In-call controls (Meet; Zoom/Teams/Discord web where the same labels exist)
+
+Raise / lower hand, send a reaction, captions on/off, pin or spotlight a person, "who's in
+the call?", send a message in the meeting chat, copy the meeting link and send it to someone
+(CONFIRM), switch microphone or speaker ("use my headphones in this call"). Extends E7.
+
+### M4. Around the call
+
+- M4.1 "Your meeting starts in 2 minutes — join?" (calendar + `speak_unprompted`), joining
+  from the calendar (E6).
+- M4.2 Present a Slides deck straight into the call (with E3).
+- M4.3 Save live captions during the call; afterwards "summarize this meeting" with action
+  items offered to Calendar / Docs (local model first).
+- M4.4 Local recording (wf-recorder / OBS), CONFIRM, with a visible indicator.
+- M4.5 The same share commands for Zoom, Teams and Discord in the browser (they use the same
+  `getDisplayMedia` path the page hook already wraps).
+
+**Tests:** parsing of every phrasing above (and the four misroutes), the placeholder guard,
+the picker helper (selection file written, consumed once, falls back to the normal picker),
+DND on/off around a share, readiness waits (no `SLEEP` in `meet_share`), and the audit log
+staying out of the developer's `logs/`.
+
+---
+
+## 13. Neighbouring features not covered elsewhere  *(N1 Part 12; N2.2–N2.4, N2.6 Part 15/16; N3.5, N4.1, N4.2 Part 14; N5.1, N5.3 Part 16 — done 2026-11-11; N2.1, N2.5, N3 (but N3.5), N4.3, N5.2 open)*
+
+Ideas that sit next to what was built in V4 (cloud models, key storage, the redesigned and
+GPU-composited UI, tab Parts 2a/2b) and that no section above covers. Each is small on its own;
+pick them up alongside the part they neighbour. Ask before any that spends money or changes
+the user's system.
+
+### N1. Browser, next to Parts 2a/2b
+
+- N1.1 **Save and restore a tab session** — "save these tabs as research", "open my research
+  tabs" (stored locally as titles + URLs; restore into a new window).
+- N1.2 **Reading list** — "read this later", "what's on my reading list", "open the next one"
+  (Chrome's `readingList` API, MV3, Chrome 120+).
+- N1.3 **Picture-in-picture** — "pop this video out" (`video.requestPictureInPicture()` in the
+  page; YouTube and any `<video>`).
+- N1.4 **Media on the page** — "skip ad", "play at 1.5x", "skip 30 seconds", "loop this video"
+  (page `<video>` element; the active YouTube tab first).
+- N1.5 **Screenshot of a tab / full page** — "screenshot this page" (`tabs.captureVisibleTab`;
+  full page by scroll-and-stitch), saved to Pictures and copied to the clipboard.
+- N1.6 **Tab hygiene suggestions** — "you have 14 tabs open, 5 are duplicates — close them?"
+  through `speak_unprompted` (proactive service, respects calls and standby).
+- N1.7 **Open the same page in another browser / profile** — "open this in Chromium",
+  "open this in my work profile".
+
+### N2. Models and keys, next to V4 §2
+
+- N2.1 **Usage and cost** — tokens and estimated spend per provider today / this month,
+  shown in Settings → AI models; an optional monthly cap that falls back to Groq/Gemini/local
+  when reached.
+- N2.2 **Model speed test** — Settings → "Compare": one fixed classification and one short
+  reply on every configured provider and the local model, with first-token and total times.
+- N2.3 **LM Studio management** — show which model is loaded, "load Qwen 3.5" / "unload the
+  model" (LM Studio's REST API), and warn when the loaded model has no vision.
+- N2.4 **Key health on boot** — test each stored key once in the background and say "your
+  Claude key has no credit" / "your Groq key was revoked" before the first request fails.
+- N2.5 **Re-run the DMM matrix from Settings** ("check how well Kayra understands commands on
+  this model"), with the 53-case score shown per provider.
+- N2.6 **Export / import settings** (without keys) to move a setup to another machine.
+
+### N3. Interface, next to the redesign and GPU work
+
+- N3.1 **Command palette** (Ctrl+K style): type any Kayra command or setting name, run it.
+- N3.2 **Keyboard shortcut list** — a "?" overlay listing every shortcut; editable shortcuts.
+- N3.3 **Text size and density** — "larger text" / "compact" in Settings, applied live through
+  the theme tokens (also helps the 2.25x display).
+- N3.4 **Light theme / follow the Omarchy theme** — the tokens are already centralised.
+- N3.5 **Voice preview** — a Play button next to the Voice dropdown that speaks a sample line.
+- N3.6 **Settings search** — filter all five sections by a word.
+- N3.7 **Performance panel** — the `KAYRA_UI_PROFILE` numbers and the GPU status shown in
+  System, instead of only in the log.
+- N3.8 **Notifications inbox** — what Kayra said while you were away (proactive lines, failed
+  actions) in one list on Home.
+
+### N4. Voice, next to the voice dropdown
+
+- N4.1 **Speaking speed and pitch** in Settings (Kokoro `speed`), applied live.
+- N4.2 **Per-language voice** — answer in Hindi with a Hindi voice when asked in Hindi.
+- N4.3 **Wake word** ("Kayra, …") as an option to the always-listening microphone, with a
+  local detector so nothing leaves the machine.
+- N4.4 **Hearing the names on screen** *(done 2026-11-11, V19)* — recognition in `en-IN`, and
+  the transcript repair stage corrects a misheard chat / file / button name to the one on
+  screen it sounds like (`automation/screen_vocabulary.py`, `docs/reference/VOICE_LOOP.md` →
+  Names on screen). Open: N4.5 local Whisper with the on-screen names as hot words, if the
+  audit log still shows mishearings after a week of en-IN.
+
+### N5. Safety and housekeeping
+
+- N5.1 **Backup of memory and settings** (local zip, keys excluded) and restore.
+- N5.2 **Audit log viewer** in Automation: search, filter by risky actions, export.
+- N5.3 **Test hygiene sweep** — find every other place a unit suite writes to the developer's
+  `logs/`, `data/` or `Reports/` (M0.6 found one) and route it to a temp dir.
+
+---
+
+## 14. Chrome profiles  *(requested 2026-11-10; P1, P2, P3, P5 done 2026-11-11 — part 5P; P4 and the default-profile setting open)*
+
+**What the user asked.** "Open Google Chrome" shows Chrome's *Who's using Chrome?* picker. The
+user has five profiles that they renamed themselves (for example Personal, Work, Study, Study 2
+and one named after a person); three are signed in to accounts on the same school
+domain. They want "open my Work Chrome" / "open Chrome on <email>" to open straight into that
+profile. (No real names, emails or domains are recorded here or anywhere in the repository.)
+
+**Hard requirement: fully dynamic.** Nothing about anyone's profiles is ever written in the
+code or the repository, and no user is asked to edit code, `.env` or a config file. Kayra
+reads the profiles from Chrome itself every time, so it works for any user, any number of
+profiles, renamed or never named.
+
+### P1. Discover profiles from Chrome (read-only, local)
+- Source: Chrome's own `Local State` JSON, `profile.info_cache` — one entry per profile folder
+  (`Default`, `Profile 1`, …) with the profile `name` (what the picker shows above the avatar:
+  "Personal", "Work"), the account's `gaia_name` / `gaia_given_name` (the account's display name),
+  `user_name` (the email), `hosted_domain` (e.g. a school domain), `is_using_default_name`
+  (true when the user never renamed it — "Person 1"), plus `profile.last_used` and
+  `profile.last_active_profiles`.
+- Locations (through `kayra.platforms`, never guessed in a shared module): Linux
+  `~/.config/google-chrome/Local State` (also `chromium`, `BraveSoftware/Brave-Browser`,
+  `microsoft-edge` — same format); Windows `%LOCALAPPDATA%\Google\Chrome\User Data\Local
+  State`. The browser that "open Chrome" means is the one Kayra already resolves.
+- Re-read when the file's modification time changes (a rename in Chrome shows up at the next
+  request; no restart, no cache to clear). Parse failures -> "I can't read Chrome's profiles"
+  and plain "open Chrome" still works.
+- Privacy: read on this computer only; emails and names are matched locally
+  (`semantic_match`), never logged in full (counts only), never sent to any model. The
+  classifier sees only the user's words.
+
+### P2. Say it any way
+- Shapes: "open Chrome as / with / for / on / in <X>", "open my <X> Chrome", "open <X>'s
+  Chrome", "open Chrome with my <domain or org> account", "open Chrome on <email>" (spoken
+  emails via `common.spoken_email`), "switch to my <X> profile", "which Chrome profiles do I
+  have?", and a site inside a profile: "open Gmail in my Work Chrome" (= the profile + the URL).
+- Matching (`semantic_match.match`) against EVERY field of every profile: profile name, account
+  name and given name, email and its local part, domain and its first labels ("my school
+  account"), and
+  ordinal words for unnamed profiles ("the first profile", "profile 2"). The profile name
+  wins a tie over an account name ("Study" -> the profile named Study, not every Study-domain
+  account); spoken numbers make "study two" -> "Study 2".
+- Ambiguity asks, naming what tells them apart, from the data — e.g. "my school Chrome" with
+  three profiles on one domain -> "Work, Study or Study 2?"; for never-renamed profiles it
+  describes them by account: "Person 1 (<account name>) or Person 2 (<account name>)?"
+- Plain "open Chrome" is unchanged (Chrome's picker) unless the user says "always open Chrome
+  as Work" — stored as a USER SETTING (Settings + `.env` key written by Settings, never by hand),
+  with "use the last profile I used" as the other option (`profile.last_used`).
+- Optional, spoken: "call the Study 2 profile my exam prep" -> a local alias
+  (`data/aliases.json`, H2) — again data, never code. Renaming in Chrome works just as well.
+
+### P3. Open it
+- `<browser> --profile-directory="<folder>" [url]` through the existing launcher (argv, no
+  shell). If that browser is already running, Chrome opens a window in that profile; then the
+  new window is focused (Hyprland: the newest window of the browser's class).
+- Spoken result names the profile and the account: "Opened Chrome as Work (<account name>)."
+
+### P4. The Kayra Bridge in more than one profile (follow-up)
+- The extension is installed per profile. After opening a profile Kayra checks whether the
+  bridge connected FROM it; if not: "Chrome is open as Study 2, but the Kayra extension isn't
+  installed there — say 'browser set up' to add it."
+- The bridge must accept one connection per profile and route each command to the profile in
+  front (the extension reports its profile with `chrome.identity`-free means: the hello carries
+  a per-install id kept in `chrome.storage.local`). Until then, browser commands go to the
+  profile that connected first, and Kayra says which.
+- "switch to my Work Chrome window" needs the window <-> profile link (Hyprland sees one class
+  for all profiles): from the bridge per profile (P4), else the window title when Chrome puts
+  the profile name in it.
+
+### P5. Tests
+- A temporary `Local State` with: renamed profiles (the user's five shapes, with made-up
+  emails), never-renamed ones ("Person 1"), two on one domain, one without an account, a
+  corrupt file, and a rename between two requests (mtime).
+- Phrasings: every shape in P2, spoken emails, "study two", ties (profile name beats account
+  name), ambiguity questions built from the data, plain "open Chrome" untouched.
+- Launch argv recorded by the fake runner (no real browser); the extension-missing sentence.
+- A guard test: no profile name, email or domain from the user's machine appears anywhere in
+  `src/` or `tests/` (the feature must stay data-driven).
+- Add the phrasings to `tests/test_dmm_browser.py` (rules-first where the shape is unambiguous).
+
+
+---
+
+## 15. Bugs and errors — moved  *(2026-11-11)*
+
+Bugs are tracked in their own file now: **[`BUGS.md`](BUGS.md)** — open bugs at the top, fixed
+ones (L0–L10, V19–V22) at the bottom. This plan is for NEW features only.

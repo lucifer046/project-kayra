@@ -106,6 +106,10 @@ SITES = {
     "google photos": _s("https://photos.google.com/", ("my google photos",),
                  ("google photos",), "google", "https://photos.google.com/search/{q}"),
     "meet": _s("https://meet.google.com/", ("google meet",), ("meet",), "google"),
+    # L9 (audit log 2026-11-11): "open Google Chat" was "no app called google chat". Never the
+    # bare word "chat" — that is a WhatsApp chat.
+    "google chat": _s("https://chat.google.com/", ("gchat", "hangouts chat", "google hangouts"),
+                      ("google chat",), "google"),
     "calendar": _s("https://calendar.google.com/", ("google calendar", "my calendar"),
                    ("google calendar",), "google"),
     "classroom": _s("https://classroom.google.com/", ("google classroom",),
@@ -372,6 +376,12 @@ SITES = {
                           ("my orders",), "list"),
     "github notifications": _s("https://github.com/notifications", (), ("notifications",),
                                "list"),
+    "linkedin jobs": _s("https://www.linkedin.com/jobs/", ("linkedin job search", "jobs on linkedin"),
+                        ("jobs | linkedin",), "list", "https://www.linkedin.com/jobs/search/?keywords={q}"),
+    "linkedin notifications": _s("https://www.linkedin.com/notifications/", ("my linkedin notifications",),
+                                 ("notifications | linkedin",), "list"),
+    "linkedin messages": _s("https://www.linkedin.com/messaging/", ("my linkedin messages", "linkedin inbox"),
+                            ("messaging | linkedin",), "list"),
     "github pull requests": _s("https://github.com/pulls", ("my pull requests", "my prs"),
                                ("pull requests",), "list"),
 }
@@ -388,7 +398,8 @@ _DISPLAY = {"youtube": "YouTube", "youtube music": "YouTube Music", "github": "G
             "jiocinema": "JioCinema", "jiosaavn": "JioSaavn", "geeksforgeeks": "GeeksforGeeks",
             "espncricinfo": "ESPNcricinfo", "duckduckgo": "DuckDuckGo", "paypal": "PayPal",
             "bigbasket": "BigBasket", "hackerrank": "HackerRank", "codechef": "CodeChef",
-            "iitm portal": "IIT Madras", "iitm bs portal": "the IITM BS portal"}
+            "linkedin jobs": "LinkedIn Jobs", "linkedin notifications": "LinkedIn notifications",
+            "linkedin messages": "LinkedIn messages", "iitm portal": "IIT Madras", "iitm bs portal": "the IITM BS portal"}
 
 
 def display_name(name):

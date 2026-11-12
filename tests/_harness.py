@@ -43,6 +43,10 @@ import tempfile
 import platform
 import traceback
 
+# A suite never writes the developer's automation audit log (logs/automation.log). run_all.py
+# points it at a temporary file; a suite run on its own keeps the audit in memory only.
+os.environ.setdefault("KAYRA_AUDIT_LOG", "off")
+
 # The package lives under src/; put it on the path so suites run without installing.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if os.path.join(PROJECT_ROOT, "src") not in sys.path:
@@ -533,7 +537,8 @@ def has_tts_model():
     try:
         from kayra.core.paths import model_path
         return any(os.path.isfile(model_path(name))
-                   for name in ("kokoro-v1.0.int8.onnx", "kokoro.onnx"))
+                   for name in ("kokoro-v1.0.fp16.onnx", "kokoro-v1.0.onnx",
+                               "kokoro-v1.0.int8.onnx", "kokoro.onnx"))
     except Exception:
         return False
 

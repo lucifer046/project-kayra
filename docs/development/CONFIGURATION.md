@@ -18,7 +18,9 @@ are read from the process environment first so one run can be made verbose witho
 | `TTS_DEVICE_MODE` | `AUTO` / `GPU` / `CPU` for speech synthesis | **live** (Settings) |
 | `STT_BROWSER` | `auto` / `chrome` / `edge` / … | **live** (Settings) |
 | `FORCE_ONLINE`, `LOCAL_*` | local LLM server vs cloud | next start |
-| `CohereAPIKey`, `GROQ_API_KEY`, `GEMINI_API_KEY` | cloud providers | next start |
+| `CLAUDE_API_KEY`, `GROQ_API_KEY`, `GEMINI_API_KEY` | cloud providers (Claude → Groq → Gemini, intent and chat). Set them in Settings → Cloud models: stored in the system keyring (`.env` then says `@keyring`), Test and Remove per provider | immediately |
+| `CLOUD_FIRST` | prefer the cloud keys while a local server runs | next start |
+| `CLAUDE_MODEL`, `GROQ_CHAT_MODEL`, `GROQ_DECISION_MODEL`, `GEMINI_CHAT_MODEL` | model ids | immediately |
 | `PROVIDER_COOLDOWN_*`, `PROVIDER_TIMEOUT_SECONDS` | router stand-down and request timeout (clamped) | next start |
 | `PROACTIVE_*` | proactive agent and presence: switch, tick, cooldowns, threshold, late-night window, habit caps, phrasing | switch is live |
 | `AUTOMATION_*` | confirmation TTL, shell timeout, screenshot retention, timer cap (Windows) | next start |

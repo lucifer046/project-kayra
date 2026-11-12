@@ -50,6 +50,7 @@ import json
 import shutil
 import socket
 import subprocess
+import threading
 import webbrowser
 from urllib.parse import quote_plus
 
@@ -230,9 +231,30 @@ def wait_until_gone(address, timeout=None):
         SLEEP(0.1)
 
 
+def _webapp_site(app):
+    """'web.whatsapp.com' for a web-app entry (omarchy-launch-webapp …), else None."""
+    try:
+        url = linux_apps.webapp_url(getattr(app, "entry", None))
+    except Exception:
+        url = None
+    if not url:
+        return None
+    host = re.sub(r"^[a-z]+://", "", url.lower()).split("/")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def _shows_site(window, site):
+    """A Chromium --app window of `site`, whatever profile it runs in. The entry's
+    StartupWMClass names ONE profile ("…__-Default"); a web app launched with another profile
+    has another class ("…__-Profile_1"), so Kayra waited 8 s for a window that was already
+    there and then said "WhatsApp isn't open" (the audit log, 2026-11-11)."""
+    return bool(site) and any(linux_apps.site_of_window_class(c) == site for c in window.classes)
+
+
 def _windows_for(target, strict=True):
     """Windows belonging to an AppTarget. Strict = class identity only (for anything destructive)."""
-    matches = [w for w in list_windows() if w.classes & target.classes]
+    site = _webapp_site(target)
+    matches = [w for w in list_windows() if w.classes & target.classes or _shows_site(w, site)]
     if matches or strict:
         return matches
     needle = target.label.lower()
@@ -353,7 +375,7 @@ def _wait_for_window(app, before, timeout=None):
         for window in list_windows():
             if window.address in before:
                 continue
-            if window.classes & app.classes or not app.classes:
+            if window.classes & app.classes or not app.classes or _shows_site(window, _webapp_site(app)):
                 return window
         SLEEP(0.2)
     return None
@@ -395,6 +417,18 @@ def close_target(name, all_instances=False):
         return ActionResult.not_found(f"I couldn't find {name} open.")
     matches = _windows_for(app, strict=True)
     if not matches:
+        # A web app with no window of its own may be open as a TAB ("close WhatsApp" with
+        # WhatsApp in a Chrome tab): close that tab — never something inside it.
+        site = _webapp_site(app)
+        if site:
+            try:
+                from kayra.automation import web_macros
+                if web_macros.BRIDGE.connected():
+                    closed = (web_macros.BRIDGE.call("tabs.close", match=site, all=True) or {}).get("closed", 0)
+                    if closed:
+                        return ActionResult.success(f"{app.label} is closed.", closed=closed)
+            except Exception:
+                pass
         return ActionResult.not_found(f"{app.label} isn't open.")
     if all_instances:
         for window in matches:
@@ -1302,6 +1336,38 @@ def _browser_in_front():
         return False
 
 
+def _is_open_chat(target, W):
+    """'close the group' with WhatsApp in front and no tab group at all: the open chat."""
+    try:
+        return (str(target).lower() in ("current", "the", "this", "that", "whatsapp")
+                and common.front_site(situation) == "web.whatsapp.com" and not W._groups())
+    except Exception:
+        return False
+
+
+def _page_scroll(params):
+    """A scroll with a direction / place / amount. Into the page when a browser (or Kayra's own
+    window, while the user talks to it) is in front; with real keys when another app is, so
+    "scroll to the bottom" in a terminal or a PDF viewer does not move a hidden Chrome tab."""
+    from kayra.automation import web_macros
+    direction = params.get("direction", "down")
+    front = None
+    try:
+        front = active_window()
+    except Exception:
+        pass
+    elsewhere = front is not None and not front.kayra_owned and not _is_browser_window(front)
+    if params.get("until") or (web_macros.BRIDGE.connected() and not elsewhere):
+        return web_macros.page_scroll(direction, params.get("until"), params.get("where", ""),
+                                      params.get("amount", 1.0))
+    if not elsewhere:
+        return web_macros.page_scroll(direction)             # says how to set the bridge up
+    if direction in ("up", "down"):
+        return mouse_action(f"scroll_{direction}")
+    ok = send_keys("ctrl+home" if direction == "top" else "ctrl+end")
+    return ActionResult.success("Done.") if ok else ActionResult.failure("I couldn't scroll that window.")
+
+
 def mouse_action(verb, target=None):
     # A click or scroll with Chrome in front goes INSIDE the page through the extension: it
     # needs no screenshot, no OCR and no /dev/uinput, and it can click things a screen
@@ -1445,10 +1511,12 @@ def click_on_text(phrase, verb="click_text"):
     if monitor is None:
         return ActionResult.unsupported("Clicking on text needs the Hyprland session.")
     import tempfile
-    handle, path = tempfile.mkstemp(prefix="kayra-ocr-", suffix=".png")
+    # PPM, not PNG: this file is read once by tesseract and deleted, so compressing it is pure
+    # cost (measured 151 ms -> 35 ms for a 2880x1800 capture; the OCR itself is ~1.2 s).
+    handle, path = tempfile.mkstemp(prefix="kayra-ocr-", suffix=".ppm")
     os.close(handle)
     try:
-        if not _ok("grim", "-o", str(monitor.get("name")), path, timeout=6.0):
+        if not _ok("grim", "-o", str(monitor.get("name")), "-t", "ppm", path, timeout=6.0):
             return ActionResult.failure("I couldn't capture the screen.")
         words = ocr_words(path)
     finally:
@@ -1879,10 +1947,17 @@ def _dispatch(action):
                         return ActionResult.not_found(result.message, web_fallback=True)
                     return web_macros.open_site(target, None)
             return result
-        if verb == "close":
-            return close_target(target)
-        if verb == "close_all":
-            return close_target(target, all_instances=True)
+        if verb in ("close", "close_all"):
+            from kayra.automation import web_macros
+            if params.get("confirmed_ids") is not None:
+                return web_macros.close_site_tabs(target, params["confirmed_ids"])
+            result = close_target(target, all_instances=verb == "close_all")
+            if result is not None and result.status == Status.NOT_FOUND:
+                # L6: a site with no window of its own ("close Google Drive") is its tab(s).
+                closed = web_macros.close_site_tabs(target, action=action)
+                if closed is not None:
+                    return closed
+            return result
         if verb == "restart":
             return restart_app(target)
         if verb == "content":
@@ -2055,39 +2130,216 @@ def _dispatch(action):
     return _dispatch_extended(domain, verb, target, params, action)
 
 
+def _agent():
+    from kayra.automation import page_agent
+    return page_agent
+
+
+def _learning(verb, target):
+    from kayra.automation import learning
+    if verb == "show":
+        return ActionResult.success(learning.describe())
+    if verb == "forget_last":
+        said = learning.forget_last()
+        return ActionResult.success(said) if said else ActionResult.not_found("There's nothing I just learned to forget.")
+    if verb == "forget_all":
+        count = learning.forget_all()
+        return ActionResult.success(f"Forgot everything I'd learned ({count} things)." if count else "There was nothing to forget.")
+    if verb == "forget_app":
+        count = learning.forget_app(target.lower().replace(" ", ""))
+        return ActionResult.success(f"Forgot {count} thing{'s' if count != 1 else ''} about {target}." if count
+                                    else f"I hadn't learned anything about {target}.")
+    if verb == "forget_recipe":
+        from kayra.automation import page_agent
+        return ActionResult.success(f"Forgot how to {target}.") if page_agent.forget_recipe(target) else \
+            ActionResult.not_found(f"I don't have a shortcut for {target}.")
+    return None
+
+
+def _share_warning(action):
+    from kayra.automation import web_macros
+    return web_macros.share_warning(action)
+
+
+common.SHARE_WARNING["fn"] = _share_warning      # a reference, not a side effect: nothing runs at import
+
+
+def _inbox():
+    from kayra.automation import inbox
+    return inbox
+
+
+def _profiles():
+    from kayra.automation import chrome_profiles
+    return chrome_profiles
+
+
 def _dispatch_extended(domain, verb, target, params, action):
     """Round 3 domains: web, diagnostics, screen, scenes, plans, triggers, files, dev."""
     from kayra.automation import (web_macros as W, diagnostics as D, screen_ai as V,
                                   workflows as F, linux_system as S)
+    W.new_command()                       # a fresh "which tab is active?" for this command
+    if domain == "voice":
+        return common.voice_rate(target)
+    if domain == "backup":
+        from kayra.automation import backup as B
+        return {"create": B.create, "list": B.list_backups, "restore": B.restore}[verb]()
+    if domain == "models":
+        from kayra.automation import local_models as M
+        return {"status": M.loaded_report, "unload": M.unload, "speed": M.speed_test,
+                "keys": M.key_health, "load": lambda: M.load(target)}[verb]()
+    if domain == "learning":
+        return _learning(verb, target)
+    if domain == "inbox":
+        if verb == "all":
+            return _inbox().inbox_all()
+        if verb == "offers":
+            return _inbox().set_message_offers(target == "on")
+        return _inbox().reply_anywhere(target, params.get("text", ""), action)
     if domain == "browser":
         table = {"tabs_list": lambda: W.tabs_list(),
                  "tab_switch": lambda: W.tab_switch(target),
-                 "tab_close": lambda: W.tab_close(target, params.get("all", False)),
+                 "tab_close": lambda: W.tab_close(target, params.get("all", False),
+                                                  params.get("confirmed_ids"), action),
+                 "tabs_close_unpinned": lambda: W.tabs_close_unpinned(params.get("confirmed_ids"), action),
+                 "tabs_group": lambda: W.tabs_group(target, params.get("title", "")),
+                 "groups_list": lambda: W.groups_list(),
+                 "group_add": lambda: W.group_add(target),
+                 "group_rename": lambda: W.group_update(target, title=params.get("title", "")),
+                 "group_color": lambda: W.group_update(target, color=params.get("color")),
+                 "group_collapse": lambda: W.group_open(target) if params.get("or_chat") else
+                 W.group_update(target, collapsed=params.get("collapsed", True)),
+                 "group_ungroup": lambda: W.group_ungroup(target),
+                 "group_close": lambda: W.wa_close() if _is_open_chat(target, W) else
+                 W.group_close(target, params.get("confirmed_ids"), action),
+                 "tab_detach": lambda: W.tab_detach(params.get("monitor", False)),
+                 "windows_merge": lambda: W.windows_merge(),
+                 "page_result": lambda: W.page_result(params.get("nth", 1), params.get("new_tab", False)),
+                 "page_results": lambda: W.page_results(),
+                 "page_find_step": lambda: W.page_find_step(params.get("step", 1)),
+                 "page_find_clear": lambda: W.page_find_clear(),
                  "tabs_close_others": lambda: W.tabs_close_others(),
+                 "tabs_close_duplicates": lambda: W.tabs_close_duplicates(),
+                 "tabs_close_side": lambda: W.tabs_close_side(target),
+                 "tabs_mute_others": lambda: W.tabs_mute_others(params.get("on", True)),
+                 "tabs_recently_closed": lambda: W.tabs_recently_closed(),
+                 "tab_reopen": lambda: W.tab_reopen(target),
+                 "tabs_discard": lambda: W.tabs_discard(),
+                 "tab_find": lambda: W.tab_find(target),
+                 "page_reload": lambda: W.page_reload(params.get("hard", False)),
+                 "page_zoom": lambda: W.page_zoom(target),
+                 "page_copy": lambda: W.page_copy(target),
                  "tab_mute": lambda: W.tab_mute(target, params.get("on", True)),
                  "tab_pin": lambda: W.tab_pin(),
                  "page_click": lambda: W.page_click(target, params.get("nth", 1)),
                  "page_type": lambda: W.page_type(target, params.get("text", ""),
                                                   params.get("submit", False)),
-                 "page_scroll": lambda: W.page_scroll(params.get("direction", "down"),
-                                                      params.get("until")),
-                 "page_read": lambda: W.page_read(), "page_summarize": lambda: W.page_summarize(),
+                 "page_scroll": lambda: _page_scroll(params),
+                 "search_close": lambda: W.search_close(),
+                 "page_read": lambda: W.page_read(target), "page_summarize": lambda: W.page_summarize(target),
+                 "page_ask": lambda: W.page_ask(params.get("question", "")),
+                 "page_comments": lambda: W.page_comments(params.get("summarize", False)),
+                 "video_summary": lambda: W.video_summary(),
+                 "page_translate": lambda: W.page_translate(target),
+                 "selection_explain": lambda: W.selection_explain(),
+                 "selection_translate": lambda: W.selection_translate(target),
+                 "bookmark_add": lambda: W.bookmark_add(params.get("folder", "")),
+                 "bookmarks_search": lambda: W.bookmarks_search(target),
+                 "bookmark_delete": lambda: W.bookmark_delete(target, params.get("confirmed_ids"), action),
+                 "history_clear": lambda: W.history_clear(target, params.get("confirmed", False), action),
+                 "history_list": lambda: W.history_list(params.get("days", 1)),
+                 "downloads_list": lambda: W.downloads_list(),
+                 "download_open": lambda: W.download_open(params.get("confirmed_id"), action),
+                 "download_show": lambda: W.download_show(),
+                 "download_control": lambda: W.download_control(target),
+                 "search_here": lambda: W.search_here(target),
+                 "page_help": lambda: W.page_help(),
+                 "ws_open": lambda: W.ws_open(target, params.get("kind", "file")),
+                 "ws_search": lambda: W.ws_search(target, params.get("kind", "file"), params.get("open", False)),
+                 "ws_create": lambda: W.ws_create(target, params.get("title", "")),
+                 "sheet_cell": lambda: W.sheet_cell(target),
+                 "sheet_calc": lambda: W.sheet_calc(target, params.get("op", "sum"), params.get("where")),
+                 "sheet_row": lambda: W.sheet_row(target, params.get("headers", False)),
+                 "ws_share": lambda: W.ws_share(target),
+                 "slides_present": lambda: W.slides_present(),
+                 "slides_nav": lambda: W.slides_nav(target),
+                 "ws_recent": lambda: W.ws_recent(),
+                 "ws_download": lambda: W.ws_download(),
+                 "keep_note": lambda: W.keep_note(params.get("text", "")),
+                 "form_responses": lambda: W.form_responses(target),
+                 "classroom_due": lambda: W.classroom_due(),
                  "page_find": lambda: W.page_find(target), "page_controls": lambda: W.page_controls(),
                  "history_open": lambda: W.history_open(target, params.get("days", 7)),
                  "bookmark_open": lambda: W.bookmark_open(target),
                  "bridge_setup": lambda: W.bridge_setup(), "bridge_status": lambda: W.bridge_status(),
-                 "bridge_update": lambda: W.bridge_update()}
+                 "bridge_update": lambda: W.bridge_update(),
+                 # ── Part 6 ──
+                 "form_fill": lambda: W.form_fill(params.get("confirmed"), action),
+                 "form_choose": lambda: W.form_choose(params.get("field", ""), params.get("option", target),
+                                                      params.get("kind", "select"), params.get("state")),
+                 "form_submit": lambda: W.form_submit(),
+                 "page_key": lambda: W.page_key(target, params.get("count", 1)),
+                 "file_upload": lambda: W.file_upload(target, params.get("field", ""),
+                                                      params.get("confirmed_path"), action),
+                 "video": lambda: W.video_control(params.get("op", target), params.get("value")),
+                 "video_subscribe": lambda: W.video_control("subscribe"),
+                 "site_search": lambda: W.site_search(params.get("site", ""), target, params.get("sort", ""),
+                                                      params.get("lo", 0), params.get("hi", 0), params.get("where")),
+                 "shop_refine": lambda: W.shop_refine(params.get("sort", ""), params.get("lo", 0), params.get("hi", 0)),
+                 "product_info": lambda: W.product_info(),
+                 "profile_set": lambda: W.profile_set(target, params.get("text", "")),
+                 "profile_show": lambda: W.profile_show(params.get("read", False)),
+                 "profile_forget": lambda: W.profile_forget(target),
+                 "profile_clear": lambda: W.profile_forget("all"),
+                 # ── Part 6b ──
+                 "ai_ask": lambda: W.ai_ask(params.get("bot", "chatgpt"), params.get("question", ""),
+                                            bool(params.get("new"))),
+                 "ai_read": lambda: W.ai_read("" if target == "current" else target, bool(params.get("full"))),
+                 "social": lambda: W.social(target, params.get("site", ""), params.get("name", ""),
+                                            params.get("period", ""), params.get("read", True)),
+                 # ── Part 5P: Chrome profiles, read from Chrome's own Local State ──
+                 "chrome_profile": lambda: _profiles().open_profile(target, params.get("browser", ""),
+                                                                    params.get("url", ""), params.get("email", "")),
+                 "chrome_profiles": lambda: _profiles().list_profiles(params.get("browser", "")),
+                 "chrome_guest": lambda: _profiles().open_guest(params.get("browser", "")),
+                 # ── Part 7: the page agent and its recipes ──
+                 "agent": lambda: _agent().run(target, params.get("resume"), action),
+                 "agent_recipes": lambda: _agent().list_recipes(),
+                 # ── Part 12 ──
+                 "session_save": lambda: W.session_save(target), "session_open": lambda: W.session_open(target),
+                 "sessions_list": lambda: W.sessions_list(), "session_delete": lambda: W.session_delete(target),
+                 "reading_add": lambda: W.reading_add(), "reading_list": lambda: W.reading_list(),
+                 "reading_next": lambda: W.reading_next(), "reading_clear": lambda: W.reading_clear(),
+                 "video_pip": lambda: W.video_pip(target != "off"),
+                 "page_screenshot": lambda: W.page_screenshot(target == "full"),
+                 "tabs_tidy": lambda: W.tabs_tidy_report(),
+                 "open_elsewhere": lambda: W.open_elsewhere(target, params.get("profile", ""))}
         handler = table.get(verb)
         return handler() if handler else None
     if domain == "meet":
+        if verb == "present":
+            return W.meet_present(target)
+        if verb in ("notes", "summary"):
+            from kayra.automation import meeting_notes as N
+            return N.summarize() if verb == "summary" else N.start() if target == "on" else N.stop()
+        if verb in ("record", "record_stop"):
+            return V.record(verb == "record")
+        if verb in ("people", "react", "pin", "message", "link"):
+            return {"people": lambda: W.meet_people(), "react": lambda: W.meet_react(target),
+                    "pin": lambda: W.meet_pin(target),
+                    "message": lambda: W.meet_chat(params.get("text", ""), bool(params.get("confirmed")), action),
+                    "link": lambda: W.meet_link(params.get("to", ""), action)}[verb]()
+        if verb == "admit":
+            return W.meet_admit(True)
         if verb == "join":
             return W.meet_join(target)
         if verb == "share":
-            return W.meet_share(target or "monitor")
+            return W.meet_share(target or "monitor", params.get("name", ""),
+                                bool(params.get("audio")), bool(params.get("instead")))
         if verb == "stop_share":
-            result = W._click_first(W._MEET_LABELS["stop_share"]) if W.BRIDGE.connected() else None
-            return ActionResult.success("Stopped sharing.") if result else \
-                ActionResult.not_found("You're not sharing.")
+            return W.meet_stop_share()
+        if verb == "share_status":
+            return W.meet_share_status()
         return W.meet_toggle(verb, params.get("on"))
     if domain == "email":
         if verb in ("reply", "reply_all", "forward", "archive", "delete", "back", "unread", "star", "spam"):
@@ -2102,12 +2354,39 @@ def _dispatch_extended(domain, verb, target, params, action):
                                              params.get("query", "")),
                 "draft": lambda: W.email_draft(target, params.get("subject", ""),
                                                params.get("body", "")),
-                "send": lambda: W.email_send()}[verb]()
+                "send": lambda: W.email_send(),
+                "search": lambda: W.email_search(target),
+                "compose": lambda: W.email_compose(),
+                "label": lambda: W.email_label(target)}[verb]()
     if domain == "calendar":
+        if verb == "next":
+            return W.calendar_next(bool(params.get("join")))
         return W.calendar_add(params.get("text", target)) if verb == "add" else \
             W.calendar_agenda(target)
     if domain == "message":
-        return W.message_send(target, params.get("text", ""))
+        if verb == "open":
+            return W.wa_open(target)
+        if verb == "search":
+            return W.wa_search(target, bool(params.get("open")))
+        if verb == "close":
+            return W.wa_close()
+        if verb == "unread":
+            return W.wa_unread()
+        if verb == "read":
+            return W.wa_read(target, bool(params.get("today")), int(params.get("count") or 0))
+        if verb == "other":
+            return W.wa_other()
+        if verb == "manage":
+            return W.wa_manage(params.get("op", "mute"), target, params.get("span", ""))
+        if verb == "act":
+            return W.wa_message(params.get("op", "star"), target, params.get("text", ""), params.get("to", ""),
+                                params.get("confirmed"), action)
+        if verb == "send_draft":
+            return W.message_send_draft(params.get("confirmed_chat"), params.get("confirmed_text"), action)
+        if verb == "send_file":
+            return W.wa_send_file(target, params.get("what", ""), params.get("confirmed_path"),
+                                  params.get("confirmed_chat"), action)
+        return W.message_send(target, params.get("text", ""), params.get("confirmed_chat"), action)
     if domain == "diagnose":
         if verb == "fix":
             return ActionResult.success(D.apply_fixes())
@@ -2175,7 +2454,7 @@ def _music_sleep(text):
     seconds = common.parse_duration(text) or 30 * 60
     label = _humanize_duration(seconds)
     timer_id, error = RUNTIME.timers.add(
-        seconds, f"music sleep timer", on_fire=lambda _l: media_action("pause"))
+        seconds, "music sleep timer", on_fire=lambda _l: media_action("pause"))
     return ActionResult.failure(error) if timer_id is None else \
         ActionResult.success(f"I'll stop the music in {label}.")
 
@@ -2214,6 +2493,10 @@ shutdown_automation = RUNTIME.shutdown
 take_chat_handoff = RUNTIME.take_chat_handoff
 
 
+_LAST_FRONT = {}
+FRONT_MEMORY_S = 120.0
+
+
 def situation():
     """
     What is on screen, for the understanding layer: the app in front, the web app / site it
@@ -2223,6 +2506,10 @@ def situation():
     out = {}
     try:
         front = active_window()
+        if (front is None or front.kayra_owned) and _LAST_FRONT.get("at") and \
+                time.monotonic() - _LAST_FRONT["at"] <= FRONT_MEMORY_S:
+            # Talking to Kayra's own window: the app the user was in a moment ago (H0.2).
+            out.update({k: v for k, v in _LAST_FRONT.items() if k != "at"})
         if front is not None and not front.kayra_owned:
             out["app"] = front.initial_class or front.cls
             out["window_title"] = (front.title or "")[:120]
@@ -2230,6 +2517,9 @@ def situation():
                          if linux_apps.site_of_window_class(c)), None)
             if site:
                 out["site"] = site
+            _LAST_FRONT.clear()
+            _LAST_FRONT.update({k: out[k] for k in ("app", "window_title", "site") if k in out},
+                               at=time.monotonic())
     except Exception:
         pass
     try:
@@ -2263,15 +2553,27 @@ def start_services(speaker=None):
     from kayra.automation import browser_bridge, workflows, linux_system
     if speaker is not None:
         common.set_announcer(speaker)
-    from kayra.automation import status_file
+    from kayra.automation import status_file, web_macros
+    browser_bridge.BRIDGE.on_hello = web_macros.refresh_stale_extension
     started = {"bridge": browser_bridge.start(), "watcher": workflows.ensure_watcher(),
-               "notifications": linux_system.start_notification_log(),
+               "notifications": linux_system.start_notification_log(_inbox().on_notification),
                "status": status_file.start()}
+    # Part 15 (N2.4): KEY_HEALTH_ON_BOOT=on checks the stored keys once, in the background.
+    from kayra.automation import local_models
+    from kayra.core.config import env
+    if str(env("KEY_HEALTH_ON_BOOT", "off") or "off").strip().lower() in ("1", "on", "true", "yes"):
+        threading.Thread(target=local_models.boot_check, args=(common.announce,), daemon=True,
+                         name="kayra-key-check").start()
+        started["key_check"] = True
     return started
 
 
 def _stop_services():
-    from kayra.automation import browser_bridge, workflows, linux_system
+    from kayra.automation import browser_bridge, workflows, linux_system, meeting_notes
+    try:
+        meeting_notes.stop()                      # the notes of a call still going are saved, not lost
+    except Exception:
+        pass
     try:
         workflows.save_last_session()
     except Exception:

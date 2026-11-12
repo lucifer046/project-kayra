@@ -69,6 +69,11 @@ def reports_dir() -> str:
     return _ensure(os.path.join(project_root(), "Reports"))
 
 
+def backups_dir() -> str:
+    """Part 16: Kayra's own backups of memory and settings (never API keys)."""
+    return _ensure(os.path.join(project_root(), "backups"))
+
+
 def docs_dir() -> str:
     return os.path.join(project_root(), "docs")
 

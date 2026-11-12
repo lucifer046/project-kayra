@@ -40,7 +40,7 @@ available). The per-version Linux results are recorded in
 | pyperclip | >=1.8 | all | automation clipboard | |
 | send2trash | >=1.8 | all | automation file delete (optional) | |
 | openai | >=1.30 | all | OpenAI-compatible clients (Groq, Gemini, local) | 3.x verified by the provider-router suite |
-| cohere | >=6.0,<8 | all | DMM primary | v1 `chat_stream(message=, preamble=, chat_history=)` verified through 7.3.1 |
+| anthropic | >=2.0 | all | Claude: first cloud provider (DMM and chat) | verified with 2.7.0; imported lazily by `llm_engine` |
 | kokoro-onnx | >=0.4 | all | `output/text_to_speech` | pulls CPU `onnxruntime` transitively; setup repairs |
 | sounddevice | >=0.4 | all | audio out | Linux needs system PortAudio |
 | numpy | >=1.26 | all | audio, gestures | |
@@ -67,7 +67,7 @@ installed only when an NVIDIA GPU is present — on Windows and Linux alike).
 | mediapipe | 0.10.35 | 0.10.35 |
 | PySide6-Essentials (installed on Arch's glibc) | 6.11.3 (ceiling) | 6.11.3 (3.11) / 6.12.0 (3.12+) |
 | evdev | 1.9.3 | 2.0.0 |
-| openai / cohere / selenium | 3.46.0 / 7.3.1 / 4.52.0 | same |
+| openai / anthropic / selenium | 3.46.0 / 2.7.0 / 4.52.0 | same |
 
 ## MediaPipe: two APIs, one detector
 

@@ -151,9 +151,9 @@ These reach a model provider, a real browser, or the sound card.
 .\.venv\Scripts\python.exe tests\run_all.py --integration
 ```
 
-`test_dmm_matrix.py` is paced under Cohere's rate limit and takes about three minutes. **It
+`test_dmm_matrix.py` is paced (`--delay=`, default 1 s) and takes about a minute. **It
 follows the same local-first routing the assistant does**, so with an LM Studio or Ollama
-server running it measures the LOCAL model, not Cohere — the numbers are not comparable
+server running it measures the LOCAL model, not the cloud — the numbers are not comparable
 between the two. If you are checking a classifier change, know which one you measured.
 
 ---
@@ -342,8 +342,11 @@ Routing, failover and cooldowns — **no provider is ever called**; the clock is
 .\.venv\Scripts\python.exe tests\test_provider_router.py
 ```
 
-Expected: 124 checks pass, including a 20-request storm proving a rate-limited Cohere key is
-called **once**, not twenty times.
+Expected: 166 checks pass, including a 20-request storm proving a rate-limited provider is
+called **once**, not twenty times, the status-code classification (a retired model or a
+"limit: 0" plan is MODEL_UNAVAILABLE, never RATE_LIMITED), the Claude request shape (cached
+few-shot prefix, thinking off on Haiku 5.5) and a key reload clearing only that provider's
+cooldown.
 
 Real calls (needs keys or a local server):
 
@@ -351,13 +354,28 @@ Real calls (needs keys or a local server):
 .\.venv\Scripts\python.exe tests\test_dmm_matrix.py
 ```
 
-Expected against Cohere: 53/53 intent boundaries, 0 duplicate tokens, 0 unexecutable tokens.
+Historical baseline (Cohere, removed 2026-11-10): 53/53 intent boundaries, 0 duplicate tokens,
+0 unexecutable tokens. Re-measure against Claude Haiku (FORCE_ONLINE=True, a Claude key) before
+relying on a number.
 Against a local model it typically scores 50–51/53; the failing cases are the documented flaky
 boundaries. **The matrix is not deterministic at the last decimal** — re-run before concluding
 a change caused a single-case drop.
 
-Relevant log lines: `[LLM] Provider: Cohere`, `[LLM] Result: RATE_LIMITED`,
-`[LLM] Fallback: Groq`.
+Browser, Meet and Workspace phrasings have their own suite (added in the V9 tuning pass),
+which runs the REAL routing path — rules first (`common.direct_tokens`), then the classifier —
+and scores the action each utterance ends as. Local model only; it skips itself otherwise:
+
+```bash
+.venv/bin/python tests/test_dmm_browser.py [--verbose]
+```
+
+Healthy (2026-11-10, gemma-4-e4b): 72/72, "Rules first (no model): 55/72" (62 cases in V9,
+plus the WhatsApp phrasings of Part 5). A failure names the
+tokens the classifier produced; a phrasing that should not need the model belongs on the
+`_DIRECT_BROWSER` allow-list only if its whole-utterance shape cannot be conversation.
+
+Relevant log lines: `[DMM] Provider: Claude (claude-haiku-5-5)`, `[DMM] Result: RATE_LIMITED`,
+`[DMM] Fallback: Groq`.
 
 ---
 
@@ -687,6 +705,12 @@ Every suite in the unit tier is **SAFE**. That is enforced structurally, not by 
 - `FakeMouse` records pointer calls instead of performing them.
 - `TemporaryProject` redirects `core.paths` at a temp directory, so persistence code runs for
   real against a store nobody owns.
+- `KAYRA_AUDIT_LOG` keeps the automation audit trail out of `logs/automation.log`:
+  `run_all.py` points every suite at a temporary file, and `_harness.py` sets it to `off` for a
+  suite run on its own (the in-memory ring still records). `test_browser_control.py` [9]/[14]
+  fail if the real log grows. Until 2026-11-10 every unit run appended `meet.*` lines to it.
+- `web_macros.SHARE_HELPER` must be replaced by a fake in any test that shares a screen: the
+  real one reads `~/.config/hypr/xdph.conf` and writes under `$XDG_RUNTIME_DIR`.
 
 Both classes of protection exist because both mistakes were actually made here: a UI test wrote
 the developer's real `.env`, and an agent test read the developer's real battery.
@@ -877,6 +901,7 @@ voice state machine exists to prevent.
 | `test_tts_device.py` | ONNX Runtime device | unit | onnxruntime | nothing | 20s |
 | `test_audio_pipeline.py` | Audio pipeline | integration | Kokoro model | nothing | 30s |
 | `test_stt_lifecycle.py` | STT session lifecycle | integration | Chrome or Edge | nothing | 60s |
+| `test_dmm_browser.py` | Browser intents, rules first | integration | a local model | nothing | 30s |
 | `test_dmm_matrix.py` | DMM intent boundaries | integration | a model provider | nothing | 180s |
 | `test_DMM.py` | DMM smoke | integration | a model provider | nothing | 20s |
 | `test_engine.py` | LLM engine smoke | integration | a model provider | nothing | 20s |
